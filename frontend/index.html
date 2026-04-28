@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>合约网格交易系统</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">
+      <div class="brand-mark">GRID</div>
+      <div>
+        <div class="brand-title">合约网格交易</div>
+        <div class="brand-subtitle">Binance-like Futures Grid</div>
+      </div>
+    </div>
+
+    <div class="nav-actions">
+      <div class="runtime-pill">
+        <span id="nav-status" class="status-dot stopped"></span>
+        <span id="nav-status-text">未运行</span>
+      </div>
+      <button class="btn btn-outline" type="button" onclick="openApiModal()">API 配置</button>
+    </div>
+  </nav>
+
+  <main class="page-shell">
+    <section class="left-panel">
+      <div class="card quote-card">
+        <div class="card-title-row">
+          <div>
+            <div class="eyebrow">实时行情</div>
+            <h2>交易对监控</h2>
+          </div>
+          <button class="btn btn-ghost btn-sm" type="button" onclick="fetchPrice()">刷新</button>
+        </div>
+
+        <div class="symbol-row">
+          <input id="symbol-input" class="form-input symbol-input" type="text" value="BTCUSDT" placeholder="例如 BTCUSDT" />
+        </div>
+
+        <div class="price-row">
+          <div id="last-price" class="price-value">--</div>
+          <div id="price-change" class="price-change">--</div>
+        </div>
+
+        <div class="meta-grid">
+          <div class="meta-item">
+            <span>标记价</span>
+            <strong id="mark-price">--</strong>
+          </div>
+          <div class="meta-item">
+            <span>24h 成交量</span>
+            <strong id="vol-24h">--</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title-row">
+          <div>
+            <div class="eyebrow">账户概览</div>
+            <h2>USDT 余额</h2>
+          </div>
+          <button class="btn btn-ghost btn-sm" type="button" onclick="fetchBalance()">刷新</button>
+        </div>
+
+        <div class="stats-grid three">
+          <div class="stat-box">
+            <span>可用余额</span>
+            <strong id="balance-avail">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>账户净值</span>
+            <strong id="balance-equity">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>未实现盈亏</span>
+            <strong id="balance-upnl">--</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">策略设置</div>
+        <h2>网格参数</h2>
+
+        <form id="grid-form" onsubmit="return false;">
+          <div class="form-group">
+            <label>方向</label>
+            <div class="direction-toggle">
+              <button id="btn-long" class="dir-btn active long" type="button" onclick="setDirection('long')">做多</button>
+              <button id="btn-short" class="dir-btn" type="button" onclick="setDirection('short')">做空</button>
+              <button id="btn-neutral" class="dir-btn" type="button" onclick="setDirection('neutral')">中性</button>
+            </div>
+            <input id="direction" type="hidden" value="long" />
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="grid-mode">网格模式</label>
+              <select id="grid-mode" class="form-input">
+                <option value="arithmetic">等差网格</option>
+                <option value="geometric">等比网格</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="grid-count">网格数量</label>
+              <input id="grid-count" class="form-input" type="number" value="30" min="2" max="100" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="upper-price">价格上限</label>
+              <input id="upper-price" class="form-input" type="number" step="any" placeholder="0.11" />
+            </div>
+            <div class="form-group">
+              <label for="lower-price">价格下限</label>
+              <input id="lower-price" class="form-input" type="number" step="any" placeholder="0.095" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="total-investment">总投入金额（USDT）</label>
+              <input id="total-investment" class="form-input" type="number" value="500" min="0" step="any" />
+            </div>
+            <div class="form-group">
+              <label for="trigger-price">触发价格（可选）</label>
+              <input id="trigger-price" class="form-input" type="number" step="any" placeholder="留空则立即启动" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="stop-loss-price">止损价格（可选）</label>
+              <input id="stop-loss-price" class="form-input" type="number" step="any" placeholder="留空则不启用" />
+            </div>
+            <div class="form-group">
+              <label for="take-profit-price">止盈价格（可选）</label>
+              <input id="take-profit-price" class="form-input" type="number" step="any" placeholder="留空则不启用" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="leverage-slider">杠杆倍数</label>
+            <div class="range-row">
+              <input id="leverage-slider" type="range" min="1" max="50" value="3" />
+              <strong id="leverage-val">3x</strong>
+            </div>
+            <input id="leverage" type="hidden" value="3" />
+          </div>
+
+          <div id="grid-preview" class="preview-box hidden">
+            <div>网格间距 <strong id="prev-step">--</strong></div>
+            <div>单格收益百分比 <strong id="prev-profit-pct">--</strong></div>
+            <div>单格预计收益 <strong id="prev-profit">--</strong> USDT</div>
+            <div>每格预计数量 <strong id="prev-qty">--</strong></div>
+            <div>总预估开仓量 <strong id="prev-total-qty">--</strong></div>
+          </div>
+
+          <div class="action-row">
+            <button id="btn-start" class="btn btn-primary btn-wide" type="button" onclick="startGrid()">启动网格</button>
+            <button id="btn-stop" class="btn btn-danger btn-wide hidden" type="button" onclick="stopGrid()">停止网格</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="right-panel">
+      <div class="card running-grids-card">
+        <div class="card-title-row">
+          <div>
+            <div class="eyebrow">多币种网格</div>
+            <h2>运行中策略</h2>
+          </div>
+          <button class="btn btn-ghost btn-sm" type="button" onclick="pollGridStatus()">刷新</button>
+        </div>
+        <div id="running-grids-body" class="running-grids-body">
+          <div class="empty-state">暂无运行中的策略</div>
+        </div>
+      </div>
+
+      <div id="status-card" class="card hidden">
+        <div class="card-title-row">
+          <div>
+            <div class="eyebrow">运行状态</div>
+            <h2>当前策略</h2>
+          </div>
+          <div class="live-tag" id="live-tag-text">运行中</div>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-box">
+            <span>交易对</span>
+            <strong id="st-symbol">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>方向</span>
+            <strong id="st-direction">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>模式</span>
+            <strong id="st-mode">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>累计利润</span>
+            <strong id="st-profit">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>初始动作</span>
+            <strong id="st-initial">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>单格收益率</span>
+            <strong id="st-grid-profit-pct">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>完成配对</span>
+            <strong id="st-completed-pairs">--</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="card pending-orders-card">
+        <div class="card-title-row">
+          <div>
+            <div class="eyebrow">订单队列</div>
+            <h2>待处理订单</h2>
+          </div>
+        </div>
+        <div class="pending-meta">
+          <span>每笔数量 <strong id="pending-qty">--</strong></span>
+          <span>最新价 <strong id="pending-last-price">--</strong></span>
+        </div>
+        <div class="pending-counts">
+          <span class="side-buy">买(<strong id="pending-buy-count">0</strong>)</span>
+          <span class="side-sell">卖(<strong id="pending-sell-count">0</strong>)</span>
+        </div>
+        <div class="pending-ratio">
+          <div id="pending-buy-bar" class="pending-buy-bar"></div>
+          <div id="pending-sell-bar" class="pending-sell-bar"></div>
+        </div>
+        <div class="pending-head">
+          <span>距离成交%</span>
+          <span>价格 (USDT)</span>
+          <span>距离成交%</span>
+        </div>
+        <div id="pending-orders-body" class="pending-orders-body">
+          <div class="empty-state">暂无待处理订单</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">仓位监控</div>
+        <h2>当前持仓</h2>
+        <div id="positions-body" class="panel-body">
+          <div class="empty-state">暂无持仓</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">挂单追踪</div>
+        <h2>网格挂单</h2>
+        <div id="orders-body" class="panel-body">
+          <div class="empty-state">网格未启动</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">成交记录</div>
+        <h2>最近成交</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>方向</th>
+                <th>价格</th>
+                <th>数量</th>
+                <th>利润</th>
+                <th>时间</th>
+              </tr>
+            </thead>
+            <tbody id="filled-body">
+              <tr>
+                <td class="empty-state" colspan="5">暂无成交</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="api-modal" class="modal-overlay hidden" onclick="closeModalOutside(event)">
+    <div class="modal-card">
+      <div class="eyebrow">交易所连接</div>
+      <h2>Bybit API 配置</h2>
+      <p class="modal-hint">建议先使用 Testnet 调试。API Key 需要具备合约读写权限，不要开启提现权限。</p>
+      <div id="cfg-status" class="config-status">当前未保存 API 配置</div>
+
+      <div class="form-group">
+        <label for="cfg-api-key">API Key</label>
+        <input id="cfg-api-key" class="form-input" type="text" placeholder="输入 API Key" />
+      </div>
+
+      <div class="form-group">
+        <label for="cfg-api-secret">API Secret</label>
+        <input id="cfg-api-secret" class="form-input" type="password" placeholder="输入 API Secret" />
+      </div>
+
+      <label class="checkbox-row">
+        <input id="cfg-testnet" type="checkbox" />
+        <span>使用测试网 Testnet</span>
+      </label>
+
+      <div id="cfg-error" class="error-text hidden"></div>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" type="button" onclick="closeApiModal()">取消</button>
+        <button class="btn btn-primary" type="button" onclick="saveApiConfig()">保存并验证</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

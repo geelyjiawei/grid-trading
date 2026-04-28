@@ -1,0 +1,7 @@
+backend/api_config.json
+backend/__pycache__/
+tests/__pycache__/
+.env
+.venv/
+data/
+__pycache__/

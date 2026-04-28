@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+backend/__pycache__/
+tests/__pycache__/
+data/
+backend/api_config.json
+.env
+.git/

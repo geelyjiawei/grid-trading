@@ -1,0 +1,14 @@
+services:
+  grid-trading:
+    build: .
+    container_name: grid-trading
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      GRID_CONFIG_FILE: /app/data/api_config.json
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
