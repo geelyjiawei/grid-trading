@@ -4,3 +4,4 @@ requests==2.31.0
 python-dotenv==1.0.1
 aiofiles==23.2.1
 cryptography>=42.0.0
+pyotp==2.9.0

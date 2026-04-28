@@ -15,6 +15,8 @@ if str(ROOT_DIR / "tests") not in sys.path:
     sys.path.insert(0, str(ROOT_DIR / "tests"))
 
 import main  # noqa: E402
+import pyotp  # noqa: E402
+from auth import hash_password  # noqa: E402
 from test_grid_engine import FakeClient  # noqa: E402
 
 
@@ -27,6 +29,15 @@ class MultiGridServerTests(unittest.TestCase):
     def tearDown(self):
         main._engines.clear()
         main._client = None
+        for key in (
+            "AUTH_REQUIRED",
+            "ADMIN_USERNAME",
+            "ADMIN_PASSWORD_HASH",
+            "TOTP_SECRET",
+            "SESSION_SECRET",
+            "AUTH_SHOW_TOTP_SETUP",
+        ):
+            os.environ.pop(key, None)
 
     def _payload(self, symbol):
         return {
@@ -118,6 +129,30 @@ class MultiGridServerTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_auth_required_blocks_api_until_totp_login(self):
+        secret = pyotp.random_base32()
+        os.environ["AUTH_REQUIRED"] = "true"
+        os.environ["ADMIN_USERNAME"] = "admin"
+        os.environ["ADMIN_PASSWORD_HASH"] = hash_password("correct horse battery staple")
+        os.environ["TOTP_SECRET"] = secret
+        os.environ["SESSION_SECRET"] = "test-session-secret"
+
+        unauthenticated = self.client.get("/api/grid/status")
+        self.assertEqual(unauthenticated.status_code, 401)
+
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "admin",
+                "password": "correct horse battery staple",
+                "code": pyotp.TOTP(secret).now(),
+            },
+        )
+        self.assertEqual(login.status_code, 200)
+
+        authenticated = self.client.get("/api/grid/status")
+        self.assertEqual(authenticated.status_code, 200)
 
 
 if __name__ == "__main__":

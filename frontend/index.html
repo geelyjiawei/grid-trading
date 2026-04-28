@@ -294,6 +294,37 @@
     </section>
   </main>
 
+  <div id="auth-modal" class="auth-overlay hidden">
+    <div class="auth-card">
+      <div class="brand-mark auth-mark">GRID</div>
+      <div class="eyebrow">Secure Access</div>
+      <h2>登录交易面板</h2>
+      <p class="modal-hint">请输入管理员密码和 Google Authenticator 6 位验证码。</p>
+
+      <div id="auth-setup" class="config-status hidden"></div>
+
+      <form onsubmit="login(event)">
+        <div class="form-group">
+          <label for="auth-username">用户名</label>
+          <input id="auth-username" class="form-input" type="text" value="admin" autocomplete="username" />
+        </div>
+
+        <div class="form-group">
+          <label for="auth-password">密码</label>
+          <input id="auth-password" class="form-input" type="password" autocomplete="current-password" />
+        </div>
+
+        <div class="form-group">
+          <label for="auth-code">Google 验证码</label>
+          <input id="auth-code" class="form-input" type="text" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code" />
+        </div>
+
+        <div id="auth-error" class="error-text hidden"></div>
+        <button class="btn btn-primary btn-wide" type="submit">登录</button>
+      </form>
+    </div>
+  </div>
+
   <div id="api-modal" class="modal-overlay hidden" onclick="closeModalOutside(event)">
     <div class="modal-card">
       <div class="eyebrow">交易所连接</div>

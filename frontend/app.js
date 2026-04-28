@@ -3,9 +3,13 @@ let allGridStatuses = [];
 let currentDirection = "long";
 let toastTimer = null;
 let latestPrice = NaN;
+let authRequired = false;
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
+  const authenticated = await checkAuth();
+  if (!authenticated) return;
+
   await loadConfig();
   await fetchPrice();
   await pollGridStatus();
@@ -13,6 +17,67 @@ document.addEventListener("DOMContentLoaded", async () => {
   window.setInterval(fetchPrice, 5000);
   window.setInterval(pollGridStatus, 3000);
 });
+
+async function checkAuth() {
+  try {
+    const status = await api("/api/auth/status", "GET", null, { skipAuthRedirect: true });
+    authRequired = Boolean(status.required);
+    if (!status.required || status.authenticated) {
+      hideAuthModal();
+      return true;
+    }
+
+    showAuthModal(status);
+    return false;
+  } catch (error) {
+    showAuthModal({ configured: false, error: error.message });
+    return false;
+  }
+}
+
+function showAuthModal(status = {}) {
+  const modal = document.getElementById("auth-modal");
+  const setup = document.getElementById("auth-setup");
+  modal.classList.remove("hidden");
+
+  if (!status.configured) {
+    setup.textContent = "服务器尚未配置登录保护，请先在 .env 中设置 ADMIN_PASSWORD_HASH、TOTP_SECRET 和 SESSION_SECRET。";
+    setup.classList.remove("hidden");
+  } else if (status.totp_secret) {
+    setup.textContent = `首次绑定 Google Authenticator：手动输入密钥 ${status.totp_secret}`;
+    setup.classList.remove("hidden");
+  } else {
+    setup.classList.add("hidden");
+  }
+}
+
+function hideAuthModal() {
+  document.getElementById("auth-modal").classList.add("hidden");
+}
+
+async function login(event) {
+  event.preventDefault();
+  const errorEl = document.getElementById("auth-error");
+  errorEl.classList.add("hidden");
+
+  try {
+    await api("/api/auth/login", "POST", {
+      username: document.getElementById("auth-username").value.trim(),
+      password: document.getElementById("auth-password").value,
+      code: document.getElementById("auth-code").value.trim(),
+    }, { skipAuthRedirect: true });
+
+    hideAuthModal();
+    await loadConfig();
+    await fetchPrice();
+    await pollGridStatus();
+    window.setInterval(fetchPrice, 5000);
+    window.setInterval(pollGridStatus, 3000);
+  } catch (error) {
+    errorEl.textContent = error.message;
+    errorEl.classList.remove("hidden");
+  }
+}
 
 function bindEvents() {
   const slider = document.getElementById("leverage-slider");
@@ -485,12 +550,16 @@ async function saveApiConfig() {
   }
 }
 
-async function api(url, method = "GET", body = null) {
+async function api(url, method = "GET", body = null, optionsOverride = {}) {
   const options = { method, headers: { "Content-Type": "application/json" } };
   if (body !== null) options.body = JSON.stringify(body);
 
   const response = await fetch(url, options);
-  const data = await response.json();
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401 && authRequired && !optionsOverride.skipAuthRedirect) {
+    showAuthModal({ configured: true });
+    throw new Error("请先登录");
+  }
   if (!response.ok) throw new Error(data.detail || "请求失败");
   return data;
 }

@@ -2,12 +2,22 @@ import json
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from auth import (
+    COOKIE_NAME,
+    build_totp_uri,
+    create_session,
+    get_auth_settings,
+    verify_password,
+    verify_session,
+    verify_totp,
+)
 from bybit_client import BybitClient
 from grid_engine import GridEngine
 from secret_store import decrypt_text, encrypt_text, storage_backend
@@ -119,6 +129,33 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 
+AUTH_PUBLIC_PATHS = {"/api/auth/status", "/api/auth/login", "/api/auth/logout"}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    settings = get_auth_settings()
+    if (
+        not settings.required
+        or not request.url.path.startswith("/api/")
+        or request.url.path in AUTH_PUBLIC_PATHS
+    ):
+        return await call_next(request)
+
+    if not settings.configured:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Authentication is required but not configured"},
+        )
+
+    username = verify_session(request.cookies.get(COOKIE_NAME, ""), settings)
+    if not username:
+        return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+
+    request.state.auth_user = username
+    return await call_next(request)
+
+
 class ApiConfig(BaseModel):
     api_key: str = Field(min_length=1)
     api_secret: str = Field(min_length=1)
@@ -139,9 +176,71 @@ class GridConfig(BaseModel):
     take_profit_price: float | None = None
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+    code: str = Field(min_length=6, max_length=12)
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    settings = get_auth_settings()
+    username = None
+    if settings.configured:
+        username = verify_session(request.cookies.get(COOKIE_NAME, ""), settings)
+
+    response = {
+        "required": settings.required,
+        "configured": settings.configured,
+        "authenticated": bool(username) or not settings.required,
+        "username": username,
+    }
+    if (
+        settings.required
+        and settings.configured
+        and not username
+        and _parse_bool(os.getenv("AUTH_SHOW_TOTP_SETUP"))
+    ):
+        response["totp_uri"] = build_totp_uri(settings)
+        response["totp_secret"] = settings.totp_secret
+    return response
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: LoginRequest, response: Response):
+    settings = get_auth_settings()
+    if not settings.required:
+        return {"ok": True, "message": "Authentication is disabled"}
+    if not settings.configured:
+        raise HTTPException(status_code=503, detail="Authentication is required but not configured")
+    if payload.username != settings.username:
+        raise HTTPException(status_code=401, detail="Invalid username, password, or code")
+    if not verify_password(payload.password, settings.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username, password, or code")
+    if not verify_totp(payload.code, settings.totp_secret):
+        raise HTTPException(status_code=401, detail="Invalid username, password, or code")
+
+    token = create_session(settings.username, settings)
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite="lax",
+        max_age=43200,
+    )
+    return {"ok": True, "message": "Logged in"}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(response: Response):
+    response.delete_cookie(COOKIE_NAME)
+    return {"ok": True, "message": "Logged out"}
 
 
 @app.get("/api/config")

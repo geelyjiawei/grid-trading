@@ -659,6 +659,32 @@ h2 {
   backdrop-filter: blur(10px);
 }
 
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background:
+    radial-gradient(circle at top left, rgba(242, 193, 78, 0.16), transparent 30%),
+    rgba(4, 8, 13, 0.86);
+  backdrop-filter: blur(16px);
+}
+
+.auth-card {
+  width: min(430px, 100%);
+  padding: 26px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: linear-gradient(180deg, var(--panel) 0%, var(--panel-strong) 100%);
+  box-shadow: var(--shadow);
+}
+
+.auth-mark {
+  margin-bottom: 16px;
+}
+
 .modal-card {
   width: min(480px, 100%);
   padding: 24px;
