@@ -16,6 +16,7 @@ if str(ROOT_DIR / "tests") not in sys.path:
 
 import main  # noqa: E402
 import pyotp  # noqa: E402
+from binance_client import BinanceFuturesClient  # noqa: E402
 from auth import hash_password  # noqa: E402
 from test_grid_engine import FakeClient  # noqa: E402
 
@@ -86,6 +87,7 @@ class MultiGridServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             main.API_CONFIG_FILE = str(Path(tmpdir) / "api_config.json")
             config = {
+                "exchange": "binance",
                 "api_key": "abcd1234efgh",
                 "api_secret": "super-private-token",
                 "testnet": True,
@@ -97,6 +99,7 @@ class MultiGridServerTests(unittest.TestCase):
 
             self.assertEqual(loaded["api_key"], config["api_key"])
             self.assertEqual(loaded["api_secret"], config["api_secret"])
+            self.assertEqual(loaded["exchange"], "binance")
             self.assertEqual(loaded["testnet"], config["testnet"])
             self.assertEqual(loaded["source"], "file")
             self.assertEqual(main._mask_api_key(loaded["api_key"]), "abcd...efgh")
@@ -108,11 +111,13 @@ class MultiGridServerTests(unittest.TestCase):
 
     def test_api_config_can_be_loaded_from_environment(self):
         old_values = {
+            "GRID_EXCHANGE": os.environ.get("GRID_EXCHANGE"),
             "BYBIT_API_KEY": os.environ.get("BYBIT_API_KEY"),
             "BYBIT_API_SECRET": os.environ.get("BYBIT_API_SECRET"),
             "BYBIT_TESTNET": os.environ.get("BYBIT_TESTNET"),
         }
         try:
+            os.environ["GRID_EXCHANGE"] = "bybit"
             os.environ["BYBIT_API_KEY"] = "env-api-key"
             os.environ["BYBIT_API_SECRET"] = "env-api-secret"
             os.environ["BYBIT_TESTNET"] = "true"
@@ -121,6 +126,7 @@ class MultiGridServerTests(unittest.TestCase):
 
             self.assertEqual(loaded["api_key"], "env-api-key")
             self.assertEqual(loaded["api_secret"], "env-api-secret")
+            self.assertEqual(loaded["exchange"], "bybit")
             self.assertTrue(loaded["testnet"])
             self.assertEqual(loaded["source"], "env")
         finally:
@@ -129,6 +135,70 @@ class MultiGridServerTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_binance_api_config_can_be_loaded_from_environment(self):
+        old_values = {
+            "GRID_EXCHANGE": os.environ.get("GRID_EXCHANGE"),
+            "BINANCE_API_KEY": os.environ.get("BINANCE_API_KEY"),
+            "BINANCE_API_SECRET": os.environ.get("BINANCE_API_SECRET"),
+            "BINANCE_TESTNET": os.environ.get("BINANCE_TESTNET"),
+        }
+        try:
+            os.environ["GRID_EXCHANGE"] = "binance"
+            os.environ["BINANCE_API_KEY"] = "binance-key"
+            os.environ["BINANCE_API_SECRET"] = "binance-secret"
+            os.environ["BINANCE_TESTNET"] = "true"
+
+            loaded = main._load_env_api_config()
+
+            self.assertEqual(loaded["exchange"], "binance")
+            self.assertEqual(loaded["api_key"], "binance-key")
+            self.assertEqual(loaded["api_secret"], "binance-secret")
+            self.assertTrue(loaded["testnet"])
+            self.assertEqual(loaded["source"], "env")
+            self.assertIsInstance(
+                main._build_client_from_config(loaded),
+                BinanceFuturesClient,
+            )
+        finally:
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_binance_order_and_position_shapes_match_grid_engine_contract(self):
+        client = BinanceFuturesClient("", "", True)
+
+        order = client._normalize_order(
+            {
+                "orderId": 123,
+                "clientOrderId": "g_1_B_abcdef",
+                "side": "BUY",
+                "price": "100.5",
+                "origQty": "0.01",
+                "status": "NEW",
+                "reduceOnly": False,
+                "time": 1714012800000,
+            }
+        )
+        position = client._normalize_position(
+            {
+                "positionAmt": "-0.25",
+                "entryPrice": "105",
+                "markPrice": "100",
+                "unRealizedProfit": "1.25",
+                "leverage": "3",
+                "liquidationPrice": "140",
+            }
+        )
+
+        self.assertEqual(order["orderId"], "123")
+        self.assertEqual(order["orderLinkId"], "g_1_B_abcdef")
+        self.assertEqual(order["side"], "Buy")
+        self.assertEqual(position["side"], "Sell")
+        self.assertEqual(position["size"], "0.25")
+        self.assertEqual(position["avgPrice"], "105")
 
     def test_auth_required_blocks_api_until_totp_login(self):
         secret = pyotp.random_base32()

@@ -18,12 +18,14 @@ from auth import (
     verify_session,
     verify_totp,
 )
+from binance_client import BinanceFuturesClient
 from bybit_client import BybitClient
 from grid_engine import GridEngine
 from secret_store import decrypt_text, encrypt_text, storage_backend
 
 
 _engines: dict[str, GridEngine] = {}
+SUPPORTED_EXCHANGES = {"bybit", "binance"}
 
 BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
@@ -34,16 +36,34 @@ def _parse_bool(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_exchange(exchange: str | None) -> str:
+    normalized = str(exchange or "bybit").strip().lower()
+    return normalized if normalized in SUPPORTED_EXCHANGES else "bybit"
+
+
 def _load_env_api_config() -> dict | None:
-    api_key = os.getenv("BYBIT_API_KEY", "").strip()
-    api_secret = os.getenv("BYBIT_API_SECRET", "").strip()
+    exchange = _normalize_exchange(os.getenv("GRID_EXCHANGE") or os.getenv("EXCHANGE"))
+    prefix = "BINANCE" if exchange == "binance" else "BYBIT"
+    api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+    api_secret = os.getenv(f"{prefix}_API_SECRET", "").strip()
+
+    if not api_key and not api_secret and exchange == "bybit":
+        binance_key = os.getenv("BINANCE_API_KEY", "").strip()
+        binance_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        if binance_key and binance_secret:
+            exchange = "binance"
+            prefix = "BINANCE"
+            api_key = binance_key
+            api_secret = binance_secret
+
     if not api_key or not api_secret:
         return None
 
     return {
+        "exchange": exchange,
         "api_key": api_key,
         "api_secret": api_secret,
-        "testnet": _parse_bool(os.getenv("BYBIT_TESTNET")),
+        "testnet": _parse_bool(os.getenv(f"{prefix}_TESTNET")),
         "source": "env",
     }
 
@@ -54,19 +74,20 @@ def _load_api_config() -> dict:
         return env_config
 
     if not os.path.exists(API_CONFIG_FILE):
-        return {"api_key": "", "api_secret": "", "testnet": False, "source": "none"}
+        return {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False, "source": "none"}
 
     try:
         with open(API_CONFIG_FILE, "r", encoding="utf-8") as file:
             config = json.load(file)
     except (OSError, json.JSONDecodeError):
-        return {"api_key": "", "api_secret": "", "testnet": False}
+        return {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False}
 
     try:
         if config.get("encrypted"):
             return {
                 "api_key": decrypt_text(str(config.get("api_key", ""))),
                 "api_secret": decrypt_text(str(config.get("api_secret", ""))),
+                "exchange": _normalize_exchange(config.get("exchange")),
                 "testnet": bool(config.get("testnet", False)),
                 "source": "file",
             }
@@ -75,6 +96,7 @@ def _load_api_config() -> dict:
         migrated = {
             "api_key": str(config.get("api_key", "")),
             "api_secret": str(config.get("api_secret", "")),
+            "exchange": _normalize_exchange(config.get("exchange")),
             "testnet": bool(config.get("testnet", False)),
             "source": "file",
         }
@@ -82,17 +104,21 @@ def _load_api_config() -> dict:
             _save_api_config(migrated)
         return migrated
     except Exception:
-        return {"api_key": "", "api_secret": "", "testnet": False, "source": "none"}
+        return {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False, "source": "none"}
 
 
 def _save_api_config(config: dict):
     encrypted_config = {
         "encrypted": True,
         "backend": storage_backend(),
+        "exchange": _normalize_exchange(config.get("exchange")),
         "api_key": encrypt_text(str(config.get("api_key", ""))),
         "api_secret": encrypt_text(str(config.get("api_secret", ""))),
         "testnet": bool(config.get("testnet", False)),
     }
+    config_dir = os.path.dirname(API_CONFIG_FILE)
+    if config_dir:
+        os.makedirs(config_dir, exist_ok=True)
     with open(API_CONFIG_FILE, "w", encoding="utf-8") as file:
         json.dump(encrypted_config, file, ensure_ascii=False, indent=2)
 
@@ -101,10 +127,21 @@ def _mask_api_key(api_key: str) -> str:
     return f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) >= 8 else api_key
 
 
-def _build_client_from_config(config: dict) -> BybitClient | None:
+def _build_client_from_config(config: dict):
     if not config.get("api_key") or not config.get("api_secret"):
         return None
-    return BybitClient(config["api_key"], config["api_secret"], bool(config.get("testnet", False)))
+    return _build_client(
+        _normalize_exchange(config.get("exchange")),
+        config["api_key"],
+        config["api_secret"],
+        bool(config.get("testnet", False)),
+    )
+
+
+def _build_client(exchange: str, api_key: str, api_secret: str, testnet: bool):
+    if exchange == "binance":
+        return BinanceFuturesClient(api_key, api_secret, testnet)
+    return BybitClient(api_key, api_secret, testnet)
 
 
 _api_config = _load_api_config()
@@ -157,6 +194,7 @@ async def auth_middleware(request: Request, call_next):
 
 
 class ApiConfig(BaseModel):
+    exchange: str = "bybit"
     api_key: str = Field(min_length=1)
     api_secret: str = Field(min_length=1)
     testnet: bool = False
@@ -247,6 +285,7 @@ def auth_logout(response: Response):
 def get_config():
     api_key = _api_config.get("api_key", "")
     return {
+        "exchange": _normalize_exchange(_api_config.get("exchange")),
         "api_key": _mask_api_key(api_key),
         "testnet": _api_config.get("testnet", False),
         "configured": bool(api_key),
@@ -259,11 +298,12 @@ def get_config():
 def set_config(cfg: ApiConfig):
     global _client, _api_config
 
-    candidate = BybitClient(cfg.api_key.strip(), cfg.api_secret.strip(), cfg.testnet)
+    exchange = _normalize_exchange(cfg.exchange)
+    candidate = _build_client(exchange, cfg.api_key.strip(), cfg.api_secret.strip(), cfg.testnet)
     try:
         balance = candidate.get_balance()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to connect to Bybit: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Failed to connect to {exchange.title()}: {exc}") from exc
 
     if balance.get("retCode") != 0:
         raise HTTPException(
@@ -272,6 +312,7 @@ def set_config(cfg: ApiConfig):
         )
 
     saved_config = cfg.model_dump()
+    saved_config["exchange"] = exchange
     try:
         _save_api_config(saved_config)
     except RuntimeError as exc:
@@ -279,12 +320,13 @@ def set_config(cfg: ApiConfig):
 
     _client = candidate
     _api_config = {**saved_config, "source": "file"}
-    return {"ok": True, "message": "API config saved"}
+    return {"ok": True, "message": f"{exchange.title()} API config saved"}
 
 
 @app.get("/api/price/{symbol}")
 def get_price(symbol: str):
-    client = _client or BybitClient("", "", bool(_api_config.get("testnet", False)))
+    exchange = _normalize_exchange(_api_config.get("exchange"))
+    client = _client or _build_client(exchange, "", "", bool(_api_config.get("testnet", False)))
     resp = client.get_ticker(symbol.upper())
     if resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch ticker"))
@@ -343,7 +385,7 @@ def get_positions(symbol: str):
                 "entry_price": item.get("avgPrice", "0"),
                 "mark_price": item.get("markPrice", "0"),
                 "unrealised_pnl": item.get("unrealisedPnl", "0"),
-                "leverage": item.get("leverage", "0"),
+                "leverage": item.get("leverage", ""),
                 "liq_price": item.get("liqPrice", ""),
             }
         )
@@ -504,7 +546,7 @@ def cancel_all_symbol_orders(symbol: str):
     return {"ok": True, "message": f"All open orders for {symbol.upper()} were cancelled"}
 
 
-def _get_client() -> BybitClient:
+def _get_client():
     if not _client:
         raise HTTPException(status_code=400, detail="Please configure API Key first")
     return _client

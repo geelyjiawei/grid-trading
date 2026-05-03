@@ -12,7 +12,7 @@
       <div class="brand-mark">GRID</div>
       <div>
         <div class="brand-title">合约网格交易</div>
-        <div class="brand-subtitle">Binance-like Futures Grid</div>
+        <div class="brand-subtitle">Multi-Exchange Futures Grid</div>
       </div>
     </div>
 
@@ -328,9 +328,17 @@
   <div id="api-modal" class="modal-overlay hidden" onclick="closeModalOutside(event)">
     <div class="modal-card">
       <div class="eyebrow">交易所连接</div>
-      <h2>Bybit API 配置</h2>
+      <h2>交易所 API 配置</h2>
       <p class="modal-hint">建议先使用 Testnet 调试。API Key 需要具备合约读写权限，不要开启提现权限。</p>
       <div id="cfg-status" class="config-status">当前未保存 API 配置</div>
+
+      <div class="form-group">
+        <label for="cfg-exchange">交易所</label>
+        <select id="cfg-exchange" class="form-input">
+          <option value="bybit">Bybit USDT 永续</option>
+          <option value="binance">Binance USDT-M Futures</option>
+        </select>
+      </div>
 
       <div class="form-group">
         <label for="cfg-api-key">API Key</label>

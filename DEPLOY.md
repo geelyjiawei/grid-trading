@@ -19,9 +19,15 @@ cp .env.example .env
 编辑 `.env`：
 
 ```bash
+GRID_EXCHANGE=bybit
 BYBIT_API_KEY=你的Key
 BYBIT_API_SECRET=你的Secret
 BYBIT_TESTNET=false
+
+# 如果使用 Binance，把 GRID_EXCHANGE 改为 binance，并填写：
+BINANCE_API_KEY=你的Key
+BINANCE_API_SECRET=你的Secret
+BINANCE_TESTNET=false
 ```
 
 建议服务器部署优先使用环境变量，不要在网页里保存 API。API 权限不要开启提现，最好在交易所后台限制服务器 IP。

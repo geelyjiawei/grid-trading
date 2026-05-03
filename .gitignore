@@ -2,6 +2,14 @@ backend/api_config.json
 backend/__pycache__/
 tests/__pycache__/
 .env
+.env.*
 .venv/
 data/
 __pycache__/
+*.key
+*.pem
+*.p8
+*.p12
+*.crt
+*.secret
+secrets/

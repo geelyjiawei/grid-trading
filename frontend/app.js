@@ -105,6 +105,7 @@ function bindEvents() {
 async function loadConfig() {
   try {
     const config = await api("/api/config");
+    document.getElementById("cfg-exchange").value = config.exchange || "bybit";
     document.getElementById("cfg-testnet").checked = Boolean(config.testnet);
     renderConfigStatus(config);
     if (config.configured) {
@@ -126,7 +127,8 @@ function renderConfigStatus(config) {
   }
 
   const source = config.source === "env" ? "环境变量" : "本地加密文件";
-  statusEl.textContent = `已配置：${config.api_key} · ${config.testnet ? "Testnet" : "Mainnet"} · ${source}`;
+  const exchange = config.exchange === "binance" ? "Binance" : "Bybit";
+  statusEl.textContent = `已配置：${exchange} · ${config.api_key} · ${config.testnet ? "Testnet" : "Mainnet"} · ${source}`;
   statusEl.className = "config-status configured";
 }
 
@@ -483,11 +485,12 @@ async function fetchPositions() {
       const pnl = Number(position.unrealised_pnl || 0);
       const direction = position.side === "Buy" ? "多仓" : "空仓";
       const sideClass = position.side === "Buy" ? "side-buy" : "side-sell";
+      const leverage = position.leverage ? `${position.leverage}x` : "--";
       return `
         <div class="position-card">
           <div class="position-head">
             <strong class="${sideClass}">${direction}</strong>
-            <span class="muted">${position.leverage}x</span>
+            <span class="muted">${leverage}</span>
           </div>
           <div class="position-grid">
             <div><span>数量</span><strong>${position.size}</strong></div>
@@ -524,6 +527,7 @@ function closeModalOutside(event) {
 }
 
 async function saveApiConfig() {
+  const exchange = document.getElementById("cfg-exchange").value;
   const apiKey = document.getElementById("cfg-api-key").value.trim();
   const apiSecret = document.getElementById("cfg-api-secret").value.trim();
   const testnet = document.getElementById("cfg-testnet").checked;
@@ -536,7 +540,7 @@ async function saveApiConfig() {
   }
 
   try {
-    const result = await api("/api/config", "POST", { api_key: apiKey, api_secret: apiSecret, testnet });
+    const result = await api("/api/config", "POST", { exchange, api_key: apiKey, api_secret: apiSecret, testnet });
     errorEl.classList.add("hidden");
     document.getElementById("cfg-api-key").value = "";
     document.getElementById("cfg-api-secret").value = "";
