@@ -14,6 +14,7 @@ class BybitClient:
         self.api_secret = api_secret
         self.base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.recv_window = "5000"
+        self._asset_price_cache: dict[str, Decimal] = {}
 
     def _sign(self, payload: str, timestamp: str) -> str:
         raw = f"{timestamp}{self.api_key}{self.recv_window}{payload}"
@@ -102,6 +103,7 @@ class BybitClient:
         order_type: str = "Limit",
         reduce_only: bool = False,
         order_link_id: str = "",
+        time_in_force: str | None = None,
     ) -> dict:
         payload: dict[str, Any] = {
             "category": "linear",
@@ -113,7 +115,7 @@ class BybitClient:
         }
         if order_type == "Limit":
             payload["price"] = price
-            payload["timeInForce"] = "GTC"
+            payload["timeInForce"] = time_in_force or "GTC"
         if order_link_id:
             payload["orderLinkId"] = order_link_id
         return self._request("POST", "/v5/order/create", payload=payload, auth=True)
@@ -157,6 +159,54 @@ class BybitClient:
             params=f"category=linear&symbol={symbol}&limit={limit}",
             auth=True,
         )
+
+    def get_order_trades(self, symbol: str, order_id: str) -> dict:
+        resp = self._request(
+            "GET",
+            "/v5/execution/list",
+            params=f"category=linear&symbol={symbol}&orderId={order_id}&limit=100",
+            auth=True,
+        )
+        if resp.get("retCode") != 0:
+            return resp
+        resp["result"]["list"] = [self._normalize_trade(item) for item in resp["result"].get("list", [])]
+        return resp
+
+    def _normalize_trade(self, item: dict[str, Any]) -> dict:
+        fee_asset = str(item.get("feeCurrency") or item.get("feeCoin") or "USDT").upper()
+        fee_amount = Decimal(str(item.get("execFee", "0")))
+        fee_usdt = self._fee_to_usdt(fee_amount, fee_asset)
+
+        return {
+            "orderId": str(item.get("orderId", "")),
+            "tradeId": str(item.get("execId", "")),
+            "side": item.get("side", ""),
+            "price": item.get("execPrice", "0"),
+            "qty": item.get("execQty", "0"),
+            "volume": item.get("execValue", "0"),
+            "fee": str(fee_amount),
+            "feeAsset": fee_asset,
+            "feeUsdt": "" if fee_usdt is None else str(fee_usdt),
+            "realizedPnl": item.get("execPnl", "0"),
+            "isMaker": str(item.get("isMaker", "")).lower() == "true",
+            "time": item.get("execTime", ""),
+        }
+
+    def _fee_to_usdt(self, amount: Decimal, asset: str) -> Decimal | None:
+        if amount == 0:
+            return Decimal("0")
+        if asset in {"", "USDT", "USDC", "BUSD", "FDUSD", "USD"}:
+            return amount
+
+        symbol = f"{asset}USDT"
+        if symbol not in self._asset_price_cache:
+            try:
+                ticker = self.get_ticker(symbol)
+                price = ticker["result"]["list"][0]["lastPrice"]
+                self._asset_price_cache[symbol] = Decimal(str(price))
+            except Exception:
+                return None
+        return amount * self._asset_price_cache[symbol]
 
     @staticmethod
     def round_to_step(value: float, step: str) -> str:

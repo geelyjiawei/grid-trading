@@ -4,6 +4,7 @@ let currentDirection = "long";
 let toastTimer = null;
 let latestPrice = NaN;
 let authRequired = false;
+let activeDetailPanel = "positions";
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -87,7 +88,7 @@ function bindEvents() {
     updatePreview();
   });
 
-  ["upper-price", "lower-price", "grid-count", "total-investment", "grid-mode"].forEach((id) => {
+  ["upper-price", "lower-price", "grid-count", "total-investment", "fee-rate", "grid-mode", "initial-order-type"].forEach((id) => {
     document.getElementById(id).addEventListener("input", updatePreview);
     document.getElementById(id).addEventListener("change", updatePreview);
   });
@@ -146,6 +147,7 @@ function updatePreview() {
   const count = parseInt(document.getElementById("grid-count").value, 10);
   const investment = parseFloat(document.getElementById("total-investment").value);
   const leverage = parseInt(document.getElementById("leverage").value, 10);
+  const feeRate = parseFeeRate();
   const gridMode = document.getElementById("grid-mode").value;
   const box = document.getElementById("grid-preview");
 
@@ -169,10 +171,14 @@ function updatePreview() {
 
   const totalQty = referencePrice > 0 ? (investment * leverage) / referencePrice : 0;
   const perGridQty = totalQty / count;
-  const perGridProfit = step * perGridQty;
+  const perGridGrossProfit = step * perGridQty;
+  const perGridFee = perGridQty * referencePrice * 2 * feeRate;
+  const perGridProfit = perGridGrossProfit - perGridFee;
 
   document.getElementById("prev-step").textContent = gridMode === "geometric" ? `${step.toFixed(6)} / ${(gridPct).toFixed(3)}%` : step.toFixed(6);
   document.getElementById("prev-profit-pct").textContent = `${gridPct.toFixed(3)}%`;
+  document.getElementById("prev-gross-profit").textContent = perGridGrossProfit.toFixed(4);
+  document.getElementById("prev-fee").textContent = perGridFee.toFixed(4);
   document.getElementById("prev-profit").textContent = perGridProfit.toFixed(4);
   document.getElementById("prev-qty").textContent = perGridQty.toFixed(6);
   document.getElementById("prev-total-qty").textContent = totalQty.toFixed(6);
@@ -226,6 +232,10 @@ async function startGrid() {
     grid_count: parseInt(document.getElementById("grid-count").value, 10),
     total_investment: parseFloat(document.getElementById("total-investment").value),
     leverage: parseInt(document.getElementById("leverage").value, 10),
+    fee_rate: parseFeeRate(),
+    initial_order_type: document.getElementById("initial-order-type").value,
+    initial_order_price: parseOptionalNumber("initial-order-price"),
+    grid_order_post_only: document.getElementById("grid-order-post-only").checked,
     trigger_price: parseOptionalNumber("trigger-price"),
     stop_loss_price: parseOptionalNumber("stop-loss-price"),
     take_profit_price: parseOptionalNumber("take-profit-price"),
@@ -299,7 +309,10 @@ function renderStatus(status, summary = {}) {
   const runningCount = Number(summary.running_count || (gridRunning ? 1 : 0));
   dot.className = `status-dot ${anyRunning ? "running" : "stopped"}`;
 
-  if (status.waiting_trigger) {
+  if (status.waiting_initial_order) {
+    text.textContent = "等待限价开仓";
+    liveTag.textContent = "等待开仓";
+  } else if (status.waiting_trigger) {
     text.textContent = "等待触发";
     liveTag.textContent = "等待触发";
   } else {
@@ -314,7 +327,7 @@ function renderStatus(status, summary = {}) {
   if (!gridRunning) {
     document.getElementById("orders-body").innerHTML = '<div class="empty-state">网格未启动</div>';
     renderPendingOrders([], status);
-    document.getElementById("filled-body").innerHTML = '<tr><td class="empty-state" colspan="5">暂无成交</td></tr>';
+    document.getElementById("filled-body").innerHTML = '<tr><td class="empty-state" colspan="8">暂无成交</td></tr>';
     return;
   }
 
@@ -328,6 +341,9 @@ function renderStatus(status, summary = {}) {
   const profitEl = document.getElementById("st-profit");
   profitEl.textContent = `${fmtNum(profit)} USDT`;
   profitEl.className = profit >= 0 ? "positive" : "negative";
+  document.getElementById("st-gross-profit").textContent = `${fmtNum(status.gross_profit ?? 0)} USDT`;
+  document.getElementById("st-fee").textContent = `${fmtNum(status.total_fee ?? 0)} USDT`;
+  document.getElementById("st-volume").textContent = `${fmtNum(status.total_volume ?? 0)} USDT`;
 
   const initialSide = status.initial_side === "Buy" ? "买入" : status.initial_side === "Sell" ? "卖出" : "--";
   document.getElementById("st-initial").textContent = status.initial_qty ? `${initialSide} ${Number(status.initial_qty).toFixed(6)}` : (status.trigger_message || "--");
@@ -449,7 +465,7 @@ function renderOrders(orders) {
 function renderFilled(filledOrders) {
   const tbody = document.getElementById("filled-body");
   if (!filledOrders.length) {
-    tbody.innerHTML = '<tr><td class="empty-state" colspan="5">暂无成交</td></tr>';
+    tbody.innerHTML = '<tr><td class="empty-state" colspan="8">暂无成交</td></tr>';
     return;
   }
 
@@ -458,17 +474,51 @@ function renderFilled(filledOrders) {
     .slice(0, 30)
     .map((item) => {
       const profit = Number(item.profit || 0);
+      const fee = Number(item.fee || 0);
+      const volume = Number(item.volume || 0);
+      const feeAsset = item.fee_asset ? ` (${item.fee_asset})` : "";
+      const liquidity = mapLiquidity(item.liquidity);
       return `
         <tr>
           <td class="${item.side === "Buy" ? "side-buy" : "side-sell"}">${item.side}</td>
           <td>${fmtMarket(item.price)}</td>
           <td>${item.qty}</td>
-          <td class="${profit >= 0 ? "positive" : "negative"}">${item.reduce_only ? `${profit >= 0 ? "+" : ""}${profit.toFixed(4)}` : "--"}</td>
+          <td>${fmtNum(volume)}</td>
+          <td>${fmtNum(fee)}${feeAsset}</td>
+          <td>${liquidity}</td>
+          <td class="${profit >= 0 ? "positive" : "negative"}">${profit >= 0 ? "+" : ""}${profit.toFixed(4)}</td>
           <td>${new Date(item.time * 1000).toLocaleTimeString()}</td>
         </tr>
       `;
     })
     .join("");
+}
+
+function openDetailModal(panel) {
+  activeDetailPanel = panel;
+  const titles = {
+    positions: ["仓位监控", "当前持仓"],
+    orders: ["挂单追踪", "网格挂单"],
+    fills: ["成交记录", "最近成交"],
+  };
+  const [eyebrow, title] = titles[panel] || titles.positions;
+
+  document.getElementById("detail-modal-eyebrow").textContent = eyebrow;
+  document.getElementById("detail-modal-title").textContent = title;
+  ["positions", "orders", "fills"].forEach((name) => {
+    document.getElementById(`detail-${name}-panel`).classList.toggle("hidden", name !== panel);
+  });
+  document.getElementById("detail-modal").classList.remove("hidden");
+}
+
+function closeDetailModal() {
+  document.getElementById("detail-modal").classList.add("hidden");
+}
+
+function closeDetailModalOutside(event) {
+  if (event.target.id === "detail-modal") {
+    closeDetailModal();
+  }
 }
 
 async function fetchPositions() {
@@ -573,10 +623,22 @@ function parseOptionalNumber(id) {
   return value === "" ? null : Number(value);
 }
 
+function parseFeeRate() {
+  const value = Number(document.getElementById("fee-rate").value);
+  return Number.isFinite(value) && value > 0 ? value / 100 : 0;
+}
+
 function mapDirection(direction) {
   if (direction === "long") return "做多";
   if (direction === "short") return "做空";
   if (direction === "neutral") return "中性";
+  return "--";
+}
+
+function mapLiquidity(liquidity) {
+  if (liquidity === "maker") return "挂单";
+  if (liquidity === "taker") return "吃单";
+  if (liquidity === "mixed") return "混合";
   return "--";
 }
 

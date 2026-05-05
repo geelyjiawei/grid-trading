@@ -208,6 +208,10 @@ class GridConfig(BaseModel):
     grid_count: int
     total_investment: float
     leverage: int
+    fee_rate: float = 0.0005
+    initial_order_type: str = "market"
+    initial_order_price: float | None = None
+    grid_order_post_only: bool = True
     grid_mode: str = "arithmetic"
     trigger_price: float | None = None
     stop_loss_price: float | None = None
@@ -399,6 +403,7 @@ async def start_grid(cfg: GridConfig):
     symbol = cfg.symbol.upper().strip()
     direction = cfg.direction.lower().strip()
     grid_mode = cfg.grid_mode.lower().strip()
+    initial_order_type = cfg.initial_order_type.lower().strip()
     existing_engine = _engines.get(symbol)
 
     if existing_engine and existing_engine.running:
@@ -411,15 +416,24 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="total_investment must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
+    if cfg.fee_rate < 0 or cfg.fee_rate > 0.01:
+        raise HTTPException(status_code=400, detail="fee_rate must be between 0 and 0.01")
     if direction not in {"long", "short", "neutral"}:
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
         raise HTTPException(status_code=400, detail="grid_mode must be arithmetic or geometric")
+    if initial_order_type not in {"market", "post_only"}:
+        raise HTTPException(status_code=400, detail="initial_order_type must be market or post_only")
+    if direction == "neutral" and initial_order_type != "market":
+        raise HTTPException(status_code=400, detail="post_only initial order is only supported for long or short grids")
+    if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
+        raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
     engine_config = cfg.model_dump()
     engine_config["symbol"] = symbol
     engine_config["direction"] = direction
     engine_config["grid_mode"] = grid_mode
+    engine_config["initial_order_type"] = initial_order_type
     engine = GridEngine(client, engine_config)
 
     try:

@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -17,8 +18,27 @@ if str(ROOT_DIR / "tests") not in sys.path:
 import main  # noqa: E402
 import pyotp  # noqa: E402
 from binance_client import BinanceFuturesClient  # noqa: E402
+from bybit_client import BybitClient  # noqa: E402
 from auth import hash_password  # noqa: E402
 from test_grid_engine import FakeClient  # noqa: E402
+
+
+class FakeConfigClient:
+    def __init__(self, api_key, api_secret, testnet=False):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.testnet = testnet
+
+    def get_balance(self):
+        return {"retCode": 0, "result": {"list": [{"coin": []}]}}
+
+
+class FakeBinanceConfigClient(FakeConfigClient):
+    pass
+
+
+class FakeBybitConfigClient(FakeConfigClient):
+    pass
 
 
 class MultiGridServerTests(unittest.TestCase):
@@ -167,6 +187,70 @@ class MultiGridServerTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_api_config_endpoint_saves_binance_and_uses_binance_client(self):
+        original_path = main.API_CONFIG_FILE
+        original_binance = main.BinanceFuturesClient
+        original_bybit = main.BybitClient
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                main.API_CONFIG_FILE = str(Path(tmpdir) / "api_config.json")
+                main.BinanceFuturesClient = FakeBinanceConfigClient
+                main.BybitClient = FakeBybitConfigClient
+
+                response = self.client.post(
+                    "/api/config",
+                    json={
+                        "exchange": "binance",
+                        "api_key": "binance-api-key",
+                        "api_secret": "binance-api-secret",
+                        "testnet": True,
+                    },
+                )
+                config_response = self.client.get("/api/config")
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["message"], "Binance API config saved")
+                self.assertIsInstance(main._client, FakeBinanceConfigClient)
+                self.assertEqual(main._api_config["exchange"], "binance")
+                self.assertEqual(config_response.json()["exchange"], "binance")
+                self.assertEqual(config_response.json()["api_key"], "bina...-key")
+            finally:
+                main.API_CONFIG_FILE = original_path
+                main.BinanceFuturesClient = original_binance
+                main.BybitClient = original_bybit
+
+    def test_api_config_endpoint_saves_bybit_and_uses_bybit_client(self):
+        original_path = main.API_CONFIG_FILE
+        original_binance = main.BinanceFuturesClient
+        original_bybit = main.BybitClient
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                main.API_CONFIG_FILE = str(Path(tmpdir) / "api_config.json")
+                main.BinanceFuturesClient = FakeBinanceConfigClient
+                main.BybitClient = FakeBybitConfigClient
+
+                response = self.client.post(
+                    "/api/config",
+                    json={
+                        "exchange": "bybit",
+                        "api_key": "bybit-api-key",
+                        "api_secret": "bybit-api-secret",
+                        "testnet": False,
+                    },
+                )
+                config_response = self.client.get("/api/config")
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["message"], "Bybit API config saved")
+                self.assertIsInstance(main._client, FakeBybitConfigClient)
+                self.assertEqual(main._api_config["exchange"], "bybit")
+                self.assertEqual(config_response.json()["exchange"], "bybit")
+                self.assertEqual(config_response.json()["api_key"], "bybi...-key")
+            finally:
+                main.API_CONFIG_FILE = original_path
+                main.BinanceFuturesClient = original_binance
+                main.BybitClient = original_bybit
+
     def test_binance_order_and_position_shapes_match_grid_engine_contract(self):
         client = BinanceFuturesClient("", "", True)
 
@@ -192,6 +276,20 @@ class MultiGridServerTests(unittest.TestCase):
                 "liquidationPrice": "140",
             }
         )
+        client._asset_price_cache["BNBUSDT"] = Decimal("600")
+        trade = client._normalize_trade(
+            {
+                "orderId": 123,
+                "id": 456,
+                "side": "BUY",
+                "price": "100",
+                "qty": "0.5",
+                "quoteQty": "50",
+                "commission": "0.001",
+                "commissionAsset": "BNB",
+                "maker": True,
+            }
+        )
 
         self.assertEqual(order["orderId"], "123")
         self.assertEqual(order["orderLinkId"], "g_1_B_abcdef")
@@ -199,6 +297,9 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(position["side"], "Sell")
         self.assertEqual(position["size"], "0.25")
         self.assertEqual(position["avgPrice"], "105")
+        self.assertEqual(trade["feeAsset"], "BNB")
+        self.assertEqual(trade["feeUsdt"], "0.600")
+        self.assertTrue(trade["isMaker"])
 
     def test_auth_required_blocks_api_until_totp_login(self):
         secret = pyotp.random_base32()

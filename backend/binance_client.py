@@ -16,6 +16,7 @@ class BinanceFuturesClient:
         self.api_secret = api_secret
         self.base_url = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
         self.recv_window = 5000
+        self._asset_price_cache: dict[str, Decimal] = {}
 
     def _sign(self, params: dict[str, Any]) -> str:
         query = urlencode(params, doseq=True)
@@ -139,6 +140,7 @@ class BinanceFuturesClient:
         order_type: str = "Limit",
         reduce_only: bool = False,
         order_link_id: str = "",
+        time_in_force: str | None = None,
     ) -> dict:
         params: dict[str, Any] = {
             "symbol": symbol.upper(),
@@ -149,7 +151,7 @@ class BinanceFuturesClient:
         }
         if order_type.lower() == "limit":
             params["price"] = price
-            params["timeInForce"] = "GTC"
+            params["timeInForce"] = "GTX" if time_in_force == "PostOnly" else (time_in_force or "GTC")
         if order_link_id:
             params["newClientOrderId"] = order_link_id
 
@@ -207,6 +209,18 @@ class BinanceFuturesClient:
             "result": {"list": [self._normalize_order(item) for item in orders]},
         }
 
+    def get_order_trades(self, symbol: str, order_id: str) -> dict:
+        trades = self._request(
+            "GET",
+            "/fapi/v1/userTrades",
+            params={"symbol": symbol.upper(), "orderId": order_id, "limit": 100},
+            auth=True,
+        )
+        return {
+            "retCode": 0,
+            "result": {"list": [self._normalize_trade(item) for item in trades]},
+        }
+
     @staticmethod
     def _to_binance_side(side: str) -> str:
         return "BUY" if side.lower() == "buy" else "SELL"
@@ -226,6 +240,44 @@ class BinanceFuturesClient:
             "reduceOnly": item.get("reduceOnly", False),
             "createdTime": str(item.get("time", "")),
         }
+
+    def _normalize_trade(self, item: dict[str, Any]) -> dict:
+        price = Decimal(str(item.get("price", "0")))
+        qty = Decimal(str(item.get("qty", "0")))
+        volume = Decimal(str(item.get("quoteQty") or (price * qty)))
+        fee_amount = Decimal(str(item.get("commission", "0")))
+        fee_asset = str(item.get("commissionAsset", "USDT")).upper()
+        fee_usdt = self._fee_to_usdt(fee_amount, fee_asset)
+
+        return {
+            "orderId": str(item.get("orderId", "")),
+            "tradeId": str(item.get("id", "")),
+            "side": self._from_binance_side(str(item.get("side", ""))),
+            "price": str(price),
+            "qty": str(qty),
+            "volume": str(volume),
+            "fee": str(fee_amount),
+            "feeAsset": fee_asset,
+            "feeUsdt": "" if fee_usdt is None else str(fee_usdt),
+            "realizedPnl": item.get("realizedPnl", "0"),
+            "isMaker": bool(item.get("maker", False)),
+            "time": str(item.get("time", "")),
+        }
+
+    def _fee_to_usdt(self, amount: Decimal, asset: str) -> Decimal | None:
+        if amount == 0:
+            return Decimal("0")
+        if asset in {"USDT", "USDC", "BUSD", "FDUSD", "USD"}:
+            return amount
+
+        symbol = f"{asset}USDT"
+        if symbol not in self._asset_price_cache:
+            try:
+                ticker = self._request("GET", "/fapi/v1/ticker/price", params={"symbol": symbol})
+                self._asset_price_cache[symbol] = Decimal(str(ticker.get("price", "0")))
+            except Exception:
+                return None
+        return amount * self._asset_price_cache[symbol]
 
     @staticmethod
     def _normalize_position(item: dict[str, Any]) -> dict:

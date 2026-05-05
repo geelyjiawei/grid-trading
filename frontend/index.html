@@ -113,6 +113,25 @@
 
           <div class="form-row">
             <div class="form-group">
+              <label for="initial-order-type">开仓方式</label>
+              <select id="initial-order-type" class="form-input">
+                <option value="market">市价开仓（立即成交）</option>
+                <option value="post_only">Post Only 限价开仓（省手续费）</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="initial-order-price">开仓限价（可选）</label>
+              <input id="initial-order-price" class="form-input" type="number" step="any" placeholder="留空自动贴近当前价" />
+            </div>
+          </div>
+
+          <div class="checkbox-row">
+            <input id="grid-order-post-only" type="checkbox" checked />
+            <label for="grid-order-post-only">网格挂单也使用 Post Only，避免异常吃单</label>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
               <label for="upper-price">价格上限</label>
               <input id="upper-price" class="form-input" type="number" step="any" placeholder="0.11" />
             </div>
@@ -128,19 +147,30 @@
               <input id="total-investment" class="form-input" type="number" value="500" min="0" step="any" />
             </div>
             <div class="form-group">
-              <label for="trigger-price">触发价格（可选）</label>
-              <input id="trigger-price" class="form-input" type="number" step="any" placeholder="留空则立即启动" />
+              <label for="fee-rate">兜底手续费率（%）</label>
+              <input id="fee-rate" class="form-input" type="number" value="0.05" min="0" max="1" step="0.001" />
             </div>
           </div>
 
           <div class="form-row">
             <div class="form-group">
+              <label for="trigger-price">触发价格（可选）</label>
+              <input id="trigger-price" class="form-input" type="number" step="any" placeholder="留空则立即启动" />
+            </div>
+            <div class="form-group">
               <label for="stop-loss-price">止损价格（可选）</label>
               <input id="stop-loss-price" class="form-input" type="number" step="any" placeholder="留空则不启用" />
             </div>
+          </div>
+
+          <div class="form-row">
             <div class="form-group">
               <label for="take-profit-price">止盈价格（可选）</label>
               <input id="take-profit-price" class="form-input" type="number" step="any" placeholder="留空则不启用" />
+            </div>
+            <div class="form-group">
+              <label>手续费说明</label>
+              <div class="form-hint">Post Only 会先等限价开仓成交，再布置网格；手续费优先读取成交明细。</div>
             </div>
           </div>
 
@@ -156,7 +186,9 @@
           <div id="grid-preview" class="preview-box hidden">
             <div>网格间距 <strong id="prev-step">--</strong></div>
             <div>单格收益百分比 <strong id="prev-profit-pct">--</strong></div>
-            <div>单格预计收益 <strong id="prev-profit">--</strong> USDT</div>
+            <div>单格预计毛收益 <strong id="prev-gross-profit">--</strong> USDT</div>
+            <div>单格预计手续费 <strong id="prev-fee">--</strong> USDT</div>
+            <div>单格预计净收益 <strong id="prev-profit">--</strong> USDT</div>
             <div>每格预计数量 <strong id="prev-qty">--</strong></div>
             <div>总预估开仓量 <strong id="prev-total-qty">--</strong></div>
           </div>
@@ -183,6 +215,20 @@
         </div>
       </div>
 
+      <div class="card detail-launch-card">
+        <div class="card-title-row">
+          <div>
+            <div class="eyebrow">策略详情</div>
+            <h2>快速查看</h2>
+          </div>
+        </div>
+        <div class="detail-actions">
+          <button class="btn btn-outline" type="button" onclick="openDetailModal('positions')">持仓</button>
+          <button class="btn btn-outline" type="button" onclick="openDetailModal('orders')">挂单</button>
+          <button class="btn btn-outline" type="button" onclick="openDetailModal('fills')">成交</button>
+        </div>
+      </div>
+
       <div id="status-card" class="card hidden">
         <div class="card-title-row">
           <div>
@@ -206,8 +252,20 @@
             <strong id="st-mode">--</strong>
           </div>
           <div class="stat-box">
-            <span>累计利润</span>
+            <span>净利润</span>
             <strong id="st-profit">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>毛利润</span>
+            <strong id="st-gross-profit">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>累计手续费</span>
+            <strong id="st-fee">--</strong>
+          </div>
+          <div class="stat-box">
+            <span>总交易量</span>
+            <strong id="st-volume">--</strong>
           </div>
           <div class="stat-box">
             <span>初始动作</span>
@@ -253,46 +311,56 @@
         </div>
       </div>
 
-      <div class="card">
-        <div class="eyebrow">仓位监控</div>
-        <h2>当前持仓</h2>
-        <div id="positions-body" class="panel-body">
+    </section>
+  </main>
+
+  <div id="detail-modal" class="modal-overlay hidden" onclick="closeDetailModalOutside(event)">
+    <div class="modal-card detail-modal-card">
+      <div class="card-title-row">
+        <div>
+          <div class="eyebrow" id="detail-modal-eyebrow">策略详情</div>
+          <h2 id="detail-modal-title">详情</h2>
+        </div>
+        <button class="btn btn-ghost btn-sm" type="button" onclick="closeDetailModal()">关闭</button>
+      </div>
+
+      <div id="detail-positions-panel" class="detail-panel hidden">
+        <div id="positions-body" class="panel-body detail-scroll">
           <div class="empty-state">暂无持仓</div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="eyebrow">挂单追踪</div>
-        <h2>网格挂单</h2>
-        <div id="orders-body" class="panel-body">
+      <div id="detail-orders-panel" class="detail-panel hidden">
+        <div id="orders-body" class="panel-body detail-scroll">
           <div class="empty-state">网格未启动</div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="eyebrow">成交记录</div>
-        <h2>最近成交</h2>
-        <div class="table-wrap">
+      <div id="detail-fills-panel" class="detail-panel hidden">
+        <div class="table-wrap detail-scroll">
           <table class="table">
             <thead>
               <tr>
                 <th>方向</th>
                 <th>价格</th>
                 <th>数量</th>
-                <th>利润</th>
+                <th>交易量</th>
+                <th>手续费</th>
+                <th>流动性</th>
+                <th>净利润</th>
                 <th>时间</th>
               </tr>
             </thead>
             <tbody id="filled-body">
               <tr>
-                <td class="empty-state" colspan="5">暂无成交</td>
+                <td class="empty-state" colspan="8">暂无成交</td>
               </tr>
             </tbody>
           </table>
         </div>
       </div>
-    </section>
-  </main>
+    </div>
+  </div>
 
   <div id="auth-modal" class="auth-overlay hidden">
     <div class="auth-card">

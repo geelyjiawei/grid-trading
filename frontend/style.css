@@ -100,7 +100,8 @@ input {
 .meta-item span,
 .stat-box span,
 .position-grid span,
-.modal-hint {
+.modal-hint,
+.form-hint {
   color: var(--muted);
 }
 
@@ -450,6 +451,18 @@ h2 {
   min-height: 80px;
 }
 
+.detail-launch-card {
+  position: sticky;
+  top: 92px;
+  z-index: 5;
+}
+
+.detail-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .pending-orders-card {
   overflow: hidden;
 }
@@ -690,6 +703,22 @@ h2 {
   padding: 24px;
 }
 
+.detail-modal-card {
+  width: min(1120px, calc(100vw - 32px));
+  max-height: min(760px, calc(100vh - 32px));
+  overflow: hidden;
+}
+
+.detail-panel {
+  min-height: 260px;
+}
+
+.detail-scroll {
+  max-height: min(610px, calc(100vh - 180px));
+  overflow: auto;
+  padding-right: 4px;
+}
+
 .modal-hint {
   margin: 12px 0 18px;
   line-height: 1.7;
@@ -781,6 +810,7 @@ h2 {
   .meta-grid,
   .stats-grid,
   .stats-grid.three,
+  .detail-actions,
   .position-grid,
   .order-item,
   .pending-meta,
