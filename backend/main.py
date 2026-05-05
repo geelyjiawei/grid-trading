@@ -69,18 +69,26 @@ def _load_env_api_config() -> dict | None:
 
 
 def _load_api_config() -> dict:
+    file_config = _load_file_api_config()
+    if file_config and file_config.get("api_key") and file_config.get("api_secret"):
+        return file_config
+
     env_config = _load_env_api_config()
     if env_config:
         return env_config
 
+    return file_config or {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False, "source": "none"}
+
+
+def _load_file_api_config() -> dict | None:
     if not os.path.exists(API_CONFIG_FILE):
-        return {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False, "source": "none"}
+        return None
 
     try:
         with open(API_CONFIG_FILE, "r", encoding="utf-8") as file:
             config = json.load(file)
     except (OSError, json.JSONDecodeError):
-        return {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False}
+        return None
 
     try:
         if config.get("encrypted"):
@@ -104,7 +112,7 @@ def _load_api_config() -> dict:
             _save_api_config(migrated)
         return migrated
     except Exception:
-        return {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False, "source": "none"}
+        return None
 
 
 def _save_api_config(config: dict):

@@ -130,31 +130,35 @@ class MultiGridServerTests(unittest.TestCase):
         main.API_CONFIG_FILE = original_path
 
     def test_api_config_can_be_loaded_from_environment(self):
+        original_path = main.API_CONFIG_FILE
         old_values = {
             "GRID_EXCHANGE": os.environ.get("GRID_EXCHANGE"),
             "BYBIT_API_KEY": os.environ.get("BYBIT_API_KEY"),
             "BYBIT_API_SECRET": os.environ.get("BYBIT_API_SECRET"),
             "BYBIT_TESTNET": os.environ.get("BYBIT_TESTNET"),
         }
-        try:
-            os.environ["GRID_EXCHANGE"] = "bybit"
-            os.environ["BYBIT_API_KEY"] = "env-api-key"
-            os.environ["BYBIT_API_SECRET"] = "env-api-secret"
-            os.environ["BYBIT_TESTNET"] = "true"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                main.API_CONFIG_FILE = str(Path(tmpdir) / "missing_api_config.json")
+                os.environ["GRID_EXCHANGE"] = "bybit"
+                os.environ["BYBIT_API_KEY"] = "env-api-key"
+                os.environ["BYBIT_API_SECRET"] = "env-api-secret"
+                os.environ["BYBIT_TESTNET"] = "true"
 
-            loaded = main._load_api_config()
+                loaded = main._load_api_config()
 
-            self.assertEqual(loaded["api_key"], "env-api-key")
-            self.assertEqual(loaded["api_secret"], "env-api-secret")
-            self.assertEqual(loaded["exchange"], "bybit")
-            self.assertTrue(loaded["testnet"])
-            self.assertEqual(loaded["source"], "env")
-        finally:
-            for key, value in old_values.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+                self.assertEqual(loaded["api_key"], "env-api-key")
+                self.assertEqual(loaded["api_secret"], "env-api-secret")
+                self.assertEqual(loaded["exchange"], "bybit")
+                self.assertTrue(loaded["testnet"])
+                self.assertEqual(loaded["source"], "env")
+            finally:
+                main.API_CONFIG_FILE = original_path
+                for key, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
     def test_binance_api_config_can_be_loaded_from_environment(self):
         old_values = {
@@ -186,6 +190,45 @@ class MultiGridServerTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def test_saved_file_config_takes_priority_over_environment(self):
+        original_path = main.API_CONFIG_FILE
+        old_values = {
+            "GRID_EXCHANGE": os.environ.get("GRID_EXCHANGE"),
+            "BYBIT_API_KEY": os.environ.get("BYBIT_API_KEY"),
+            "BYBIT_API_SECRET": os.environ.get("BYBIT_API_SECRET"),
+            "BYBIT_TESTNET": os.environ.get("BYBIT_TESTNET"),
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                main.API_CONFIG_FILE = str(Path(tmpdir) / "api_config.json")
+                os.environ["GRID_EXCHANGE"] = "bybit"
+                os.environ["BYBIT_API_KEY"] = "env-bybit-key"
+                os.environ["BYBIT_API_SECRET"] = "env-bybit-secret"
+                os.environ["BYBIT_TESTNET"] = "false"
+
+                main._save_api_config(
+                    {
+                        "exchange": "binance",
+                        "api_key": "file-binance-key",
+                        "api_secret": "file-binance-secret",
+                        "testnet": True,
+                    }
+                )
+                loaded = main._load_api_config()
+
+                self.assertEqual(loaded["source"], "file")
+                self.assertEqual(loaded["exchange"], "binance")
+                self.assertEqual(loaded["api_key"], "file-binance-key")
+                self.assertTrue(loaded["testnet"])
+                self.assertIsInstance(main._build_client_from_config(loaded), BinanceFuturesClient)
+            finally:
+                main.API_CONFIG_FILE = original_path
+                for key, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
     def test_api_config_endpoint_saves_binance_and_uses_binance_client(self):
         original_path = main.API_CONFIG_FILE
