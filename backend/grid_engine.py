@@ -3,16 +3,17 @@ import logging
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
-from typing import Optional
+from typing import Any, Callable, Optional
 
 
 logger = logging.getLogger(__name__)
 
 
 class GridEngine:
-    def __init__(self, client, config: dict):
+    def __init__(self, client, config: dict, state_callback: Callable[["GridEngine"], None] | None = None):
         self.client = client
         self.config = config
+        self.state_callback = state_callback
         self.running = False
         self.grid_levels: list[float] = []
         self.active_orders: dict[str, dict] = {}
@@ -38,6 +39,74 @@ class GridEngine:
         self._pending_targets: dict | None = None
         self._stopping = False
         self._task: Optional[asyncio.Task] = None
+
+    def _persist_state(self):
+        if self.state_callback:
+            self.state_callback(self)
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "config": self.config,
+            "running": self.running,
+            "grid_levels": self.grid_levels,
+            "active_orders": self.active_orders,
+            "filled_orders": self.filled_orders[-200:],
+            "completed_pairs": self.completed_pairs,
+            "gross_profit": self.gross_profit,
+            "total_profit": self.total_profit,
+            "total_fee": self.total_fee,
+            "total_volume": self.total_volume,
+            "start_time": self.start_time,
+            "tick_size": self.tick_size,
+            "qty_step": self.qty_step,
+            "min_qty": self.min_qty,
+            "current_price": self.current_price,
+            "initial_side": self.initial_side,
+            "initial_qty": self.initial_qty,
+            "grid_profit_pct": self.grid_profit_pct,
+            "waiting_trigger": self.waiting_trigger,
+            "trigger_message": self.trigger_message,
+            "grid_ready": self.grid_ready,
+            "waiting_initial_order": self.waiting_initial_order,
+            "opening_order": self.opening_order,
+            "pending_targets": self._pending_targets,
+            "saved_at": time.time(),
+        }
+
+    def restore_state(self, state: dict[str, Any]):
+        self.config = dict(state.get("config") or self.config)
+        self.grid_levels = list(state.get("grid_levels") or [])
+        self.active_orders = dict(state.get("active_orders") or {})
+        self.filled_orders = list(state.get("filled_orders") or [])
+        self.completed_pairs = int(state.get("completed_pairs") or 0)
+        self.gross_profit = float(state.get("gross_profit") or 0)
+        self.total_profit = float(state.get("total_profit") or 0)
+        self.total_fee = float(state.get("total_fee") or 0)
+        self.total_volume = float(state.get("total_volume") or 0)
+        self.start_time = state.get("start_time")
+        self.tick_size = str(state.get("tick_size") or self.tick_size)
+        self.qty_step = str(state.get("qty_step") or self.qty_step)
+        self.min_qty = float(state.get("min_qty") or self.min_qty)
+        self.current_price = float(state.get("current_price") or 0)
+        self.initial_side = str(state.get("initial_side") or "")
+        self.initial_qty = float(state.get("initial_qty") or 0)
+        self.grid_profit_pct = float(state.get("grid_profit_pct") or 0)
+        self.waiting_trigger = bool(state.get("waiting_trigger", False))
+        self.trigger_message = str(state.get("trigger_message") or "")
+        self.grid_ready = bool(state.get("grid_ready", False))
+        self.waiting_initial_order = bool(state.get("waiting_initial_order", False))
+        self.opening_order = state.get("opening_order")
+        self._pending_targets = state.get("pending_targets")
+
+        if not self.grid_levels:
+            self.grid_levels = self._calculate_levels()
+        try:
+            self._fetch_precision()
+            self.current_price = self._get_current_price()
+        except Exception as exc:
+            logger.warning("Restore refresh failed symbol=%s msg=%s", self.config.get("symbol"), exc)
+        self._persist_state()
 
     async def initialize(self):
         symbol = self.config["symbol"]
@@ -65,8 +134,10 @@ class GridEngine:
             return
         self._stopping = False
         self.running = True
-        self.start_time = time.time()
+        if self.start_time is None:
+            self.start_time = time.time()
         self._task = asyncio.create_task(self._run_loop())
+        self._persist_state()
 
     async def stop(self):
         self._stopping = True
@@ -78,10 +149,25 @@ class GridEngine:
             except asyncio.CancelledError:
                 pass
 
-        try:
-            self.client.cancel_all_orders(self.config["symbol"])
-        finally:
-            self.active_orders.clear()
+        resp = self.client.cancel_all_orders(self.config["symbol"])
+        if resp.get("retCode") != 0:
+            raise RuntimeError(resp.get("retMsg", "Failed to cancel open orders"))
+
+        self.active_orders.clear()
+        self.opening_order = None
+        self.waiting_initial_order = False
+        self.grid_ready = False
+        self._persist_state()
+
+    async def suspend(self):
+        """Stop the local polling task without touching exchange orders."""
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._persist_state()
 
     def get_status(self) -> dict:
         return {
@@ -353,6 +439,7 @@ class GridEngine:
             fee_asset=stats["fee_asset"],
             fee_source=stats["fee_source"],
         )
+        self._persist_state()
 
     def _place_limit_open(self, side: str, qty: float, price: float):
         qty_text = self._fq(qty)
@@ -382,6 +469,7 @@ class GridEngine:
             "price": price_text,
             "qty": qty_text,
         }
+        self._persist_state()
 
     def _initial_limit_price(self, side: str, current_price: float) -> float:
         configured_price = self.config.get("initial_order_price")
@@ -450,6 +538,7 @@ class GridEngine:
             "status": "open",
             "reduce_only": reduce_only,
         }
+        self._persist_state()
         return link_id
 
     def _is_trigger_hit(self, current_price: float) -> bool:
@@ -470,7 +559,10 @@ class GridEngine:
         direction = self.config["direction"]
 
         if not (levels[0] < current_price < levels[-1]):
-            raise RuntimeError("Current price must stay inside the configured range")
+            raise RuntimeError(
+                f"Current price {current_price} must stay inside the configured range "
+                f"{levels[0]} - {levels[-1]}"
+            )
 
         self.waiting_trigger = False
         self.trigger_message = ""
@@ -541,6 +633,7 @@ class GridEngine:
             "allocated_qtys": allocated_qtys,
             "qty_per_grid": qty_per_grid,
         }
+        self._persist_state()
 
         if direction in {"long", "short"}:
             if self.config.get("initial_order_type", "market") == "post_only":
@@ -557,6 +650,7 @@ class GridEngine:
             self._deploy_pending_targets()
 
         self.grid_ready = True
+        self._persist_state()
 
     def _deploy_pending_targets(self, qty_scale: float = 1.0):
         if not self._pending_targets:
@@ -583,6 +677,7 @@ class GridEngine:
         self.grid_ready = True
         self.waiting_initial_order = False
         self.trigger_message = ""
+        self._persist_state()
 
     def _risk_hit(self, current_price: float) -> bool:
         direction = self.config["direction"]
@@ -644,6 +739,8 @@ class GridEngine:
             self._close_all_positions()
         except Exception as exc:
             logger.exception("Risk shutdown failed: %s", exc)
+        finally:
+            self._persist_state()
 
     async def _run_loop(self):
         while self.running:
@@ -718,6 +815,7 @@ class GridEngine:
         )
         self.opening_order = None
         self._deploy_pending_targets(qty_scale)
+        self._persist_state()
 
     async def _check_fills(self):
         resp = self.client.get_open_orders(self.config["symbol"])
@@ -738,14 +836,39 @@ class GridEngine:
             if self._stopping:
                 break
             order = self.active_orders.pop(link_id)
-            self._record_fill(order)
-            self._place_counter_order(order)
+            handled = self._handle_closed_order(order)
+            if not handled:
+                logger.info(
+                    "Grid order closed without confirmed fill symbol=%s order_id=%s link_id=%s",
+                    self.config.get("symbol"),
+                    order.get("order_id"),
+                    link_id,
+                )
+            self._persist_state()
 
-    def _record_fill(self, order: dict):
+    def _handle_closed_order(self, order: dict) -> bool:
+        fallback_qty = float(order["qty"])
+        fallback_price = float(order["price"])
+        allow_estimate = not hasattr(self.client, "get_order_trades")
+        stats = self._get_trade_stats(
+            order["order_id"],
+            fallback_price,
+            fallback_qty,
+            allow_estimate=allow_estimate,
+        )
+        if not stats or stats["qty"] <= 0:
+            return False
+
+        filled_order = {**order, "qty": str(stats["qty"])}
+        self._record_fill(filled_order, stats)
+        self._place_counter_order(filled_order)
+        return True
+
+    def _record_fill(self, order: dict, stats: dict | None = None):
         level_idx = order["level_idx"]
         fallback_qty = float(order["qty"])
         fallback_price = float(order["price"])
-        stats = self._get_trade_stats(order["order_id"], fallback_price, fallback_qty)
+        stats = stats or self._get_trade_stats(order["order_id"], fallback_price, fallback_qty)
         qty = stats["qty"]
         price = stats["price"]
         gross_profit = 0.0
@@ -782,6 +905,7 @@ class GridEngine:
                 "reduce_only": order["reduce_only"],
             }
         )
+        self._persist_state()
 
     def _place_counter_order(self, order: dict):
         direction = self.config["direction"]

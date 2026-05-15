@@ -447,6 +447,28 @@ h2 {
   text-align: right;
 }
 
+.risk-card {
+  border-color: rgba(255, 107, 107, 0.36);
+  background:
+    radial-gradient(circle at top right, rgba(255, 107, 107, 0.18), transparent 34%),
+    var(--card);
+}
+
+.risk-card h2 {
+  color: #ffb3b3;
+}
+
+.risk-body {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.risk-body strong {
+  color: #fff;
+}
+
 .panel-body {
   min-height: 80px;
 }

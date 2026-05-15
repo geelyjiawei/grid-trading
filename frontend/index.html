@@ -215,6 +215,17 @@
         </div>
       </div>
 
+      <div id="risk-card" class="card risk-card hidden">
+        <div class="card-title-row">
+          <div>
+            <div class="eyebrow">风险提醒</div>
+            <h2>发现未托管交易</h2>
+          </div>
+          <button id="btn-cancel-orphans" class="btn btn-danger btn-sm hidden" type="button" onclick="cancelOrphanOrders()">撤销孤儿挂单</button>
+        </div>
+        <div id="risk-body" class="risk-body"></div>
+      </div>
+
       <div class="card detail-launch-card">
         <div class="card-title-row">
           <div>
@@ -406,6 +417,7 @@
           <option value="bybit">Bybit USDT 永续</option>
           <option value="binance">Binance USDT-M Futures</option>
         </select>
+        <div id="cfg-draft-hint" class="form-hint">选择交易所后，填写对应 API 并保存才会切换。</div>
       </div>
 
       <div class="form-group">

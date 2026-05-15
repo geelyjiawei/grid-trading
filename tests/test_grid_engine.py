@@ -52,10 +52,29 @@ class FakeClient:
         self.open_limit_order_ids.clear()
         return {"retCode": 0}
 
+    def cancel_order(self, symbol, order_id):
+        self.open_limit_order_ids.discard(str(order_id))
+        return {"retCode": 0}
+
     def get_open_orders(self, symbol):
+        by_id = {str(order["orderId"]): order for order in self.orders}
         return {
             "retCode": 0,
-            "result": {"list": [{"orderId": oid} for oid in sorted(self.open_limit_order_ids)]},
+            "result": {
+                "list": [
+                    {
+                        "orderId": oid,
+                        "orderLinkId": by_id.get(oid, {}).get("order_link_id", ""),
+                        "side": by_id.get(oid, {}).get("side", ""),
+                        "price": by_id.get(oid, {}).get("price", "0"),
+                        "qty": by_id.get(oid, {}).get("qty", "0"),
+                        "orderStatus": "NEW",
+                        "reduceOnly": by_id.get(oid, {}).get("reduce_only", False),
+                        "createdTime": "1",
+                    }
+                    for oid in sorted(self.open_limit_order_ids)
+                ]
+            },
         }
 
     def get_positions(self, symbol):
@@ -348,6 +367,91 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.orders), order_count)
         self.assertEqual(engine.filled_orders, [])
+
+    async def test_cancelled_grid_order_is_not_treated_as_fill_when_trade_details_are_empty(self):
+        client = FakeClient("100")
+        client.trade_details = {}
+        client.get_order_trades = lambda symbol, order_id: {"retCode": 0, "result": {"list": []}}
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        order = next(iter(engine.active_orders.values()))
+        order_count = len(client.orders)
+        client.open_limit_order_ids.discard(order["order_id"])
+
+        await engine._check_fills()
+
+        self.assertEqual(engine.filled_orders, [])
+        self.assertEqual(len(client.orders), order_count)
+        self.assertNotIn(order["link_id"], engine.active_orders)
+
+    async def test_restored_grid_continues_tracking_saved_orders_after_restart(self):
+        snapshots = []
+        client = FakeClient("100")
+        client.trade_details = {}
+        client.get_order_trades = lambda symbol, order_id: {
+            "retCode": 0,
+            "result": {"list": client.trade_details.get(order_id, [])},
+        }
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+            state_callback=lambda item: snapshots.append(item.to_state()),
+        )
+
+        await engine.initialize()
+        saved = engine.to_state()
+        restored = GridEngine(client, saved["config"])
+        restored.restore_state(saved)
+        take_profit = next(
+            order for order in restored.active_orders.values() if order["side"] == "Buy" and order["reduce_only"]
+        )
+        client.trade_details[take_profit["order_id"]] = [
+            {
+                "price": take_profit["price"],
+                "qty": take_profit["qty"],
+                "volume": str(float(take_profit["price"]) * float(take_profit["qty"])),
+                "feeUsdt": "0.01",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        ]
+        client.open_limit_order_ids.discard(take_profit["order_id"])
+
+        await restored._check_fills()
+
+        self.assertGreater(len(snapshots), 0)
+        self.assertEqual(restored.completed_pairs, 1)
+        self.assertTrue(
+            any(order["side"] == "Sell" and not order["reduce_only"] for order in restored.active_orders.values())
+        )
 
     async def test_neutral_grid_deploys_both_buy_and_sell_limit_orders_without_market_position(self):
         client = FakeClient("100")

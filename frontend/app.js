@@ -5,6 +5,8 @@ let toastTimer = null;
 let latestPrice = NaN;
 let authRequired = false;
 let activeDetailPanel = "positions";
+let activeExchange = "bybit";
+let currentRiskSymbol = "";
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -101,14 +103,18 @@ function bindEvents() {
     }
     await pollGridStatus();
   });
+
+  document.getElementById("cfg-exchange").addEventListener("change", renderConfigDraftHint);
 }
 
 async function loadConfig() {
   try {
     const config = await api("/api/config");
+    activeExchange = config.exchange || "bybit";
     document.getElementById("cfg-exchange").value = config.exchange || "bybit";
     document.getElementById("cfg-testnet").checked = Boolean(config.testnet);
     renderConfigStatus(config);
+    renderConfigDraftHint();
     if (config.configured) {
       await fetchBalance();
     }
@@ -129,8 +135,23 @@ function renderConfigStatus(config) {
 
   const source = config.source === "env" ? "环境变量" : "本地加密文件";
   const exchange = config.exchange === "binance" ? "Binance" : "Bybit";
-  statusEl.textContent = `已配置：${exchange} · ${config.api_key} · ${config.testnet ? "Testnet" : "Mainnet"} · ${source}`;
+  statusEl.textContent = `当前生效：${exchange} · ${config.api_key} · ${config.testnet ? "Testnet" : "Mainnet"} · ${source}`;
   statusEl.className = "config-status configured";
+}
+
+function renderConfigDraftHint() {
+  const hintEl = document.getElementById("cfg-draft-hint");
+  if (!hintEl) return;
+
+  const selected = document.getElementById("cfg-exchange").value;
+  const selectedName = selected === "binance" ? "Binance" : "Bybit";
+  const activeName = activeExchange === "binance" ? "Binance" : "Bybit";
+
+  if (selected === activeExchange) {
+    hintEl.textContent = `正在编辑 ${selectedName} 配置。保存并验证成功后会继续使用 ${selectedName}。`;
+  } else {
+    hintEl.textContent = `当前生效是 ${activeName}。你正在编辑 ${selectedName}，必须填写 ${selectedName} API 并点击“保存并验证”，成功后才会切换。`;
+  }
 }
 
 function setDirection(direction) {
@@ -249,6 +270,16 @@ async function startGrid() {
     showToast("价格区间填写不正确", "error");
     return;
   }
+  if (
+    Number.isFinite(latestPrice)
+    && !(payload.lower_price < latestPrice && latestPrice < payload.upper_price)
+  ) {
+    showToast(
+      `当前价 ${fmtMarket(latestPrice)} 不在区间 ${payload.lower_price} - ${payload.upper_price} 内`,
+      "error",
+    );
+    return;
+  }
   if (!payload.grid_count || payload.grid_count < 2) {
     showToast("网格数量至少为 2", "error");
     return;
@@ -289,6 +320,7 @@ async function pollGridStatus() {
     const currentStatus = findStatusForSymbol(getSymbol()) || { running: false, symbol: getSymbol() };
     renderRunningGrids(allGridStatuses);
     renderStatus(currentStatus, summary);
+    await fetchRiskSnapshot(getSymbol());
     if (currentStatus.running && currentStatus.grid_ready) {
       await fetchPositions();
     } else {
@@ -296,6 +328,61 @@ async function pollGridStatus() {
     }
   } catch (_) {
     // Keep UI quiet during polling.
+  }
+}
+
+async function fetchRiskSnapshot(symbol) {
+  if (!symbol) return;
+  try {
+    const risk = await api(`/api/risk/${symbol}`);
+    renderRiskSnapshot(risk);
+  } catch (_) {
+    renderRiskSnapshot({ has_risk: false });
+  }
+}
+
+function renderRiskSnapshot(risk) {
+  const card = document.getElementById("risk-card");
+  const body = document.getElementById("risk-body");
+  const cancelBtn = document.getElementById("btn-cancel-orphans");
+  if (!card || !body || !cancelBtn) return;
+
+  const hasRisk = Boolean(risk.has_risk);
+  currentRiskSymbol = risk.symbol || getSymbol();
+  card.classList.toggle("hidden", !hasRisk);
+  if (!hasRisk) {
+    body.innerHTML = "";
+    cancelBtn.classList.add("hidden");
+    return;
+  }
+
+  const orphanCount = Number(risk.orphan_order_count || 0);
+  const positionText = (risk.positions || [])
+    .map((position) => `${position.side === "Buy" ? "多仓" : "空仓"} ${position.size}，均价 ${fmtMarket(position.entry_price)}`)
+    .join("；");
+  const messages = [];
+  if (orphanCount > 0) {
+    messages.push(`<div><strong>${currentRiskSymbol}</strong> 有 ${orphanCount} 个程序历史挂单未被当前网格托管。</div>`);
+  }
+  if (risk.unmanaged_position && positionText) {
+    messages.push(`<div>当前还有未托管持仓：${positionText}。</div>`);
+  }
+  messages.push("<div>建议先撤销孤儿挂单，再决定是否手动保留或平掉持仓。</div>");
+  body.innerHTML = messages.join("");
+  cancelBtn.classList.toggle("hidden", orphanCount <= 0);
+}
+
+async function cancelOrphanOrders() {
+  const symbol = currentRiskSymbol || getSymbol();
+  if (!symbol) return;
+  if (!window.confirm(`确认撤销 ${symbol} 的未托管网格挂单？这不会平掉现有持仓。`)) return;
+
+  try {
+    const result = await api(`/api/risk/cancel-orphans/${symbol}`, "POST");
+    showToast(`已撤销 ${result.cancelled.length} 个孤儿挂单`, "success");
+    await pollGridStatus();
+  } catch (error) {
+    showToast(`撤销孤儿挂单失败：${error.message}`, "error");
   }
 }
 

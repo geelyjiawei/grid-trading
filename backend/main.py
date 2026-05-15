@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -30,6 +31,7 @@ SUPPORTED_EXCHANGES = {"bybit", "binance"}
 BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
 API_CONFIG_FILE = os.getenv("GRID_CONFIG_FILE") or os.path.join(BASE_DIR, "api_config.json")
+GRID_STATE_FILE = os.getenv("GRID_STATE_FILE") or os.path.join(os.path.dirname(API_CONFIG_FILE), "grid_state.json")
 
 
 def _parse_bool(value: str | None) -> bool:
@@ -156,12 +158,88 @@ _api_config = _load_api_config()
 _client = _build_client_from_config(_api_config)
 
 
+def _load_grid_state_file() -> dict:
+    if not os.path.exists(GRID_STATE_FILE):
+        return {"version": 1, "grids": {}}
+
+    try:
+        with open(GRID_STATE_FILE, "r", encoding="utf-8") as file:
+            state = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "grids": {}}
+
+    if not isinstance(state, dict):
+        return {"version": 1, "grids": {}}
+    state.setdefault("version", 1)
+    state.setdefault("grids", {})
+    return state
+
+
+def _write_grid_state_file(state: dict):
+    state_dir = os.path.dirname(GRID_STATE_FILE)
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+    tmp_path = f"{GRID_STATE_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as file:
+        json.dump(state, file, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, GRID_STATE_FILE)
+
+
+def _save_engine_state(engine: GridEngine):
+    symbol = str(engine.config.get("symbol", "")).upper()
+    if not symbol:
+        return
+
+    state = _load_grid_state_file()
+    state["exchange"] = _normalize_exchange(_api_config.get("exchange"))
+    state["testnet"] = bool(_api_config.get("testnet", False))
+    state["updated_at"] = time.time()
+    state.setdefault("grids", {})[symbol] = engine.to_state()
+    _write_grid_state_file(state)
+
+
+def _delete_engine_state(symbol: str):
+    state = _load_grid_state_file()
+    grids = state.setdefault("grids", {})
+    grids.pop(symbol.upper(), None)
+    state["updated_at"] = time.time()
+    _write_grid_state_file(state)
+
+
+def _restore_saved_engines():
+    if not _client:
+        return
+
+    state = _load_grid_state_file()
+    if _normalize_exchange(state.get("exchange")) != _normalize_exchange(_api_config.get("exchange")):
+        return
+    if bool(state.get("testnet", False)) != bool(_api_config.get("testnet", False)):
+        return
+
+    for symbol, engine_state in list(state.get("grids", {}).items()):
+        if symbol in _engines:
+            continue
+        config = dict(engine_state.get("config") or {})
+        if not config:
+            continue
+        config["symbol"] = str(config.get("symbol") or symbol).upper()
+        engine = GridEngine(_client, config, state_callback=_save_engine_state)
+        try:
+            engine.restore_state(engine_state)
+            _engines[config["symbol"]] = engine
+            engine.start()
+        except Exception:
+            # Keep the saved state on disk so the UI/risk checks can still show the problem.
+            _engines.pop(config["symbol"], None)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _restore_saved_engines()
     yield
     for engine in list(_engines.values()):
         if engine.running:
-            await engine.stop()
+            await engine.suspend()
 
 
 app = FastAPI(title="Grid Trading", lifespan=lifespan)
@@ -310,6 +388,9 @@ def get_config():
 def set_config(cfg: ApiConfig):
     global _client, _api_config
 
+    if any(engine.running for engine in _engines.values()):
+        raise HTTPException(status_code=400, detail="Stop all running grids before changing exchange API config")
+
     exchange = _normalize_exchange(cfg.exchange)
     candidate = _build_client(exchange, cfg.api_key.strip(), cfg.api_secret.strip(), cfg.testnet)
     try:
@@ -442,7 +523,7 @@ async def start_grid(cfg: GridConfig):
     engine_config["direction"] = direction
     engine_config["grid_mode"] = grid_mode
     engine_config["initial_order_type"] = initial_order_type
-    engine = GridEngine(client, engine_config)
+    engine = GridEngine(client, engine_config, state_callback=_save_engine_state)
 
     try:
         await engine.initialize()
@@ -451,6 +532,7 @@ async def start_grid(cfg: GridConfig):
 
     _engines[symbol] = engine
     engine.start()
+    _save_engine_state(engine)
     return {"ok": True, "message": f"{symbol} {direction} grid started"}
 
 
@@ -477,7 +559,10 @@ async def stop_all_grids():
         raise HTTPException(status_code=400, detail="No active grid")
 
     for engine in running:
+        symbol = str(engine.config.get("symbol", "")).upper()
         await engine.stop()
+        if symbol:
+            _delete_engine_state(symbol)
 
     return {"ok": True, "message": "All grids stopped and open orders cancelled"}
 
@@ -488,6 +573,7 @@ async def _stop_grid(symbol: str):
         raise HTTPException(status_code=400, detail="No active grid")
 
     await engine.stop()
+    _delete_engine_state(symbol)
     return {"ok": True, "message": f"{symbol} grid stopped and open orders cancelled"}
 
 
@@ -513,6 +599,99 @@ def grid_symbol_status(symbol: str):
 
 def _engine_status(engine: GridEngine) -> dict:
     return engine.get_status()
+
+
+def _is_grid_order(item: dict) -> bool:
+    link_id = str(item.get("orderLinkId") or item.get("order_link_id") or "")
+    return link_id.startswith(("g_", "open_"))
+
+
+def _managed_order_ids(engine: GridEngine | None) -> set[str]:
+    if not engine:
+        return set()
+    ids = {str(order.get("order_id", "")) for order in engine.active_orders.values()}
+    if engine.opening_order:
+        ids.add(str(engine.opening_order.get("order_id", "")))
+    return {order_id for order_id in ids if order_id}
+
+
+def _risk_snapshot(symbol: str) -> dict:
+    client = _get_client()
+    symbol = symbol.upper().strip()
+    engine = _engines.get(symbol)
+    managed_ids = _managed_order_ids(engine)
+
+    open_resp = client.get_open_orders(symbol)
+    if open_resp.get("retCode") != 0:
+        raise HTTPException(status_code=400, detail=open_resp.get("retMsg", "Failed to fetch open orders"))
+    open_orders = open_resp["result"].get("list", [])
+    grid_orders = [order for order in open_orders if _is_grid_order(order)]
+    orphan_orders = [
+        {
+            "order_id": item.get("orderId", ""),
+            "order_link_id": item.get("orderLinkId", ""),
+            "side": item.get("side", ""),
+            "price": item.get("price", "0"),
+            "qty": item.get("qty", "0"),
+            "status": item.get("orderStatus", ""),
+            "reduce_only": item.get("reduceOnly", False),
+            "created_time": item.get("createdTime", ""),
+        }
+        for item in grid_orders
+        if str(item.get("orderId", "")) not in managed_ids
+    ]
+
+    position_resp = client.get_positions(symbol)
+    if position_resp.get("retCode") != 0:
+        raise HTTPException(status_code=400, detail=position_resp.get("retMsg", "Failed to fetch positions"))
+    positions = []
+    for item in position_resp["result"].get("list", []):
+        try:
+            size = float(item.get("size", 0))
+        except (TypeError, ValueError):
+            size = 0
+        if size > 0:
+            positions.append(
+                {
+                    "side": item.get("side", ""),
+                    "size": item.get("size", "0"),
+                    "entry_price": item.get("avgPrice", "0"),
+                    "mark_price": item.get("markPrice", "0"),
+                    "unrealised_pnl": item.get("unrealisedPnl", "0"),
+                }
+            )
+
+    unmanaged_position = bool(positions and (not engine or not engine.running))
+    return {
+        "symbol": symbol,
+        "engine_running": bool(engine and engine.running),
+        "orphan_order_count": len(orphan_orders),
+        "orphan_orders": orphan_orders,
+        "unmanaged_position": unmanaged_position,
+        "positions": positions,
+        "has_risk": bool(orphan_orders or unmanaged_position),
+    }
+
+
+@app.get("/api/risk/{symbol}")
+def risk_snapshot(symbol: str):
+    return _risk_snapshot(symbol)
+
+
+@app.post("/api/risk/cancel-orphans/{symbol}")
+def cancel_orphan_orders(symbol: str):
+    client = _get_client()
+    snapshot = _risk_snapshot(symbol)
+    cancelled = []
+    for order in snapshot["orphan_orders"]:
+        order_id = str(order.get("order_id", ""))
+        if not order_id:
+            continue
+        resp = client.cancel_order(snapshot["symbol"], order_id)
+        if resp.get("retCode") != 0:
+            raise HTTPException(status_code=400, detail=resp.get("retMsg", f"Failed to cancel {order_id}"))
+        cancelled.append(order_id)
+    return {"ok": True, "symbol": snapshot["symbol"], "cancelled": cancelled}
 
 
 @app.get("/api/orders/history/{symbol}")

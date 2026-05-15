@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/backend \
-    GRID_CONFIG_FILE=/app/data/api_config.json
+    GRID_CONFIG_FILE=/app/data/api_config.json \
+    GRID_STATE_FILE=/app/data/grid_state.json
 
 WORKDIR /app
 

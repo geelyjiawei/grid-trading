@@ -43,6 +43,9 @@ class FakeBybitConfigClient(FakeConfigClient):
 
 class MultiGridServerTests(unittest.TestCase):
     def setUp(self):
+        self._original_state_file = main.GRID_STATE_FILE
+        self._state_tmp = tempfile.TemporaryDirectory()
+        main.GRID_STATE_FILE = str(Path(self._state_tmp.name) / "grid_state.json")
         main._engines.clear()
         main._client = FakeClient("100")
         self.client = TestClient(main.app)
@@ -50,6 +53,8 @@ class MultiGridServerTests(unittest.TestCase):
     def tearDown(self):
         main._engines.clear()
         main._client = None
+        main.GRID_STATE_FILE = self._original_state_file
+        self._state_tmp.cleanup()
         for key in (
             "AUTH_REQUIRED",
             "ADMIN_USERNAME",
@@ -101,6 +106,56 @@ class MultiGridServerTests(unittest.TestCase):
 
         self.assertEqual(first_response.status_code, 200)
         self.assertEqual(second_response.status_code, 400)
+
+    def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
+        main._client.place_order(
+            symbol="BILLUSDT",
+            side="Sell",
+            qty="625",
+            price="0.17243",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id="g_1_S_orphan",
+        )
+        main._client.positions = [{"side": "Sell", "size": "1250", "avgPrice": "0.1727"}]
+
+        snapshot = self.client.get("/api/risk/BILLUSDT")
+
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertTrue(snapshot.json()["has_risk"])
+        self.assertEqual(snapshot.json()["orphan_order_count"], 1)
+        self.assertTrue(snapshot.json()["unmanaged_position"])
+
+        cancelled = self.client.post("/api/risk/cancel-orphans/BILLUSDT")
+        after = self.client.get("/api/risk/BILLUSDT")
+
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(len(cancelled.json()["cancelled"]), 1)
+        self.assertEqual(after.json()["orphan_order_count"], 0)
+
+    def test_api_config_change_is_blocked_while_grid_is_running(self):
+        original_binance = main.BinanceFuturesClient
+        original_bybit = main.BybitClient
+        try:
+            main.BinanceFuturesClient = FakeBinanceConfigClient
+            main.BybitClient = FakeBybitConfigClient
+            start = self.client.post("/api/grid/start", json=self._payload("BTCUSDT"))
+            response = self.client.post(
+                "/api/config",
+                json={
+                    "exchange": "binance",
+                    "api_key": "binance-api-key",
+                    "api_secret": "binance-api-secret",
+                    "testnet": False,
+                },
+            )
+
+            self.assertEqual(start.status_code, 200)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("Stop all running grids", response.json()["detail"])
+        finally:
+            main.BinanceFuturesClient = original_binance
+            main.BybitClient = original_bybit
 
     def test_api_config_can_be_saved_and_loaded_from_disk(self):
         original_path = main.API_CONFIG_FILE
