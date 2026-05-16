@@ -1,5 +1,6 @@
 backend/api_config.json
 backend/grid_state.json
+backend/grid_history.json
 backend/__pycache__/
 tests/__pycache__/
 .env

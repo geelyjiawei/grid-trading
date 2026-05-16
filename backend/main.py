@@ -32,6 +32,7 @@ BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
 API_CONFIG_FILE = os.getenv("GRID_CONFIG_FILE") or os.path.join(BASE_DIR, "api_config.json")
 GRID_STATE_FILE = os.getenv("GRID_STATE_FILE") or os.path.join(os.path.dirname(API_CONFIG_FILE), "grid_state.json")
+GRID_HISTORY_FILE = os.getenv("GRID_HISTORY_FILE") or os.path.join(os.path.dirname(API_CONFIG_FILE), "grid_history.json")
 
 
 def _parse_bool(value: str | None) -> bool:
@@ -185,6 +186,85 @@ def _write_grid_state_file(state: dict):
     os.replace(tmp_path, GRID_STATE_FILE)
 
 
+def _load_grid_history_file() -> dict:
+    if not os.path.exists(GRID_HISTORY_FILE):
+        return {"version": 1, "runs": []}
+
+    try:
+        with open(GRID_HISTORY_FILE, "r", encoding="utf-8") as file:
+            history = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "runs": []}
+
+    if not isinstance(history, dict):
+        return {"version": 1, "runs": []}
+    history.setdefault("version", 1)
+    history.setdefault("runs", [])
+    return history
+
+
+def _write_grid_history_file(history: dict):
+    history_dir = os.path.dirname(GRID_HISTORY_FILE)
+    if history_dir:
+        os.makedirs(history_dir, exist_ok=True)
+    tmp_path = f"{GRID_HISTORY_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as file:
+        json.dump(history, file, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, GRID_HISTORY_FILE)
+
+
+def _history_record_from_engine(engine: GridEngine, status: str = "running") -> dict:
+    config = engine.config
+    return {
+        "run_id": config.get("run_id", ""),
+        "symbol": str(config.get("symbol", "")).upper(),
+        "exchange": _normalize_exchange(_api_config.get("exchange")),
+        "direction": config.get("direction", ""),
+        "grid_mode": config.get("grid_mode", "arithmetic"),
+        "lower_price": config.get("lower_price"),
+        "upper_price": config.get("upper_price"),
+        "grid_count": config.get("grid_count"),
+        "leverage": config.get("leverage"),
+        "total_investment": config.get("total_investment"),
+        "status": status,
+        "started_at": engine.start_time or time.time(),
+        "updated_at": time.time(),
+        "stopped_at": time.time() if status in {"stopped", "closed"} else None,
+        "initial_side": engine.initial_side,
+        "initial_qty": round(engine.initial_qty, 8),
+        "completed_pairs": engine.completed_pairs,
+        "gross_profit": round(engine.gross_profit, 4),
+        "net_profit": round(engine.total_profit, 4),
+        "total_fee": round(engine.total_fee, 4),
+        "total_volume": round(engine.total_volume, 4),
+        "filled_count": len(engine.filled_orders),
+        "last_message": engine.trigger_message,
+    }
+
+
+def _upsert_grid_history(engine: GridEngine, status: str = "running"):
+    run_id = str(engine.config.get("run_id", ""))
+    if not run_id:
+        return
+
+    history = _load_grid_history_file()
+    runs = history.setdefault("runs", [])
+    new_record = _history_record_from_engine(engine, status)
+    for index, record in enumerate(runs):
+        if record.get("run_id") == run_id:
+            new_record["started_at"] = record.get("started_at") or new_record["started_at"]
+            if status not in {"stopped", "closed"}:
+                new_record["stopped_at"] = record.get("stopped_at")
+            runs[index] = {**record, **new_record}
+            break
+    else:
+        runs.append(new_record)
+
+    history["runs"] = sorted(runs, key=lambda item: float(item.get("started_at") or 0), reverse=True)[:500]
+    history["updated_at"] = time.time()
+    _write_grid_history_file(history)
+
+
 def _save_engine_state(engine: GridEngine):
     symbol = str(engine.config.get("symbol", "")).upper()
     if not symbol:
@@ -196,6 +276,7 @@ def _save_engine_state(engine: GridEngine):
     state["updated_at"] = time.time()
     state.setdefault("grids", {})[symbol] = engine.to_state()
     _write_grid_state_file(state)
+    _upsert_grid_history(engine, "running" if engine.running else "saved")
 
 
 def _delete_engine_state(symbol: str):
@@ -523,6 +604,7 @@ async def start_grid(cfg: GridConfig):
     engine_config["direction"] = direction
     engine_config["grid_mode"] = grid_mode
     engine_config["initial_order_type"] = initial_order_type
+    engine_config["run_id"] = f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
     engine = GridEngine(client, engine_config, state_callback=_save_engine_state)
 
     try:
@@ -561,6 +643,7 @@ async def stop_all_grids():
     for engine in running:
         symbol = str(engine.config.get("symbol", "")).upper()
         await engine.stop()
+        _upsert_grid_history(engine, "stopped")
         if symbol:
             _delete_engine_state(symbol)
 
@@ -573,6 +656,7 @@ async def _stop_grid(symbol: str):
         raise HTTPException(status_code=400, detail="No active grid")
 
     await engine.stop()
+    _upsert_grid_history(engine, "stopped")
     _delete_engine_state(symbol)
     return {"ok": True, "message": f"{symbol} grid stopped and open orders cancelled"}
 
@@ -599,6 +683,18 @@ def grid_symbol_status(symbol: str):
 
 def _engine_status(engine: GridEngine) -> dict:
     return engine.get_status()
+
+
+@app.get("/api/grid/history")
+def grid_history(limit: int = 100):
+    history = _load_grid_history_file()
+    safe_limit = max(1, min(int(limit or 100), 500))
+    runs = sorted(
+        history.get("runs", []),
+        key=lambda item: float(item.get("started_at") or 0),
+        reverse=True,
+    )[:safe_limit]
+    return {"runs": runs}
 
 
 def _is_grid_order(item: dict) -> bool:

@@ -44,8 +44,10 @@ class FakeBybitConfigClient(FakeConfigClient):
 class MultiGridServerTests(unittest.TestCase):
     def setUp(self):
         self._original_state_file = main.GRID_STATE_FILE
+        self._original_history_file = main.GRID_HISTORY_FILE
         self._state_tmp = tempfile.TemporaryDirectory()
         main.GRID_STATE_FILE = str(Path(self._state_tmp.name) / "grid_state.json")
+        main.GRID_HISTORY_FILE = str(Path(self._state_tmp.name) / "grid_history.json")
         main._engines.clear()
         main._client = FakeClient("100")
         self.client = TestClient(main.app)
@@ -54,6 +56,7 @@ class MultiGridServerTests(unittest.TestCase):
         main._engines.clear()
         main._client = None
         main.GRID_STATE_FILE = self._original_state_file
+        main.GRID_HISTORY_FILE = self._original_history_file
         self._state_tmp.cleanup()
         for key in (
             "AUTH_REQUIRED",
@@ -106,6 +109,26 @@ class MultiGridServerTests(unittest.TestCase):
 
         self.assertEqual(first_response.status_code, 200)
         self.assertEqual(second_response.status_code, 400)
+
+    def test_grid_history_records_running_and_stopped_strategy_summary(self):
+        start = self.client.post("/api/grid/start", json=self._payload("BILLUSDT"))
+        running_history = self.client.get("/api/grid/history").json()
+
+        self.assertEqual(start.status_code, 200)
+        self.assertEqual(len(running_history["runs"]), 1)
+        self.assertEqual(running_history["runs"][0]["symbol"], "BILLUSDT")
+        self.assertEqual(running_history["runs"][0]["direction"], "long")
+        self.assertEqual(running_history["runs"][0]["status"], "running")
+        self.assertIn("net_profit", running_history["runs"][0])
+        self.assertIn("total_fee", running_history["runs"][0])
+        self.assertIn("total_volume", running_history["runs"][0])
+
+        stop = self.client.post("/api/grid/stop/BILLUSDT")
+        stopped_history = self.client.get("/api/grid/history").json()
+
+        self.assertEqual(stop.status_code, 200)
+        self.assertEqual(stopped_history["runs"][0]["status"], "stopped")
+        self.assertIsNotNone(stopped_history["runs"][0]["stopped_at"])
 
     def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
         main._client.place_order(

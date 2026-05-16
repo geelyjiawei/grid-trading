@@ -238,6 +238,7 @@
           <button class="btn btn-outline" type="button" onclick="openDetailModal('positions')">持仓</button>
           <button class="btn btn-outline" type="button" onclick="openDetailModal('orders')">挂单</button>
           <button class="btn btn-outline" type="button" onclick="openDetailModal('fills')">成交</button>
+          <button class="btn btn-outline" type="button" onclick="openDetailModal('history')">历史</button>
         </div>
       </div>
 
@@ -366,6 +367,31 @@
             <tbody id="filled-body">
               <tr>
                 <td class="empty-state" colspan="8">暂无成交</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="detail-history-panel" class="detail-panel hidden">
+        <div class="table-wrap detail-scroll">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>开始时间</th>
+                <th>交易对</th>
+                <th>方向</th>
+                <th>模式</th>
+                <th>状态</th>
+                <th>净利润</th>
+                <th>手续费</th>
+                <th>总交易量</th>
+                <th>完成配对</th>
+              </tr>
+            </thead>
+            <tbody id="history-body">
+              <tr>
+                <td class="empty-state" colspan="9">暂无历史</td>
               </tr>
             </tbody>
           </table>

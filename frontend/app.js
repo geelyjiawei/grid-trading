@@ -616,15 +616,19 @@ function openDetailModal(panel) {
     positions: ["仓位监控", "当前持仓"],
     orders: ["挂单追踪", "网格挂单"],
     fills: ["成交记录", "最近成交"],
+    history: ["策略复盘", "开仓历史"],
   };
   const [eyebrow, title] = titles[panel] || titles.positions;
 
   document.getElementById("detail-modal-eyebrow").textContent = eyebrow;
   document.getElementById("detail-modal-title").textContent = title;
-  ["positions", "orders", "fills"].forEach((name) => {
+  ["positions", "orders", "fills", "history"].forEach((name) => {
     document.getElementById(`detail-${name}-panel`).classList.toggle("hidden", name !== panel);
   });
   document.getElementById("detail-modal").classList.remove("hidden");
+  if (panel === "history") {
+    fetchGridHistory();
+  }
 }
 
 function closeDetailModal() {
@@ -635,6 +639,40 @@ function closeDetailModalOutside(event) {
   if (event.target.id === "detail-modal") {
     closeDetailModal();
   }
+}
+
+async function fetchGridHistory() {
+  try {
+    const data = await api("/api/grid/history?limit=100");
+    renderGridHistory(data.runs || []);
+  } catch (error) {
+    document.getElementById("history-body").innerHTML = `<tr><td class="empty-state" colspan="9">读取历史失败：${error.message}</td></tr>`;
+  }
+}
+
+function renderGridHistory(runs) {
+  const tbody = document.getElementById("history-body");
+  if (!runs.length) {
+    tbody.innerHTML = '<tr><td class="empty-state" colspan="9">暂无历史</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = runs.map((run) => {
+    const profit = Number(run.net_profit || 0);
+    return `
+      <tr>
+        <td>${formatTime(run.started_at)}</td>
+        <td>${run.symbol || "--"}</td>
+        <td>${mapDirection(run.direction)}</td>
+        <td>${run.grid_mode === "geometric" ? "等比" : "等差"}</td>
+        <td>${mapRunStatus(run.status)}</td>
+        <td class="${profit >= 0 ? "positive" : "negative"}">${fmtNum(profit)}</td>
+        <td>${fmtNum(run.total_fee || 0)}</td>
+        <td>${fmtNum(run.total_volume || 0)}</td>
+        <td>${run.completed_pairs ?? 0}</td>
+      </tr>
+    `;
+  }).join("");
 }
 
 async function fetchPositions() {
@@ -758,6 +796,14 @@ function mapLiquidity(liquidity) {
   return "--";
 }
 
+function mapRunStatus(status) {
+  if (status === "running") return "运行中";
+  if (status === "stopped") return "已停止";
+  if (status === "closed") return "已关闭";
+  if (status === "saved") return "已保存";
+  return status || "--";
+}
+
 function getSymbol() {
   return document.getElementById("symbol-input").value.trim().toUpperCase();
 }
@@ -802,6 +848,12 @@ function formatVolume(value) {
   if (num >= 1e6) return `${(num / 1e6).toFixed(2)}M`;
   if (num >= 1e3) return `${(num / 1e3).toFixed(2)}K`;
   return num.toFixed(2);
+}
+
+function formatTime(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return "--";
+  return new Date(num * 1000).toLocaleString();
 }
 
 function showToast(message, type = "info") {
