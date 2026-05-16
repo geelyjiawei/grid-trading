@@ -130,6 +130,33 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(stopped_history["runs"][0]["status"], "stopped")
         self.assertIsNotNone(stopped_history["runs"][0]["stopped_at"])
 
+    def test_grid_preview_uses_active_grid_count_and_exchange_qty_step(self):
+        main._client = FakeClient("100")
+        payload = {
+            "symbol": "BILLUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 103,
+            "lower_price": 99,
+            "grid_count": 40,
+            "total_investment": 100,
+            "leverage": 10,
+            "fee_rate": 0.0005,
+            "trigger_price": None,
+            "stop_loss_price": None,
+            "take_profit_price": None,
+        }
+
+        response = self.client.post("/api/grid/preview", json=payload)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["active_grid_count"], 10)
+        self.assertEqual(data["grid_count"], 40)
+        self.assertAlmostEqual(data["total_qty"], 10.0)
+        self.assertAlmostEqual(data["qty_per_grid_min"], 1.0)
+        self.assertAlmostEqual(data["qty_per_grid_max"], 1.0)
+
     def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
         main._client.place_order(
             symbol="BILLUSDT",

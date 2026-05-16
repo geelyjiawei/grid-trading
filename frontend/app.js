@@ -7,6 +7,7 @@ let authRequired = false;
 let activeDetailPanel = "positions";
 let activeExchange = "bybit";
 let currentRiskSymbol = "";
+let previewRequestSeq = 0;
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -162,7 +163,7 @@ function setDirection(direction) {
   document.getElementById("btn-neutral").className = `dir-btn${direction === "neutral" ? " active" : ""}`;
 }
 
-function updatePreview() {
+async function updatePreview() {
   const upper = parseFloat(document.getElementById("upper-price").value);
   const lower = parseFloat(document.getElementById("lower-price").value);
   const count = parseInt(document.getElementById("grid-count").value, 10);
@@ -171,68 +172,54 @@ function updatePreview() {
   const feeRate = parseFeeRate();
   const gridMode = document.getElementById("grid-mode").value;
   const box = document.getElementById("grid-preview");
+  const symbol = getSymbol();
 
-  if (!upper || !lower || !count || !investment || upper <= lower) {
+  if (!symbol || !upper || !lower || !count || !investment || upper <= lower) {
     box.classList.add("hidden");
     return;
   }
 
-  const referencePrice = Number.isFinite(latestPrice) ? latestPrice : (upper + lower) / 2;
-  const levels = calculateGridLevels(lower, upper, count, gridMode);
-  const activeGridCount = estimateActiveGridCount(levels, referencePrice, currentDirection);
-  let step;
-  let gridPct;
+  const requestSeq = ++previewRequestSeq;
+  try {
+    const preview = await api("/api/grid/preview", "POST", {
+      symbol,
+      direction: currentDirection,
+      grid_mode: gridMode,
+      upper_price: upper,
+      lower_price: lower,
+      grid_count: count,
+      total_investment: investment,
+      leverage,
+      fee_rate: feeRate,
+      initial_order_type: document.getElementById("initial-order-type").value,
+      initial_order_price: parseOptionalNumber("initial-order-price"),
+      grid_order_post_only: document.getElementById("grid-order-post-only").checked,
+      trigger_price: parseOptionalNumber("trigger-price"),
+      stop_loss_price: parseOptionalNumber("stop-loss-price"),
+      take_profit_price: parseOptionalNumber("take-profit-price"),
+    });
+    if (requestSeq !== previewRequestSeq) return;
 
-  if (gridMode === "geometric") {
-    const ratio = Math.pow(upper / lower, 1 / count);
-    gridPct = (ratio - 1) * 100;
-    step = referencePrice * (ratio - 1);
-  } else {
-    step = (upper - lower) / count;
-    gridPct = referencePrice > 0 ? (step / referencePrice) * 100 : 0;
+    const minQty = Number(preview.qty_per_grid_min || 0);
+    const maxQty = Number(preview.qty_per_grid_max || 0);
+    const qtyText = Math.abs(maxQty - minQty) > 0
+      ? `${formatOrderQty(minQty)} - ${formatOrderQty(maxQty)}`
+      : formatOrderQty(preview.qty_per_grid_avg);
+
+    document.getElementById("prev-step").textContent = gridMode === "geometric"
+      ? `${Number(preview.grid_step).toFixed(6)} / ${Number(preview.grid_profit_pct).toFixed(3)}%`
+      : Number(preview.grid_step).toFixed(6);
+    document.getElementById("prev-profit-pct").textContent = `${Number(preview.grid_profit_pct).toFixed(3)}%`;
+    document.getElementById("prev-gross-profit").textContent = Number(preview.per_grid_gross_profit).toFixed(4);
+    document.getElementById("prev-fee").textContent = Number(preview.per_grid_fee).toFixed(4);
+    document.getElementById("prev-profit").textContent = Number(preview.per_grid_net_profit).toFixed(4);
+    document.getElementById("prev-active-count").textContent = `${preview.active_grid_count} / ${preview.grid_count}`;
+    document.getElementById("prev-qty").textContent = qtyText;
+    document.getElementById("prev-total-qty").textContent = formatOrderQty(preview.total_qty);
+    box.classList.remove("hidden");
+  } catch (_) {
+    box.classList.add("hidden");
   }
-
-  const totalQty = referencePrice > 0 ? (investment * leverage) / referencePrice : 0;
-  const perGridQty = activeGridCount > 0 ? totalQty / activeGridCount : 0;
-  const perGridGrossProfit = step * perGridQty;
-  const perGridFee = perGridQty * referencePrice * 2 * feeRate;
-  const perGridProfit = perGridGrossProfit - perGridFee;
-
-  document.getElementById("prev-step").textContent = gridMode === "geometric" ? `${step.toFixed(6)} / ${(gridPct).toFixed(3)}%` : step.toFixed(6);
-  document.getElementById("prev-profit-pct").textContent = `${gridPct.toFixed(3)}%`;
-  document.getElementById("prev-gross-profit").textContent = perGridGrossProfit.toFixed(4);
-  document.getElementById("prev-fee").textContent = perGridFee.toFixed(4);
-  document.getElementById("prev-profit").textContent = perGridProfit.toFixed(4);
-  document.getElementById("prev-active-count").textContent = `${activeGridCount} / ${count}`;
-  document.getElementById("prev-qty").textContent = perGridQty.toFixed(6);
-  document.getElementById("prev-total-qty").textContent = totalQty.toFixed(6);
-  box.classList.remove("hidden");
-}
-
-function calculateGridLevels(lower, upper, count, gridMode) {
-  if (gridMode === "geometric") {
-    const ratio = Math.pow(upper / lower, 1 / count);
-    return Array.from({ length: count + 1 }, (_, index) => lower * Math.pow(ratio, index));
-  }
-
-  const step = (upper - lower) / count;
-  return Array.from({ length: count + 1 }, (_, index) => lower + step * index);
-}
-
-function estimateActiveGridCount(levels, referencePrice, direction) {
-  if (!levels.length || !Number.isFinite(referencePrice)) return 0;
-  const lastIndex = levels.length - 1;
-
-  if (direction === "long") {
-    return levels.slice(1).filter((level) => level > referencePrice).length;
-  }
-  if (direction === "short") {
-    return levels.slice(0, lastIndex).filter((level) => level < referencePrice).length;
-  }
-
-  const buyCount = levels.slice(0, lastIndex).filter((level) => level < referencePrice).length;
-  const sellCount = levels.slice(1).filter((level) => level > referencePrice).length;
-  return buyCount + sellCount;
 }
 
 async function fetchPrice() {

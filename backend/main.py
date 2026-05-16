@@ -242,6 +242,121 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
     }
 
 
+def _round_down_steps(value: float, step: str) -> int:
+    from decimal import Decimal, ROUND_DOWN
+
+    value_decimal = Decimal(str(value))
+    step_decimal = Decimal(str(step))
+    return int((value_decimal / step_decimal).quantize(Decimal("1"), rounding=ROUND_DOWN))
+
+
+def _steps_to_qty(steps: int, step: str) -> float:
+    from decimal import Decimal
+
+    return float(Decimal(str(step)) * Decimal(steps))
+
+
+def _calculate_grid_levels(lower: float, upper: float, count: int, grid_mode: str) -> list[float]:
+    if grid_mode == "geometric":
+        ratio = (upper / lower) ** (1 / count)
+        return [round(lower * (ratio ** idx), 10) for idx in range(count + 1)]
+
+    step = (upper - lower) / count
+    return [round(lower + (step * idx), 10) for idx in range(count + 1)]
+
+
+def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> dict:
+    ticker = client.get_ticker(symbol)
+    if ticker.get("retCode") != 0:
+        raise HTTPException(status_code=400, detail=ticker.get("retMsg", "Failed to fetch current price"))
+    current_price = float(ticker["result"]["list"][0]["lastPrice"])
+
+    info_resp = client.get_instrument_info(symbol)
+    if info_resp.get("retCode") != 0:
+        raise HTTPException(status_code=400, detail=info_resp.get("retMsg", "Failed to fetch instrument info"))
+    instrument = info_resp["result"]["list"][0]
+    qty_step = instrument["lotSizeFilter"]["qtyStep"]
+    min_qty = float(instrument["lotSizeFilter"]["minOrderQty"])
+
+    levels = _calculate_grid_levels(cfg.lower_price, cfg.upper_price, cfg.grid_count, grid_mode)
+    if not (levels[0] < current_price < levels[-1]):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Current price {current_price} must stay inside the configured range {levels[0]} - {levels[-1]}",
+        )
+
+    if direction == "long":
+        active_targets = [
+            (idx, levels[idx + 1], "Sell")
+            for idx in range(len(levels) - 1)
+            if levels[idx + 1] > current_price
+        ]
+    elif direction == "short":
+        active_targets = [
+            (idx, levels[idx], "Buy")
+            for idx in range(len(levels) - 1)
+            if levels[idx] < current_price
+        ]
+    else:
+        active_targets = [
+            (idx, levels[idx], "Buy")
+            for idx in range(len(levels) - 1)
+            if levels[idx] < current_price
+        ] + [
+            (idx, levels[idx + 1], "Sell")
+            for idx in range(len(levels) - 1)
+            if levels[idx + 1] > current_price
+        ]
+
+    active_count = len(active_targets)
+    if active_count <= 0:
+        raise HTTPException(status_code=400, detail="No valid grid targets were found around current price")
+
+    raw_total_qty = (cfg.total_investment * cfg.leverage) / current_price
+    total_steps = _round_down_steps(raw_total_qty, qty_step)
+    if total_steps < active_count:
+        raise HTTPException(status_code=400, detail="Total investment is too small for this symbol and grid count")
+
+    base_steps = total_steps // active_count
+    remainder_steps = total_steps % active_count
+    per_order_qtys = [
+        _steps_to_qty(base_steps + (1 if index < remainder_steps else 0), qty_step)
+        for index in range(active_count)
+    ]
+    total_qty = _steps_to_qty(total_steps, qty_step)
+
+    if grid_mode == "geometric":
+        ratio = (levels[1] / levels[0]) if len(levels) > 1 else 1
+        grid_profit_pct = (ratio - 1) * 100
+        grid_step = current_price * (ratio - 1)
+    else:
+        grid_step = levels[1] - levels[0] if len(levels) > 1 else 0
+        grid_profit_pct = (grid_step / current_price) * 100 if current_price > 0 else 0
+
+    average_qty = total_qty / active_count
+    fee_rate = max(0.0, float(cfg.fee_rate or 0))
+    gross_profit = grid_step * average_qty
+    fee = average_qty * current_price * 2 * fee_rate
+
+    return {
+        "symbol": symbol,
+        "current_price": current_price,
+        "grid_step": grid_step,
+        "grid_profit_pct": grid_profit_pct,
+        "active_grid_count": active_count,
+        "grid_count": cfg.grid_count,
+        "total_qty": total_qty,
+        "qty_per_grid_avg": average_qty,
+        "qty_per_grid_min": min(per_order_qtys),
+        "qty_per_grid_max": max(per_order_qtys),
+        "qty_step": qty_step,
+        "min_qty": min_qty,
+        "per_grid_gross_profit": gross_profit,
+        "per_grid_fee": fee,
+        "per_grid_net_profit": gross_profit - fee,
+    }
+
+
 def _upsert_grid_history(engine: GridEngine, status: str = "running"):
     run_id = str(engine.config.get("run_id", ""))
     if not run_id:
@@ -565,6 +680,31 @@ def get_positions(symbol: str):
         )
 
     return {"positions": positions}
+
+
+@app.post("/api/grid/preview")
+def grid_preview(cfg: GridConfig):
+    client = _get_client()
+    symbol = cfg.symbol.upper().strip()
+    direction = cfg.direction.lower().strip()
+    grid_mode = cfg.grid_mode.lower().strip()
+
+    if cfg.upper_price <= cfg.lower_price:
+        raise HTTPException(status_code=400, detail="upper_price must be greater than lower_price")
+    if cfg.grid_count < 2 or cfg.grid_count > 100:
+        raise HTTPException(status_code=400, detail="grid_count must be between 2 and 100")
+    if cfg.total_investment <= 0:
+        raise HTTPException(status_code=400, detail="total_investment must be greater than 0")
+    if cfg.leverage < 1 or cfg.leverage > 125:
+        raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
+    if cfg.fee_rate < 0 or cfg.fee_rate > 0.01:
+        raise HTTPException(status_code=400, detail="fee_rate must be between 0 and 0.01")
+    if direction not in {"long", "short", "neutral"}:
+        raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
+    if grid_mode not in {"arithmetic", "geometric"}:
+        raise HTTPException(status_code=400, detail="grid_mode must be arithmetic or geometric")
+
+    return _preview_grid(client, cfg, symbol, direction, grid_mode)
 
 
 @app.post("/api/grid/start")
