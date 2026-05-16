@@ -22,6 +22,7 @@ class FakeClient:
         self.positions = []
         self.reject_post_only_reduce = False
         self.reject_reduce_limit = False
+        self.cancelled_orders = []
 
     def get_instrument_info(self, symbol):
         return {
@@ -70,6 +71,7 @@ class FakeClient:
         return {"retCode": 0}
 
     def cancel_order(self, symbol, order_id):
+        self.cancelled_orders.append(str(order_id))
         self.open_limit_order_ids.discard(str(order_id))
         return {"retCode": 0}
 
@@ -577,6 +579,47 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(repair_orders)
         self.assertEqual(repair_orders[-1]["qty"], "2.5")
+
+    async def test_boundary_repair_does_not_trust_stale_reduce_orders(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "2.5"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        engine.current_price = 89
+        engine.active_orders = {
+            key: order
+            for key, order in engine.active_orders.items()
+            if order["reduce_only"] and order["side"] == "Buy"
+        }
+
+        engine._repair_boundary_position()
+
+        repair_orders = [
+            order
+            for order in client.orders
+            if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
+        ]
+        self.assertTrue(client.cancelled_orders)
+        self.assertTrue(repair_orders)
+        self.assertEqual(repair_orders[-1]["qty"], "2.5")
+        self.assertEqual(engine.active_orders, {})
 
     async def test_boundary_repair_is_throttled_to_avoid_duplicate_market_closes(self):
         client = FakeClient("100")

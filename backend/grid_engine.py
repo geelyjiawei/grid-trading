@@ -851,6 +851,7 @@ class GridEngine:
                     break
 
                 if self.grid_ready:
+                    self._repair_boundary_position()
                     await self._check_fills()
                     self._repair_boundary_position()
 
@@ -885,15 +886,37 @@ class GridEngine:
         if position_qty < self.min_qty:
             return
 
-        active_reduce_qty = self._active_reduce_qty(close_side)
-        missing_qty = position_qty - active_reduce_qty
-        if missing_qty >= self.min_qty:
-            self._boundary_repair_in_progress = True
+        self._boundary_repair_in_progress = True
+        try:
+            self._cancel_stale_reduce_orders(close_side)
+            refreshed_qty = self._position_size(position_side)
+            if refreshed_qty >= self.min_qty:
+                self._place_reduce_market(close_side, refreshed_qty, reason)
+                self._boundary_repair_retry_after = time.time() + 2
+        finally:
+            self._boundary_repair_in_progress = False
+
+    def _cancel_stale_reduce_orders(self, side: str):
+        for link_id, order in list(self.active_orders.items()):
+            if order.get("side") != side or not order.get("reduce_only"):
+                continue
+
+            order_id = str(order.get("order_id", ""))
             try:
-                self._place_reduce_market(close_side, missing_qty, reason)
-                self._boundary_repair_retry_after = time.time() + 10
-            finally:
-                self._boundary_repair_in_progress = False
+                result = {"retCode": 0}
+                if order_id:
+                    result = self.client.cancel_order(self.config["symbol"], order_id)
+                if result.get("retCode") != 0:
+                    raise RuntimeError(result.get("retMsg", "Failed to cancel stale reduce order"))
+                self.active_orders.pop(link_id, None)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to cancel stale reduce order before boundary repair symbol=%s order_id=%s msg=%s",
+                    self.config.get("symbol"),
+                    order_id,
+                    exc,
+                )
+        self._persist_state()
 
     async def _check_initial_order(self):
         if not self.opening_order:
