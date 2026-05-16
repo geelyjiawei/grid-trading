@@ -131,6 +131,17 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(stopped_history["runs"][0]["status"], "stopped")
         self.assertIsNotNone(stopped_history["runs"][0]["stopped_at"])
 
+    def test_grid_status_reports_total_profit_with_unrealised_pnl(self):
+        main._client.positions = [{"side": "Buy", "size": "1", "unrealisedPnl": "2.5"}]
+
+        start = self.client.post("/api/grid/start", json=self._payload("BILLUSDT"))
+        status = self.client.get("/api/grid/status/BILLUSDT").json()
+
+        self.assertEqual(start.status_code, 200)
+        self.assertIn("realized_net_profit", status)
+        self.assertEqual(status["unrealised_pnl"], 2.5)
+        self.assertAlmostEqual(status["total_equity_profit"], status["realized_net_profit"] + 2.5)
+
     def test_grid_preview_uses_active_grid_count_and_exchange_qty_step(self):
         main._client = FakeClient("100")
         payload = {

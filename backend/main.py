@@ -860,7 +860,26 @@ def grid_symbol_status(symbol: str):
 
 
 def _engine_status(engine: GridEngine) -> dict:
-    return engine.get_status()
+    status = engine.get_status()
+    unrealised_pnl = 0.0
+    try:
+        client = _get_client()
+        resp = client.get_positions(str(status.get("symbol", "")).upper())
+        if resp.get("retCode") == 0:
+            for item in resp.get("result", {}).get("list", []):
+                try:
+                    unrealised_pnl += float(item.get("unrealisedPnl", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+    except Exception:
+        unrealised_pnl = 0.0
+
+    realized_net = float(status.get("total_profit", 0) or 0)
+    status["realized_gross_profit"] = status.get("gross_profit", 0)
+    status["realized_net_profit"] = round(realized_net, 4)
+    status["unrealised_pnl"] = round(unrealised_pnl, 4)
+    status["total_equity_profit"] = round(realized_net + unrealised_pnl, 4)
+    return status
 
 
 @app.get("/api/grid/history")

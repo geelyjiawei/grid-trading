@@ -445,12 +445,20 @@ function renderStatus(status, summary = {}) {
   document.getElementById("st-grid-profit-pct").textContent = status.grid_profit_pct ? `${Number(status.grid_profit_pct).toFixed(3)}%` : "--";
   document.getElementById("st-completed-pairs").textContent = String(status.completed_pairs ?? 0);
 
-  const profit = Number(status.total_profit ?? 0);
+  const profit = Number(status.total_equity_profit ?? status.total_profit ?? 0);
+  const realizedNet = Number(status.realized_net_profit ?? status.total_profit ?? 0);
+  const unrealized = Number(status.unrealised_pnl ?? 0);
   const profitEl = document.getElementById("st-profit");
   profitEl.textContent = `${fmtNum(profit)} USDT`;
   profitEl.className = profit >= 0 ? "positive" : "negative";
   document.getElementById("st-gross-profit").textContent = `${fmtNum(status.gross_profit ?? 0)} USDT`;
   document.getElementById("st-fee").textContent = `${fmtNum(status.total_fee ?? 0)} USDT`;
+  const realizedEl = document.getElementById("st-realized-net");
+  realizedEl.textContent = `${fmtNum(realizedNet)} USDT`;
+  realizedEl.className = realizedNet >= 0 ? "positive" : "negative";
+  const unrealizedEl = document.getElementById("st-unrealized");
+  unrealizedEl.textContent = `${fmtNum(unrealized)} USDT`;
+  unrealizedEl.className = unrealized >= 0 ? "positive" : "negative";
   document.getElementById("st-volume").textContent = `${fmtNum(status.total_volume ?? 0)} USDT`;
 
   const initialSide = status.initial_side === "Buy" ? "买入" : status.initial_side === "Sell" ? "卖出" : "--";
@@ -473,7 +481,7 @@ function renderRunningGrids(statuses) {
   }
 
   body.innerHTML = runningStatuses.map((status) => {
-    const profit = Number(status.total_profit || 0);
+    const profit = Number(status.total_equity_profit ?? status.total_profit ?? 0);
     const completedPairs = Number(status.completed_pairs || 0);
     return `
       <button class="grid-summary-item${status.symbol === getSymbol() ? " active" : ""}" type="button" onclick="selectGridSymbol('${status.symbol}')">

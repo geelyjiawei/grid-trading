@@ -191,6 +191,7 @@ class GridEngine:
             "filled_orders": self.filled_orders[-50:],
             "gross_profit": round(self.gross_profit, 4),
             "total_profit": round(self.total_profit, 4),
+            "realized_net_profit": round(self.total_profit, 4),
             "total_fee": round(self.total_fee, 4),
             "total_volume": round(self.total_volume, 4),
             "fee_rate": self._fee_rate(),
