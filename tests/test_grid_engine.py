@@ -19,6 +19,8 @@ class FakeClient:
         self.ticker_price = float(ticker_price)
         self.open_limit_order_ids = set()
         self.positions = []
+        self.reject_post_only_reduce = False
+        self.reject_reduce_limit = False
 
     def get_instrument_info(self, symbol):
         return {
@@ -40,6 +42,20 @@ class FakeClient:
         return {"retCode": 0, "result": {"list": [{"lastPrice": str(self.ticker_price)}]}}
 
     def place_order(self, **kwargs):
+        if (
+            self.reject_post_only_reduce
+            and kwargs.get("order_type") == "Limit"
+            and kwargs.get("reduce_only")
+            and kwargs.get("time_in_force") == "PostOnly"
+        ):
+            return {"retCode": 400, "retMsg": "Post Only order will be rejected"}
+        if (
+            self.reject_reduce_limit
+            and kwargs.get("order_type") == "Limit"
+            and kwargs.get("reduce_only")
+            and kwargs.get("time_in_force") != "PostOnly"
+        ):
+            return {"retCode": 400, "retMsg": "Reduce limit rejected"}
         self.order_seq += 1
         order = dict(kwargs)
         order["orderId"] = str(self.order_seq)
@@ -452,6 +468,114 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(order["side"] == "Sell" and not order["reduce_only"] for order in restored.active_orders.values())
         )
+
+    async def test_reduce_order_retries_without_post_only_when_maker_rejected(self):
+        client = FakeClient("100")
+        client.reject_post_only_reduce = True
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": True,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        filled_sell = next(order for order in engine.active_orders.values() if order["side"] == "Sell")
+        engine.active_orders.pop(filled_sell["link_id"])
+        engine._place_counter_order(filled_sell)
+
+        reduce_orders = [
+            order
+            for order in client.orders
+            if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Limit"
+        ]
+        self.assertTrue(reduce_orders)
+        self.assertIsNone(reduce_orders[-1].get("time_in_force"))
+
+    async def test_reduce_order_market_repairs_when_limit_retry_is_rejected(self):
+        client = FakeClient("100")
+        client.reject_post_only_reduce = True
+        client.reject_reduce_limit = True
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": True,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        filled_sell = next(order for order in engine.active_orders.values() if order["side"] == "Sell")
+        engine.active_orders.pop(filled_sell["link_id"])
+        engine._place_counter_order(filled_sell)
+
+        repair_orders = [
+            order
+            for order in client.orders
+            if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
+        ]
+        self.assertTrue(repair_orders)
+        self.assertIn("Safety repair", engine.trigger_message)
+
+    async def test_short_boundary_repairs_residual_position_below_lower_range(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "2.5"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": True,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        engine.current_price = 89
+        engine.active_orders = {
+            key: order
+            for key, order in engine.active_orders.items()
+            if not order["reduce_only"]
+        }
+
+        engine._repair_boundary_position()
+
+        repair_orders = [
+            order
+            for order in client.orders
+            if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
+        ]
+        self.assertTrue(repair_orders)
+        self.assertEqual(repair_orders[-1]["qty"], "2.5")
 
     async def test_neutral_grid_deploys_both_buy_and_sell_limit_orders_without_market_position(self):
         client = FakeClient("100")

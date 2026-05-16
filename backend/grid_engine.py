@@ -405,6 +405,44 @@ class GridEngine:
                 return True
         return False
 
+    def _active_reduce_qty(self, side: str) -> float:
+        return sum(
+            float(order.get("qty", 0) or 0)
+            for order in self.active_orders.values()
+            if order.get("side") == side and order.get("reduce_only")
+        )
+
+    def _position_size(self, side: str) -> float:
+        resp = self.client.get_positions(self.config["symbol"])
+        if resp.get("retCode") != 0:
+            raise RuntimeError(resp.get("retMsg", "Failed to fetch positions"))
+
+        total = 0.0
+        for position in resp["result"].get("list", []):
+            if position.get("side") != side:
+                continue
+            try:
+                total += float(position.get("size", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    def _place_reduce_market(self, side: str, qty: float, reason: str):
+        qty_text = self._fq(qty)
+        result = self.client.place_order(
+            symbol=self.config["symbol"],
+            side=side,
+            qty=qty_text,
+            order_type="Market",
+            reduce_only=True,
+            order_link_id=f"repair_{side[0]}_{uuid.uuid4().hex[:6]}",
+        )
+        if result.get("retCode") != 0:
+            raise RuntimeError(result.get("retMsg", f"Failed to place reduce-only repair order: {reason}"))
+        self.trigger_message = f"Safety repair placed {side} reduce-only {qty_text}: {reason}"
+        logger.warning(self.trigger_message)
+        self._persist_state()
+
     def _place_market_open(self, side: str, qty: float):
         qty_text = self._fq(qty)
         result = self.client.place_order(
@@ -497,25 +535,77 @@ class GridEngine:
         if self._stopping:
             return None
 
+        def submit_limit(use_post_only: bool):
+            return self.client.place_order(
+                    symbol=self.config["symbol"],
+                    side=side,
+                    qty=qty,
+                    price=price_text,
+                    order_type="Limit",
+                    reduce_only=reduce_only,
+                    order_link_id=link_id,
+                    time_in_force="PostOnly" if use_post_only else None,
+                )
+
+        use_post_only = bool(self.config.get("grid_order_post_only", True))
         try:
-            result = self.client.place_order(
-                symbol=self.config["symbol"],
-                side=side,
-                qty=qty,
-                price=price_text,
-                order_type="Limit",
-                reduce_only=reduce_only,
-                order_link_id=link_id,
-                time_in_force="PostOnly" if self.config.get("grid_order_post_only", True) else None,
-            )
+            result = submit_limit(use_post_only)
         except Exception as exc:
+            if reduce_only and use_post_only:
+                logger.warning(
+                    "Post-only reduce order failed; retrying as normal reduce-only limit side=%s price=%s msg=%s",
+                    side,
+                    price_text,
+                    exc,
+                )
+                try:
+                    result = submit_limit(False)
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Reduce-only limit retry failed; placing market repair side=%s price=%s msg=%s",
+                        side,
+                        price_text,
+                        retry_exc,
+                    )
+                    self._place_reduce_market(side, float(qty), "reduce limit placement failed")
+                    return None
+            else:
+                logger.warning(
+                    "Place order failed side=%s price=%s reduce_only=%s msg=%s",
+                    side,
+                    price_text,
+                    reduce_only,
+                    exc,
+                )
+                return None
+
+        if result.get("retCode") != 0 and reduce_only and use_post_only:
             logger.warning(
-                "Place order failed side=%s price=%s reduce_only=%s msg=%s",
+                "Post-only reduce order rejected; retrying as normal reduce-only limit side=%s price=%s msg=%s",
                 side,
                 price_text,
-                reduce_only,
-                exc,
+                result.get("retMsg"),
             )
+            try:
+                result = submit_limit(False)
+            except Exception as retry_exc:
+                logger.warning(
+                    "Reduce-only limit retry failed; placing market repair side=%s price=%s msg=%s",
+                    side,
+                    price_text,
+                    retry_exc,
+                )
+                self._place_reduce_market(side, float(qty), "reduce limit placement failed")
+                return None
+
+        if result.get("retCode") != 0 and reduce_only:
+            logger.warning(
+                "Reduce-only limit rejected; placing market repair side=%s price=%s msg=%s",
+                side,
+                price_text,
+                result.get("retMsg"),
+            )
+            self._place_reduce_market(side, float(qty), "reduce limit rejected")
             return None
 
         if result.get("retCode") != 0:
@@ -759,6 +849,7 @@ class GridEngine:
 
                 if self.grid_ready:
                     await self._check_fills()
+                    self._repair_boundary_position()
 
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
@@ -766,6 +857,31 @@ class GridEngine:
             except Exception as exc:
                 logger.exception("Grid polling failed: %s", exc)
                 await asyncio.sleep(5)
+
+    def _repair_boundary_position(self):
+        direction = self.config["direction"]
+        lower = float(self.config["lower_price"])
+        upper = float(self.config["upper_price"])
+
+        if direction == "short" and self.current_price <= lower:
+            position_side = "Sell"
+            close_side = "Buy"
+            reason = f"short grid below lower boundary {lower}"
+        elif direction == "long" and self.current_price >= upper:
+            position_side = "Buy"
+            close_side = "Sell"
+            reason = f"long grid above upper boundary {upper}"
+        else:
+            return
+
+        position_qty = self._position_size(position_side)
+        if position_qty < self.min_qty:
+            return
+
+        active_reduce_qty = self._active_reduce_qty(close_side)
+        missing_qty = position_qty - active_reduce_qty
+        if missing_qty >= self.min_qty:
+            self._place_reduce_market(close_side, missing_qty, reason)
 
     async def _check_initial_order(self):
         if not self.opening_order:
