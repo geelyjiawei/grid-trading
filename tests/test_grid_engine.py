@@ -138,7 +138,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(market_orders[0]["side"], "Sell")
         self.assertGreater(len(buy_reduce_orders), 0)
         self.assertGreater(len(sell_open_orders), 0)
-        self.assertTrue(all(o.get("time_in_force") == "PostOnly" for o in limit_orders))
+        self.assertTrue(all(o.get("time_in_force") is None for o in limit_orders))
 
         market_qty = sum(float(o["qty"]) for o in market_orders)
         reduce_qty = sum(float(o["qty"]) for o in buy_reduce_orders)

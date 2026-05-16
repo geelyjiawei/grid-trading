@@ -547,7 +547,8 @@ class GridEngine:
                     time_in_force="PostOnly" if use_post_only else None,
                 )
 
-        use_post_only = bool(self.config.get("grid_order_post_only", True))
+        # Reduce-only orders are safety exits; never let maker-only rules prevent them.
+        use_post_only = bool(self.config.get("grid_order_post_only", False)) and not reduce_only
         try:
             result = submit_limit(use_post_only)
         except Exception as exc:

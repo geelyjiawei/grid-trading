@@ -297,7 +297,7 @@ class GridConfig(BaseModel):
     fee_rate: float = 0.0005
     initial_order_type: str = "market"
     initial_order_price: float | None = None
-    grid_order_post_only: bool = True
+    grid_order_post_only: bool = False
     grid_mode: str = "arithmetic"
     trigger_price: float | None = None
     stop_loss_price: float | None = None
