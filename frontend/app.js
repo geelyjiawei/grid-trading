@@ -178,6 +178,8 @@ function updatePreview() {
   }
 
   const referencePrice = Number.isFinite(latestPrice) ? latestPrice : (upper + lower) / 2;
+  const levels = calculateGridLevels(lower, upper, count, gridMode);
+  const activeGridCount = estimateActiveGridCount(levels, referencePrice, currentDirection);
   let step;
   let gridPct;
 
@@ -191,7 +193,7 @@ function updatePreview() {
   }
 
   const totalQty = referencePrice > 0 ? (investment * leverage) / referencePrice : 0;
-  const perGridQty = totalQty / count;
+  const perGridQty = activeGridCount > 0 ? totalQty / activeGridCount : 0;
   const perGridGrossProfit = step * perGridQty;
   const perGridFee = perGridQty * referencePrice * 2 * feeRate;
   const perGridProfit = perGridGrossProfit - perGridFee;
@@ -201,9 +203,36 @@ function updatePreview() {
   document.getElementById("prev-gross-profit").textContent = perGridGrossProfit.toFixed(4);
   document.getElementById("prev-fee").textContent = perGridFee.toFixed(4);
   document.getElementById("prev-profit").textContent = perGridProfit.toFixed(4);
+  document.getElementById("prev-active-count").textContent = `${activeGridCount} / ${count}`;
   document.getElementById("prev-qty").textContent = perGridQty.toFixed(6);
   document.getElementById("prev-total-qty").textContent = totalQty.toFixed(6);
   box.classList.remove("hidden");
+}
+
+function calculateGridLevels(lower, upper, count, gridMode) {
+  if (gridMode === "geometric") {
+    const ratio = Math.pow(upper / lower, 1 / count);
+    return Array.from({ length: count + 1 }, (_, index) => lower * Math.pow(ratio, index));
+  }
+
+  const step = (upper - lower) / count;
+  return Array.from({ length: count + 1 }, (_, index) => lower + step * index);
+}
+
+function estimateActiveGridCount(levels, referencePrice, direction) {
+  if (!levels.length || !Number.isFinite(referencePrice)) return 0;
+  const lastIndex = levels.length - 1;
+
+  if (direction === "long") {
+    return levels.slice(1).filter((level) => level > referencePrice).length;
+  }
+  if (direction === "short") {
+    return levels.slice(0, lastIndex).filter((level) => level < referencePrice).length;
+  }
+
+  const buyCount = levels.slice(0, lastIndex).filter((level) => level < referencePrice).length;
+  const sellCount = levels.slice(1).filter((level) => level > referencePrice).length;
+  return buyCount + sellCount;
 }
 
 async function fetchPrice() {
