@@ -230,6 +230,18 @@ class BinanceFuturesClient:
             "result": {"list": [self._normalize_trade(item) for item in trades]},
         }
 
+    def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
+        trades = self._request(
+            "GET",
+            "/fapi/v1/userTrades",
+            params={"symbol": symbol.upper(), "limit": limit},
+            auth=True,
+        )
+        return {
+            "retCode": 0,
+            "result": {"list": [self._normalize_trade(item) for item in trades]},
+        }
+
     @staticmethod
     def _to_binance_side(side: str) -> str:
         return "BUY" if side.lower() == "buy" else "SELL"

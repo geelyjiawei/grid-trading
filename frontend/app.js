@@ -8,6 +8,8 @@ let activeDetailPanel = "positions";
 let activeExchange = "bybit";
 let currentRiskSymbol = "";
 let previewRequestSeq = 0;
+let exchangeOpenOrders = [];
+let exchangeTrades = [];
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -340,6 +342,12 @@ async function pollGridStatus() {
     allGridStatuses = Array.isArray(summary.engines) ? summary.engines : [];
     const currentStatus = findStatusForSymbol(getSymbol()) || { running: false, symbol: getSymbol() };
     renderRunningGrids(allGridStatuses);
+    if (currentStatus.running) {
+      await fetchExchangeOrderData(getSymbol());
+    } else {
+      exchangeOpenOrders = [];
+      exchangeTrades = [];
+    }
     renderStatus(currentStatus, summary);
     await fetchRiskSnapshot(getSymbol());
     if (currentStatus.running && currentStatus.grid_ready) {
@@ -349,6 +357,21 @@ async function pollGridStatus() {
     }
   } catch (_) {
     // Keep UI quiet during polling.
+  }
+}
+
+async function fetchExchangeOrderData(symbol) {
+  if (!symbol) return;
+  try {
+    const [openData, tradeData] = await Promise.all([
+      api(`/api/orders/open/${symbol}`),
+      api(`/api/trades/${symbol}?limit=100`),
+    ]);
+    exchangeOpenOrders = Array.isArray(openData.orders) ? openData.orders : [];
+    exchangeTrades = Array.isArray(tradeData.trades) ? tradeData.trades : [];
+  } catch (_) {
+    exchangeOpenOrders = [];
+    exchangeTrades = [];
   }
 }
 
@@ -464,9 +487,10 @@ function renderStatus(status, summary = {}) {
   const initialSide = status.initial_side === "Buy" ? "买入" : status.initial_side === "Sell" ? "卖出" : "--";
   document.getElementById("st-initial").textContent = status.initial_qty ? `${initialSide} ${Number(status.initial_qty).toFixed(6)}` : (status.trigger_message || "--");
 
-  renderOrders(status.active_orders || []);
-  renderPendingOrders(status.active_orders || [], status);
-  renderFilled(status.filled_orders || []);
+  const openOrders = exchangeOpenOrders.length ? exchangeOpenOrders : (status.active_orders || []);
+  renderOrders(openOrders);
+  renderPendingOrders(openOrders, status);
+  renderFilled(exchangeTrades.length ? exchangeTrades : (status.filled_orders || []));
 }
 
 function renderRunningGrids(statuses) {
@@ -523,7 +547,7 @@ function renderPendingOrders(orders, status = {}) {
 
   buyCountEl.textContent = String(buyOrders.length);
   sellCountEl.textContent = String(sellOrders.length);
-  qtyEl.textContent = formatOrderQty(status.config?.qty_per_grid || orders[0]?.qty);
+  qtyEl.textContent = formatOrderQty(orders[0]?.qty || status.config?.qty_per_grid);
   lastPriceEl.textContent = Number.isFinite(currentPrice) ? `${fmtMarket(currentPrice)} USDT` : "--";
 
   const total = buyOrders.length + sellOrders.length;
@@ -570,10 +594,10 @@ function renderOrders(orders) {
     <div class="order-item">
       <div>
         <div class="${order.side === "Buy" ? "side-buy" : "side-sell"}">${order.side === "Buy" ? "买入" : "卖出"}</div>
-        <div class="muted">${order.reduce_only ? "止盈/平仓" : "开仓/补仓"}</div>
+        <div class="muted">${order.reduce_only ? "止盈/平仓" : "开仓/补仓"} · ${order.status || "open"}</div>
       </div>
       <div class="order-price">${fmtMarket(order.price)}</div>
-      <div class="muted">${order.qty}</div>
+      <div class="muted">${formatOrderQty(order.qty)}</div>
     </div>
   `).join("");
 }
@@ -589,21 +613,22 @@ function renderFilled(filledOrders) {
     .reverse()
     .slice(0, 30)
     .map((item) => {
-      const profit = Number(item.profit || 0);
-      const fee = Number(item.fee || 0);
+      const profit = Number(item.realized_pnl ?? item.profit ?? 0);
+      const fee = Number(item.fee_usdt || item.fee || 0);
       const volume = Number(item.volume || 0);
       const feeAsset = item.fee_asset ? ` (${item.fee_asset})` : "";
-      const liquidity = mapLiquidity(item.liquidity);
+      const liquidity = item.is_maker === true ? "挂单" : item.is_maker === false ? "吃单" : mapLiquidity(item.liquidity);
+      const timeValue = formatTradeTime(item.time);
       return `
         <tr>
           <td class="${item.side === "Buy" ? "side-buy" : "side-sell"}">${item.side}</td>
           <td>${fmtMarket(item.price)}</td>
-          <td>${item.qty}</td>
-          <td>${fmtNum(volume)}</td>
-          <td>${fmtNum(fee)}${feeAsset}</td>
+          <td>${formatOrderQty(item.qty)}</td>
+          <td>${fmtPrecise(volume, 8)}</td>
+          <td>${fmtPrecise(fee, 10)}${feeAsset}</td>
           <td>${liquidity}</td>
-          <td class="${profit >= 0 ? "positive" : "negative"}">${profit >= 0 ? "+" : ""}${profit.toFixed(4)}</td>
-          <td>${new Date(item.time * 1000).toLocaleTimeString()}</td>
+          <td class="${profit >= 0 ? "positive" : "negative"}">${profit >= 0 ? "+" : ""}${fmtPrecise(profit, 8)}</td>
+          <td>${timeValue}</td>
         </tr>
       `;
     })
@@ -823,14 +848,27 @@ function fmtNum(value) {
 }
 
 function fmtMarket(value) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num.toLocaleString() : "--";
+  return fmtPrecise(value, 10);
 }
 
 function formatOrderQty(value) {
+  return fmtPrecise(value, 8);
+}
+
+function fmtPrecise(value, maxDecimals = 8) {
   const num = Number(value);
   if (!Number.isFinite(num)) return "--";
-  return Number.isInteger(num) ? num.toLocaleString() : num.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+  return num.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: maxDecimals,
+  });
+}
+
+function formatTradeTime(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return "--";
+  const ms = num > 1e12 ? num : num * 1000;
+  return new Date(ms).toLocaleString();
 }
 
 function formatDistancePercent(price, currentPrice) {

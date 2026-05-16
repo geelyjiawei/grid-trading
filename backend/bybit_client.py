@@ -174,6 +174,18 @@ class BybitClient:
         resp["result"]["list"] = [self._normalize_trade(item) for item in resp["result"].get("list", [])]
         return resp
 
+    def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
+        resp = self._request(
+            "GET",
+            "/v5/execution/list",
+            params=f"category=linear&symbol={symbol}&limit={limit}",
+            auth=True,
+        )
+        if resp.get("retCode") != 0:
+            return resp
+        resp["result"]["list"] = [self._normalize_trade(item) for item in resp["result"].get("list", [])]
+        return resp
+
     def _normalize_trade(self, item: dict[str, Any]) -> dict:
         fee_asset = str(item.get("feeCurrency") or item.get("feeCoin") or "USDT").upper()
         fee_amount = Decimal(str(item.get("execFee", "0")))

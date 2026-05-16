@@ -1008,6 +1008,37 @@ def order_history(symbol: str):
     return {"orders": orders}
 
 
+@app.get("/api/trades/{symbol}")
+def recent_trades(symbol: str, limit: int = 100):
+    client = _get_client()
+    if not hasattr(client, "get_recent_trades"):
+        raise HTTPException(status_code=400, detail="Exchange client does not support trade history")
+
+    safe_limit = max(1, min(int(limit or 100), 500))
+    resp = client.get_recent_trades(symbol.upper(), safe_limit)
+    if resp.get("retCode") != 0:
+        raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch trades"))
+
+    trades = [
+        {
+            "order_id": item.get("orderId", ""),
+            "trade_id": item.get("tradeId", ""),
+            "side": item.get("side", ""),
+            "price": item.get("price", "0"),
+            "qty": item.get("qty", "0"),
+            "volume": item.get("volume", "0"),
+            "fee": item.get("fee", "0"),
+            "fee_asset": item.get("feeAsset", ""),
+            "fee_usdt": item.get("feeUsdt", ""),
+            "realized_pnl": item.get("realizedPnl", "0"),
+            "is_maker": item.get("isMaker", False),
+            "time": item.get("time", ""),
+        }
+        for item in resp["result"].get("list", [])
+    ]
+    return {"trades": trades}
+
+
 @app.get("/api/orders/open/{symbol}")
 def open_orders(symbol: str):
     client = _get_client()
