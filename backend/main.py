@@ -39,6 +39,20 @@ def _parse_bool(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _private_chmod(path: str):
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _cors_allowed_origins() -> list[str]:
+    origins = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    return [item.strip() for item in origins.split(",") if item.strip()]
+
+
 def _normalize_exchange(exchange: str | None) -> str:
     normalized = str(exchange or "bybit").strip().lower()
     return normalized if normalized in SUPPORTED_EXCHANGES else "bybit"
@@ -132,6 +146,7 @@ def _save_api_config(config: dict):
         os.makedirs(config_dir, exist_ok=True)
     with open(API_CONFIG_FILE, "w", encoding="utf-8") as file:
         json.dump(encrypted_config, file, ensure_ascii=False, indent=2)
+    _private_chmod(API_CONFIG_FILE)
 
 
 def _mask_api_key(api_key: str) -> str:
@@ -184,6 +199,7 @@ def _write_grid_state_file(state: dict):
     with open(tmp_path, "w", encoding="utf-8") as file:
         json.dump(state, file, ensure_ascii=False, indent=2)
     os.replace(tmp_path, GRID_STATE_FILE)
+    _private_chmod(GRID_STATE_FILE)
 
 
 def _load_grid_history_file() -> dict:
@@ -211,6 +227,7 @@ def _write_grid_history_file(history: dict):
     with open(tmp_path, "w", encoding="utf-8") as file:
         json.dump(history, file, ensure_ascii=False, indent=2)
     os.replace(tmp_path, GRID_HISTORY_FILE)
+    _private_chmod(GRID_HISTORY_FILE)
 
 
 def _history_record_from_engine(engine: GridEngine, status: str = "running") -> dict:
@@ -439,12 +456,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Grid Trading", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_allowed_origins = _cors_allowed_origins()
+if _allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+    )
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 

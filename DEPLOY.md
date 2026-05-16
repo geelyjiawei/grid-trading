@@ -75,6 +75,14 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 然后填入 `.env`。
 
+如果你使用普通口令作为 `GRID_CONFIG_KEY`，建议同时生成并配置 `GRID_CONFIG_SALT`：
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+公网服务器不建议直接用 HTTP 在网页里输入 API Key。生产环境请使用 Caddy / Nginx 配置 HTTPS，并把 `AUTH_COOKIE_SECURE=true`。
+
 ## 3. Docker Compose 启动
 
 ```bash
@@ -103,6 +111,12 @@ http://服务器IP:8000
 
 生产环境建议再加 Nginx / Caddy 反向代理和 HTTPS。
 
+默认不开放跨域访问。如果确实需要从其他域名访问 API，在 `.env` 中明确设置：
+
+```bash
+CORS_ALLOWED_ORIGINS=https://你的域名
+```
+
 ## 5. 更新部署
 
 上传新代码后执行：
@@ -116,5 +130,5 @@ docker compose up -d --build
 - 不要把 `.env` 发给别人。
 - 不要开启 API 提现权限。
 - 服务器安全组只开放必要端口。
-- 如果公网访问，建议使用 HTTPS。
-- 当前网格运行状态仍在内存中，容器重启后不会自动恢复旧网格；交易所残留挂单/持仓需要先检查。
+- 如果公网访问，必须使用 HTTPS，避免 API Key 和登录 Cookie 明文传输。
+- 网格运行状态会保存到 `GRID_STATE_FILE`，容器重启后会尝试恢复；但重启或异常后仍建议先查看页面风险提示、挂单和持仓。

@@ -38,6 +38,8 @@ class GridEngine:
         self.opening_order: dict | None = None
         self._pending_targets: dict | None = None
         self._stopping = False
+        self._boundary_repair_in_progress = False
+        self._boundary_repair_retry_after = 0.0
         self._task: Optional[asyncio.Task] = None
 
     def _persist_state(self):
@@ -825,9 +827,9 @@ class GridEngine:
         self._stopping = True
         self.running = False
         try:
+            self._close_all_positions()
             self.client.cancel_all_orders(self.config["symbol"])
             self.active_orders.clear()
-            self._close_all_positions()
         except Exception as exc:
             logger.exception("Risk shutdown failed: %s", exc)
         finally:
@@ -860,6 +862,10 @@ class GridEngine:
                 await asyncio.sleep(5)
 
     def _repair_boundary_position(self):
+        now = time.time()
+        if self._boundary_repair_in_progress or now < self._boundary_repair_retry_after:
+            return
+
         direction = self.config["direction"]
         lower = float(self.config["lower_price"])
         upper = float(self.config["upper_price"])
@@ -882,7 +888,12 @@ class GridEngine:
         active_reduce_qty = self._active_reduce_qty(close_side)
         missing_qty = position_qty - active_reduce_qty
         if missing_qty >= self.min_qty:
-            self._place_reduce_market(close_side, missing_qty, reason)
+            self._boundary_repair_in_progress = True
+            try:
+                self._place_reduce_market(close_side, missing_qty, reason)
+                self._boundary_repair_retry_after = time.time() + 10
+            finally:
+                self._boundary_repair_in_progress = False
 
     async def _check_initial_order(self):
         if not self.opening_order:

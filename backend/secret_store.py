@@ -1,5 +1,6 @@
 import base64
 import ctypes
+import hashlib
 import os
 import sys
 from ctypes import wintypes
@@ -26,10 +27,25 @@ def _get_fernet():
 
     try:
         from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     except ImportError as exc:
         raise RuntimeError("cryptography is required for GRID_CONFIG_KEY encrypted storage") from exc
 
-    return Fernet(key.encode("ascii"))
+    try:
+        return Fernet(key.encode("ascii"))
+    except Exception:
+        salt = os.getenv("GRID_CONFIG_SALT", "").strip().encode("utf-8")
+        if not salt:
+            salt = hashlib.sha256(b"grid-trading-api-config-v1").digest()
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=390000,
+        )
+        derived_key = base64.urlsafe_b64encode(kdf.derive(key.encode("utf-8")))
+        return Fernet(derived_key)
 
 
 def _protect_bytes(data: bytes) -> bytes:

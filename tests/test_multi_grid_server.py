@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -448,6 +449,40 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(trade["feeAsset"], "BNB")
         self.assertEqual(trade["feeUsdt"], "0.600")
         self.assertTrue(trade["isMaker"])
+
+    def test_binance_fee_asset_price_cache_expires(self):
+        client = BinanceFuturesClient("", "", True)
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            return {"price": "700"}
+
+        client._request = fake_request
+        client._asset_price_cache["BNBUSDT"] = (Decimal("600"), time.time() - 61)
+
+        fee_usdt = client._fee_to_usdt(Decimal("0.001"), "BNB")
+
+        self.assertEqual(fee_usdt, Decimal("0.700"))
+        self.assertEqual(len(calls), 1)
+
+    def test_private_state_files_are_chmod_600_on_unix(self):
+        main._write_grid_state_file({"version": 1, "grids": {}})
+        main._write_grid_history_file({"version": 1, "runs": []})
+
+        if os.name != "nt":
+            self.assertEqual(oct(Path(main.GRID_STATE_FILE).stat().st_mode & 0o777), "0o600")
+            self.assertEqual(oct(Path(main.GRID_HISTORY_FILE).stat().st_mode & 0o777), "0o600")
+
+    def test_cors_origins_default_to_same_origin_only(self):
+        os.environ.pop("CORS_ALLOWED_ORIGINS", None)
+        self.assertEqual(main._cors_allowed_origins(), [])
+
+        os.environ["CORS_ALLOWED_ORIGINS"] = "https://example.com, http://127.0.0.1:8000"
+        self.assertEqual(
+            main._cors_allowed_origins(),
+            ["https://example.com", "http://127.0.0.1:8000"],
+        )
 
     def test_auth_required_blocks_api_until_totp_login(self):
         secret = pyotp.random_base32()

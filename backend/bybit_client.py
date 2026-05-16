@@ -9,12 +9,14 @@ import requests
 
 
 class BybitClient:
+    ASSET_PRICE_TTL_SECONDS = 60
+
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.recv_window = "5000"
-        self._asset_price_cache: dict[str, Decimal] = {}
+        self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
 
     def _sign(self, payload: str, timestamp: str) -> str:
         raw = f"{timestamp}{self.api_key}{self.recv_window}{payload}"
@@ -199,14 +201,26 @@ class BybitClient:
             return amount
 
         symbol = f"{asset}USDT"
-        if symbol not in self._asset_price_cache:
-            try:
-                ticker = self.get_ticker(symbol)
-                price = ticker["result"]["list"][0]["lastPrice"]
-                self._asset_price_cache[symbol] = Decimal(str(price))
-            except Exception:
-                return None
-        return amount * self._asset_price_cache[symbol]
+        now = time.time()
+        cached = self._asset_price_cache.get(symbol)
+        if isinstance(cached, tuple):
+            cached_price, cached_at = cached
+            if now - cached_at < self.ASSET_PRICE_TTL_SECONDS:
+                return amount * cached_price
+        elif cached is not None:
+            return amount * cached
+
+        try:
+            ticker = self.get_ticker(symbol)
+            price = Decimal(str(ticker["result"]["list"][0]["lastPrice"]))
+            self._asset_price_cache[symbol] = (price, now)
+            return amount * price
+        except Exception:
+            if isinstance(cached, tuple):
+                return amount * cached[0]
+            if cached is not None:
+                return amount * cached
+            return None
 
     @staticmethod
     def round_to_step(value: float, step: str) -> str:

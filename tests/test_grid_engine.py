@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 import unittest
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -576,6 +577,42 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(repair_orders)
         self.assertEqual(repair_orders[-1]["qty"], "2.5")
+
+    async def test_boundary_repair_is_throttled_to_avoid_duplicate_market_closes(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "2.5"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        engine.current_price = 89
+        engine.active_orders = {}
+
+        engine._repair_boundary_position()
+        engine._repair_boundary_position()
+
+        repair_orders = [
+            order
+            for order in client.orders
+            if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
+        ]
+        self.assertEqual(len(repair_orders), 1)
+        self.assertGreater(engine._boundary_repair_retry_after, time.time())
 
     async def test_neutral_grid_deploys_both_buy_and_sell_limit_orders_without_market_position(self):
         client = FakeClient("100")

@@ -10,13 +10,15 @@ import requests
 
 class BinanceFuturesClient:
     exchange = "binance"
+    ASSET_PRICE_TTL_SECONDS = 60
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
         self.recv_window = 5000
-        self._asset_price_cache: dict[str, Decimal] = {}
+        self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
+        self._instrument_info_cache: dict[str, tuple[dict, float]] = {}
 
     def _sign(self, params: dict[str, Any]) -> str:
         query = urlencode(params, doseq=True)
@@ -76,7 +78,12 @@ class BinanceFuturesClient:
 
     def get_instrument_info(self, symbol: str) -> dict:
         symbol = symbol.upper()
-        data = self._request("GET", "/fapi/v1/exchangeInfo")
+        cached = self._instrument_info_cache.get(symbol)
+        now = time.time()
+        if cached and now - cached[1] < 300:
+            return cached[0]
+
+        data = self._request("GET", "/fapi/v1/exchangeInfo", params={"symbol": symbol})
         instrument = next((item for item in data.get("symbols", []) if item.get("symbol") == symbol), None)
         if not instrument:
             return {"retCode": -1, "retMsg": f"Symbol {symbol} not found"}
@@ -84,7 +91,7 @@ class BinanceFuturesClient:
         filters = {item.get("filterType"): item for item in instrument.get("filters", [])}
         price_filter = filters.get("PRICE_FILTER", {})
         lot_filter = filters.get("LOT_SIZE", {})
-        return {
+        result = {
             "retCode": 0,
             "result": {
                 "list": [
@@ -98,6 +105,8 @@ class BinanceFuturesClient:
                 ]
             },
         }
+        self._instrument_info_cache[symbol] = (result, now)
+        return result
 
     def get_balance(self) -> dict:
         balances = self._request("GET", "/fapi/v3/balance", auth=True)
@@ -271,13 +280,26 @@ class BinanceFuturesClient:
             return amount
 
         symbol = f"{asset}USDT"
-        if symbol not in self._asset_price_cache:
-            try:
-                ticker = self._request("GET", "/fapi/v1/ticker/price", params={"symbol": symbol})
-                self._asset_price_cache[symbol] = Decimal(str(ticker.get("price", "0")))
-            except Exception:
-                return None
-        return amount * self._asset_price_cache[symbol]
+        now = time.time()
+        cached = self._asset_price_cache.get(symbol)
+        if isinstance(cached, tuple):
+            cached_price, cached_at = cached
+            if now - cached_at < self.ASSET_PRICE_TTL_SECONDS:
+                return amount * cached_price
+        elif cached is not None:
+            return amount * cached
+
+        try:
+            ticker = self._request("GET", "/fapi/v1/ticker/price", params={"symbol": symbol})
+            price = Decimal(str(ticker.get("price", "0")))
+            self._asset_price_cache[symbol] = (price, now)
+            return amount * price
+        except Exception:
+            if isinstance(cached, tuple):
+                return amount * cached[0]
+            if cached is not None:
+                return amount * cached
+            return None
 
     @staticmethod
     def _normalize_position(item: dict[str, Any]) -> dict:
