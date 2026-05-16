@@ -24,6 +24,11 @@ BYBIT_API_KEY=你的Key
 BYBIT_API_SECRET=你的Secret
 BYBIT_TESTNET=false
 
+# 兜底手续费率：仅在交易所成交明细拿不到真实手续费时使用。
+# Binance USDT-M 合约普通默认：挂单 0.02%，吃单 0.05%。
+GRID_MAKER_FEE_RATE=0.0002
+GRID_TAKER_FEE_RATE=0.0005
+
 # 如果使用 Binance，把 GRID_EXCHANGE 改为 binance，并填写：
 BINANCE_API_KEY=你的Key
 BINANCE_API_SECRET=你的Secret

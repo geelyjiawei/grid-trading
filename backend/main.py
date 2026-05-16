@@ -27,6 +27,8 @@ from secret_store import decrypt_text, encrypt_text, storage_backend
 
 _engines: dict[str, GridEngine] = {}
 SUPPORTED_EXCHANGES = {"bybit", "binance"}
+DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
+DEFAULT_TAKER_FEE_RATE = float(os.getenv("GRID_TAKER_FEE_RATE", "0.0005"))
 
 BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
@@ -282,6 +284,13 @@ def _calculate_grid_levels(lower: float, upper: float, count: int, grid_mode: st
     return [round(lower + (step * idx), 10) for idx in range(count + 1)]
 
 
+def _validate_fee_rates(cfg: "GridConfig"):
+    for field in ("fee_rate", "maker_fee_rate", "taker_fee_rate"):
+        value = getattr(cfg, field)
+        if value is not None and (value < 0 or value > 0.01):
+            raise HTTPException(status_code=400, detail=f"{field} must be between 0 and 0.01")
+
+
 def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> dict:
     ticker = client.get_ticker(symbol)
     if ticker.get("retCode") != 0:
@@ -351,9 +360,14 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         grid_profit_pct = (grid_step / current_price) * 100 if current_price > 0 else 0
 
     average_qty = total_qty / active_count
-    fee_rate = max(0.0, float(cfg.fee_rate or 0))
+    maker_fee_rate = max(0.0, float(cfg.maker_fee_rate if cfg.maker_fee_rate is not None else cfg.fee_rate or 0))
+    taker_fee_rate = max(0.0, float(cfg.taker_fee_rate if cfg.taker_fee_rate is not None else cfg.fee_rate or 0))
+    opening_fee_rate = maker_fee_rate if cfg.initial_order_type == "post_only" else taker_fee_rate
+    grid_fee_rate = maker_fee_rate
     gross_profit = grid_step * average_qty
-    fee = average_qty * current_price * 2 * fee_rate
+    open_fee = average_qty * current_price * opening_fee_rate
+    close_fee = average_qty * current_price * grid_fee_rate
+    fee = open_fee + close_fee
 
     return {
         "symbol": symbol,
@@ -369,8 +383,12 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         "qty_step": qty_step,
         "min_qty": min_qty,
         "per_grid_gross_profit": gross_profit,
+        "per_grid_open_fee": open_fee,
+        "per_grid_close_fee": close_fee,
         "per_grid_fee": fee,
         "per_grid_net_profit": gross_profit - fee,
+        "maker_fee_rate": maker_fee_rate,
+        "taker_fee_rate": taker_fee_rate,
     }
 
 
@@ -510,7 +528,9 @@ class GridConfig(BaseModel):
     grid_count: int
     total_investment: float
     leverage: int
-    fee_rate: float = 0.0005
+    fee_rate: float = DEFAULT_TAKER_FEE_RATE
+    maker_fee_rate: float | None = DEFAULT_MAKER_FEE_RATE
+    taker_fee_rate: float | None = DEFAULT_TAKER_FEE_RATE
     initial_order_type: str = "market"
     initial_order_price: float | None = None
     grid_order_post_only: bool = False
@@ -717,8 +737,7 @@ def grid_preview(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="total_investment must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
-    if cfg.fee_rate < 0 or cfg.fee_rate > 0.01:
-        raise HTTPException(status_code=400, detail="fee_rate must be between 0 and 0.01")
+    _validate_fee_rates(cfg)
     if direction not in {"long", "short", "neutral"}:
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
@@ -746,8 +765,7 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="total_investment must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
-    if cfg.fee_rate < 0 or cfg.fee_rate > 0.01:
-        raise HTTPException(status_code=400, detail="fee_rate must be between 0 and 0.01")
+    _validate_fee_rates(cfg)
     if direction not in {"long", "short", "neutral"}:
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:

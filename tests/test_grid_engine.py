@@ -357,6 +357,56 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(engine.filled_orders[0]["fee"], 0.071)
         self.assertAlmostEqual(engine.filled_orders[0]["profit"], 4.929)
 
+    async def test_pair_profit_uses_actual_entry_and_exit_prices(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "maker_fee_rate": 0.0002,
+                "taker_fee_rate": 0.0005,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        client.trade_details = {}
+
+        def get_order_trades(symbol, order_id):
+            return {"retCode": 0, "result": {"list": client.trade_details.get(order_id, [])}}
+
+        client.get_order_trades = get_order_trades
+        await engine.initialize()
+
+        take_profit_order = next(
+            order for order in engine.active_orders.values() if order["side"] == "Sell" and order["reduce_only"]
+        )
+        self.assertAlmostEqual(float(take_profit_order["entry_price"]), 100.0)
+        client.trade_details[take_profit_order["order_id"]] = [
+            {
+                "price": "104",
+                "qty": "1",
+                "volume": "104",
+                "feeUsdt": "0.0208",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        ]
+
+        client.open_limit_order_ids.discard(take_profit_order["order_id"])
+        await engine._check_fills()
+
+        self.assertAlmostEqual(engine.filled_orders[0]["gross_profit"], 4.0)
+        self.assertAlmostEqual(engine.filled_orders[0]["profit"], 3.9792)
+        self.assertEqual(engine.filled_orders[0]["liquidity"], "maker")
+
     async def test_stopping_grid_does_not_replace_cancelled_orders(self):
         client = FakeClient("100")
         engine = GridEngine(

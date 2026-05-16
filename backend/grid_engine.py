@@ -30,6 +30,7 @@ class GridEngine:
         self.current_price = 0.0
         self.initial_side = ""
         self.initial_qty = 0.0
+        self.initial_entry_price = 0.0
         self.grid_profit_pct = 0.0
         self.waiting_trigger = False
         self.trigger_message = ""
@@ -66,6 +67,7 @@ class GridEngine:
             "current_price": self.current_price,
             "initial_side": self.initial_side,
             "initial_qty": self.initial_qty,
+            "initial_entry_price": self.initial_entry_price,
             "grid_profit_pct": self.grid_profit_pct,
             "waiting_trigger": self.waiting_trigger,
             "trigger_message": self.trigger_message,
@@ -93,6 +95,7 @@ class GridEngine:
         self.current_price = float(state.get("current_price") or 0)
         self.initial_side = str(state.get("initial_side") or "")
         self.initial_qty = float(state.get("initial_qty") or 0)
+        self.initial_entry_price = float(state.get("initial_entry_price") or 0)
         self.grid_profit_pct = float(state.get("grid_profit_pct") or 0)
         self.waiting_trigger = bool(state.get("waiting_trigger", False))
         self.trigger_message = str(state.get("trigger_message") or "")
@@ -191,10 +194,13 @@ class GridEngine:
             "total_fee": round(self.total_fee, 4),
             "total_volume": round(self.total_volume, 4),
             "fee_rate": self._fee_rate(),
+            "maker_fee_rate": self._maker_fee_rate(),
+            "taker_fee_rate": self._taker_fee_rate(),
             "start_time": self.start_time,
             "current_price": self.current_price,
             "initial_side": self.initial_side,
             "initial_qty": round(self.initial_qty, 8),
+            "initial_entry_price": round(self.initial_entry_price, 10),
             "grid_profit_pct": round(self.grid_profit_pct, 6),
             "config": self.config,
         }
@@ -246,6 +252,20 @@ class GridEngine:
     def _fee_rate(self) -> float:
         return max(0.0, float(self.config.get("fee_rate", 0.0005) or 0))
 
+    def _maker_fee_rate(self) -> float:
+        if self.config.get("maker_fee_rate") is not None:
+            return max(0.0, float(self.config.get("maker_fee_rate") or 0))
+        return self._fee_rate()
+
+    def _taker_fee_rate(self) -> float:
+        if self.config.get("taker_fee_rate") is not None:
+            return max(0.0, float(self.config.get("taker_fee_rate") or 0))
+        return self._fee_rate()
+
+    def _estimate_fee(self, volume: float, liquidity: str = "taker") -> float:
+        rate = self._maker_fee_rate() if liquidity == "maker" else self._taker_fee_rate()
+        return volume * rate
+
     def _record_trade_value(
         self,
         price: float,
@@ -258,7 +278,7 @@ class GridEngine:
         fee_source: str = "estimated",
     ) -> dict:
         notional = volume if volume is not None else price * qty
-        fee = fee if fee is not None else notional * self._fee_rate()
+        fee = fee if fee is not None else self._estimate_fee(notional)
         net_profit = gross_profit - fee
 
         self.total_volume += notional
@@ -283,9 +303,10 @@ class GridEngine:
         fallback_qty: float,
         *,
         allow_estimate: bool = True,
+        liquidity_hint: str = "taker",
     ) -> dict | None:
         fallback_volume = fallback_price * fallback_qty
-        fallback_fee = fallback_volume * self._fee_rate()
+        fallback_fee = self._estimate_fee(fallback_volume, liquidity_hint)
         stats = {
             "price": fallback_price,
             "qty": fallback_qty,
@@ -293,8 +314,8 @@ class GridEngine:
             "fee": fallback_fee,
             "fee_asset": "USDT estimated",
             "fee_source": "estimated",
-            "maker_count": 0,
-            "taker_count": 0,
+            "maker_count": 1 if liquidity_hint == "maker" else 0,
+            "taker_count": 1 if liquidity_hint != "maker" else 0,
         }
 
         if not order_id or not hasattr(self.client, "get_order_trades"):
@@ -352,7 +373,7 @@ class GridEngine:
                 total_fee += float(fee_usdt_text)
             else:
                 converted_all = False
-                total_fee += volume * self._fee_rate()
+                total_fee += self._estimate_fee(volume, "maker" if trade.get("isMaker") else "taker")
 
         if total_qty <= 0 or total_volume <= 0:
             if not allow_estimate:
@@ -461,16 +482,18 @@ class GridEngine:
         self.initial_side = side
         self.initial_qty = float(qty_text)
         order_id = str(result.get("result", {}).get("orderId", ""))
-        stats = self._get_trade_stats(order_id, self.current_price, self.initial_qty)
+        stats = self._get_trade_stats(order_id, self.current_price, self.initial_qty, liquidity_hint="taker")
         if stats is None:
+            volume = self.current_price * self.initial_qty
             stats = {
                 "price": self.current_price,
                 "qty": self.initial_qty,
-                "volume": self.current_price * self.initial_qty,
-                "fee": self.current_price * self.initial_qty * self._fee_rate(),
+                "volume": volume,
+                "fee": self._estimate_fee(volume, "taker"),
                 "fee_asset": "USDT estimated",
                 "fee_source": "estimated",
             }
+        self.initial_entry_price = stats["price"]
         self._record_trade_value(
             stats["price"],
             stats["qty"],
@@ -500,6 +523,7 @@ class GridEngine:
 
         self.initial_side = side
         self.initial_qty = float(qty_text)
+        self.initial_entry_price = 0.0
         self.waiting_initial_order = True
         self.trigger_message = f"Waiting for post-only opening order at {price_text}"
         self.opening_order = {
@@ -526,6 +550,7 @@ class GridEngine:
         level_idx: int,
         reduce_only: bool,
         qty_override: float | None = None,
+        entry_price: float | None = None,
     ) -> Optional[str]:
         raw_qty = float(qty_override) if qty_override is not None else float(self.config["qty_per_grid"])
         qty = self._fq(raw_qty)
@@ -629,7 +654,10 @@ class GridEngine:
             "price": price_text,
             "qty": qty,
             "status": "open",
+            "order_type": "Limit",
+            "time_in_force": "PostOnly" if use_post_only else "GTC",
             "reduce_only": reduce_only,
+            "entry_price": entry_price,
         }
         self._persist_state()
         return link_id
@@ -758,7 +786,14 @@ class GridEngine:
         if direction in {"long", "short"}:
             for target, allocated_qty in zip(profit_targets, allocated_qtys):
                 idx, target_price, target_side = target
-                self._place(target_side, target_price, idx, reduce_only=True, qty_override=allocated_qty)
+                self._place(
+                    target_side,
+                    target_price,
+                    idx,
+                    reduce_only=True,
+                    qty_override=allocated_qty,
+                    entry_price=self.initial_entry_price,
+                )
 
             for idx, target_price, target_side in add_targets:
                 self._place(target_side, target_price, idx, reduce_only=False, qty_override=qty_per_grid)
@@ -933,7 +968,13 @@ class GridEngine:
 
         fallback_price = float(self.opening_order["price"])
         planned_qty = float(self.opening_order["qty"])
-        stats = self._get_trade_stats(order_id, fallback_price, planned_qty, allow_estimate=False)
+        stats = self._get_trade_stats(
+            order_id,
+            fallback_price,
+            planned_qty,
+            allow_estimate=False,
+            liquidity_hint="maker",
+        )
         if not stats or stats["qty"] <= 0:
             self.waiting_initial_order = False
             self.opening_order = None
@@ -956,6 +997,7 @@ class GridEngine:
             return
 
         self.initial_qty = stats["qty"]
+        self.initial_entry_price = stats["price"]
         self._record_trade_value(
             stats["price"],
             stats["qty"],
@@ -1006,26 +1048,44 @@ class GridEngine:
             fallback_price,
             fallback_qty,
             allow_estimate=allow_estimate,
+            liquidity_hint=self._order_liquidity_hint(order),
         )
         if not stats or stats["qty"] <= 0:
             return False
 
-        filled_order = {**order, "qty": str(stats["qty"])}
+        filled_order = {**order, "qty": str(stats["qty"]), "fill_price": stats["price"]}
         self._record_fill(filled_order, stats)
         self._place_counter_order(filled_order)
         return True
+
+    def _order_liquidity_hint(self, order: dict) -> str:
+        if str(order.get("order_type", "")).lower() == "market":
+            return "taker"
+        return "maker" if order.get("time_in_force") == "PostOnly" else "maker"
 
     def _record_fill(self, order: dict, stats: dict | None = None):
         level_idx = order["level_idx"]
         fallback_qty = float(order["qty"])
         fallback_price = float(order["price"])
-        stats = stats or self._get_trade_stats(order["order_id"], fallback_price, fallback_qty)
+        stats = stats or self._get_trade_stats(
+            order["order_id"],
+            fallback_price,
+            fallback_qty,
+            liquidity_hint=self._order_liquidity_hint(order),
+        )
         qty = stats["qty"]
         price = stats["price"]
         gross_profit = 0.0
 
-        if order["reduce_only"] and level_idx + 1 < len(self.grid_levels):
-            gross_profit = (self.grid_levels[level_idx + 1] - self.grid_levels[level_idx]) * qty
+        if order["reduce_only"]:
+            entry_price = float(order.get("entry_price") or 0)
+            if entry_price > 0:
+                if self.config["direction"] == "long" and order["side"] == "Sell":
+                    gross_profit = (price - entry_price) * qty
+                elif self.config["direction"] == "short" and order["side"] == "Buy":
+                    gross_profit = (entry_price - price) * qty
+            elif level_idx + 1 < len(self.grid_levels):
+                gross_profit = (self.grid_levels[level_idx + 1] - self.grid_levels[level_idx]) * qty
             self.completed_pairs += 1
         recorded = self._record_trade_value(
             price,
@@ -1066,12 +1126,26 @@ class GridEngine:
 
         if direction == "long":
             if side == "Buy" and level_idx + 1 < len(self.grid_levels):
-                self._place("Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=True, qty_override=qty)
+                self._place(
+                    "Sell",
+                    self.grid_levels[level_idx + 1],
+                    level_idx,
+                    reduce_only=True,
+                    qty_override=qty,
+                    entry_price=float(order.get("fill_price") or order.get("price") or 0),
+                )
             elif side == "Sell":
                 self._place("Buy", self.grid_levels[level_idx], level_idx, reduce_only=False, qty_override=qty)
         elif direction == "short":
             if side == "Sell":
-                self._place("Buy", self.grid_levels[level_idx], level_idx, reduce_only=True, qty_override=qty)
+                self._place(
+                    "Buy",
+                    self.grid_levels[level_idx],
+                    level_idx,
+                    reduce_only=True,
+                    qty_override=qty,
+                    entry_price=float(order.get("fill_price") or order.get("price") or 0),
+                )
             elif level_idx + 1 < len(self.grid_levels):
                 self._place("Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=False, qty_override=qty)
         else:

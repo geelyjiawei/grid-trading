@@ -143,6 +143,8 @@ class MultiGridServerTests(unittest.TestCase):
             "total_investment": 100,
             "leverage": 10,
             "fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "taker_fee_rate": 0.0005,
             "trigger_price": None,
             "stop_loss_price": None,
             "take_profit_price": None,
@@ -157,6 +159,9 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["total_qty"], 10.0)
         self.assertAlmostEqual(data["qty_per_grid_min"], 1.0)
         self.assertAlmostEqual(data["qty_per_grid_max"], 1.0)
+        self.assertAlmostEqual(data["per_grid_open_fee"], 0.05)
+        self.assertAlmostEqual(data["per_grid_close_fee"], 0.02)
+        self.assertAlmostEqual(data["per_grid_fee"], 0.07)
 
     def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
         main._client.place_order(

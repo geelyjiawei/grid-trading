@@ -147,8 +147,19 @@
               <input id="total-investment" class="form-input" type="number" value="500" min="0" step="any" />
             </div>
             <div class="form-group">
-              <label for="fee-rate">兜底手续费率（%）</label>
-              <input id="fee-rate" class="form-input" type="number" value="0.05" min="0" max="1" step="0.001" />
+              <label for="maker-fee-rate">挂单手续费率 Maker（%）</label>
+              <input id="maker-fee-rate" class="form-input" type="number" value="0.02" min="0" max="1" step="0.001" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="taker-fee-rate">吃单手续费率 Taker（%）</label>
+              <input id="taker-fee-rate" class="form-input" type="number" value="0.05" min="0" max="1" step="0.001" />
+            </div>
+            <div class="form-group">
+              <label>手续费说明</label>
+              <div class="form-hint">Binance 合约默认按挂单 0.02%、吃单 0.05% 兜底；成交明细返回真实手续费时，优先使用真实手续费。</div>
             </div>
           </div>
 
@@ -169,7 +180,7 @@
               <input id="take-profit-price" class="form-input" type="number" step="any" placeholder="留空则不启用" />
             </div>
             <div class="form-group">
-              <label>手续费说明</label>
+              <label>运行说明</label>
               <div class="form-hint">开仓可选 Post Only 省手续费；网格运行挂单默认不用 Post Only，优先保证补单和平仓可靠。</div>
             </div>
           </div>
@@ -471,6 +482,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260516-grid-preview"></script>
-</body>
+    <script src="/static/app.js?v=20260517-fee-profit"></script>
+  </body>
 </html>

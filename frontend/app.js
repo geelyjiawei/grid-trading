@@ -91,7 +91,7 @@ function bindEvents() {
     updatePreview();
   });
 
-  ["upper-price", "lower-price", "grid-count", "total-investment", "fee-rate", "grid-mode", "initial-order-type"].forEach((id) => {
+  ["upper-price", "lower-price", "grid-count", "total-investment", "maker-fee-rate", "taker-fee-rate", "grid-mode", "initial-order-type"].forEach((id) => {
     document.getElementById(id).addEventListener("input", updatePreview);
     document.getElementById(id).addEventListener("change", updatePreview);
   });
@@ -169,7 +169,8 @@ async function updatePreview() {
   const count = parseInt(document.getElementById("grid-count").value, 10);
   const investment = parseFloat(document.getElementById("total-investment").value);
   const leverage = parseInt(document.getElementById("leverage").value, 10);
-  const feeRate = parseFeeRate();
+  const makerFeeRate = parsePercentRate("maker-fee-rate");
+  const takerFeeRate = parsePercentRate("taker-fee-rate");
   const gridMode = document.getElementById("grid-mode").value;
   const box = document.getElementById("grid-preview");
   const symbol = getSymbol();
@@ -190,7 +191,9 @@ async function updatePreview() {
       grid_count: count,
       total_investment: investment,
       leverage,
-      fee_rate: feeRate,
+      fee_rate: takerFeeRate,
+      maker_fee_rate: makerFeeRate,
+      taker_fee_rate: takerFeeRate,
       initial_order_type: document.getElementById("initial-order-type").value,
       initial_order_price: parseOptionalNumber("initial-order-price"),
       grid_order_post_only: document.getElementById("grid-order-post-only").checked,
@@ -211,7 +214,7 @@ async function updatePreview() {
       : Number(preview.grid_step).toFixed(6);
     document.getElementById("prev-profit-pct").textContent = `${Number(preview.grid_profit_pct).toFixed(3)}%`;
     document.getElementById("prev-gross-profit").textContent = Number(preview.per_grid_gross_profit).toFixed(4);
-    document.getElementById("prev-fee").textContent = Number(preview.per_grid_fee).toFixed(4);
+    document.getElementById("prev-fee").textContent = `${Number(preview.per_grid_fee).toFixed(4)}（开 ${Number(preview.per_grid_open_fee || 0).toFixed(4)} / 平 ${Number(preview.per_grid_close_fee || 0).toFixed(4)}）`;
     document.getElementById("prev-profit").textContent = Number(preview.per_grid_net_profit).toFixed(4);
     document.getElementById("prev-active-count").textContent = `${preview.active_grid_count} / ${preview.grid_count}`;
     document.getElementById("prev-qty").textContent = qtyText;
@@ -269,7 +272,9 @@ async function startGrid() {
     grid_count: parseInt(document.getElementById("grid-count").value, 10),
     total_investment: parseFloat(document.getElementById("total-investment").value),
     leverage: parseInt(document.getElementById("leverage").value, 10),
-    fee_rate: parseFeeRate(),
+    fee_rate: parsePercentRate("taker-fee-rate"),
+    maker_fee_rate: parsePercentRate("maker-fee-rate"),
+    taker_fee_rate: parsePercentRate("taker-fee-rate"),
     initial_order_type: document.getElementById("initial-order-type").value,
     initial_order_price: parseOptionalNumber("initial-order-price"),
     grid_order_post_only: document.getElementById("grid-order-post-only").checked,
@@ -764,8 +769,8 @@ function parseOptionalNumber(id) {
   return value === "" ? null : Number(value);
 }
 
-function parseFeeRate() {
-  const value = Number(document.getElementById("fee-rate").value);
+function parsePercentRate(id) {
+  const value = Number(document.getElementById(id).value);
   return Number.isFinite(value) && value > 0 ? value / 100 : 0;
 }
 
