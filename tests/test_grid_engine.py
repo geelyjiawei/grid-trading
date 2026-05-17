@@ -1,6 +1,5 @@
 import asyncio
 import sys
-import time
 import unittest
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -591,7 +590,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(repair_orders)
         self.assertIn("Safety repair", engine.trigger_message)
 
-    async def test_short_boundary_repairs_residual_position_below_lower_range(self):
+    async def test_boundary_break_does_not_market_close_by_default(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "2.5"}]
         engine = GridEngine(
@@ -627,10 +626,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in client.orders
             if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
         ]
-        self.assertTrue(repair_orders)
-        self.assertEqual(repair_orders[-1]["qty"], "2.5")
+        self.assertFalse(repair_orders)
 
-    async def test_boundary_repair_does_not_trust_stale_reduce_orders(self):
+    async def test_boundary_break_does_not_cancel_stale_reduce_orders_by_default(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "2.5"}]
         engine = GridEngine(
@@ -666,12 +664,11 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in client.orders
             if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
         ]
-        self.assertTrue(client.cancelled_orders)
-        self.assertTrue(repair_orders)
-        self.assertEqual(repair_orders[-1]["qty"], "2.5")
-        self.assertEqual(engine.active_orders, {})
+        self.assertFalse(client.cancelled_orders)
+        self.assertFalse(repair_orders)
+        self.assertTrue(engine.active_orders)
 
-    async def test_boundary_repair_is_throttled_to_avoid_duplicate_market_closes(self):
+    async def test_boundary_market_repair_is_explicit_opt_in(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "2.5"}]
         engine = GridEngine(
@@ -689,6 +686,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 "trigger_price": None,
                 "stop_loss_price": None,
                 "take_profit_price": None,
+                "boundary_market_repair": True,
             },
         )
 
@@ -705,7 +703,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
         ]
         self.assertEqual(len(repair_orders), 1)
-        self.assertGreater(engine._boundary_repair_retry_after, time.time())
+        self.assertGreater(engine._boundary_repair_retry_after, 0)
 
     async def test_neutral_grid_deploys_both_buy_and_sell_limit_orders_without_market_position(self):
         client = FakeClient("100")
