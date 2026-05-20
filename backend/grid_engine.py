@@ -895,8 +895,9 @@ class GridEngine:
                     break
 
                 if self.grid_ready:
-                    self._resume_paused_replacements()
                     await self._check_fills()
+                    self._repair_boundary_position()
+                    self._resume_paused_replacements()
 
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
@@ -906,9 +907,6 @@ class GridEngine:
                 await asyncio.sleep(5)
 
     def _repair_boundary_position(self):
-        if not bool(self.config.get("boundary_market_repair", False)):
-            return
-
         now = time.time()
         if self._boundary_repair_in_progress or now < self._boundary_repair_retry_after:
             return
