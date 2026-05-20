@@ -39,7 +39,6 @@ class GridEngine:
         self.opening_order: dict | None = None
         self._pending_targets: dict | None = None
         self.paused_replacements: list[dict] = []
-        self.boundary_close_order: dict | None = None
         self._stopping = False
         self._boundary_repair_in_progress = False
         self._boundary_repair_retry_after = 0.0
@@ -78,7 +77,6 @@ class GridEngine:
             "opening_order": self.opening_order,
             "pending_targets": self._pending_targets,
             "paused_replacements": self.paused_replacements[-200:],
-            "boundary_close_order": self.boundary_close_order,
             "saved_at": time.time(),
         }
 
@@ -108,7 +106,6 @@ class GridEngine:
         self.opening_order = state.get("opening_order")
         self._pending_targets = state.get("pending_targets")
         self.paused_replacements = list(state.get("paused_replacements") or [])
-        self.boundary_close_order = state.get("boundary_close_order")
 
         if not self.grid_levels:
             self.grid_levels = self._calculate_levels()
@@ -165,7 +162,6 @@ class GridEngine:
             raise RuntimeError(resp.get("retMsg", "Failed to cancel open orders"))
 
         self.active_orders.clear()
-        self.boundary_close_order = None
         self.opening_order = None
         self.waiting_initial_order = False
         self.grid_ready = False
@@ -195,7 +191,6 @@ class GridEngine:
             "active_orders": list(self.active_orders.values()),
             "paused_replacements": self.paused_replacements,
             "paused_replacements_count": len(self.paused_replacements),
-            "boundary_close_order": self.boundary_close_order,
             "completed_pairs": self.completed_pairs,
             "filled_count": len(self.filled_orders),
             "filled_orders": self.filled_orders[-50:],
@@ -464,70 +459,6 @@ class GridEngine:
             except (TypeError, ValueError):
                 continue
         return total
-
-    def _cancel_all_grid_orders(self):
-        resp = self.client.cancel_all_orders(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to cancel grid orders"))
-        self.active_orders.clear()
-        self.boundary_close_order = None
-        self.paused_replacements.clear()
-        self._persist_state()
-
-    def _boundary_exit_plan(self) -> tuple[str, str, float, str] | None:
-        direction = self.config["direction"]
-        lower = float(self.config["lower_price"])
-        upper = float(self.config["upper_price"])
-        if direction == "short":
-            return "Sell", "Buy", lower, f"short grid below lower boundary {lower}"
-        if direction == "long":
-            return "Buy", "Sell", upper, f"long grid above upper boundary {upper}"
-        return None
-
-    def _ensure_boundary_close_order(self):
-        if self.boundary_close_order or self.config.get("direction") not in {"long", "short"}:
-            return
-
-        plan = self._boundary_exit_plan()
-        if not plan:
-            return
-        position_side, close_side, boundary_price, reason = plan
-        if self._position_size(position_side) < self.min_qty:
-            return
-
-        link_id = f"boundary_{close_side[0]}_{uuid.uuid4().hex[:6]}"
-        stop_price = self._fp(boundary_price)
-        if hasattr(self.client, "place_boundary_close_order"):
-            result = self.client.place_boundary_close_order(
-                symbol=self.config["symbol"],
-                side=close_side,
-                stop_price=stop_price,
-                order_link_id=link_id,
-            )
-        else:
-            result = self.client.place_order(
-                symbol=self.config["symbol"],
-                side=close_side,
-                qty=self._fq(self._position_size(position_side)),
-                stop_price=stop_price,
-                order_type="TAKE_PROFIT_MARKET",
-                reduce_only=True,
-                order_link_id=link_id,
-            )
-        if result.get("retCode") != 0:
-            raise RuntimeError(result.get("retMsg", f"Failed to place boundary close order: {reason}"))
-
-        self.boundary_close_order = {
-            "link_id": link_id,
-            "order_id": result["result"].get("orderId", ""),
-            "side": close_side,
-            "price": stop_price,
-            "order_type": "TAKE_PROFIT_MARKET",
-            "reduce_only": True,
-            "close_position": True,
-            "reason": reason,
-        }
-        self._persist_state()
 
     def _place_reduce_market(self, side: str, qty: float, reason: str) -> str:
         qty_text = self._fq(qty)
@@ -883,7 +814,6 @@ class GridEngine:
         self.grid_ready = True
         self.waiting_initial_order = False
         self.trigger_message = ""
-        self._ensure_boundary_close_order()
         self._persist_state()
 
     def _risk_hit(self, current_price: float) -> bool:
@@ -965,7 +895,6 @@ class GridEngine:
                     break
 
                 if self.grid_ready:
-                    self._ensure_boundary_close_order()
                     await self._check_fills()
                     self._repair_boundary_position()
                     self._resume_paused_replacements()
@@ -982,26 +911,32 @@ class GridEngine:
         if self._boundary_repair_in_progress or now < self._boundary_repair_retry_after:
             return
 
-        plan = self._boundary_exit_plan()
-        if not plan:
+        direction = self.config["direction"]
+        lower = float(self.config["lower_price"])
+        upper = float(self.config["upper_price"])
+
+        if direction == "short" and self.current_price <= lower:
+            position_side = "Sell"
+            close_side = "Buy"
+            reason = f"short grid below lower boundary {lower}"
+        elif direction == "long" and self.current_price >= upper:
+            position_side = "Buy"
+            close_side = "Sell"
+            reason = f"long grid above upper boundary {upper}"
+        else:
             return
-        position_side, close_side, boundary_price, reason = plan
-        if close_side == "Buy" and self.current_price > boundary_price:
-            return
-        if close_side == "Sell" and self.current_price < boundary_price:
+
+        position_qty = self._position_size(position_side)
+        if position_qty < self.min_qty:
             return
 
         self._boundary_repair_in_progress = True
         try:
-            self._cancel_all_grid_orders()
+            self._cancel_stale_reduce_orders(close_side)
             refreshed_qty = self._position_size(position_side)
             if refreshed_qty >= self.min_qty:
                 self._place_reduce_market(close_side, refreshed_qty, reason)
                 self._boundary_repair_retry_after = time.time() + 2
-            self.running = False
-            self.grid_ready = False
-            self.trigger_message = f"Boundary exit completed: {reason}"
-            self._persist_state()
         finally:
             self._boundary_repair_in_progress = False
 
@@ -1090,9 +1025,6 @@ class GridEngine:
             raise RuntimeError(resp.get("retMsg", "Failed to fetch open orders"))
 
         open_order_ids = {item["orderId"] for item in resp["result"].get("list", [])}
-        if self.boundary_close_order and str(self.boundary_close_order.get("order_id", "")) not in open_order_ids:
-            self.boundary_close_order = None
-            self._persist_state()
         if self._stopping:
             return
 

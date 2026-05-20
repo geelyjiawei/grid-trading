@@ -146,7 +146,6 @@ class BinanceFuturesClient:
         side: str,
         qty: str,
         price: str | None = None,
-        stop_price: str | None = None,
         order_type: str = "Limit",
         reduce_only: bool = False,
         order_link_id: str = "",
@@ -162,31 +161,9 @@ class BinanceFuturesClient:
         if order_type.lower() == "limit":
             params["price"] = price
             params["timeInForce"] = "GTX" if time_in_force == "PostOnly" else (time_in_force or "GTC")
-        if stop_price is not None:
-            params["stopPrice"] = stop_price
         if order_link_id:
             params["newClientOrderId"] = order_link_id
 
-        result = self._request("POST", "/fapi/v1/order", params=params, auth=True)
-        return {"retCode": 0, "result": {"orderId": str(result.get("orderId", ""))}}
-
-    def place_boundary_close_order(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        stop_price: str,
-        order_link_id: str = "",
-    ) -> dict:
-        params: dict[str, Any] = {
-            "symbol": symbol.upper(),
-            "side": self._to_binance_side(side),
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": stop_price,
-            "closePosition": "true",
-        }
-        if order_link_id:
-            params["newClientOrderId"] = order_link_id
         result = self._request("POST", "/fapi/v1/order", params=params, auth=True)
         return {"retCode": 0, "result": {"orderId": str(result.get("orderId", ""))}}
 
