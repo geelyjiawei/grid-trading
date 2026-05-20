@@ -38,6 +38,7 @@ class GridEngine:
         self.waiting_initial_order = False
         self.opening_order: dict | None = None
         self._pending_targets: dict | None = None
+        self.paused_replacements: list[dict] = []
         self._stopping = False
         self._boundary_repair_in_progress = False
         self._boundary_repair_retry_after = 0.0
@@ -75,6 +76,7 @@ class GridEngine:
             "waiting_initial_order": self.waiting_initial_order,
             "opening_order": self.opening_order,
             "pending_targets": self._pending_targets,
+            "paused_replacements": self.paused_replacements[-200:],
             "saved_at": time.time(),
         }
 
@@ -103,6 +105,7 @@ class GridEngine:
         self.waiting_initial_order = bool(state.get("waiting_initial_order", False))
         self.opening_order = state.get("opening_order")
         self._pending_targets = state.get("pending_targets")
+        self.paused_replacements = list(state.get("paused_replacements") or [])
 
         if not self.grid_levels:
             self.grid_levels = self._calculate_levels()
@@ -186,6 +189,8 @@ class GridEngine:
             "grid_mode": self.config.get("grid_mode", "arithmetic"),
             "grid_levels": self.grid_levels,
             "active_orders": list(self.active_orders.values()),
+            "paused_replacements": self.paused_replacements,
+            "paused_replacements_count": len(self.paused_replacements),
             "completed_pairs": self.completed_pairs,
             "filled_count": len(self.filled_orders),
             "filled_orders": self.filled_orders[-50:],
@@ -244,6 +249,10 @@ class GridEngine:
 
         step = self.grid_levels[1] - self.grid_levels[0]
         return (step / reference_price) * 100
+
+    def _in_grid_range(self, price: float | None = None) -> bool:
+        current = self.current_price if price is None else float(price)
+        return float(self.config["lower_price"]) <= current <= float(self.config["upper_price"])
 
     def _calc_total_qty(self, reference_price: float) -> float:
         total_investment = float(self.config["total_investment"])
@@ -451,7 +460,7 @@ class GridEngine:
                 continue
         return total
 
-    def _place_reduce_market(self, side: str, qty: float, reason: str):
+    def _place_reduce_market(self, side: str, qty: float, reason: str) -> str:
         qty_text = self._fq(qty)
         result = self.client.place_order(
             symbol=self.config["symbol"],
@@ -466,6 +475,7 @@ class GridEngine:
         self.trigger_message = f"Safety repair placed {side} reduce-only {qty_text}: {reason}"
         logger.warning(self.trigger_message)
         self._persist_state()
+        return str(result["result"].get("orderId") or "")
 
     def _place_market_open(self, side: str, qty: float):
         qty_text = self._fq(qty)
@@ -596,8 +606,7 @@ class GridEngine:
                         price_text,
                         retry_exc,
                     )
-                    self._place_reduce_market(side, float(qty), "reduce limit placement failed")
-                    return None
+                    return self._place_reduce_market(side, float(qty), "reduce limit placement failed")
             else:
                 logger.warning(
                     "Place order failed side=%s price=%s reduce_only=%s msg=%s",
@@ -634,8 +643,7 @@ class GridEngine:
                 price_text,
                 result.get("retMsg"),
             )
-            self._place_reduce_market(side, float(qty), "reduce limit rejected")
-            return None
+            return self._place_reduce_market(side, float(qty), "reduce limit rejected")
 
         if result.get("retCode") != 0:
             logger.warning(
@@ -887,6 +895,7 @@ class GridEngine:
                     break
 
                 if self.grid_ready:
+                    self._resume_paused_replacements()
                     await self._check_fills()
 
                 await asyncio.sleep(3)
@@ -1057,8 +1066,34 @@ class GridEngine:
 
         filled_order = {**order, "qty": str(stats["qty"]), "fill_price": stats["price"]}
         self._record_fill(filled_order, stats)
-        self._place_counter_order(filled_order)
+        if self._in_grid_range():
+            self._place_counter_order(filled_order)
+        else:
+            self.paused_replacements.append(filled_order)
+            self.trigger_message = (
+                f"Price {self.current_price} is outside grid range; "
+                "counter order is queued until price returns."
+            )
+            self._persist_state()
         return True
+
+    def _resume_paused_replacements(self):
+        if not self.paused_replacements or not self._in_grid_range() or self._stopping:
+            return
+
+        pending = list(self.paused_replacements)
+        remaining = []
+        self.paused_replacements.clear()
+        for order in pending:
+            if not self._place_counter_order(order):
+                remaining.append(order)
+        self.paused_replacements = remaining
+        self.trigger_message = (
+            ""
+            if not remaining
+            else f"{len(remaining)} counter order(s) are still queued; retrying next poll."
+        )
+        self._persist_state()
 
     def _order_liquidity_hint(self, order: dict) -> str:
         if str(order.get("order_type", "")).lower() == "market":
@@ -1120,7 +1155,31 @@ class GridEngine:
         )
         self._persist_state()
 
-    def _place_counter_order(self, order: dict):
+    def _place_counter_leg(
+        self,
+        side: str,
+        price: float,
+        level_idx: int,
+        *,
+        reduce_only: bool,
+        qty: float,
+        entry_price: float | None = None,
+    ) -> bool:
+        if self._has_active_order(side, level_idx, reduce_only):
+            return True
+        return (
+            self._place(
+                side,
+                price,
+                level_idx,
+                reduce_only=reduce_only,
+                qty_override=qty,
+                entry_price=entry_price,
+            )
+            is not None
+        )
+
+    def _place_counter_order(self, order: dict) -> bool:
         direction = self.config["direction"]
         side = order["side"]
         level_idx = order["level_idx"]
@@ -1128,30 +1187,39 @@ class GridEngine:
 
         if direction == "long":
             if side == "Buy" and level_idx + 1 < len(self.grid_levels):
-                self._place(
+                return self._place_counter_leg(
                     "Sell",
                     self.grid_levels[level_idx + 1],
                     level_idx,
                     reduce_only=True,
-                    qty_override=qty,
+                    qty=qty,
                     entry_price=float(order.get("fill_price") or order.get("price") or 0),
                 )
             elif side == "Sell":
-                self._place("Buy", self.grid_levels[level_idx], level_idx, reduce_only=False, qty_override=qty)
+                return self._place_counter_leg(
+                    "Buy", self.grid_levels[level_idx], level_idx, reduce_only=False, qty=qty
+                )
         elif direction == "short":
             if side == "Sell":
-                self._place(
+                return self._place_counter_leg(
                     "Buy",
                     self.grid_levels[level_idx],
                     level_idx,
                     reduce_only=True,
-                    qty_override=qty,
+                    qty=qty,
                     entry_price=float(order.get("fill_price") or order.get("price") or 0),
                 )
             elif level_idx + 1 < len(self.grid_levels):
-                self._place("Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=False, qty_override=qty)
+                return self._place_counter_leg(
+                    "Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=False, qty=qty
+                )
         else:
             if side == "Buy" and level_idx + 1 < len(self.grid_levels):
-                self._place("Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=False, qty_override=qty)
+                return self._place_counter_leg(
+                    "Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=False, qty=qty
+                )
             elif side == "Sell":
-                self._place("Buy", self.grid_levels[level_idx], level_idx, reduce_only=False, qty_override=qty)
+                return self._place_counter_leg(
+                    "Buy", self.grid_levels[level_idx], level_idx, reduce_only=False, qty=qty
+                )
+        return True

@@ -590,6 +590,52 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(repair_orders)
         self.assertIn("Safety repair", engine.trigger_message)
 
+    async def test_counter_order_is_queued_while_price_is_outside_grid_range(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        filled_sell = next(order for order in engine.active_orders.values() if order["side"] == "Sell")
+        engine.active_orders.pop(filled_sell["link_id"])
+        before_reduce_buys = [
+            order for order in client.orders if order.get("side") == "Buy" and order.get("reduce_only")
+        ]
+
+        engine.current_price = 89
+        handled = engine._handle_closed_order(filled_sell)
+
+        after_reduce_buys = [
+            order for order in client.orders if order.get("side") == "Buy" and order.get("reduce_only")
+        ]
+        self.assertTrue(handled)
+        self.assertEqual(len(after_reduce_buys), len(before_reduce_buys))
+        self.assertEqual(engine.get_status()["paused_replacements_count"], 1)
+
+        engine.current_price = 100
+        engine._resume_paused_replacements()
+
+        resumed_reduce_buys = [
+            order for order in client.orders if order.get("side") == "Buy" and order.get("reduce_only")
+        ]
+        self.assertEqual(len(resumed_reduce_buys), len(before_reduce_buys) + 1)
+        self.assertEqual(engine.get_status()["paused_replacements_count"], 0)
+
     async def test_boundary_break_does_not_market_close_by_default(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "2.5"}]
