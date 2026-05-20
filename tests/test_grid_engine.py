@@ -65,6 +65,16 @@ class FakeClient:
             self.open_limit_order_ids.add(order["orderId"])
         return {"retCode": 0, "result": {"orderId": order["orderId"]}}
 
+    def place_boundary_close_order(self, **kwargs):
+        self.order_seq += 1
+        order = dict(kwargs)
+        order["orderId"] = str(self.order_seq)
+        order["order_type"] = "TAKE_PROFIT_MARKET"
+        order["reduce_only"] = True
+        order["close_position"] = True
+        self.orders.append(order)
+        return {"retCode": 0, "result": {"orderId": order["orderId"]}}
+
     def cancel_all_orders(self, symbol):
         self.open_limit_order_ids.clear()
         return {"retCode": 0}
@@ -675,6 +685,35 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(repair_orders), 1)
         self.assertEqual(repair_orders[0]["qty"], "2.5")
 
+    async def test_short_grid_places_exchange_boundary_close_order_at_lower_range(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "2.5"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        close_orders = [order for order in client.orders if order.get("close_position")]
+        self.assertEqual(len(close_orders), 1)
+        self.assertEqual(close_orders[0]["side"], "Buy")
+        self.assertEqual(close_orders[0]["stop_price"], "90.0")
+        self.assertEqual(engine.get_status()["boundary_close_order"]["side"], "Buy")
+
     async def test_short_grid_keeps_position_when_price_breaks_upper_loss_boundary(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "2.5"}]
@@ -750,6 +789,35 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(repair_orders), 1)
         self.assertGreater(engine._boundary_repair_retry_after, 0)
+
+    async def test_long_grid_places_exchange_boundary_close_order_at_upper_range(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Buy", "size": "2.5"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        close_orders = [order for order in client.orders if order.get("close_position")]
+        self.assertEqual(len(close_orders), 1)
+        self.assertEqual(close_orders[0]["side"], "Sell")
+        self.assertEqual(close_orders[0]["stop_price"], "110.0")
+        self.assertEqual(engine.get_status()["boundary_close_order"]["side"], "Sell")
 
     async def test_long_grid_keeps_position_when_price_breaks_lower_loss_boundary(self):
         client = FakeClient("100")

@@ -102,6 +102,7 @@ class BybitClient:
         side: str,
         qty: str,
         price: str | None = None,
+        stop_price: str | None = None,
         order_type: str = "Limit",
         reduce_only: bool = False,
         order_link_id: str = "",
@@ -118,6 +119,32 @@ class BybitClient:
         if order_type == "Limit":
             payload["price"] = price
             payload["timeInForce"] = time_in_force or "GTC"
+        if stop_price is not None:
+            payload["triggerPrice"] = stop_price
+            payload["triggerDirection"] = 1 if side == "Sell" else 2
+        if order_link_id:
+            payload["orderLinkId"] = order_link_id
+        return self._request("POST", "/v5/order/create", payload=payload, auth=True)
+
+    def place_boundary_close_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        stop_price: str,
+        order_link_id: str = "",
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Market",
+            "qty": "0",
+            "reduceOnly": True,
+            "closeOnTrigger": True,
+            "triggerPrice": stop_price,
+            "triggerDirection": 1 if side == "Sell" else 2,
+        }
         if order_link_id:
             payload["orderLinkId"] = order_link_id
         return self._request("POST", "/v5/order/create", payload=payload, auth=True)
