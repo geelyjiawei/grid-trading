@@ -636,7 +636,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(resumed_reduce_buys), len(before_reduce_buys) + 1)
         self.assertEqual(engine.get_status()["paused_replacements_count"], 0)
 
-    async def test_short_grid_closes_position_when_price_breaks_lower_profit_boundary(self):
+    async def test_boundary_break_does_not_market_close_by_default(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "2.5"}]
         engine = GridEngine(
@@ -672,10 +672,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in client.orders
             if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
         ]
-        self.assertEqual(len(repair_orders), 1)
-        self.assertEqual(repair_orders[0]["qty"], "2.5")
+        self.assertFalse(repair_orders)
 
-    async def test_short_grid_keeps_position_when_price_breaks_upper_loss_boundary(self):
+    async def test_boundary_break_does_not_cancel_stale_reduce_orders_by_default(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "2.5"}]
         engine = GridEngine(
@@ -697,7 +696,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await engine.initialize()
-        engine.current_price = 111
+        engine.current_price = 89
         engine.active_orders = {
             key: order
             for key, order in engine.active_orders.items()
@@ -715,14 +714,14 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(repair_orders)
         self.assertTrue(engine.active_orders)
 
-    async def test_long_grid_closes_position_when_price_breaks_upper_profit_boundary(self):
+    async def test_boundary_market_repair_is_explicit_opt_in(self):
         client = FakeClient("100")
-        client.positions = [{"side": "Buy", "size": "2.5"}]
+        client.positions = [{"side": "Sell", "size": "2.5"}]
         engine = GridEngine(
             client,
             {
                 "symbol": "TESTUSDT",
-                "direction": "long",
+                "direction": "short",
                 "grid_mode": "arithmetic",
                 "upper_price": 110,
                 "lower_price": 90,
@@ -733,11 +732,12 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 "trigger_price": None,
                 "stop_loss_price": None,
                 "take_profit_price": None,
+                "boundary_market_repair": True,
             },
         )
 
         await engine.initialize()
-        engine.current_price = 111
+        engine.current_price = 89
         engine.active_orders = {}
 
         engine._repair_boundary_position()
@@ -746,43 +746,10 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         repair_orders = [
             order
             for order in client.orders
-            if order.get("side") == "Sell" and order.get("reduce_only") and order.get("order_type") == "Market"
+            if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
         ]
         self.assertEqual(len(repair_orders), 1)
         self.assertGreater(engine._boundary_repair_retry_after, 0)
-
-    async def test_long_grid_keeps_position_when_price_breaks_lower_loss_boundary(self):
-        client = FakeClient("100")
-        client.positions = [{"side": "Buy", "size": "2.5"}]
-        engine = GridEngine(
-            client,
-            {
-                "symbol": "TESTUSDT",
-                "direction": "long",
-                "grid_mode": "arithmetic",
-                "upper_price": 110,
-                "lower_price": 90,
-                "grid_count": 4,
-                "total_investment": 100,
-                "leverage": 2,
-                "grid_order_post_only": False,
-                "trigger_price": None,
-                "stop_loss_price": None,
-                "take_profit_price": None,
-            },
-        )
-
-        await engine.initialize()
-        engine.current_price = 89
-
-        engine._repair_boundary_position()
-
-        repair_orders = [
-            order
-            for order in client.orders
-            if order.get("side") == "Sell" and order.get("reduce_only") and order.get("order_type") == "Market"
-        ]
-        self.assertFalse(repair_orders)
 
     async def test_neutral_grid_deploys_both_buy_and_sell_limit_orders_without_market_position(self):
         client = FakeClient("100")
