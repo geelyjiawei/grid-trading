@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -25,6 +26,7 @@ from grid_engine import GridEngine
 from secret_store import decrypt_text, encrypt_text, storage_backend
 
 
+logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
 SUPPORTED_EXCHANGES = {"bybit", "binance"}
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
@@ -459,8 +461,9 @@ def _restore_saved_engines():
             engine.restore_state(engine_state)
             _engines[config["symbol"]] = engine
             engine.start()
-        except Exception:
+        except Exception as exc:
             # Keep the saved state on disk so the UI/risk checks can still show the problem.
+            logger.exception("Failed to restore saved grid symbol=%s: %s", config.get("symbol"), exc)
             _engines.pop(config["symbol"], None)
 
 

@@ -815,6 +815,7 @@ class GridEngine:
         self.grid_ready = True
         self.waiting_initial_order = False
         self.trigger_message = ""
+        self._pending_targets = None
         self._persist_state()
 
     def _risk_hit(self, current_price: float) -> bool:
@@ -1040,7 +1041,24 @@ class GridEngine:
         for link_id in filled_links:
             if self._stopping:
                 break
-            order = self.active_orders.pop(link_id)
+            order = self.active_orders[link_id]
+            status = self._get_order_status(order)
+            if self._is_cancelled_status(status):
+                self.active_orders.pop(link_id, None)
+                self._replace_cancelled_order(order)
+                self._persist_state()
+                continue
+            if not self._is_filled_status(status) and status != "UNKNOWN":
+                logger.info(
+                    "Grid order closed with non-fill status symbol=%s order_id=%s link_id=%s status=%s",
+                    self.config.get("symbol"),
+                    order.get("order_id"),
+                    link_id,
+                    status,
+                )
+                continue
+
+            self.active_orders.pop(link_id, None)
             handled = self._handle_closed_order(order)
             if not handled:
                 logger.info(
@@ -1099,7 +1117,51 @@ class GridEngine:
     def _order_liquidity_hint(self, order: dict) -> str:
         if str(order.get("order_type", "")).lower() == "market":
             return "taker"
-        return "maker" if order.get("time_in_force") == "PostOnly" else "maker"
+        return "maker" if order.get("time_in_force") == "PostOnly" else "taker"
+
+    def _get_order_status(self, order: dict) -> str:
+        if not hasattr(self.client, "get_order"):
+            return "UNKNOWN"
+        try:
+            resp = self.client.get_order(self.config["symbol"], str(order.get("order_id", "")))
+        except Exception as exc:
+            logger.warning("Fetch order status failed order_id=%s msg=%s", order.get("order_id"), exc)
+            return "UNKNOWN"
+        if resp.get("retCode") != 0:
+            logger.warning(
+                "Fetch order status rejected order_id=%s msg=%s",
+                order.get("order_id"),
+                resp.get("retMsg"),
+            )
+            return "UNKNOWN"
+        status = resp.get("result", {}).get("orderStatus") or resp.get("result", {}).get("status")
+        return str(status or "UNKNOWN").upper()
+
+    @staticmethod
+    def _is_filled_status(status: str) -> bool:
+        return status in {"FILLED", "FILLED_PARTIALLY"}
+
+    @staticmethod
+    def _is_cancelled_status(status: str) -> bool:
+        return status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "DEACTIVATED"}
+
+    def _replace_cancelled_order(self, order: dict):
+        placed = self._place(
+            order["side"],
+            float(order["price"]),
+            int(order["level_idx"]),
+            reduce_only=bool(order["reduce_only"]),
+            qty_override=float(order["qty"]),
+            entry_price=order.get("entry_price"),
+            allow_duplicate=True,
+        )
+        if placed:
+            logger.warning(
+                "Replaced cancelled grid order symbol=%s old_order_id=%s new_link_id=%s",
+                self.config.get("symbol"),
+                order.get("order_id"),
+                placed,
+            )
 
     def _record_fill(self, order: dict, stats: dict | None = None):
         level_idx = order["level_idx"]

@@ -95,6 +95,26 @@ class FakeClient:
             },
         }
 
+    def get_order(self, symbol, order_id):
+        order = next((item for item in self.orders if str(item.get("orderId")) == str(order_id)), None)
+        if not order:
+            return {"retCode": 0, "result": {}}
+        if str(order_id) in self.open_limit_order_ids:
+            status = "NEW"
+        else:
+            status = order.get("orderStatus", "FILLED")
+        return {
+            "retCode": 0,
+            "result": {
+                "orderId": str(order_id),
+                "orderStatus": status,
+                "side": order.get("side", ""),
+                "price": order.get("price", "0"),
+                "qty": order.get("qty", "0"),
+                "reduceOnly": order.get("reduce_only", False),
+            },
+        }
+
     def get_positions(self, symbol):
         return {"retCode": 0, "result": {"list": self.positions}}
 
@@ -181,6 +201,47 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.filled_orders[0]["reduce_only"])
         self.assertEqual(engine.get_status()["completed_pairs"], 1)
         self.assertTrue(any(order["side"] == "Buy" and not order["reduce_only"] for order in new_orders))
+
+    async def test_cancelled_grid_order_is_replaced_without_recording_a_fill(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        order = next(iter(engine.active_orders.values()))
+        before_fills = len(engine.filled_orders)
+        before_pairs = engine.completed_pairs
+        client.open_limit_order_ids.discard(order["order_id"])
+        original = next(item for item in client.orders if item["orderId"] == order["order_id"])
+        original["orderStatus"] = "CANCELED"
+
+        await engine._check_fills()
+
+        self.assertEqual(len(engine.filled_orders), before_fills)
+        self.assertEqual(engine.completed_pairs, before_pairs)
+        replacement_orders = [
+            item
+            for item in engine.active_orders.values()
+            if item["side"] == order["side"]
+            and item["level_idx"] == order["level_idx"]
+            and item["reduce_only"] == order["reduce_only"]
+        ]
+        self.assertEqual(len(replacement_orders), 1)
+        self.assertNotEqual(replacement_orders[0]["order_id"], order["order_id"])
 
     async def test_short_add_fill_places_reduce_order_even_when_level_already_has_reduce_order(self):
         client = FakeClient("102")
@@ -275,6 +336,64 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             sum(float(order["qty"]) for order in reduce_orders),
             float(existing_reduce_orders[0]["qty"]) + float(add_order["qty"]),
         )
+
+    async def test_gtc_limit_fallback_fee_uses_taker_rate(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "maker_fee_rate": 0.0002,
+                "taker_fee_rate": 0.0005,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        order = next(order for order in engine.active_orders.values() if order["time_in_force"] == "GTC")
+        stats = engine._get_trade_stats(
+            "",
+            fallback_price=100,
+            fallback_qty=10,
+            liquidity_hint=engine._order_liquidity_hint(order),
+        )
+
+        self.assertEqual(engine._order_liquidity_hint(order), "taker")
+        self.assertAlmostEqual(stats["fee"], 0.5)
+
+    async def test_pending_targets_are_cleared_after_grid_deployment(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.grid_ready)
+        self.assertIsNone(engine._pending_targets)
+        self.assertIsNone(engine.to_state()["pending_targets"])
 
     async def test_fee_and_volume_are_counted_in_usdt_equivalent(self):
         client = FakeClient("100")

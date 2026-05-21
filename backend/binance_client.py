@@ -156,7 +156,7 @@ class BinanceFuturesClient:
             "side": self._to_binance_side(side),
             "type": order_type.upper(),
             "quantity": qty,
-            "reduceOnly": "true" if reduce_only else "false",
+            "reduceOnly": reduce_only,
         }
         if order_type.lower() == "limit":
             params["price"] = price
@@ -196,6 +196,15 @@ class BinanceFuturesClient:
             "retCode": 0,
             "result": {"list": [self._normalize_order(item) for item in orders]},
         }
+
+    def get_order(self, symbol: str, order_id: str) -> dict:
+        order = self._request(
+            "GET",
+            "/fapi/v1/order",
+            params={"symbol": symbol.upper(), "orderId": order_id},
+            auth=True,
+        )
+        return {"retCode": 0, "result": self._normalize_order(order)}
 
     def get_positions(self, symbol: str) -> dict:
         positions = self._request(
