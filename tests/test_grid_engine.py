@@ -182,6 +182,100 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.get_status()["completed_pairs"], 1)
         self.assertTrue(any(order["side"] == "Buy" and not order["reduce_only"] for order in new_orders))
 
+    async def test_short_add_fill_places_reduce_order_even_when_level_already_has_reduce_order(self):
+        client = FakeClient("102")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        add_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 2
+        )
+        existing_reduce_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"] and order["level_idx"] == 2
+        ]
+        self.assertEqual(len(existing_reduce_orders), 1)
+
+        client.open_limit_order_ids.discard(add_order["order_id"])
+        await engine._check_fills()
+
+        reduce_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"] and order["level_idx"] == 2
+        ]
+        self.assertEqual(len(reduce_orders), 2)
+        self.assertAlmostEqual(
+            sum(float(order["qty"]) for order in reduce_orders),
+            float(existing_reduce_orders[0]["qty"]) + float(add_order["qty"]),
+        )
+
+    async def test_long_add_fill_places_reduce_order_even_when_level_already_has_reduce_order(self):
+        client = FakeClient("98")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        add_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and not order["reduce_only"] and order["level_idx"] == 1
+        )
+        existing_reduce_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and order["reduce_only"] and order["level_idx"] == 1
+        ]
+        self.assertEqual(len(existing_reduce_orders), 1)
+
+        client.open_limit_order_ids.discard(add_order["order_id"])
+        await engine._check_fills()
+
+        reduce_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and order["reduce_only"] and order["level_idx"] == 1
+        ]
+        self.assertEqual(len(reduce_orders), 2)
+        self.assertAlmostEqual(
+            sum(float(order["qty"]) for order in reduce_orders),
+            float(existing_reduce_orders[0]["qty"]) + float(add_order["qty"]),
+        )
+
     async def test_fee_and_volume_are_counted_in_usdt_equivalent(self):
         client = FakeClient("100")
         engine = GridEngine(

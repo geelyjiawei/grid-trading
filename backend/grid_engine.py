@@ -562,13 +562,14 @@ class GridEngine:
         reduce_only: bool,
         qty_override: float | None = None,
         entry_price: float | None = None,
+        allow_duplicate: bool = False,
     ) -> Optional[str]:
         raw_qty = float(qty_override) if qty_override is not None else float(self.config["qty_per_grid"])
         qty = self._fq(raw_qty)
         price_text = self._fp(price)
         link_id = f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:6]}"
 
-        if self._has_active_order(side, level_idx, reduce_only):
+        if not allow_duplicate and self._has_active_order(side, level_idx, reduce_only):
             return None
         if self._stopping:
             return None
@@ -1165,8 +1166,6 @@ class GridEngine:
         qty: float,
         entry_price: float | None = None,
     ) -> bool:
-        if self._has_active_order(side, level_idx, reduce_only):
-            return True
         return (
             self._place(
                 side,
@@ -1175,6 +1174,7 @@ class GridEngine:
                 reduce_only=reduce_only,
                 qty_override=qty,
                 entry_price=entry_price,
+                allow_duplicate=True,
             )
             is not None
         )
