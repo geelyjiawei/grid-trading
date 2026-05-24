@@ -139,8 +139,9 @@ class MultiGridServerTests(unittest.TestCase):
 
         self.assertEqual(start.status_code, 200)
         self.assertIn("realized_net_profit", status)
-        self.assertEqual(status["unrealised_pnl"], 2.5)
-        self.assertAlmostEqual(status["total_equity_profit"], status["realized_net_profit"] + 2.5)
+        self.assertEqual(status["account_unrealised_pnl"], 2.5)
+        self.assertEqual(status["unrealised_pnl"], 0.0)
+        self.assertAlmostEqual(status["total_equity_profit"], status["realized_net_profit"])
 
     def test_grid_preview_uses_active_grid_count_and_exchange_qty_step(self):
         main._client = FakeClient("100")

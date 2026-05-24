@@ -31,6 +31,10 @@ class GridEngine:
         self.initial_side = ""
         self.initial_qty = 0.0
         self.initial_entry_price = 0.0
+        self.baseline_position_side = ""
+        self.baseline_position_qty = 0.0
+        self.baseline_position_entry_price = 0.0
+        self.grid_position_net_qty = 0.0
         self.grid_profit_pct = 0.0
         self.waiting_trigger = False
         self.trigger_message = ""
@@ -69,6 +73,10 @@ class GridEngine:
             "initial_side": self.initial_side,
             "initial_qty": self.initial_qty,
             "initial_entry_price": self.initial_entry_price,
+            "baseline_position_side": self.baseline_position_side,
+            "baseline_position_qty": self.baseline_position_qty,
+            "baseline_position_entry_price": self.baseline_position_entry_price,
+            "grid_position_net_qty": self.grid_position_net_qty,
             "grid_profit_pct": self.grid_profit_pct,
             "waiting_trigger": self.waiting_trigger,
             "trigger_message": self.trigger_message,
@@ -98,6 +106,13 @@ class GridEngine:
         self.initial_side = str(state.get("initial_side") or "")
         self.initial_qty = float(state.get("initial_qty") or 0)
         self.initial_entry_price = float(state.get("initial_entry_price") or 0)
+        self.baseline_position_side = str(state.get("baseline_position_side") or "")
+        self.baseline_position_qty = float(state.get("baseline_position_qty") or 0)
+        self.baseline_position_entry_price = float(state.get("baseline_position_entry_price") or 0)
+        if "grid_position_net_qty" in state:
+            self.grid_position_net_qty = float(state.get("grid_position_net_qty") or 0)
+        else:
+            self.grid_position_net_qty = self._derive_grid_position_net_qty()
         self.grid_profit_pct = float(state.get("grid_profit_pct") or 0)
         self.waiting_trigger = bool(state.get("waiting_trigger", False))
         self.trigger_message = str(state.get("trigger_message") or "")
@@ -207,6 +222,14 @@ class GridEngine:
             "initial_side": self.initial_side,
             "initial_qty": round(self.initial_qty, 8),
             "initial_entry_price": round(self.initial_entry_price, 10),
+            "baseline_position": {
+                "side": self.baseline_position_side,
+                "qty": round(self.baseline_position_qty, 8),
+                "entry_price": round(self.baseline_position_entry_price, 10),
+            },
+            "grid_position_net_qty": round(self._grid_position_net_qty(), 8),
+            "grid_position_qty": round(self._grid_position_qty(), 8),
+            "expected_position_net_qty": round(self._expected_position_net_qty(), 8),
             "grid_profit_pct": round(self.grid_profit_pct, 6),
             "config": self.config,
         }
@@ -460,6 +483,172 @@ class GridEngine:
                 continue
         return total
 
+    def _position_snapshots(self) -> list[dict]:
+        resp = self.client.get_positions(self.config["symbol"])
+        if resp.get("retCode") != 0:
+            raise RuntimeError(resp.get("retMsg", "Failed to fetch positions"))
+
+        positions = []
+        for position in resp["result"].get("list", []):
+            side = str(position.get("side") or "")
+            try:
+                qty = abs(float(position.get("size", 0) or 0))
+            except (TypeError, ValueError):
+                qty = 0.0
+            if side not in {"Buy", "Sell"} or qty < self.min_qty:
+                continue
+            try:
+                entry_price = float(
+                    position.get("avgPrice")
+                    or position.get("entryPrice")
+                    or position.get("entry_price")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                entry_price = 0.0
+            positions.append({"side": side, "qty": qty, "entry_price": entry_price})
+        return positions
+
+    def _capture_baseline_position(self, open_side: str):
+        if self.baseline_position_qty >= self.min_qty or self.baseline_position_side:
+            return
+
+        positions = self._position_snapshots()
+        if not positions:
+            return
+
+        direction = self.config["direction"]
+        if direction == "neutral":
+            raise RuntimeError(
+                "Existing position detected; neutral grid cannot isolate old positions in one-way mode"
+            )
+
+        opposite = [position for position in positions if position["side"] != open_side]
+        if opposite:
+            summary = ", ".join(f"{item['side']} {item['qty']:g}" for item in positions)
+            raise RuntimeError(
+                f"Existing {self.config['symbol']} position would be offset by this {direction} grid: {summary}"
+            )
+
+        total_qty = sum(position["qty"] for position in positions)
+        if total_qty < self.min_qty:
+            return
+        weighted_entry = sum(position["qty"] * position["entry_price"] for position in positions)
+        self.baseline_position_side = open_side
+        self.baseline_position_qty = total_qty
+        self.baseline_position_entry_price = weighted_entry / total_qty if weighted_entry > 0 else 0.0
+
+    @staticmethod
+    def _signed_qty(side: str, qty: float) -> float:
+        return qty if side == "Buy" else -qty if side == "Sell" else 0.0
+
+    def _baseline_position_net_qty(self) -> float:
+        return self._signed_qty(self.baseline_position_side, self.baseline_position_qty)
+
+    def _grid_position_net_qty(self) -> float:
+        if self.config["direction"] == "long":
+            return max(0.0, self.grid_position_net_qty)
+        if self.config["direction"] == "short":
+            return min(0.0, self.grid_position_net_qty)
+        return self.grid_position_net_qty
+
+    def _derive_grid_position_net_qty(self) -> float:
+        direction = self.config["direction"]
+        if direction in {"long", "short"}:
+            reduce_side = "Sell" if direction == "long" else "Buy"
+            reduce_qty = sum(
+                float(order.get("qty", 0) or 0)
+                for order in self.active_orders.values()
+                if order.get("side") == reduce_side and order.get("reduce_only")
+            )
+            if reduce_qty > 0:
+                return reduce_qty if direction == "long" else -reduce_qty
+
+        if direction == "long":
+            net_qty = self.initial_qty
+            for order in self.filled_orders:
+                qty = float(order.get("qty", 0) or 0)
+                if order.get("side") == "Buy" and not order.get("reduce_only"):
+                    net_qty += qty
+                elif order.get("side") == "Sell" and order.get("reduce_only"):
+                    net_qty -= qty
+            return max(0.0, net_qty)
+
+        if direction == "short":
+            net_qty = -self.initial_qty
+            for order in self.filled_orders:
+                qty = float(order.get("qty", 0) or 0)
+                if order.get("side") == "Sell" and not order.get("reduce_only"):
+                    net_qty -= qty
+                elif order.get("side") == "Buy" and order.get("reduce_only"):
+                    net_qty += qty
+            return min(0.0, net_qty)
+
+        for order in self.filled_orders:
+            qty = float(order.get("qty", 0) or 0)
+            net_qty += self._signed_qty(str(order.get("side") or ""), qty)
+        return net_qty
+
+    def _set_initial_grid_position(self, side: str, qty: float):
+        self.grid_position_net_qty = self._signed_qty(side, qty)
+
+    def _apply_grid_position_fill(self, order: dict, qty: float):
+        direction = self.config["direction"]
+        side = order.get("side")
+        reduce_only = bool(order.get("reduce_only"))
+        if direction == "long":
+            if side == "Buy" and not reduce_only:
+                self.grid_position_net_qty += qty
+            elif side == "Sell" and reduce_only:
+                self.grid_position_net_qty -= qty
+            self.grid_position_net_qty = max(0.0, self.grid_position_net_qty)
+        elif direction == "short":
+            if side == "Sell" and not reduce_only:
+                self.grid_position_net_qty -= qty
+            elif side == "Buy" and reduce_only:
+                self.grid_position_net_qty += qty
+            self.grid_position_net_qty = min(0.0, self.grid_position_net_qty)
+        else:
+            self.grid_position_net_qty += self._signed_qty(str(side or ""), qty)
+
+    def _apply_market_reduce_to_grid_position(self, side: str, qty: float):
+        self._apply_grid_position_fill({"side": side, "reduce_only": True}, qty)
+
+    def _grid_position_qty(self) -> float:
+        return abs(self._grid_position_net_qty())
+
+    def _expected_position_net_qty(self) -> float:
+        return self._baseline_position_net_qty() + self._grid_position_net_qty()
+
+    def estimate_grid_unrealized_pnl(self, mark_price: float) -> float:
+        direction = self.config["direction"]
+        grid_qty = self._grid_position_qty()
+        if direction not in {"long", "short"} or grid_qty < self.min_qty:
+            return 0.0
+
+        reduce_side = "Sell" if direction == "long" else "Buy"
+        remaining = grid_qty
+        pnl = 0.0
+        for order in self.active_orders.values():
+            if not order.get("reduce_only") or order.get("side") != reduce_side:
+                continue
+            if remaining < self.min_qty:
+                break
+            qty = min(remaining, float(order.get("qty", 0) or 0))
+            entry_price = float(order.get("entry_price") or self.initial_entry_price or order.get("price") or 0)
+            if direction == "long":
+                pnl += (mark_price - entry_price) * qty
+            else:
+                pnl += (entry_price - mark_price) * qty
+            remaining -= qty
+
+        if remaining >= self.min_qty and self.initial_entry_price > 0:
+            if direction == "long":
+                pnl += (mark_price - self.initial_entry_price) * remaining
+            else:
+                pnl += (self.initial_entry_price - mark_price) * remaining
+        return pnl
+
     def _place_reduce_market(self, side: str, qty: float, reason: str) -> str:
         qty_text = self._fq(qty)
         result = self.client.place_order(
@@ -472,6 +661,7 @@ class GridEngine:
         )
         if result.get("retCode") != 0:
             raise RuntimeError(result.get("retMsg", f"Failed to place reduce-only repair order: {reason}"))
+        self._apply_market_reduce_to_grid_position(side, float(qty_text))
         self.trigger_message = f"Safety repair placed {side} reduce-only {qty_text}: {reason}"
         logger.warning(self.trigger_message)
         self._persist_state()
@@ -504,7 +694,9 @@ class GridEngine:
                 "fee_asset": "USDT estimated",
                 "fee_source": "estimated",
             }
+        self.initial_qty = stats["qty"]
         self.initial_entry_price = stats["price"]
+        self._set_initial_grid_position(side, stats["qty"])
         self._record_trade_value(
             stats["price"],
             stats["qty"],
@@ -735,6 +927,9 @@ class GridEngine:
                 if levels[idx + 1] > current_price
             ]
 
+        if direction in {"long", "short"}:
+            self._capture_baseline_position(open_side)
+
         target_count = len(profit_targets) if direction in {"long", "short"} else len(add_targets)
         if target_count <= 0:
             raise RuntimeError("No valid grid targets were found around current price")
@@ -848,6 +1043,26 @@ class GridEngine:
         return False
 
     def _close_all_positions(self):
+        direction = self.config["direction"]
+        if direction in {"long", "short"}:
+            position_side = "Buy" if direction == "long" else "Sell"
+            close_side = "Sell" if position_side == "Buy" else "Buy"
+            size = min(self._position_size(position_side), self._grid_position_qty())
+            if size < self.min_qty:
+                return
+            result = self.client.place_order(
+                symbol=self.config["symbol"],
+                side=close_side,
+                qty=self._fq(size),
+                order_type="Market",
+                reduce_only=True,
+                order_link_id=f"close_{close_side[0]}_{uuid.uuid4().hex[:6]}",
+            )
+            if result.get("retCode") != 0:
+                raise RuntimeError(result.get("retMsg", "Failed to close grid position"))
+            self.grid_position_net_qty = 0.0
+            return
+
         resp = self.client.get_positions(self.config["symbol"])
         if resp.get("retCode") != 0:
             raise RuntimeError(resp.get("retMsg", "Failed to fetch positions"))
@@ -930,14 +1145,14 @@ class GridEngine:
         else:
             return
 
-        position_qty = self._position_size(position_side)
+        position_qty = min(self._position_size(position_side), self._grid_position_qty())
         if position_qty < self.min_qty:
             return
 
         self._boundary_repair_in_progress = True
         try:
             self._cancel_stale_reduce_orders(close_side)
-            refreshed_qty = self._position_size(position_side)
+            refreshed_qty = min(self._position_size(position_side), self._grid_position_qty())
             if refreshed_qty >= self.min_qty:
                 self._place_reduce_market(close_side, refreshed_qty, reason)
                 self._boundary_repair_retry_after = time.time() + 2
@@ -1011,6 +1226,7 @@ class GridEngine:
 
         self.initial_qty = stats["qty"]
         self.initial_entry_price = stats["price"]
+        self._set_initial_grid_position(self.initial_side, stats["qty"])
         self._record_trade_value(
             stats["price"],
             stats["qty"],
@@ -1085,7 +1301,7 @@ class GridEngine:
 
         filled_order = {**order, "qty": str(stats["qty"]), "fill_price": stats["price"]}
         self._record_fill(filled_order, stats)
-        if self._in_grid_range():
+        if self._in_grid_range() or self._counter_order_reduces_grid_position(filled_order):
             self._place_counter_order(filled_order)
         else:
             self.paused_replacements.append(filled_order)
@@ -1143,7 +1359,14 @@ class GridEngine:
 
     @staticmethod
     def _is_cancelled_status(status: str) -> bool:
-        return status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "DEACTIVATED"}
+        return status in {
+            "CANCELED",
+            "CANCELLED",
+            "REJECTED",
+            "EXPIRED",
+            "EXPIRED_IN_MATCH",
+            "DEACTIVATED",
+        }
 
     def _replace_cancelled_order(self, order: dict):
         placed = self._place(
@@ -1153,7 +1376,7 @@ class GridEngine:
             reduce_only=bool(order["reduce_only"]),
             qty_override=float(order["qty"]),
             entry_price=order.get("entry_price"),
-            allow_duplicate=True,
+            allow_duplicate=bool(order["reduce_only"]),
         )
         if placed:
             logger.warning(
@@ -1176,6 +1399,7 @@ class GridEngine:
         qty = stats["qty"]
         price = stats["price"]
         gross_profit = 0.0
+        self._apply_grid_position_fill(order, qty)
 
         if order["reduce_only"]:
             entry_price = float(order.get("entry_price") or 0)
@@ -1236,10 +1460,20 @@ class GridEngine:
                 reduce_only=reduce_only,
                 qty_override=qty,
                 entry_price=entry_price,
-                allow_duplicate=True,
+                allow_duplicate=bool(reduce_only),
             )
             is not None
         )
+
+    def _counter_order_reduces_grid_position(self, order: dict) -> bool:
+        direction = self.config["direction"]
+        side = order.get("side")
+        level_idx = int(order.get("level_idx", 0) or 0)
+        if direction == "long":
+            return side == "Buy" and level_idx + 1 < len(self.grid_levels)
+        if direction == "short":
+            return side == "Sell"
+        return False
 
     def _place_counter_order(self, order: dict) -> bool:
         direction = self.config["direction"]

@@ -166,6 +166,104 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         reduce_qty = sum(float(o["qty"]) for o in buy_reduce_orders)
         self.assertAlmostEqual(market_qty, reduce_qty)
 
+    async def test_short_grid_records_existing_same_side_position_as_baseline(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "882", "avgPrice": "0.64"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        status = engine.get_status()
+        self.assertEqual(status["baseline_position"]["side"], "Sell")
+        self.assertEqual(status["baseline_position"]["qty"], 882)
+        self.assertGreater(status["grid_position_qty"], 0)
+        self.assertAlmostEqual(
+            status["expected_position_net_qty"],
+            -(882 + status["grid_position_qty"]),
+        )
+
+    async def test_short_grid_rejects_opposite_existing_position(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Buy", "size": "2.0", "avgPrice": "99"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "would be offset"):
+            await engine.initialize()
+
+    async def test_restore_derives_grid_position_from_active_reduce_orders(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        engine.restore_state(
+            {
+                "config": engine.config,
+                "grid_levels": [90, 95, 100, 105, 110],
+                "active_orders": {
+                    "g_1_B_restore": {
+                        "link_id": "g_1_B_restore",
+                        "order_id": "1",
+                        "level_idx": 1,
+                        "side": "Buy",
+                        "price": "95.0",
+                        "qty": "445",
+                        "status": "open",
+                        "order_type": "Limit",
+                        "time_in_force": "GTC",
+                        "reduce_only": True,
+                        "entry_price": 100,
+                    }
+                },
+                "filled_orders": [],
+            }
+        )
+
+        self.assertEqual(engine.get_status()["grid_position_net_qty"], -445)
+
     async def test_long_grid_replenishes_buy_after_take_profit_fill(self):
         client = FakeClient("100")
         engine = GridEngine(
@@ -243,6 +341,45 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replacement_orders), 1)
         self.assertNotEqual(replacement_orders[0]["order_id"], order["order_id"])
 
+    async def test_expired_in_match_order_is_replaced_without_recording_a_fill(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        order = next(item for item in engine.active_orders.values() if not item["reduce_only"])
+        before_fills = len(engine.filled_orders)
+        client.open_limit_order_ids.discard(order["order_id"])
+        original = next(item for item in client.orders if item["orderId"] == order["order_id"])
+        original["orderStatus"] = "EXPIRED_IN_MATCH"
+
+        await engine._check_fills()
+
+        self.assertEqual(len(engine.filled_orders), before_fills)
+        replacement_orders = [
+            item
+            for item in engine.active_orders.values()
+            if item["side"] == order["side"]
+            and item["level_idx"] == order["level_idx"]
+            and item["reduce_only"] == order["reduce_only"]
+        ]
+        self.assertEqual(len(replacement_orders), 1)
+        self.assertNotEqual(replacement_orders[0]["order_id"], order["order_id"])
+
     async def test_short_add_fill_places_reduce_order_even_when_level_already_has_reduce_order(self):
         client = FakeClient("102")
         engine = GridEngine(
@@ -289,6 +426,48 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             sum(float(order["qty"]) for order in reduce_orders),
             float(existing_reduce_orders[0]["qty"]) + float(add_order["qty"]),
         )
+
+    async def test_reduce_fill_does_not_duplicate_existing_short_add_order(self):
+        client = FakeClient("102")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        reduce_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"] and order["level_idx"] == 2
+        )
+        before_add_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 2
+        ]
+        self.assertEqual(len(before_add_orders), 1)
+
+        placed = engine._place_counter_order(reduce_order)
+
+        after_add_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 2
+        ]
+        self.assertFalse(placed)
+        self.assertEqual(len(after_add_orders), 1)
 
     async def test_long_add_fill_places_reduce_order_even_when_level_already_has_reduce_order(self):
         client = FakeClient("98")
@@ -803,7 +982,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(repair_orders)
         self.assertIn("Safety repair", engine.trigger_message)
 
-    async def test_counter_order_is_queued_while_price_is_outside_grid_range(self):
+    async def test_reduce_counter_order_is_placed_even_outside_grid_range(self):
         client = FakeClient("100")
         engine = GridEngine(
             client,
@@ -837,16 +1016,53 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             order for order in client.orders if order.get("side") == "Buy" and order.get("reduce_only")
         ]
         self.assertTrue(handled)
-        self.assertEqual(len(after_reduce_buys), len(before_reduce_buys))
+        self.assertEqual(len(after_reduce_buys), len(before_reduce_buys) + 1)
+        self.assertEqual(engine.get_status()["paused_replacements_count"], 0)
+
+    async def test_non_reduce_counter_order_is_queued_while_price_is_outside_grid_range(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        filled_buy = next(
+            order for order in engine.active_orders.values() if order["side"] == "Buy" and order["reduce_only"]
+        )
+        before_open_sells = [
+            order for order in client.orders if order.get("side") == "Sell" and not order.get("reduce_only")
+        ]
+
+        engine.current_price = 89
+        handled = engine._handle_closed_order(filled_buy)
+
+        after_open_sells = [
+            order for order in client.orders if order.get("side") == "Sell" and not order.get("reduce_only")
+        ]
+        self.assertTrue(handled)
+        self.assertEqual(len(after_open_sells), len(before_open_sells))
         self.assertEqual(engine.get_status()["paused_replacements_count"], 1)
 
         engine.current_price = 100
         engine._resume_paused_replacements()
-
-        resumed_reduce_buys = [
-            order for order in client.orders if order.get("side") == "Buy" and order.get("reduce_only")
+        resumed_open_sells = [
+            order for order in client.orders if order.get("side") == "Sell" and not order.get("reduce_only")
         ]
-        self.assertEqual(len(resumed_reduce_buys), len(before_reduce_buys) + 1)
+        self.assertEqual(len(resumed_open_sells), len(before_open_sells) + 1)
         self.assertEqual(engine.get_status()["paused_replacements_count"], 0)
 
     async def test_boundary_break_does_not_market_close_by_default(self):
@@ -962,6 +1178,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             if order.get("side") == "Buy" and order.get("reduce_only") and order.get("order_type") == "Market"
         ]
         self.assertEqual(len(repair_orders), 1)
+        self.assertAlmostEqual(float(repair_orders[0]["qty"]), engine.initial_qty)
         self.assertGreater(engine._boundary_repair_retry_after, 0)
 
     async def test_neutral_grid_deploys_both_buy_and_sell_limit_orders_without_market_position(self):

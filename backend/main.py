@@ -253,6 +253,8 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
         "stopped_at": time.time() if status in {"stopped", "closed"} else None,
         "initial_side": engine.initial_side,
         "initial_qty": round(engine.initial_qty, 8),
+        "baseline_position_side": engine.baseline_position_side,
+        "baseline_position_qty": round(engine.baseline_position_qty, 8),
         "completed_pairs": engine.completed_pairs,
         "gross_profit": round(engine.gross_profit, 4),
         "net_profit": round(engine.total_profit, 4),
@@ -864,24 +866,49 @@ def grid_symbol_status(symbol: str):
 
 def _engine_status(engine: GridEngine) -> dict:
     status = engine.get_status()
-    unrealised_pnl = 0.0
+    account_unrealised_pnl = 0.0
+    actual_position_net_qty = 0.0
+    mark_price = None
     try:
         client = _get_client()
         resp = client.get_positions(str(status.get("symbol", "")).upper())
         if resp.get("retCode") == 0:
             for item in resp.get("result", {}).get("list", []):
+                side = str(item.get("side") or "")
                 try:
-                    unrealised_pnl += float(item.get("unrealisedPnl", 0) or 0)
+                    size = float(item.get("size", 0) or 0)
                 except (TypeError, ValueError):
-                    continue
+                    size = 0.0
+                if side == "Buy":
+                    actual_position_net_qty += size
+                elif side == "Sell":
+                    actual_position_net_qty -= size
+                try:
+                    account_unrealised_pnl += float(item.get("unrealisedPnl", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+                if mark_price is None:
+                    try:
+                        mark_price = float(item.get("markPrice", 0) or 0)
+                    except (TypeError, ValueError):
+                        mark_price = None
     except Exception:
-        unrealised_pnl = 0.0
+        account_unrealised_pnl = 0.0
 
     realized_net = float(status.get("total_profit", 0) or 0)
+    grid_unrealised_pnl = (
+        engine.estimate_grid_unrealized_pnl(mark_price)
+        if mark_price is not None and mark_price > 0
+        else 0.0
+    )
+    expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
     status["realized_gross_profit"] = status.get("gross_profit", 0)
     status["realized_net_profit"] = round(realized_net, 4)
-    status["unrealised_pnl"] = round(unrealised_pnl, 4)
-    status["total_equity_profit"] = round(realized_net + unrealised_pnl, 4)
+    status["unrealised_pnl"] = round(grid_unrealised_pnl, 4)
+    status["account_unrealised_pnl"] = round(account_unrealised_pnl, 4)
+    status["account_position_net_qty"] = round(actual_position_net_qty, 8)
+    status["position_delta_from_grid"] = round(actual_position_net_qty - expected_position_net_qty, 8)
+    status["total_equity_profit"] = round(realized_net + grid_unrealised_pnl, 4)
     return status
 
 
@@ -941,15 +968,21 @@ def _risk_snapshot(symbol: str) -> dict:
     if position_resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=position_resp.get("retMsg", "Failed to fetch positions"))
     positions = []
+    actual_position_net_qty = 0.0
     for item in position_resp["result"].get("list", []):
         try:
             size = float(item.get("size", 0))
         except (TypeError, ValueError):
             size = 0
         if size > 0:
+            side = item.get("side", "")
+            if side == "Buy":
+                actual_position_net_qty += size
+            elif side == "Sell":
+                actual_position_net_qty -= size
             positions.append(
                 {
-                    "side": item.get("side", ""),
+                    "side": side,
                     "size": item.get("size", "0"),
                     "entry_price": item.get("avgPrice", "0"),
                     "mark_price": item.get("markPrice", "0"),
@@ -958,12 +991,22 @@ def _risk_snapshot(symbol: str) -> dict:
             )
 
     unmanaged_position = bool(positions and (not engine or not engine.running))
+    unmanaged_delta_qty = 0.0
+    expected_position_net_qty = 0.0
+    if engine and engine.running:
+        status = engine.get_status()
+        expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
+        unmanaged_delta_qty = actual_position_net_qty - expected_position_net_qty
+        unmanaged_position = abs(unmanaged_delta_qty) >= max(float(engine.min_qty), 1e-12)
     return {
         "symbol": symbol,
         "engine_running": bool(engine and engine.running),
         "orphan_order_count": len(orphan_orders),
         "orphan_orders": orphan_orders,
         "unmanaged_position": unmanaged_position,
+        "unmanaged_delta_qty": round(unmanaged_delta_qty, 8),
+        "expected_position_net_qty": round(expected_position_net_qty, 8),
+        "actual_position_net_qty": round(actual_position_net_qty, 8),
         "positions": positions,
         "has_risk": bool(orphan_orders or unmanaged_position),
     }

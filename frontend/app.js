@@ -486,6 +486,16 @@ function renderStatus(status, summary = {}) {
 
   const initialSide = status.initial_side === "Buy" ? "买入" : status.initial_side === "Sell" ? "卖出" : "--";
   document.getElementById("st-initial").textContent = status.initial_qty ? `${initialSide} ${Number(status.initial_qty).toFixed(6)}` : (status.trigger_message || "--");
+  const baseline = status.baseline_position || {};
+  const baselineSide = baseline.side === "Buy" ? "多仓" : baseline.side === "Sell" ? "空仓" : "--";
+  document.getElementById("st-baseline-position").textContent = Number(baseline.qty || 0) > 0
+    ? `${baselineSide} ${formatOrderQty(baseline.qty)}`
+    : "--";
+  const gridNetQty = Number(status.grid_position_net_qty || 0);
+  const gridSide = gridNetQty > 0 ? "多仓" : gridNetQty < 0 ? "空仓" : "--";
+  document.getElementById("st-grid-position").textContent = Math.abs(gridNetQty) > 0
+    ? `${gridSide} ${formatOrderQty(Math.abs(gridNetQty))}`
+    : "--";
 
   const openOrders = exchangeOpenOrders.length ? exchangeOpenOrders : (status.active_orders || []);
   renderOrders(openOrders);
