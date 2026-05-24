@@ -127,6 +127,7 @@ class GridEngine:
         try:
             self._fetch_precision()
             self.current_price = self._get_current_price()
+            self._migrate_baseline_position_from_exchange()
         except Exception as exc:
             logger.warning("Restore refresh failed symbol=%s msg=%s", self.config.get("symbol"), exc)
         self._persist_state()
@@ -537,6 +538,34 @@ class GridEngine:
         self.baseline_position_side = open_side
         self.baseline_position_qty = total_qty
         self.baseline_position_entry_price = weighted_entry / total_qty if weighted_entry > 0 else 0.0
+
+    def _migrate_baseline_position_from_exchange(self):
+        if self.baseline_position_qty >= self.min_qty or self.baseline_position_side:
+            return
+
+        grid_net_qty = self._grid_position_net_qty()
+        if abs(grid_net_qty) < self.min_qty:
+            return
+
+        positions = self._position_snapshots()
+        actual_net_qty = sum(self._signed_qty(item["side"], item["qty"]) for item in positions)
+        baseline_net_qty = actual_net_qty - grid_net_qty
+        if abs(baseline_net_qty) < self.min_qty:
+            return
+        if baseline_net_qty * grid_net_qty <= 0:
+            return
+
+        baseline_side = "Buy" if baseline_net_qty > 0 else "Sell"
+        baseline_qty = abs(baseline_net_qty)
+        matching_positions = [item for item in positions if item["side"] == baseline_side]
+        weighted_entry = sum(item["qty"] * item["entry_price"] for item in matching_positions)
+        total_matching_qty = sum(item["qty"] for item in matching_positions)
+
+        self.baseline_position_side = baseline_side
+        self.baseline_position_qty = baseline_qty
+        self.baseline_position_entry_price = (
+            weighted_entry / total_matching_qty if weighted_entry > 0 and total_matching_qty > 0 else 0.0
+        )
 
     @staticmethod
     def _signed_qty(side: str, qty: float) -> float:

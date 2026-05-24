@@ -264,6 +264,55 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(engine.get_status()["grid_position_net_qty"], -445)
 
+    async def test_restore_migrates_same_side_unmanaged_position_to_baseline(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "1238", "avgPrice": "0.6405"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        engine.restore_state(
+            {
+                "config": engine.config,
+                "grid_levels": [90, 95, 100, 105, 110],
+                "active_orders": {
+                    "g_1_B_restore": {
+                        "link_id": "g_1_B_restore",
+                        "order_id": "1",
+                        "level_idx": 1,
+                        "side": "Buy",
+                        "price": "95.0",
+                        "qty": "445",
+                        "status": "open",
+                        "order_type": "Limit",
+                        "time_in_force": "GTC",
+                        "reduce_only": True,
+                        "entry_price": 100,
+                    }
+                },
+                "filled_orders": [],
+            }
+        )
+
+        status = engine.get_status()
+        self.assertEqual(status["grid_position_net_qty"], -445)
+        self.assertEqual(status["baseline_position"]["side"], "Sell")
+        self.assertEqual(status["baseline_position"]["qty"], 793)
+        self.assertEqual(status["expected_position_net_qty"], -1238)
+
     async def test_long_grid_replenishes_buy_after_take_profit_fill(self):
         client = FakeClient("100")
         engine = GridEngine(
