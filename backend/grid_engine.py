@@ -1564,6 +1564,8 @@ class GridEngine:
         qty: float,
         entry_price: float | None = None,
     ) -> bool:
+        if not reduce_only and self._has_active_order(side, level_idx, reduce_only):
+            return True
         return (
             self._place(
                 side,

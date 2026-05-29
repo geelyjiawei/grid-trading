@@ -601,8 +601,55 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 2
         ]
-        self.assertFalse(placed)
+        self.assertTrue(placed)
         self.assertEqual(len(after_add_orders), 1)
+
+    async def test_existing_non_reduce_counter_order_counts_as_resumed(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        existing_add_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 2
+        ]
+        self.assertEqual(len(existing_add_orders), 1)
+        engine.paused_replacements = [
+            {
+                "side": "Buy",
+                "price": "100",
+                "qty": "1",
+                "level_idx": 2,
+                "reduce_only": True,
+                "fill_price": 100,
+            }
+        ]
+
+        engine._resume_paused_replacements()
+
+        add_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 2
+        ]
+        self.assertEqual(len(add_orders), 1)
+        self.assertEqual(engine.paused_replacements, [])
 
     async def test_long_add_fill_places_reduce_order_even_when_level_already_has_reduce_order(self):
         client = FakeClient("98")
