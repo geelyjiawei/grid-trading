@@ -46,6 +46,7 @@ class GridEngine:
         self._stopping = False
         self._boundary_repair_in_progress = False
         self._boundary_repair_retry_after = 0.0
+        self._allow_restore_baseline_migration = False
         self._task: Optional[asyncio.Task] = None
 
     def _persist_state(self):
@@ -109,6 +110,7 @@ class GridEngine:
         self.baseline_position_side = str(state.get("baseline_position_side") or "")
         self.baseline_position_qty = float(state.get("baseline_position_qty") or 0)
         self.baseline_position_entry_price = float(state.get("baseline_position_entry_price") or 0)
+        self._allow_restore_baseline_migration = "grid_position_net_qty" not in state
         if "grid_position_net_qty" in state:
             self.grid_position_net_qty = float(state.get("grid_position_net_qty") or 0)
         else:
@@ -484,6 +486,18 @@ class GridEngine:
                 continue
         return total
 
+    def _actual_position_net_qty(self) -> float:
+        return sum(self._signed_qty(item["side"], item["qty"]) for item in self._position_snapshots())
+
+    def _actual_grid_position_net_qty(self) -> float:
+        actual_grid_qty = self._actual_position_net_qty() - self._baseline_position_net_qty()
+        direction = self.config["direction"]
+        if direction == "long":
+            return max(0.0, actual_grid_qty)
+        if direction == "short":
+            return min(0.0, actual_grid_qty)
+        return actual_grid_qty
+
     def _position_snapshots(self) -> list[dict]:
         resp = self.client.get_positions(self.config["symbol"])
         if resp.get("retCode") != 0:
@@ -540,6 +554,8 @@ class GridEngine:
         self.baseline_position_entry_price = weighted_entry / total_qty if weighted_entry > 0 else 0.0
 
     def _migrate_baseline_position_from_exchange(self):
+        if not self._allow_restore_baseline_migration:
+            return
         if self.baseline_position_qty >= self.min_qty or self.baseline_position_side:
             return
 
@@ -642,6 +658,72 @@ class GridEngine:
 
     def _apply_market_reduce_to_grid_position(self, side: str, qty: float):
         self._apply_grid_position_fill({"side": side, "reduce_only": True}, qty)
+
+    def _sync_grid_position_with_exchange(self):
+        if self.config["direction"] not in {"long", "short"}:
+            return
+
+        actual_grid_qty = self._actual_grid_position_net_qty()
+        local_grid_qty = self._grid_position_net_qty()
+        if abs(actual_grid_qty - local_grid_qty) < self.min_qty:
+            return
+
+        logger.warning(
+            "Grid position ledger reconciled with exchange symbol=%s local=%s actual=%s baseline=%s",
+            self.config.get("symbol"),
+            local_grid_qty,
+            actual_grid_qty,
+            self._baseline_position_net_qty(),
+        )
+        self.grid_position_net_qty = actual_grid_qty
+        self._persist_state()
+
+    def _reconcile_grid_position_protection(self):
+        if self.config["direction"] not in {"long", "short"} or self._stopping:
+            return
+
+        self._sync_grid_position_with_exchange()
+
+        grid_qty = self._grid_position_qty()
+        if grid_qty < self.min_qty:
+            return
+
+        direction = self.config["direction"]
+        if direction == "short":
+            reduce_side = "Buy"
+            reduce_price = float(self.config["lower_price"])
+            level_idx = 0
+        else:
+            reduce_side = "Sell"
+            reduce_price = float(self.config["upper_price"])
+            level_idx = max(0, len(self.grid_levels) - 2)
+
+        active_reduce_qty = self._active_reduce_qty(reduce_side)
+        missing_qty = grid_qty - active_reduce_qty
+        if missing_qty < self.min_qty:
+            return
+
+        placed = self._place(
+            reduce_side,
+            reduce_price,
+            level_idx,
+            reduce_only=True,
+            qty_override=missing_qty,
+            entry_price=self.initial_entry_price or None,
+            allow_duplicate=True,
+        )
+        if placed:
+            self.trigger_message = (
+                f"Repaired missing reduce-only protection: {reduce_side} {self._fq(missing_qty)}"
+            )
+            logger.warning(
+                "Missing reduce-only protection repaired symbol=%s side=%s qty=%s price=%s",
+                self.config.get("symbol"),
+                reduce_side,
+                self._fq(missing_qty),
+                self._fp(reduce_price),
+            )
+            self._persist_state()
 
     def _grid_position_qty(self) -> float:
         return abs(self._grid_position_net_qty())
@@ -1143,6 +1225,7 @@ class GridEngine:
                 if self.grid_ready:
                     self._resume_paused_replacements()
                     await self._check_fills()
+                    self._reconcile_grid_position_protection()
 
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
