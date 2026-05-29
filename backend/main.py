@@ -829,6 +829,7 @@ async def stop_all_grids():
         _upsert_grid_history(engine, "stopped")
         if symbol:
             _delete_engine_state(symbol)
+            _engines.pop(symbol, None)
 
     return {"ok": True, "message": "All grids stopped and open orders cancelled"}
 
@@ -841,6 +842,7 @@ async def _stop_grid(symbol: str):
     await engine.stop()
     _upsert_grid_history(engine, "stopped")
     _delete_engine_state(symbol)
+    _engines.pop(symbol, None)
     return {"ok": True, "message": f"{symbol} grid stopped and open orders cancelled"}
 
 

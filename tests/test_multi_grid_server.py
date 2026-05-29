@@ -101,7 +101,7 @@ class MultiGridServerTests(unittest.TestCase):
 
         status = self.client.get("/api/grid/status").json()
         by_symbol = {item["symbol"]: item for item in status["engines"]}
-        self.assertFalse(by_symbol["BTCUSDT"]["running"])
+        self.assertNotIn("BTCUSDT", by_symbol)
         self.assertTrue(by_symbol["ETHUSDT"]["running"])
 
     def test_same_symbol_cannot_start_twice(self):

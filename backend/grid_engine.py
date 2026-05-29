@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
@@ -130,6 +131,8 @@ class GridEngine:
             self._fetch_precision()
             self.current_price = self._get_current_price()
             self._migrate_baseline_position_from_exchange()
+            self._reconcile_exchange_open_orders()
+            self._reconcile_grid_position_protection()
         except Exception as exc:
             logger.warning("Restore refresh failed symbol=%s msg=%s", self.config.get("symbol"), exc)
         self._persist_state()
@@ -470,6 +473,146 @@ class GridEngine:
             for order in self.active_orders.values()
             if order.get("side") == side and order.get("reduce_only")
         )
+
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y"}
+        return bool(value)
+
+    @staticmethod
+    def _parse_grid_link_id(link_id: str) -> tuple[int, str] | None:
+        match = re.match(r"^g_(\d+)_([BS])_", str(link_id or ""))
+        if not match:
+            return None
+        return int(match.group(1)), "Buy" if match.group(2) == "B" else "Sell"
+
+    def _fetch_open_orders(self) -> list[dict]:
+        resp = self.client.get_open_orders(self.config["symbol"])
+        if resp.get("retCode") != 0:
+            raise RuntimeError(resp.get("retMsg", "Failed to fetch open orders"))
+        return list(resp.get("result", {}).get("list", []))
+
+    def _adopt_exchange_grid_orders(self, open_orders: list[dict]) -> bool:
+        known_order_ids = {str(order.get("order_id", "")) for order in self.active_orders.values()}
+        adopted = False
+        for item in open_orders:
+            order_id = str(item.get("orderId", "") or "")
+            link_id = str(item.get("orderLinkId", "") or "")
+            parsed = self._parse_grid_link_id(link_id)
+            if not order_id or not parsed or link_id in self.active_orders or order_id in known_order_ids:
+                continue
+
+            level_idx, side_from_link = parsed
+            side = str(item.get("side") or side_from_link)
+            self.active_orders[link_id] = {
+                "link_id": link_id,
+                "order_id": order_id,
+                "level_idx": level_idx,
+                "side": side,
+                "price": str(item.get("price", "0")),
+                "qty": str(item.get("qty", "0")),
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "PostOnly" if str(item.get("timeInForce", "")) == "PostOnly" else "GTC",
+                "reduce_only": self._truthy(item.get("reduceOnly", False)),
+                "entry_price": None,
+            }
+            known_order_ids.add(order_id)
+            adopted = True
+            logger.warning(
+                "Adopted exchange grid order missing from local state symbol=%s order_id=%s link_id=%s",
+                self.config.get("symbol"),
+                order_id,
+                link_id,
+            )
+        if adopted:
+            self._persist_state()
+        return adopted
+
+    def _reconcile_exchange_open_orders(self, open_orders: list[dict] | None = None):
+        open_orders = self._fetch_open_orders() if open_orders is None else open_orders
+        self._adopt_exchange_grid_orders(open_orders)
+        open_order_ids = {str(item.get("orderId", "")) for item in open_orders}
+        if self._stopping:
+            return
+
+        closed_links = [
+            link_id
+            for link_id, order in list(self.active_orders.items())
+            if str(order.get("order_id", "")) not in open_order_ids
+        ]
+        for link_id in closed_links:
+            if self._stopping or link_id not in self.active_orders:
+                break
+            order = self.active_orders[link_id]
+            status = self._get_order_status(order)
+            if self._is_cancelled_status(status):
+                self._handle_cancelled_order(link_id, order)
+                continue
+            if self._is_filled_status(status):
+                self._handle_confirmed_closed_order(
+                    link_id,
+                    order,
+                    allow_estimate=not hasattr(self.client, "get_order_trades"),
+                )
+                continue
+            if status == "UNKNOWN":
+                # Unknown may be a temporary exchange/API gap. Only mutate state if trades prove a fill.
+                self._handle_confirmed_closed_order(link_id, order, allow_estimate=False)
+                continue
+
+            logger.info(
+                "Grid order absent from open orders but not terminal symbol=%s order_id=%s link_id=%s status=%s",
+                self.config.get("symbol"),
+                order.get("order_id"),
+                link_id,
+                status,
+            )
+
+    def _handle_cancelled_order(self, link_id: str, order: dict):
+        fallback_qty = float(order["qty"])
+        fallback_price = float(order["price"])
+        stats = self._get_trade_stats(
+            order["order_id"],
+            fallback_price,
+            fallback_qty,
+            allow_estimate=False,
+            liquidity_hint=self._order_liquidity_hint(order),
+        )
+        self.active_orders.pop(link_id, None)
+
+        filled_qty = 0.0
+        if stats and stats["qty"] > 0:
+            filled_qty = min(float(stats["qty"]), fallback_qty)
+            filled_order = {**order, "qty": str(filled_qty), "fill_price": stats["price"]}
+            self._record_fill(filled_order, {**stats, "qty": filled_qty})
+            if self._in_grid_range() or self._counter_order_reduces_grid_position(filled_order):
+                self._place_counter_order(filled_order)
+            else:
+                self.paused_replacements.append(filled_order)
+
+        remaining_qty = fallback_qty - filled_qty
+        if remaining_qty >= self.min_qty:
+            replacement = {**order, "qty": str(remaining_qty)}
+            self._replace_cancelled_order(replacement)
+        self._persist_state()
+
+    def _handle_confirmed_closed_order(self, link_id: str, order: dict, *, allow_estimate: bool) -> bool:
+        handled = self._handle_closed_order(order, allow_estimate=allow_estimate)
+        if handled:
+            self.active_orders.pop(link_id, None)
+            self._persist_state()
+            return True
+        logger.info(
+            "Grid order closed without confirmed fill symbol=%s order_id=%s link_id=%s",
+            self.config.get("symbol"),
+            order.get("order_id"),
+            link_id,
+        )
+        return False
 
     def _position_size(self, side: str) -> float:
         resp = self.client.get_positions(self.config["symbol"])
@@ -1223,8 +1366,8 @@ class GridEngine:
                     break
 
                 if self.grid_ready:
-                    self._resume_paused_replacements()
                     await self._check_fills()
+                    self._resume_paused_replacements()
                     self._reconcile_grid_position_protection()
 
                 await asyncio.sleep(3)
@@ -1352,55 +1495,13 @@ class GridEngine:
         self._persist_state()
 
     async def _check_fills(self):
-        resp = self.client.get_open_orders(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to fetch open orders"))
+        self._reconcile_exchange_open_orders()
 
-        open_order_ids = {item["orderId"] for item in resp["result"].get("list", [])}
-        if self._stopping:
-            return
-
-        filled_links = [
-            link_id
-            for link_id, order in list(self.active_orders.items())
-            if order["order_id"] not in open_order_ids
-        ]
-
-        for link_id in filled_links:
-            if self._stopping:
-                break
-            order = self.active_orders[link_id]
-            status = self._get_order_status(order)
-            if self._is_cancelled_status(status):
-                self.active_orders.pop(link_id, None)
-                self._replace_cancelled_order(order)
-                self._persist_state()
-                continue
-            if not self._is_filled_status(status) and status != "UNKNOWN":
-                logger.info(
-                    "Grid order closed with non-fill status symbol=%s order_id=%s link_id=%s status=%s",
-                    self.config.get("symbol"),
-                    order.get("order_id"),
-                    link_id,
-                    status,
-                )
-                continue
-
-            self.active_orders.pop(link_id, None)
-            handled = self._handle_closed_order(order)
-            if not handled:
-                logger.info(
-                    "Grid order closed without confirmed fill symbol=%s order_id=%s link_id=%s",
-                    self.config.get("symbol"),
-                    order.get("order_id"),
-                    link_id,
-                )
-            self._persist_state()
-
-    def _handle_closed_order(self, order: dict) -> bool:
+    def _handle_closed_order(self, order: dict, *, allow_estimate: bool | None = None) -> bool:
         fallback_qty = float(order["qty"])
         fallback_price = float(order["price"])
-        allow_estimate = not hasattr(self.client, "get_order_trades")
+        if allow_estimate is None:
+            allow_estimate = not hasattr(self.client, "get_order_trades")
         stats = self._get_trade_stats(
             order["order_id"],
             fallback_price,

@@ -222,6 +222,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restore_derives_grid_position_from_active_reduce_orders(self):
         client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "445", "avgPrice": "100"}]
         engine = GridEngine(
             client,
             {
@@ -398,6 +399,79 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         engine._reconcile_grid_position_protection()
 
         self.assertEqual(engine.get_status()["grid_position_net_qty"], 0)
+
+    async def test_restore_adopts_exchange_grid_orders_missing_from_local_state(self):
+        client = FakeClient("100")
+        client.place_order(
+            symbol="TESTUSDT",
+            side="Sell",
+            qty="2.0",
+            price="105.0",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id="g_2_S_exchange",
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        engine.restore_state(
+            {
+                "config": engine.config,
+                "grid_levels": [90, 95, 100, 105, 110],
+                "active_orders": {},
+                "grid_position_net_qty": 0,
+                "grid_ready": True,
+            }
+        )
+
+        self.assertIn("g_2_S_exchange", engine.active_orders)
+        adopted = engine.active_orders["g_2_S_exchange"]
+        self.assertEqual(adopted["level_idx"], 2)
+        self.assertEqual(adopted["side"], "Sell")
+        self.assertFalse(adopted["reduce_only"])
+
+    async def test_unknown_missing_order_is_not_removed_without_trade_proof(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        await engine.initialize()
+        order = next(iter(engine.active_orders.values()))
+        client.open_limit_order_ids.discard(order["order_id"])
+        matching = next(item for item in client.orders if item["orderId"] == order["order_id"])
+        matching["orderStatus"] = "UNKNOWN"
+
+        await engine._check_fills()
+
+        self.assertIn(order["link_id"], engine.active_orders)
+        self.assertEqual(engine.filled_orders, [])
 
     async def test_long_grid_replenishes_buy_after_take_profit_fill(self):
         client = FakeClient("100")
@@ -1040,7 +1114,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(engine.filled_orders, [])
         self.assertEqual(len(client.orders), order_count)
-        self.assertNotIn(order["link_id"], engine.active_orders)
+        self.assertIn(order["link_id"], engine.active_orders)
 
     async def test_restored_grid_continues_tracking_saved_orders_after_restart(self):
         snapshots = []
