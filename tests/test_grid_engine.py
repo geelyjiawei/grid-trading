@@ -13,10 +13,13 @@ from grid_engine import GridEngine  # noqa: E402
 
 
 class FakeClient:
-    def __init__(self, ticker_price="100"):
+    def __init__(self, ticker_price="100", tick_size="0.1", qty_step="0.1", min_qty="0.1"):
         self.orders = []
         self.order_seq = 0
         self.ticker_price = float(ticker_price)
+        self.tick_size = str(tick_size)
+        self.qty_step = str(qty_step)
+        self.min_qty = str(min_qty)
         self.open_limit_order_ids = set()
         self.positions = []
         self.reject_post_only_reduce = False
@@ -29,8 +32,8 @@ class FakeClient:
             "result": {
                 "list": [
                     {
-                        "priceFilter": {"tickSize": "0.1"},
-                        "lotSizeFilter": {"qtyStep": "0.1", "minOrderQty": "0.1"},
+                        "priceFilter": {"tickSize": self.tick_size},
+                        "lotSizeFilter": {"qtyStep": self.qty_step, "minOrderQty": self.min_qty},
                     }
                 ]
             },
@@ -982,6 +985,102 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(add_orders), 1)
         self.assertEqual(engine.paused_replacements, [])
+
+    async def test_initial_long_overlap_uses_same_qty_for_add_and_reduce_orders(self):
+        client = FakeClient("15.93", tick_size="0.01", qty_step="0.01", min_qty="0.01")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "NOKUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 16.3,
+                "lower_price": 15.6,
+                "grid_count": 30,
+                "total_investment": 40,
+                "leverage": 20,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        engine._fetch_precision()
+        engine.grid_levels = engine._calculate_levels()
+        engine.initial_entry_price = 15.93
+        engine.grid_position_net_qty = 50.18
+        engine._prepare_pending_targets(15.93, total_qty_override=50.18)
+        engine._deploy_pending_targets()
+
+        reduce_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and order["reduce_only"] and order["level_idx"] == 14
+        )
+        add_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and not order["reduce_only"] and order["level_idx"] == 14
+        )
+        self.assertEqual(reduce_order["price"], "15.95")
+        self.assertEqual(add_order["price"], "15.92")
+        self.assertEqual(reduce_order["qty"], "3.14")
+        self.assertEqual(add_order["qty"], "3.14")
+
+    async def test_counter_order_tops_up_existing_non_reduce_qty_deficit(self):
+        client = FakeClient("15.93", tick_size="0.01", qty_step="0.01", min_qty="0.01")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "NOKUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 16.3,
+                "lower_price": 15.6,
+                "grid_count": 30,
+                "total_investment": 40,
+                "leverage": 20,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        engine._fetch_precision()
+        engine.grid_levels = engine._calculate_levels()
+        engine.active_orders["existing"] = {
+            "link_id": "existing",
+            "order_id": "existing-order",
+            "level_idx": 14,
+            "side": "Buy",
+            "price": "15.92",
+            "qty": "3.13",
+            "status": "open",
+            "order_type": "Limit",
+            "time_in_force": "GTC",
+            "reduce_only": False,
+            "entry_price": None,
+        }
+
+        placed = engine._place_counter_order(
+            {
+                "side": "Sell",
+                "price": "15.95",
+                "qty": "3.14",
+                "level_idx": 14,
+                "reduce_only": True,
+                "fill_price": 15.95,
+            }
+        )
+
+        top_up_orders = [
+            order
+            for order in client.orders
+            if order["side"] == "Buy" and order["price"] == "15.92" and not order["reduce_only"]
+        ]
+        self.assertTrue(placed)
+        self.assertEqual(len(top_up_orders), 1)
+        self.assertEqual(top_up_orders[0]["qty"], "0.01")
 
     async def test_long_add_fill_places_reduce_order_even_when_level_already_has_reduce_order(self):
         client = FakeClient("98")

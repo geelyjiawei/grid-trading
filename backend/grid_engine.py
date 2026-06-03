@@ -467,6 +467,26 @@ class GridEngine:
                 return True
         return False
 
+    def _active_order_qty(self, side: str, level_idx: int, reduce_only: bool) -> float:
+        total = Decimal("0")
+        for order in self.active_orders.values():
+            if (
+                order.get("side") == side
+                and int(order.get("level_idx", 0) or 0) == level_idx
+                and bool(order.get("reduce_only")) == reduce_only
+            ):
+                total += Decimal(str(order.get("qty", 0) or 0))
+        return float(total)
+
+    def _active_order_qty_deficit(self, side: str, level_idx: int, reduce_only: bool, qty: float) -> float:
+        requested = Decimal(str(qty))
+        active = Decimal(str(self._active_order_qty(side, level_idx, reduce_only)))
+        deficit = requested - active
+        minimum_order_qty = max(Decimal(self.qty_step), Decimal(str(self.min_qty)))
+        if deficit < minimum_order_qty:
+            return 0.0
+        return float(deficit)
+
     def _active_reduce_qty(self, side: str) -> float:
         return sum(
             float(order.get("qty", 0) or 0)
@@ -1386,6 +1406,10 @@ class GridEngine:
             "profit_targets": profit_targets,
             "add_targets": add_targets,
             "allocated_qtys": allocated_qtys,
+            "allocated_qty_by_level": {
+                str(target[0]): allocated_qty
+                for target, allocated_qty in zip(profit_targets, allocated_qtys)
+            },
             "qty_per_grid": qty_per_grid,
         }
         self._persist_state()
@@ -1400,6 +1424,13 @@ class GridEngine:
         add_targets = self._pending_targets["add_targets"]
         allocated_qtys = [qty * qty_scale for qty in self._pending_targets["allocated_qtys"]]
         qty_per_grid = self._pending_targets["qty_per_grid"] * qty_scale
+        allocated_qty_by_level = {
+            int(level_idx): float(qty) * qty_scale
+            for level_idx, qty in (self._pending_targets.get("allocated_qty_by_level") or {}).items()
+        }
+
+        def qty_for_level(level_idx: int) -> float:
+            return allocated_qty_by_level.get(level_idx, qty_per_grid)
 
         if direction in {"long", "short"}:
             for target, allocated_qty in zip(profit_targets, allocated_qtys):
@@ -1414,7 +1445,7 @@ class GridEngine:
                 )
 
             for idx, target_price, target_side in add_targets:
-                self._place(target_side, target_price, idx, reduce_only=False, qty_override=qty_per_grid)
+                self._place(target_side, target_price, idx, reduce_only=False, qty_override=qty_for_level(idx))
         else:
             for target, allocated_qty in zip(add_targets, allocated_qtys):
                 idx, target_price, target_side = target
@@ -1833,8 +1864,12 @@ class GridEngine:
         qty: float,
         entry_price: float | None = None,
     ) -> bool:
-        if not reduce_only and self._has_active_order(side, level_idx, reduce_only):
-            return True
+        requested_qty = float(qty)
+        if not reduce_only:
+            deficit = self._active_order_qty_deficit(side, level_idx, reduce_only, requested_qty)
+            if deficit <= 0:
+                return True
+            qty = deficit
         return (
             self._place(
                 side,
@@ -1843,7 +1878,7 @@ class GridEngine:
                 reduce_only=reduce_only,
                 qty_override=qty,
                 entry_price=entry_price,
-                allow_duplicate=bool(reduce_only),
+                allow_duplicate=bool(reduce_only) or qty < requested_qty,
             )
             is not None
         )
