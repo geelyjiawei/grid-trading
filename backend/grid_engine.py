@@ -474,6 +474,109 @@ class GridEngine:
             if order.get("side") == side and order.get("reduce_only")
         )
 
+    def _reduce_side(self) -> str:
+        direction = self.config["direction"]
+        if direction == "long":
+            return "Sell"
+        if direction == "short":
+            return "Buy"
+        return ""
+
+    def _is_grid_reduce_side(self, side: str, reduce_only: bool) -> bool:
+        return bool(reduce_only) and side == self._reduce_side()
+
+    def _available_reduce_qty(self, side: str) -> float:
+        if not self._is_grid_reduce_side(side, True):
+            return float("inf")
+        available = Decimal(str(self._grid_position_qty())) - Decimal(str(self._active_reduce_qty(side)))
+        if available <= 0:
+            return 0.0
+        return float(available)
+
+    def _cap_reduce_order_qty(self, side: str, qty: float) -> float:
+        if not self._is_grid_reduce_side(side, True):
+            return qty
+        available = self._available_reduce_qty(side)
+        return min(qty, available)
+
+    def _halt_if_reduce_overcommitted(self) -> bool:
+        reduce_side = self._reduce_side()
+        if not reduce_side:
+            return False
+
+        grid_qty = self._grid_position_qty()
+        excess = self._active_reduce_qty(reduce_side) - grid_qty
+        if excess < self.min_qty:
+            return False
+
+        self.trigger_message = (
+            f"Reduce-only protection halted grid: open reduce orders exceed grid position "
+            f"by {excess:g} {self.config.get('symbol', '')}."
+        )
+        logger.error(
+            "Reduce-only overcommitted symbol=%s reduce_side=%s active_reduce_qty=%s grid_qty=%s excess=%s",
+            self.config.get("symbol"),
+            reduce_side,
+            self._active_reduce_qty(reduce_side),
+            grid_qty,
+            excess,
+        )
+        try:
+            result = self.client.cancel_all_orders(self.config["symbol"])
+            if result.get("retCode") != 0:
+                raise RuntimeError(result.get("retMsg", "Failed to cancel orders after reduce overcommit"))
+        except Exception as exc:
+            logger.warning(
+                "Failed to cancel orders after reduce overcommit symbol=%s msg=%s",
+                self.config.get("symbol"),
+                exc,
+            )
+        self.active_orders.clear()
+        self.grid_ready = False
+        self.running = False
+        self._stopping = True
+        self._persist_state()
+        return True
+
+    def _halt_if_baseline_breached(self) -> bool:
+        if not self.baseline_position_side or self.baseline_position_qty < self.min_qty:
+            return False
+        if self.config["direction"] not in {"long", "short"}:
+            return False
+
+        actual_same_side_qty = self._position_size(self.baseline_position_side)
+        if actual_same_side_qty + self.min_qty >= self.baseline_position_qty:
+            return False
+
+        self.trigger_message = (
+            f"Baseline position protection halted grid: expected at least "
+            f"{self.baseline_position_qty:g} {self.baseline_position_side}, "
+            f"exchange has {actual_same_side_qty:g}."
+        )
+        logger.error(
+            "Baseline position breached symbol=%s baseline_side=%s baseline_qty=%s actual_qty=%s",
+            self.config.get("symbol"),
+            self.baseline_position_side,
+            self.baseline_position_qty,
+            actual_same_side_qty,
+        )
+        try:
+            result = self.client.cancel_all_orders(self.config["symbol"])
+            if result.get("retCode") != 0:
+                raise RuntimeError(result.get("retMsg", "Failed to cancel orders after baseline breach"))
+        except Exception as exc:
+            logger.warning(
+                "Failed to cancel orders after baseline breach symbol=%s msg=%s",
+                self.config.get("symbol"),
+                exc,
+            )
+        self.active_orders.clear()
+        self.grid_ready = False
+        self.running = False
+        self._stopping = True
+        self._persist_state()
+        return True
+
     @staticmethod
     def _truthy(value: Any) -> bool:
         if isinstance(value, bool):
@@ -806,6 +909,9 @@ class GridEngine:
         if self.config["direction"] not in {"long", "short"}:
             return
 
+        if self._halt_if_baseline_breached():
+            return
+
         actual_grid_qty = self._actual_grid_position_net_qty()
         local_grid_qty = self._grid_position_net_qty()
         if abs(actual_grid_qty - local_grid_qty) < self.min_qty:
@@ -826,6 +932,10 @@ class GridEngine:
             return
 
         self._sync_grid_position_with_exchange()
+        if self._stopping:
+            return
+        if self._halt_if_reduce_overcommitted():
+            return
 
         grid_qty = self._grid_position_qty()
         if grid_qty < self.min_qty:
@@ -871,6 +981,17 @@ class GridEngine:
     def _grid_position_qty(self) -> float:
         return abs(self._grid_position_net_qty())
 
+    def _safe_grid_close_qty(self, position_side: str) -> float:
+        position_qty = self._position_size(position_side)
+        if position_qty < self.min_qty:
+            return 0.0
+
+        available_qty = position_qty
+        if self.baseline_position_side == position_side:
+            available_qty = max(0.0, position_qty - self.baseline_position_qty)
+
+        return min(available_qty, self._grid_position_qty())
+
     def _expected_position_net_qty(self) -> float:
         return self._baseline_position_net_qty() + self._grid_position_net_qty()
 
@@ -904,7 +1025,18 @@ class GridEngine:
         return pnl
 
     def _place_reduce_market(self, side: str, qty: float, reason: str) -> str:
-        qty_text = self._fq(qty)
+        capped_qty = self._cap_reduce_order_qty(side, qty)
+        if capped_qty < self.min_qty:
+            logger.warning(
+                "Skipped reduce-only market order with no grid allowance symbol=%s side=%s requested=%s reason=%s",
+                self.config.get("symbol"),
+                side,
+                qty,
+                reason,
+            )
+            return ""
+
+        qty_text = self._fq(capped_qty)
         result = self.client.place_order(
             symbol=self.config["symbol"],
             side=side,
@@ -1011,6 +1143,19 @@ class GridEngine:
         allow_duplicate: bool = False,
     ) -> Optional[str]:
         raw_qty = float(qty_override) if qty_override is not None else float(self.config["qty_per_grid"])
+        if reduce_only:
+            capped_qty = self._cap_reduce_order_qty(side, raw_qty)
+            if capped_qty < self.min_qty:
+                logger.warning(
+                    "Skipped reduce-only order with no grid allowance symbol=%s side=%s level=%s requested=%s",
+                    self.config.get("symbol"),
+                    side,
+                    level_idx,
+                    raw_qty,
+                )
+                return None
+            raw_qty = capped_qty
+
         qty = self._fq(raw_qty)
         price_text = self._fp(price)
         link_id = f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:6]}"
@@ -1147,48 +1292,78 @@ class GridEngine:
         open_side = ""
         if direction == "long":
             open_side = "Buy"
-            profit_targets = [
-                (idx, levels[idx + 1], "Sell")
-                for idx in range(len(levels) - 1)
-                if levels[idx + 1] > current_price
-            ]
-            add_targets = [
-                (idx, levels[idx], "Buy")
-                for idx in range(len(levels) - 1)
-                if levels[idx] < current_price
-            ]
         elif direction == "short":
             open_side = "Sell"
+
+        if direction in {"long", "short"}:
+            self._capture_baseline_position(open_side)
+
+        total_qty = self._prepare_pending_targets(current_price)
+
+        if direction in {"long", "short"}:
+            if self.config.get("initial_order_type", "market") == "post_only":
+                self._place_limit_open(
+                    open_side,
+                    total_qty,
+                    self._initial_limit_price(open_side, current_price),
+                )
+                return
+            self._place_market_open(open_side, total_qty)
+            self._prepare_pending_targets(self.initial_entry_price or current_price, self.initial_qty)
+            self._deploy_pending_targets()
+
+        if direction == "neutral":
+            self._deploy_pending_targets()
+
+        self.grid_ready = True
+        self._persist_state()
+
+    def _target_orders_for_price(self, reference_price: float) -> tuple[list[tuple[int, float, str]], list[tuple[int, float, str]]]:
+        levels = self.grid_levels
+        direction = self.config["direction"]
+        if direction == "long":
+            profit_targets = [
+                (idx, levels[idx + 1], "Sell")
+                for idx in range(len(levels) - 1)
+                if levels[idx + 1] > reference_price
+            ]
+            add_targets = [
+                (idx, levels[idx], "Buy")
+                for idx in range(len(levels) - 1)
+                if levels[idx] < reference_price
+            ]
+        elif direction == "short":
             profit_targets = [
                 (idx, levels[idx], "Buy")
                 for idx in range(len(levels) - 1)
-                if levels[idx] < current_price
+                if levels[idx] < reference_price
             ]
             add_targets = [
                 (idx, levels[idx + 1], "Sell")
                 for idx in range(len(levels) - 1)
-                if levels[idx + 1] > current_price
+                if levels[idx + 1] > reference_price
             ]
         else:
             profit_targets = []
             add_targets = [
                 (idx, levels[idx], "Buy")
                 for idx in range(len(levels) - 1)
-                if levels[idx] < current_price
+                if levels[idx] < reference_price
             ] + [
                 (idx, levels[idx + 1], "Sell")
                 for idx in range(len(levels) - 1)
-                if levels[idx + 1] > current_price
+                if levels[idx + 1] > reference_price
             ]
+        return profit_targets, add_targets
 
-        if direction in {"long", "short"}:
-            self._capture_baseline_position(open_side)
-
+    def _prepare_pending_targets(self, reference_price: float, total_qty_override: float | None = None) -> float:
+        direction = self.config["direction"]
+        profit_targets, add_targets = self._target_orders_for_price(reference_price)
         target_count = len(profit_targets) if direction in {"long", "short"} else len(add_targets)
         if target_count <= 0:
             raise RuntimeError("No valid grid targets were found around current price")
 
-        raw_total_qty = self._calc_total_qty(current_price)
+        raw_total_qty = float(total_qty_override) if total_qty_override is not None else self._calc_total_qty(reference_price)
         total_steps = self._qty_to_steps(raw_total_qty)
         if total_steps < target_count:
             raise RuntimeError("Total investment is too small for this symbol and grid count")
@@ -1214,23 +1389,7 @@ class GridEngine:
             "qty_per_grid": qty_per_grid,
         }
         self._persist_state()
-
-        if direction in {"long", "short"}:
-            if self.config.get("initial_order_type", "market") == "post_only":
-                self._place_limit_open(
-                    open_side,
-                    total_qty,
-                    self._initial_limit_price(open_side, current_price),
-                )
-                return
-            self._place_market_open(open_side, total_qty)
-            self._deploy_pending_targets()
-
-        if direction == "neutral":
-            self._deploy_pending_targets()
-
-        self.grid_ready = True
-        self._persist_state()
+        return total_qty
 
     def _deploy_pending_targets(self, qty_scale: float = 1.0):
         if not self._pending_targets:
@@ -1301,7 +1460,7 @@ class GridEngine:
         if direction in {"long", "short"}:
             position_side = "Buy" if direction == "long" else "Sell"
             close_side = "Sell" if position_side == "Buy" else "Buy"
-            size = min(self._position_size(position_side), self._grid_position_qty())
+            size = self._safe_grid_close_qty(position_side)
             if size < self.min_qty:
                 return
             result = self.client.place_order(
@@ -1400,14 +1559,14 @@ class GridEngine:
         else:
             return
 
-        position_qty = min(self._position_size(position_side), self._grid_position_qty())
+        position_qty = self._safe_grid_close_qty(position_side)
         if position_qty < self.min_qty:
             return
 
         self._boundary_repair_in_progress = True
         try:
             self._cancel_stale_reduce_orders(close_side)
-            refreshed_qty = min(self._position_size(position_side), self._grid_position_qty())
+            refreshed_qty = self._safe_grid_close_qty(position_side)
             if refreshed_qty >= self.min_qty:
                 self._place_reduce_market(close_side, refreshed_qty, reason)
                 self._boundary_repair_retry_after = time.time() + 2
@@ -1472,8 +1631,17 @@ class GridEngine:
             self.trigger_message = "Opening order fill quantity is too small; please restart the grid."
             return
 
+        try:
+            self._prepare_pending_targets(stats["price"], stats["qty"])
+        except RuntimeError as exc:
+            self.waiting_initial_order = False
+            self.opening_order = None
+            self.running = False
+            self.trigger_message = str(exc)
+            self._persist_state()
+            return
         allocated_qtys = self._pending_targets["allocated_qtys"] if self._pending_targets else []
-        if allocated_qtys and min(qty * qty_scale for qty in allocated_qtys) < self.min_qty:
+        if allocated_qtys and min(allocated_qtys) < self.min_qty:
             self.waiting_initial_order = False
             self.running = False
             self.trigger_message = "Opening order partial fill is too small for grid allocation."
@@ -1491,7 +1659,7 @@ class GridEngine:
             fee_source=stats["fee_source"],
         )
         self.opening_order = None
-        self._deploy_pending_targets(qty_scale)
+        self._deploy_pending_targets()
         self._persist_state()
 
     async def _check_fills(self):
