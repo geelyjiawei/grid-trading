@@ -2083,16 +2083,47 @@ class GridEngine:
             resp = self.client.get_order(self.config["symbol"], str(order.get("order_id", "")))
         except Exception as exc:
             logger.warning("Fetch order status failed order_id=%s msg=%s", order.get("order_id"), exc)
-            return "UNKNOWN"
+            return self._get_order_status_from_history(order)
         if resp.get("retCode") != 0:
             logger.warning(
                 "Fetch order status rejected order_id=%s msg=%s",
                 order.get("order_id"),
                 resp.get("retMsg"),
             )
-            return "UNKNOWN"
+            return self._get_order_status_from_history(order)
         status = resp.get("result", {}).get("orderStatus") or resp.get("result", {}).get("status")
-        return str(status or "UNKNOWN").upper()
+        normalized = str(status or "UNKNOWN").upper()
+        if normalized == "UNKNOWN":
+            return self._get_order_status_from_history(order)
+        return normalized
+
+    def _get_order_status_from_history(self, order: dict) -> str:
+        if not hasattr(self.client, "get_order_history"):
+            return "UNKNOWN"
+
+        order_id = str(order.get("order_id", "") or "")
+        link_id = str(order.get("link_id", "") or "")
+        try:
+            resp = self.client.get_order_history(self.config["symbol"], limit=1000)
+        except Exception as exc:
+            logger.warning("Fetch order history failed order_id=%s msg=%s", order_id, exc)
+            return "UNKNOWN"
+        if resp.get("retCode") != 0:
+            logger.warning(
+                "Fetch order history rejected order_id=%s msg=%s",
+                order_id,
+                resp.get("retMsg"),
+            )
+            return "UNKNOWN"
+
+        for item in resp.get("result", {}).get("list", []):
+            if order_id and str(item.get("orderId", "") or "") == order_id:
+                status = item.get("orderStatus") or item.get("status")
+                return str(status or "UNKNOWN").upper()
+            if link_id and str(item.get("orderLinkId", "") or item.get("order_link_id", "") or "") == link_id:
+                status = item.get("orderStatus") or item.get("status")
+                return str(status or "UNKNOWN").upper()
+        return "UNKNOWN"
 
     @staticmethod
     def _is_filled_status(status: str) -> bool:

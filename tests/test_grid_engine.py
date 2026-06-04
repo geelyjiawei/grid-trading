@@ -862,6 +862,58 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(order["link_id"], engine.active_orders)
         self.assertEqual(engine.filled_orders, [])
 
+    async def test_cancelled_order_history_fallback_removes_stale_active_order(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        await engine.initialize()
+        order = next(item for item in engine.active_orders.values() if item["side"] == "Buy" and item["reduce_only"])
+        client.open_limit_order_ids.discard(order["order_id"])
+        matching = next(item for item in client.orders if item["orderId"] == order["order_id"])
+        matching["orderStatus"] = "CANCELED"
+
+        def get_order(symbol, order_id):
+            raise RuntimeError("Order does not exist.")
+
+        def get_order_history(symbol, limit=1000):
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "orderId": str(item["orderId"]),
+                            "orderLinkId": item.get("order_link_id", ""),
+                            "orderStatus": item.get("orderStatus", "FILLED"),
+                        }
+                        for item in client.orders
+                        if item.get("symbol") == symbol
+                    ]
+                },
+            }
+
+        client.get_order = get_order
+        client.get_order_history = get_order_history
+
+        await engine._check_fills()
+
+        self.assertNotIn(order["link_id"], engine.active_orders)
+        self.assertEqual(engine.filled_orders, [])
+        self.assertLessEqual(engine._active_reduce_qty("Buy"), engine._grid_position_qty())
+
     async def test_long_grid_replenishes_buy_after_take_profit_fill(self):
         client = FakeClient("100")
         engine = GridEngine(
