@@ -25,6 +25,7 @@ class FakeClient:
         self.reject_post_only_reduce = False
         self.reject_reduce_limit = False
         self.cancelled_orders = []
+        self.instant_fill_reduce_limits = False
 
     def get_instrument_info(self, symbol):
         return {
@@ -64,7 +65,13 @@ class FakeClient:
         order = dict(kwargs)
         order["orderId"] = str(self.order_seq)
         self.orders.append(order)
-        if kwargs.get("order_type") == "Limit":
+        if (
+            kwargs.get("order_type") == "Limit"
+            and kwargs.get("reduce_only")
+            and self.instant_fill_reduce_limits
+        ):
+            order["orderStatus"] = "FILLED"
+        elif kwargs.get("order_type") == "Limit":
             self.open_limit_order_ids.add(order["orderId"])
         if kwargs.get("order_type") == "Market":
             self._apply_market_position(order)
@@ -895,6 +902,62 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(
             sum(float(order["qty"]) for order in reduce_orders),
             float(existing_reduce_orders[0]["qty"]) + float(add_order["qty"]),
+        )
+
+    async def test_instantly_filled_counter_order_is_reconciled_before_protection(self):
+        client = FakeClient("102")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        add_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 2
+        )
+        client.instant_fill_reduce_limits = True
+        client.open_limit_order_ids.discard(add_order["order_id"])
+
+        await engine._check_fills()
+
+        instant_reduce_order = next(
+            order
+            for order in reversed(client.orders)
+            if order["side"] == "Buy"
+            and order["reduce_only"]
+            and order.get("orderStatus") == "FILLED"
+            and order["price"] == "100.0"
+        )
+        self.assertEqual(instant_reduce_order["side"], "Buy")
+        self.assertTrue(instant_reduce_order["reduce_only"])
+        self.assertTrue(
+            any(
+                order["side"] == "Buy"
+                and order["reduce_only"]
+                and order["level_idx"] == add_order["level_idx"]
+                and abs(float(order["qty"]) - float(add_order["qty"])) < 1e-9
+                for order in engine.filled_orders
+            )
+        )
+        self.assertFalse(
+            any(
+                order.get("order_id") == instant_reduce_order["orderId"]
+                for order in engine.active_orders.values()
+            )
         )
 
     async def test_reduce_fill_does_not_duplicate_existing_short_add_order(self):

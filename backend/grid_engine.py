@@ -655,12 +655,12 @@ class GridEngine:
             self._persist_state()
         return adopted
 
-    def _reconcile_exchange_open_orders(self, open_orders: list[dict] | None = None):
+    def _reconcile_exchange_open_orders(self, open_orders: list[dict] | None = None) -> bool:
         open_orders = self._fetch_open_orders() if open_orders is None else open_orders
-        self._adopt_exchange_grid_orders(open_orders)
+        changed = self._adopt_exchange_grid_orders(open_orders)
         open_order_ids = {str(item.get("orderId", "")) for item in open_orders}
         if self._stopping:
-            return
+            return changed
 
         closed_links = [
             link_id
@@ -669,22 +669,29 @@ class GridEngine:
         ]
         for link_id in closed_links:
             if self._stopping or link_id not in self.active_orders:
-                break
+                continue
             order = self.active_orders[link_id]
             status = self._get_order_status(order)
             if self._is_cancelled_status(status):
                 self._handle_cancelled_order(link_id, order)
+                changed = True
                 continue
             if self._is_filled_status(status):
-                self._handle_confirmed_closed_order(
-                    link_id,
-                    order,
-                    allow_estimate=not hasattr(self.client, "get_order_trades"),
+                changed = (
+                    self._handle_confirmed_closed_order(
+                        link_id,
+                        order,
+                        allow_estimate=not hasattr(self.client, "get_order_trades"),
+                    )
+                    or changed
                 )
                 continue
             if status == "UNKNOWN":
                 # Unknown may be a temporary exchange/API gap. Only mutate state if trades prove a fill.
-                self._handle_confirmed_closed_order(link_id, order, allow_estimate=False)
+                changed = (
+                    self._handle_confirmed_closed_order(link_id, order, allow_estimate=False)
+                    or changed
+                )
                 continue
 
             logger.info(
@@ -694,6 +701,7 @@ class GridEngine:
                 link_id,
                 status,
             )
+        return changed
 
     def _handle_cancelled_order(self, link_id: str, order: dict):
         fallback_qty = float(order["qty"])
@@ -1694,7 +1702,12 @@ class GridEngine:
         self._persist_state()
 
     async def _check_fills(self):
-        self._reconcile_exchange_open_orders()
+        # Counter orders can be placed and filled before the next polling tick.
+        # Reconcile a few rounds so protection checks see a stable order ledger.
+        for _ in range(3):
+            changed = self._reconcile_exchange_open_orders()
+            if not changed or self._stopping:
+                break
 
     def _handle_closed_order(self, order: dict, *, allow_estimate: bool | None = None) -> bool:
         fallback_qty = float(order["qty"])
