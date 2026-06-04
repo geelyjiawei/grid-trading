@@ -460,9 +460,19 @@ def _restore_saved_engines():
         config["symbol"] = str(config.get("symbol") or symbol).upper()
         engine = GridEngine(_client, config, state_callback=_save_engine_state)
         try:
+            should_restart = bool(engine_state.get("running", False))
             engine.restore_state(engine_state)
             _engines[config["symbol"]] = engine
-            engine.start()
+            can_restart = (
+                should_restart
+                and not engine._stopping
+                and (engine.grid_ready or engine.waiting_trigger or engine.waiting_initial_order)
+            )
+            if can_restart:
+                engine.start()
+            else:
+                engine.running = False
+                engine._persist_state()
         except Exception as exc:
             # Keep the saved state on disk so the UI/risk checks can still show the problem.
             logger.exception("Failed to restore saved grid symbol=%s: %s", config.get("symbol"), exc)

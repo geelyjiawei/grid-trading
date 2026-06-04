@@ -175,6 +175,74 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["per_grid_close_fee"], 0.02)
         self.assertAlmostEqual(data["per_grid_fee"], 0.07)
 
+    def test_restore_does_not_restart_grid_after_safety_halt(self):
+        main._client = FakeClient("15.95")
+        main._client.positions = [{"side": "Buy", "size": "200", "avgPrice": "16.18"}]
+        placed = main._client.place_order(
+            symbol="NOKUSDT",
+            side="Sell",
+            qty="3.1",
+            price="15.9",
+            order_type="Limit",
+            reduce_only=True,
+            order_link_id="g_14_S_reduce",
+        )
+        order_id = placed["result"]["orderId"]
+        state = {
+            "version": 1,
+            "exchange": main._normalize_exchange(main._api_config.get("exchange")),
+            "testnet": bool(main._api_config.get("testnet", False)),
+            "grids": {
+                "NOKUSDT": {
+                    "config": {
+                        "symbol": "NOKUSDT",
+                        "direction": "long",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 16.3,
+                        "lower_price": 15.6,
+                        "grid_count": 30,
+                        "total_investment": 40,
+                        "leverage": 20,
+                    },
+                    "running": True,
+                    "grid_ready": True,
+                    "grid_levels": [15.6, 15.9, 16.3],
+                    "active_orders": {
+                        "g_14_S_reduce": {
+                            "link_id": "g_14_S_reduce",
+                            "order_id": order_id,
+                            "level_idx": 14,
+                            "side": "Sell",
+                            "price": "15.9",
+                            "qty": "3.1",
+                            "status": "open",
+                            "order_type": "Limit",
+                            "time_in_force": "GTC",
+                            "reduce_only": True,
+                            "entry_price": 15.93,
+                        }
+                    },
+                    "baseline_position_side": "Buy",
+                    "baseline_position_qty": 200.0,
+                    "baseline_position_entry_price": 16.18,
+                    "grid_position_net_qty": 0.0,
+                    "tick_size": "0.1",
+                    "qty_step": "0.1",
+                    "min_qty": 0.1,
+                }
+            },
+        }
+        main._write_grid_state_file(state)
+
+        main._restore_saved_engines()
+
+        engine = main._engines["NOKUSDT"]
+        saved = main._load_grid_state_file()["grids"]["NOKUSDT"]
+        self.assertFalse(engine.running)
+        self.assertFalse(engine.grid_ready)
+        self.assertFalse(saved["running"])
+        self.assertEqual(main._client.get_open_orders("NOKUSDT")["result"]["list"], [])
+
     def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
         main._client.place_order(
             symbol="BILLUSDT",
