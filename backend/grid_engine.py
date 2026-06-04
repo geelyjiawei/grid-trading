@@ -103,6 +103,7 @@ class GridEngine:
         }
 
     def restore_state(self, state: dict[str, Any]):
+        saved_running = bool(state.get("running", False))
         self.config = dict(state.get("config") or self.config)
         self.grid_levels = list(state.get("grid_levels") or [])
         self.active_orders = dict(state.get("active_orders") or {})
@@ -142,9 +143,10 @@ class GridEngine:
         try:
             self._fetch_precision()
             self.current_price = self._get_current_price()
-            self._migrate_baseline_position_from_exchange()
-            self._reconcile_exchange_open_orders()
-            self._reconcile_grid_position_protection()
+            if saved_running:
+                self._migrate_baseline_position_from_exchange()
+                self._reconcile_exchange_open_orders()
+                self._reconcile_grid_position_protection()
         except Exception as exc:
             logger.warning("Restore refresh failed symbol=%s msg=%s", self.config.get("symbol"), exc)
         self._persist_state()

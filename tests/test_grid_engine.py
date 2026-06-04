@@ -416,6 +416,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         engine.restore_state(
             {
+                "running": True,
                 "config": engine.config,
                 "grid_levels": [90, 95, 100, 105, 110],
                 "active_orders": {
@@ -461,6 +462,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         engine.restore_state(
             {
+                "running": True,
                 "config": engine.config,
                 "grid_levels": [90, 95, 100, 105, 110],
                 "active_orders": {
@@ -819,6 +821,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         engine.restore_state(
             {
+                "running": True,
                 "config": engine.config,
                 "grid_levels": [90, 95, 100, 105, 110],
                 "active_orders": {},
@@ -832,6 +835,44 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adopted["level_idx"], 2)
         self.assertEqual(adopted["side"], "Sell")
         self.assertFalse(adopted["reduce_only"])
+
+    async def test_restore_stopped_grid_does_not_place_protection_orders(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "0.9", "avgPrice": "100"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        def place_order(**kwargs):
+            raise AssertionError("Stopped grid restore must not place orders")
+
+        client.place_order = place_order
+        engine.restore_state(
+            {
+                "running": False,
+                "config": engine.config,
+                "grid_levels": [90, 95, 100, 105, 110],
+                "active_orders": {},
+                "grid_position_net_qty": -0.9,
+                "grid_ready": False,
+            }
+        )
+
+        self.assertFalse(engine.running)
+        self.assertEqual(engine.active_orders, {})
 
     async def test_unknown_missing_order_is_not_removed_without_trade_proof(self):
         client = FakeClient("100")
