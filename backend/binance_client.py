@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
@@ -15,8 +16,10 @@ class BinanceFuturesClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.testnet = testnet
         self.base_url = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
         self.recv_window = 5000
+        self.session = requests.Session()
         self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
         self._instrument_info_cache: dict[str, tuple[dict, float]] = {}
 
@@ -35,9 +38,10 @@ class BinanceFuturesClient:
         *,
         params: dict[str, Any] | None = None,
         auth: bool = False,
+        api_key: bool = False,
     ) -> Any:
         request_params = dict(params or {})
-        headers = {"X-MBX-APIKEY": self.api_key} if auth else None
+        headers = {"X-MBX-APIKEY": self.api_key} if auth or api_key else None
 
         if auth:
             request_params["timestamp"] = int(time.time() * 1000)
@@ -45,7 +49,7 @@ class BinanceFuturesClient:
             request_params["signature"] = self._sign(request_params)
 
         url = f"{self.base_url}{path}"
-        response = requests.request(method, url, params=request_params, headers=headers, timeout=10)
+        response = self.session.request(method, url, params=request_params, headers=headers, timeout=10)
         try:
             data = response.json()
         except ValueError:
@@ -139,7 +143,7 @@ class BinanceFuturesClient:
         )
         return {"retCode": 0}
 
-    def place_order(
+    def _build_order_params(
         self,
         *,
         symbol: str,
@@ -150,7 +154,7 @@ class BinanceFuturesClient:
         reduce_only: bool = False,
         order_link_id: str = "",
         time_in_force: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "symbol": symbol.upper(),
             "side": self._to_binance_side(side),
@@ -163,9 +167,84 @@ class BinanceFuturesClient:
             params["timeInForce"] = "GTX" if time_in_force == "PostOnly" else (time_in_force or "GTC")
         if order_link_id:
             params["newClientOrderId"] = order_link_id
+        return params
+
+    def place_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: str,
+        price: str | None = None,
+        order_type: str = "Limit",
+        reduce_only: bool = False,
+        order_link_id: str = "",
+        time_in_force: str | None = None,
+    ) -> dict:
+        params = self._build_order_params(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+            order_type=order_type,
+            reduce_only=reduce_only,
+            order_link_id=order_link_id,
+            time_in_force=time_in_force,
+        )
 
         result = self._request("POST", "/fapi/v1/order", params=params, auth=True)
         return {"retCode": 0, "result": {"orderId": str(result.get("orderId", ""))}}
+
+    def place_orders(self, orders: list[dict[str, Any]]) -> dict:
+        batch_orders = [
+            self._build_order_params(
+                symbol=str(order["symbol"]),
+                side=str(order["side"]),
+                qty=str(order["qty"]),
+                price=None if order.get("price") is None else str(order.get("price")),
+                order_type=str(order.get("order_type") or "Limit"),
+                reduce_only=bool(order.get("reduce_only", False)),
+                order_link_id=str(order.get("order_link_id") or ""),
+                time_in_force=order.get("time_in_force"),
+            )
+            for order in orders
+        ]
+        payload = json.dumps(batch_orders, separators=(",", ":"))
+        results = self._request(
+            "POST",
+            "/fapi/v1/batchOrders",
+            params={"batchOrders": payload},
+            auth=True,
+        )
+        normalized = []
+        for item in results if isinstance(results, list) else []:
+            if "orderId" in item:
+                normalized.append({"retCode": 0, "result": {"orderId": str(item.get("orderId", ""))}})
+            else:
+                normalized.append(
+                    {
+                        "retCode": int(item.get("code", -1) or -1),
+                        "retMsg": item.get("msg", "Batch order failed"),
+                        "result": {},
+                    }
+                )
+        return {"retCode": 0, "result": {"list": normalized}}
+
+    def start_user_stream(self) -> str:
+        data = self._request("POST", "/fapi/v1/listenKey", api_key=True)
+        return str(data.get("listenKey", ""))
+
+    def keepalive_user_stream(self, listen_key: str) -> dict:
+        self._request("PUT", "/fapi/v1/listenKey", params={"listenKey": listen_key}, api_key=True)
+        return {"retCode": 0}
+
+    def close_user_stream(self, listen_key: str) -> dict:
+        self._request("DELETE", "/fapi/v1/listenKey", params={"listenKey": listen_key}, api_key=True)
+        return {"retCode": 0}
+
+    def user_stream_url(self, listen_key: str) -> str:
+        base_url = "wss://stream.binancefuture.com/ws" if self.testnet else "wss://fstream.binance.com/ws"
+        return f"{base_url}/{listen_key}"
 
     def cancel_order(self, symbol: str, order_id: str) -> dict:
         self._request(

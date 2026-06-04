@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import json
 import logging
 import re
 import time
@@ -8,6 +10,12 @@ from typing import Any, Callable, Optional
 
 
 logger = logging.getLogger(__name__)
+
+NORMAL_POLL_SECONDS = 3.0
+FAST_POLL_SECONDS = 0.3
+FAST_POLL_WINDOW_SECONDS = 15.0
+USER_STREAM_KEEPALIVE_SECONDS = 30 * 60
+BATCH_ORDER_CHUNK_SIZE = 5
 
 
 class GridEngine:
@@ -49,6 +57,10 @@ class GridEngine:
         self._boundary_repair_retry_after = 0.0
         self._allow_restore_baseline_migration = False
         self._task: Optional[asyncio.Task] = None
+        self._wake_event: asyncio.Event | None = None
+        self._fast_poll_until = 0.0
+        self._user_stream_task: Optional[asyncio.Task] = None
+        self._user_stream_listen_key = ""
 
     def _persist_state(self):
         if self.state_callback:
@@ -165,12 +177,16 @@ class GridEngine:
         self.running = True
         if self.start_time is None:
             self.start_time = time.time()
+        self._wake_event = asyncio.Event()
         self._task = asyncio.create_task(self._run_loop())
+        if self._supports_user_stream():
+            self._user_stream_task = asyncio.create_task(self._user_stream_loop())
         self._persist_state()
 
     async def stop(self):
         self._stopping = True
         self.running = False
+        await self._stop_user_stream()
         if self._task:
             self._task.cancel()
             try:
@@ -190,6 +206,7 @@ class GridEngine:
 
     async def suspend(self):
         """Stop the local polling task without touching exchange orders."""
+        await self._stop_user_stream()
         if self._task:
             self._task.cancel()
             try:
@@ -197,6 +214,112 @@ class GridEngine:
             except asyncio.CancelledError:
                 pass
         self._persist_state()
+
+    def _mark_fast_poll(self, seconds: float = FAST_POLL_WINDOW_SECONDS):
+        self._fast_poll_until = max(self._fast_poll_until, time.time() + seconds)
+        if self._wake_event:
+            self._wake_event.set()
+
+    def _poll_interval(self) -> float:
+        if self.waiting_initial_order or time.time() < self._fast_poll_until:
+            return FAST_POLL_SECONDS
+        return NORMAL_POLL_SECONDS
+
+    async def _sleep_until_next_poll(self):
+        interval = self._poll_interval()
+        if not self._wake_event:
+            await asyncio.sleep(interval)
+            return
+
+        try:
+            await asyncio.wait_for(self._wake_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        self._wake_event.clear()
+
+    def _supports_user_stream(self) -> bool:
+        return all(
+            hasattr(self.client, name)
+            for name in (
+                "start_user_stream",
+                "keepalive_user_stream",
+                "close_user_stream",
+                "user_stream_url",
+            )
+        )
+
+    async def _stop_user_stream(self):
+        task = self._user_stream_task
+        self._user_stream_task = None
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        listen_key = self._user_stream_listen_key
+        self._user_stream_listen_key = ""
+        if listen_key and hasattr(self.client, "close_user_stream"):
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.client.close_user_stream, listen_key)
+
+    async def _keepalive_user_stream(self, listen_key: str):
+        while self.running and not self._stopping:
+            await asyncio.sleep(USER_STREAM_KEEPALIVE_SECONDS)
+            if not self.running or self._stopping:
+                return
+            await asyncio.to_thread(self.client.keepalive_user_stream, listen_key)
+
+    def _is_relevant_user_stream_event(self, event: dict[str, Any]) -> bool:
+        event_type = str(event.get("e") or "")
+        if event_type not in {"ORDER_TRADE_UPDATE", "TRADE_LITE"}:
+            return False
+        symbol = str(event.get("s") or event.get("o", {}).get("s") or "").upper()
+        return symbol == str(self.config.get("symbol", "")).upper()
+
+    async def _user_stream_loop(self):
+        try:
+            import websockets
+        except Exception as exc:
+            logger.warning("Binance user stream unavailable symbol=%s msg=%s", self.config.get("symbol"), exc)
+            return
+
+        while self.running and not self._stopping:
+            keepalive_task: asyncio.Task | None = None
+            try:
+                listen_key = await asyncio.to_thread(self.client.start_user_stream)
+                if not listen_key:
+                    raise RuntimeError("Empty listen key")
+                self._user_stream_listen_key = listen_key
+                keepalive_task = asyncio.create_task(self._keepalive_user_stream(listen_key))
+                async with websockets.connect(
+                    self.client.user_stream_url(listen_key),
+                    ping_interval=20,
+                    close_timeout=5,
+                ) as websocket:
+                    async for raw_message in websocket:
+                        if not self.running or self._stopping:
+                            break
+                        try:
+                            event = json.loads(raw_message)
+                        except (TypeError, ValueError):
+                            continue
+                        if self._is_relevant_user_stream_event(event):
+                            self._mark_fast_poll()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self.running and not self._stopping:
+                    logger.warning(
+                        "Binance user stream disconnected symbol=%s msg=%s",
+                        self.config.get("symbol"),
+                        exc,
+                    )
+                    await asyncio.sleep(5)
+            finally:
+                if keepalive_task:
+                    keepalive_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await keepalive_task
 
     def get_status(self) -> dict:
         return {
@@ -1078,6 +1201,7 @@ class GridEngine:
         self._apply_market_reduce_to_grid_position(side, float(qty_text))
         self.trigger_message = f"Safety repair placed {side} reduce-only {qty_text}: {reason}"
         logger.warning(self.trigger_message)
+        self._mark_fast_poll()
         self._persist_state()
         return str(result["result"].get("orderId") or "")
 
@@ -1119,6 +1243,7 @@ class GridEngine:
             fee_asset=stats["fee_asset"],
             fee_source=stats["fee_source"],
         )
+        self._mark_fast_poll()
         self._persist_state()
 
     def _place_limit_open(self, side: str, qty: float, price: float):
@@ -1150,6 +1275,7 @@ class GridEngine:
             "price": price_text,
             "qty": qty_text,
         }
+        self._mark_fast_poll()
         self._persist_state()
 
     def _initial_limit_price(self, side: str, current_price: float) -> float:
@@ -1288,8 +1414,151 @@ class GridEngine:
             "reduce_only": reduce_only,
             "entry_price": entry_price,
         }
+        self._mark_fast_poll()
         self._persist_state()
         return link_id
+
+    def _supports_batch_orders(self) -> bool:
+        # Post Only grids need per-order rejection handling, so keep them on the safer path.
+        return hasattr(self.client, "place_orders") and not bool(self.config.get("grid_order_post_only", False))
+
+    def _place_batch_limit_orders(self, order_specs: list[dict[str, Any]]) -> list[str]:
+        planned = []
+        reduce_remaining_by_side: dict[str, float] = {}
+
+        for spec in order_specs:
+            side = str(spec["side"])
+            level_idx = int(spec["level_idx"])
+            reduce_only = bool(spec.get("reduce_only", False))
+            allow_duplicate = bool(spec.get("allow_duplicate", False))
+            if not allow_duplicate and self._has_active_order(side, level_idx, reduce_only):
+                continue
+            if self._stopping:
+                break
+
+            raw_qty = float(spec.get("qty_override") or self.config["qty_per_grid"])
+            if reduce_only:
+                remaining = reduce_remaining_by_side.get(side)
+                if remaining is None:
+                    remaining = self._available_reduce_qty(side)
+                raw_qty = min(raw_qty, remaining)
+                reduce_remaining_by_side[side] = max(0.0, remaining - raw_qty)
+                if raw_qty < self.min_qty:
+                    logger.warning(
+                        "Skipped batch reduce-only order with no grid allowance symbol=%s side=%s level=%s",
+                        self.config.get("symbol"),
+                        side,
+                        level_idx,
+                    )
+                    continue
+
+            qty = self._fq(raw_qty)
+            price_text = self._fp(float(spec["price"]))
+            link_id = f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:6]}"
+            planned.append(
+                {
+                    "request": {
+                        "symbol": self.config["symbol"],
+                        "side": side,
+                        "qty": qty,
+                        "price": price_text,
+                        "order_type": "Limit",
+                        "reduce_only": reduce_only,
+                        "order_link_id": link_id,
+                        "time_in_force": None,
+                    },
+                    "state": {
+                        "link_id": link_id,
+                        "level_idx": level_idx,
+                        "side": side,
+                        "price": price_text,
+                        "qty": qty,
+                        "reduce_only": reduce_only,
+                        "entry_price": spec.get("entry_price"),
+                    },
+                    "fallback": spec,
+                }
+            )
+
+        placed_links: list[str] = []
+        for start in range(0, len(planned), BATCH_ORDER_CHUNK_SIZE):
+            chunk = planned[start : start + BATCH_ORDER_CHUNK_SIZE]
+            if self._stopping:
+                break
+            try:
+                result = self.client.place_orders([item["request"] for item in chunk])
+                if result.get("retCode") != 0:
+                    raise RuntimeError(result.get("retMsg", "Batch order failed"))
+                result_items = result.get("result", {}).get("list", [])
+                if len(result_items) != len(chunk):
+                    raise RuntimeError("Batch order response size mismatch")
+            except Exception as exc:
+                logger.warning(
+                    "Batch order placement failed; falling back to single orders symbol=%s msg=%s",
+                    self.config.get("symbol"),
+                    exc,
+                )
+                with contextlib.suppress(Exception):
+                    self._reconcile_exchange_open_orders()
+                for item in chunk:
+                    fallback = item["fallback"]
+                    link_id = self._place(
+                        str(fallback["side"]),
+                        float(fallback["price"]),
+                        int(fallback["level_idx"]),
+                        reduce_only=bool(fallback.get("reduce_only", False)),
+                        qty_override=float(fallback.get("qty_override") or self.config["qty_per_grid"]),
+                        entry_price=fallback.get("entry_price"),
+                        allow_duplicate=bool(fallback.get("allow_duplicate", False)),
+                    )
+                    if link_id:
+                        placed_links.append(link_id)
+                continue
+
+            for item, order_result in zip(chunk, result_items):
+                state = item["state"]
+                if order_result.get("retCode") == 0 and order_result.get("result", {}).get("orderId"):
+                    link_id = state["link_id"]
+                    self.active_orders[link_id] = {
+                        "link_id": link_id,
+                        "order_id": str(order_result["result"]["orderId"]),
+                        "level_idx": state["level_idx"],
+                        "side": state["side"],
+                        "price": state["price"],
+                        "qty": state["qty"],
+                        "status": "open",
+                        "order_type": "Limit",
+                        "time_in_force": "GTC",
+                        "reduce_only": state["reduce_only"],
+                        "entry_price": state["entry_price"],
+                    }
+                    placed_links.append(link_id)
+                    continue
+
+                fallback = item["fallback"]
+                logger.warning(
+                    "Batch order item failed; falling back to single order symbol=%s side=%s price=%s msg=%s",
+                    self.config.get("symbol"),
+                    fallback.get("side"),
+                    fallback.get("price"),
+                    order_result.get("retMsg"),
+                )
+                link_id = self._place(
+                    str(fallback["side"]),
+                    float(fallback["price"]),
+                    int(fallback["level_idx"]),
+                    reduce_only=bool(fallback.get("reduce_only", False)),
+                    qty_override=float(fallback.get("qty_override") or self.config["qty_per_grid"]),
+                    entry_price=fallback.get("entry_price"),
+                    allow_duplicate=bool(fallback.get("allow_duplicate", False)),
+                )
+                if link_id:
+                    placed_links.append(link_id)
+
+        if placed_links:
+            self._mark_fast_poll()
+            self._persist_state()
+        return placed_links
 
     def _is_trigger_hit(self, current_price: float) -> bool:
         trigger_price = self.config.get("trigger_price")
@@ -1440,10 +1709,42 @@ class GridEngine:
         def qty_for_level(level_idx: int) -> float:
             return allocated_qty_by_level.get(level_idx, qty_per_grid)
 
+        batch_specs: list[dict[str, Any]] = []
+
+        def deploy_or_queue(
+            side: str,
+            price: float,
+            level_idx: int,
+            *,
+            reduce_only: bool,
+            qty_override: float,
+            entry_price: float | None = None,
+        ):
+            if self._supports_batch_orders():
+                batch_specs.append(
+                    {
+                        "side": side,
+                        "price": price,
+                        "level_idx": level_idx,
+                        "reduce_only": reduce_only,
+                        "qty_override": qty_override,
+                        "entry_price": entry_price,
+                    }
+                )
+                return
+            self._place(
+                side,
+                price,
+                level_idx,
+                reduce_only=reduce_only,
+                qty_override=qty_override,
+                entry_price=entry_price,
+            )
+
         if direction in {"long", "short"}:
             for target, allocated_qty in zip(profit_targets, allocated_qtys):
                 idx, target_price, target_side = target
-                self._place(
+                deploy_or_queue(
                     target_side,
                     target_price,
                     idx,
@@ -1453,11 +1754,26 @@ class GridEngine:
                 )
 
             for idx, target_price, target_side in add_targets:
-                self._place(target_side, target_price, idx, reduce_only=False, qty_override=qty_for_level(idx))
+                deploy_or_queue(
+                    target_side,
+                    target_price,
+                    idx,
+                    reduce_only=False,
+                    qty_override=qty_for_level(idx),
+                )
         else:
             for target, allocated_qty in zip(add_targets, allocated_qtys):
                 idx, target_price, target_side = target
-                self._place(target_side, target_price, idx, reduce_only=False, qty_override=allocated_qty)
+                deploy_or_queue(
+                    target_side,
+                    target_price,
+                    idx,
+                    reduce_only=False,
+                    qty_override=allocated_qty,
+                )
+
+        if batch_specs:
+            self._place_batch_limit_orders(batch_specs)
 
         self.grid_ready = True
         self.waiting_initial_order = False
@@ -1568,12 +1884,12 @@ class GridEngine:
                     self._resume_paused_replacements()
                     self._reconcile_grid_position_protection()
 
-                await asyncio.sleep(3)
+                await self._sleep_until_next_poll()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.exception("Grid polling failed: %s", exc)
-                await asyncio.sleep(5)
+                await asyncio.sleep(1 if self.waiting_initial_order else 5)
 
     def _repair_boundary_position(self):
         if not bool(self.config.get("boundary_market_repair", False)):

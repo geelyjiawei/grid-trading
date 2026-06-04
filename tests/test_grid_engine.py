@@ -182,7 +182,128 @@ class FakeClient:
         return f"{rounded:.{decimals}f}"
 
 
+class BatchFakeClient(FakeClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batch_calls = []
+
+    def place_orders(self, orders):
+        self.batch_calls.append([dict(order) for order in orders])
+        return {
+            "retCode": 0,
+            "result": {
+                "list": [self.place_order(**order) for order in orders],
+            },
+        }
+
+
 class GridEngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_grid_uses_batch_orders_when_supported(self):
+        client = BatchFakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertGreater(len(client.batch_calls), 0)
+        self.assertTrue(
+            all(order.get("order_type") == "Limit" for batch in client.batch_calls for order in batch)
+        )
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            len(engine.active_orders),
+        )
+
+    async def test_fast_poll_window_wakes_loop_after_order_activity(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._wake_event = asyncio.Event()
+
+        self.assertEqual(engine._poll_interval(), 3.0)
+        engine._mark_fast_poll()
+
+        self.assertLess(engine._poll_interval(), 1.0)
+        self.assertTrue(engine._wake_event.is_set())
+
+    async def test_waiting_initial_order_uses_fast_poll(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine.waiting_initial_order = True
+
+        self.assertLess(engine._poll_interval(), 1.0)
+
+    async def test_user_stream_events_only_wake_relevant_symbol(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        self.assertTrue(
+            engine._is_relevant_user_stream_event({"e": "ORDER_TRADE_UPDATE", "o": {"s": "TESTUSDT"}})
+        )
+        self.assertFalse(
+            engine._is_relevant_user_stream_event({"e": "ORDER_TRADE_UPDATE", "o": {"s": "OTHERUSDT"}})
+        )
+        self.assertFalse(engine._is_relevant_user_stream_event({"e": "ACCOUNT_UPDATE", "a": {}}))
+
     async def test_short_grid_deploys_market_short_buys_below_and_sells_above(self):
         client = FakeClient("100")
         engine = GridEngine(
