@@ -16,6 +16,7 @@ FAST_POLL_SECONDS = 0.3
 FAST_POLL_WINDOW_SECONDS = 15.0
 USER_STREAM_KEEPALIVE_SECONDS = 30 * 60
 BATCH_ORDER_CHUNK_SIZE = 5
+POSITION_SYNC_GRACE_SECONDS = 2.0
 
 
 class GridEngine:
@@ -61,6 +62,8 @@ class GridEngine:
         self._fast_poll_until = 0.0
         self._user_stream_task: Optional[asyncio.Task] = None
         self._user_stream_listen_key = ""
+        self._position_mismatch_seen_at = 0.0
+        self._position_mismatch_signature: tuple[float, float, int] | None = None
 
     def _persist_state(self):
         if self.state_callback:
@@ -644,43 +647,90 @@ class GridEngine:
         available = self._available_reduce_qty(side)
         return min(qty, available)
 
-    def _halt_if_reduce_overcommitted(self) -> bool:
+    def _sort_reduce_orders_for_trim(self, reduce_side: str) -> list[tuple[str, dict]]:
+        orders = [
+            (link_id, order)
+            for link_id, order in self.active_orders.items()
+            if order.get("side") == reduce_side and order.get("reduce_only")
+        ]
+        reverse = reduce_side == "Buy"
+        return sorted(
+            orders,
+            key=lambda item: float(item[1].get("price", 0) or 0),
+            reverse=reverse,
+        )
+
+    def _trim_reduce_overcommit(self) -> bool:
         reduce_side = self._reduce_side()
         if not reduce_side:
             return False
 
         grid_qty = self._grid_position_qty()
-        excess = self._active_reduce_qty(reduce_side) - grid_qty
+        active_reduce_qty = self._active_reduce_qty(reduce_side)
+        excess = active_reduce_qty - grid_qty
         if excess < self.min_qty:
             return False
 
-        self.trigger_message = (
-            f"Reduce-only protection halted grid: open reduce orders exceed grid position "
-            f"by {excess:g} {self.config.get('symbol', '')}."
-        )
-        logger.error(
-            "Reduce-only overcommitted symbol=%s reduce_side=%s active_reduce_qty=%s grid_qty=%s excess=%s",
+        logger.warning(
+            "Reduce-only overcommitted; trimming excess symbol=%s reduce_side=%s active_reduce_qty=%s grid_qty=%s excess=%s",
             self.config.get("symbol"),
             reduce_side,
-            self._active_reduce_qty(reduce_side),
+            active_reduce_qty,
             grid_qty,
             excess,
         )
-        try:
-            result = self.client.cancel_all_orders(self.config["symbol"])
-            if result.get("retCode") != 0:
-                raise RuntimeError(result.get("retMsg", "Failed to cancel orders after reduce overcommit"))
-        except Exception as exc:
-            logger.warning(
-                "Failed to cancel orders after reduce overcommit symbol=%s msg=%s",
-                self.config.get("symbol"),
-                exc,
+
+        remaining_excess = Decimal(str(excess))
+        changed = False
+        for link_id, order in self._sort_reduce_orders_for_trim(reduce_side):
+            if remaining_excess < Decimal(str(self.min_qty)):
+                break
+
+            order_qty = Decimal(str(order.get("qty", 0) or 0))
+            order_id = str(order.get("order_id", "") or "")
+            try:
+                result = {"retCode": 0}
+                if order_id:
+                    result = self.client.cancel_order(self.config["symbol"], order_id)
+                if result.get("retCode") != 0:
+                    raise RuntimeError(result.get("retMsg", "Failed to cancel excess reduce order"))
+                self.active_orders.pop(link_id, None)
+                remaining_excess -= order_qty
+                changed = True
+                logger.warning(
+                    "Cancelled excess reduce-only order symbol=%s order_id=%s link_id=%s qty=%s",
+                    self.config.get("symbol"),
+                    order_id,
+                    link_id,
+                    order.get("qty"),
+                )
+            except Exception as exc:
+                status = self._get_order_status(order)
+                if self._is_cancelled_status(status):
+                    self.active_orders.pop(link_id, None)
+                    remaining_excess -= order_qty
+                    changed = True
+                    continue
+                logger.warning(
+                    "Failed to cancel excess reduce-only order symbol=%s order_id=%s link_id=%s status=%s msg=%s",
+                    self.config.get("symbol"),
+                    order_id,
+                    link_id,
+                    status,
+                    exc,
+                )
+                self._mark_fast_poll()
+                break
+
+        if changed:
+            self.trigger_message = (
+                f"Trimmed excess reduce-only protection: {reduce_side} {float(excess):g}"
             )
-        self.active_orders.clear()
-        self.grid_ready = False
-        self.running = False
-        self._stopping = True
-        self._persist_state()
+            self._persist_state()
+            if self._active_reduce_qty(reduce_side) - self._grid_position_qty() < self.min_qty:
+                return False
+        else:
+            self._mark_fast_poll()
         return True
 
     def _halt_if_baseline_breached(self) -> bool:
@@ -1068,7 +1118,26 @@ class GridEngine:
         actual_grid_qty = self._actual_grid_position_net_qty()
         local_grid_qty = self._grid_position_net_qty()
         if abs(actual_grid_qty - local_grid_qty) < self.min_qty:
+            self._position_mismatch_seen_at = 0.0
+            self._position_mismatch_signature = None
             return
+
+        if self._active_reduce_qty(self._reduce_side()) >= self.min_qty:
+            signature = (round(local_grid_qty, 8), round(actual_grid_qty, 8), len(self.active_orders))
+            now = time.time()
+            if self._position_mismatch_signature != signature:
+                self._position_mismatch_signature = signature
+                self._position_mismatch_seen_at = now
+            if now - self._position_mismatch_seen_at < POSITION_SYNC_GRACE_SECONDS:
+                logger.info(
+                    "Delaying grid position sync until order ledger catches up symbol=%s local=%s actual=%s active_orders=%s",
+                    self.config.get("symbol"),
+                    local_grid_qty,
+                    actual_grid_qty,
+                    len(self.active_orders),
+                )
+                self._mark_fast_poll(POSITION_SYNC_GRACE_SECONDS)
+                return
 
         logger.warning(
             "Grid position ledger reconciled with exchange symbol=%s local=%s actual=%s baseline=%s",
@@ -1078,6 +1147,8 @@ class GridEngine:
             self._baseline_position_net_qty(),
         )
         self.grid_position_net_qty = actual_grid_qty
+        self._position_mismatch_seen_at = 0.0
+        self._position_mismatch_signature = None
         self._persist_state()
 
     def _reconcile_grid_position_protection(self):
@@ -1087,7 +1158,7 @@ class GridEngine:
         self._sync_grid_position_with_exchange()
         if self._stopping:
             return
-        if self._halt_if_reduce_overcommitted():
+        if self._trim_reduce_overcommit():
             return
 
         grid_qty = self._grid_position_qty()

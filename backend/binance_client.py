@@ -196,8 +196,9 @@ class BinanceFuturesClient:
         return {"retCode": 0, "result": {"orderId": str(result.get("orderId", ""))}}
 
     def place_orders(self, orders: list[dict[str, Any]]) -> dict:
-        batch_orders = [
-            self._build_order_params(
+        batch_orders = []
+        for order in orders:
+            params = self._build_order_params(
                 symbol=str(order["symbol"]),
                 side=str(order["side"]),
                 qty=str(order["qty"]),
@@ -207,8 +208,8 @@ class BinanceFuturesClient:
                 order_link_id=str(order.get("order_link_id") or ""),
                 time_in_force=order.get("time_in_force"),
             )
-            for order in orders
-        ]
+            params["reduceOnly"] = "true" if bool(order.get("reduce_only", False)) else "false"
+            batch_orders.append(params)
         payload = json.dumps(batch_orders, separators=(",", ":"))
         results = self._request(
             "POST",

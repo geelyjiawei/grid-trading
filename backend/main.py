@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -468,6 +469,12 @@ def _restore_saved_engines():
                 and not engine._stopping
                 and (engine.grid_ready or engine.waiting_trigger or engine.waiting_initial_order)
             )
+            if can_restart:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    logger.warning("Saved grid restored without running event loop symbol=%s", config["symbol"])
+                    can_restart = False
             if can_restart:
                 engine.start()
             else:

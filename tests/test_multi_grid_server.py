@@ -175,7 +175,7 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["per_grid_close_fee"], 0.02)
         self.assertAlmostEqual(data["per_grid_fee"], 0.07)
 
-    def test_restore_does_not_restart_grid_after_safety_halt(self):
+    def test_restore_trims_reduce_overcommit_without_event_loop_restart(self):
         main._client = FakeClient("15.95")
         main._client.positions = [{"side": "Buy", "size": "200", "avgPrice": "16.18"}]
         placed = main._client.place_order(
@@ -239,7 +239,7 @@ class MultiGridServerTests(unittest.TestCase):
         engine = main._engines["NOKUSDT"]
         saved = main._load_grid_state_file()["grids"]["NOKUSDT"]
         self.assertFalse(engine.running)
-        self.assertFalse(engine.grid_ready)
+        self.assertTrue(engine.grid_ready)
         self.assertFalse(saved["running"])
         self.assertEqual(main._client.get_open_orders("NOKUSDT")["result"]["list"], [])
 

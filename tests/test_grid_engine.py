@@ -691,7 +691,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(placed)
         self.assertEqual(len(client.orders), before_order_count)
 
-    async def test_reduce_overcommit_halts_grid_instead_of_trimming_and_continuing(self):
+    async def test_reduce_overcommit_trims_excess_without_stopping(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "1", "avgPrice": "100"}]
         engine = GridEngine(
@@ -734,10 +734,59 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         engine._reconcile_grid_position_protection()
 
-        self.assertFalse(engine.running)
-        self.assertFalse(engine.grid_ready)
-        self.assertEqual(engine.active_orders, {})
-        self.assertIn("Reduce-only protection halted grid", engine.trigger_message)
+        self.assertTrue(engine.running)
+        self.assertTrue(engine.grid_ready)
+        self.assertLessEqual(engine._active_reduce_qty("Buy"), 1.0)
+        self.assertEqual(client.cancelled_orders, ["1"])
+        self.assertIn("Repaired missing reduce-only protection", engine.trigger_message)
+
+    async def test_position_sync_waits_for_order_ledger_before_overcommit_check(self):
+        client = FakeClient("100")
+        client.positions = [{"side": "Sell", "size": "75", "avgPrice": "100"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = -80.0
+        engine.initial_entry_price = 100
+        engine.active_orders = {
+            "g_1_B_existing": {
+                "link_id": "g_1_B_existing",
+                "order_id": "1",
+                "level_idx": 1,
+                "side": "Buy",
+                "price": "95.0",
+                "qty": "80.0",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 100,
+            }
+        }
+        engine.running = True
+        engine.grid_ready = True
+
+        engine._reconcile_grid_position_protection()
+
+        self.assertTrue(engine.running)
+        self.assertTrue(engine.grid_ready)
+        self.assertEqual(engine.grid_position_net_qty, -80.0)
+        self.assertEqual(client.cancelled_orders, [])
 
     async def test_baseline_breach_halts_before_old_position_is_reduced_further(self):
         client = FakeClient("100")
