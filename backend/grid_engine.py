@@ -1281,12 +1281,25 @@ class GridEngine:
         self._persist_state()
 
     def _initial_limit_price(self, side: str, current_price: float) -> float:
+        tick = float(self.tick_size)
+        maker_safe_price = current_price - tick if side == "Buy" else current_price + tick
         configured_price = self.config.get("initial_order_price")
         if configured_price is not None:
-            return float(configured_price)
+            configured_price = float(configured_price)
+            if side == "Buy" and configured_price < current_price:
+                return configured_price
+            if side == "Sell" and configured_price > current_price:
+                return configured_price
+            logger.warning(
+                "Initial post-only price would cross market symbol=%s side=%s configured=%s current=%s; using maker-safe price=%s",
+                self.config.get("symbol"),
+                side,
+                configured_price,
+                current_price,
+                maker_safe_price,
+            )
 
-        tick = float(self.tick_size)
-        return current_price - tick if side == "Buy" else current_price + tick
+        return maker_safe_price
 
     def _place(
         self,
@@ -1952,6 +1965,41 @@ class GridEngine:
                 )
         self._persist_state()
 
+    def _replace_unfilled_opening_order(self, status: str):
+        order = self.opening_order or {}
+        side = order.get("side") or self.initial_side
+        qty = float(order.get("qty") or self.initial_qty or 0)
+        if not side or qty < self.min_qty:
+            self.waiting_initial_order = False
+            self.opening_order = None
+            self.running = False
+            self.trigger_message = "Opening order closed without fills and retry quantity is too small."
+            self._persist_state()
+            return
+
+        current_price = self._get_current_price()
+        self.current_price = current_price
+        if not self._in_grid_range(current_price):
+            self.waiting_initial_order = False
+            self.opening_order = None
+            self.running = False
+            self.trigger_message = (
+                "Opening order closed without fills and price is outside grid range; "
+                "please review before restarting."
+            )
+            self._persist_state()
+            return
+
+        self.waiting_initial_order = False
+        self.opening_order = None
+        retry_price = self._initial_limit_price(side, current_price)
+        self._place_limit_open(side, qty, retry_price)
+        self.trigger_message = (
+            f"Post-only opening order ended as {status} without fills; "
+            f"replaced at {self.opening_order['price']}."
+        )
+        self._persist_state()
+
     async def _check_initial_order(self):
         if not self.opening_order:
             return
@@ -1967,6 +2015,8 @@ class GridEngine:
 
         fallback_price = float(self.opening_order["price"])
         planned_qty = float(self.opening_order["qty"])
+        snapshot = self._get_order_snapshot(self.opening_order)
+        status = self._order_status_from_snapshot(snapshot)
         stats = self._get_trade_stats(
             order_id,
             fallback_price,
@@ -1975,10 +2025,31 @@ class GridEngine:
             liquidity_hint="maker",
         )
         if not stats or stats["qty"] <= 0:
-            self.waiting_initial_order = False
-            self.opening_order = None
-            self.running = False
-            self.trigger_message = "Post-only opening order closed without fills; please restart the grid."
+            stats = self._execution_stats_from_order_snapshot(
+                snapshot,
+                fallback_price,
+                planned_qty,
+                liquidity_hint="maker",
+            )
+        if not stats or stats["qty"] <= 0:
+            if status == "UNKNOWN":
+                logger.info(
+                    "Opening order absent from open orders but status is unknown; waiting symbol=%s order_id=%s",
+                    self.config.get("symbol"),
+                    order_id,
+                )
+                self._mark_fast_poll()
+                return
+            if self._is_cancelled_status(status) or self._is_filled_status(status):
+                self._replace_unfilled_opening_order(status)
+                return
+            logger.info(
+                "Opening order absent from open orders but not terminal symbol=%s order_id=%s status=%s",
+                self.config.get("symbol"),
+                order_id,
+                status,
+            )
+            self._mark_fast_poll()
             return
 
         qty_scale = stats["qty"] / planned_qty if planned_qty > 0 else 0
@@ -2078,30 +2149,57 @@ class GridEngine:
             return "taker"
         return "maker" if order.get("time_in_force") == "PostOnly" else "taker"
 
-    def _get_order_status(self, order: dict) -> str:
-        if not hasattr(self.client, "get_order"):
+    @staticmethod
+    def _float_field(item: dict, *keys: str) -> float:
+        for key in keys:
+            value = item.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    @staticmethod
+    def _order_status_from_snapshot(snapshot: dict | None) -> str:
+        if not snapshot:
             return "UNKNOWN"
+        status = snapshot.get("orderStatus") or snapshot.get("status")
+        return str(status or "UNKNOWN").upper()
+
+    def _get_order_status(self, order: dict) -> str:
+        return self._order_status_from_snapshot(self._get_order_snapshot(order))
+
+    def _get_order_snapshot(self, order: dict) -> dict:
+        if not hasattr(self.client, "get_order"):
+            return self._get_order_from_history(order)
         try:
             resp = self.client.get_order(self.config["symbol"], str(order.get("order_id", "")))
         except Exception as exc:
             logger.warning("Fetch order status failed order_id=%s msg=%s", order.get("order_id"), exc)
-            return self._get_order_status_from_history(order)
+            return self._get_order_from_history(order)
         if resp.get("retCode") != 0:
             logger.warning(
                 "Fetch order status rejected order_id=%s msg=%s",
                 order.get("order_id"),
                 resp.get("retMsg"),
             )
-            return self._get_order_status_from_history(order)
-        status = resp.get("result", {}).get("orderStatus") or resp.get("result", {}).get("status")
-        normalized = str(status or "UNKNOWN").upper()
-        if normalized == "UNKNOWN":
-            return self._get_order_status_from_history(order)
-        return normalized
+            return self._get_order_from_history(order)
+
+        snapshot = resp.get("result", {}) or {}
+        if self._order_status_from_snapshot(snapshot) == "UNKNOWN":
+            history_snapshot = self._get_order_from_history(order)
+            if history_snapshot:
+                return history_snapshot
+        return snapshot
 
     def _get_order_status_from_history(self, order: dict) -> str:
+        return self._order_status_from_snapshot(self._get_order_from_history(order))
+
+    def _get_order_from_history(self, order: dict) -> dict:
         if not hasattr(self.client, "get_order_history"):
-            return "UNKNOWN"
+            return {}
 
         order_id = str(order.get("order_id", "") or "")
         link_id = str(order.get("link_id", "") or "")
@@ -2109,23 +2207,59 @@ class GridEngine:
             resp = self.client.get_order_history(self.config["symbol"], limit=1000)
         except Exception as exc:
             logger.warning("Fetch order history failed order_id=%s msg=%s", order_id, exc)
-            return "UNKNOWN"
+            return {}
         if resp.get("retCode") != 0:
             logger.warning(
                 "Fetch order history rejected order_id=%s msg=%s",
                 order_id,
                 resp.get("retMsg"),
             )
-            return "UNKNOWN"
+            return {}
 
         for item in resp.get("result", {}).get("list", []):
             if order_id and str(item.get("orderId", "") or "") == order_id:
-                status = item.get("orderStatus") or item.get("status")
-                return str(status or "UNKNOWN").upper()
+                return item
             if link_id and str(item.get("orderLinkId", "") or item.get("order_link_id", "") or "") == link_id:
-                status = item.get("orderStatus") or item.get("status")
-                return str(status or "UNKNOWN").upper()
-        return "UNKNOWN"
+                return item
+        return {}
+
+    def _execution_stats_from_order_snapshot(
+        self,
+        snapshot: dict,
+        fallback_price: float,
+        fallback_qty: float,
+        *,
+        liquidity_hint: str,
+    ) -> dict | None:
+        if not snapshot:
+            return None
+
+        status = self._order_status_from_snapshot(snapshot)
+        qty = self._float_field(snapshot, "executedQty", "cumExecQty", "cumQty", "cum_exec_qty")
+        if qty <= 0 and self._is_filled_status(status):
+            qty = fallback_qty
+        if qty <= 0:
+            return None
+
+        volume = self._float_field(snapshot, "cumQuote", "cumExecValue", "cum_exec_value", "volume")
+        price = self._float_field(snapshot, "avgPrice", "avg_price", "averagePrice")
+        if price <= 0 and volume > 0:
+            price = volume / qty
+        if price <= 0:
+            price = fallback_price
+        if volume <= 0:
+            volume = price * qty
+
+        return {
+            "price": price,
+            "qty": qty,
+            "volume": volume,
+            "fee": self._estimate_fee(volume, liquidity_hint),
+            "fee_asset": "USDT estimated",
+            "fee_source": "estimated",
+            "maker_count": 1 if liquidity_hint == "maker" else 0,
+            "taker_count": 1 if liquidity_hint != "maker" else 0,
+        }
 
     @staticmethod
     def _is_filled_status(status: str) -> bool:

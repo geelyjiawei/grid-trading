@@ -1623,7 +1623,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             add_sells,
         )
 
-    async def test_post_only_initial_order_without_fill_stops_safely(self):
+    async def test_post_only_initial_order_without_fill_replaces_safely(self):
         client = FakeClient("100")
         engine = GridEngine(
             client,
@@ -1646,12 +1646,82 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         client.get_order_trades = lambda symbol, order_id: {"retCode": 0, "result": {"list": []}}
 
         await engine.initialize()
+        engine.running = True
+        opening_order = engine.opening_order
+        original = next(order for order in client.orders if order["orderId"] == opening_order["order_id"])
+        original["orderStatus"] = "CANCELED"
         client.open_limit_order_ids.clear()
         await engine._check_initial_order()
 
-        self.assertFalse(engine.running)
+        self.assertTrue(engine.running)
+        self.assertTrue(engine.waiting_initial_order)
         self.assertFalse(engine.grid_ready)
-        self.assertIn("without fills", engine.trigger_message)
+        self.assertEqual(len(client.orders), 2)
+        self.assertNotEqual(engine.opening_order["order_id"], opening_order["order_id"])
+        self.assertIn("replaced", engine.trigger_message)
+
+    async def test_post_only_initial_order_filled_status_deploys_when_trades_lag(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "maker_fee_rate": 0.0002,
+                "initial_order_type": "post_only",
+                "initial_order_price": 101,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        client.get_order_trades = lambda symbol, order_id: {"retCode": 0, "result": {"list": []}}
+
+        await engine.initialize()
+        engine.running = True
+        opening_order = engine.opening_order
+        client.open_limit_order_ids.discard(opening_order["order_id"])
+
+        await engine._check_initial_order()
+
+        self.assertTrue(engine.running)
+        self.assertFalse(engine.waiting_initial_order)
+        self.assertTrue(engine.grid_ready)
+        self.assertEqual(engine.opening_order, None)
+        self.assertAlmostEqual(engine.initial_entry_price, 101.0)
+        self.assertGreater(len(engine.active_orders), 0)
+
+    async def test_post_only_initial_price_uses_maker_safe_price_when_config_would_take(self):
+        client = FakeClient("100", tick_size="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "initial_order_type": "post_only",
+                "initial_order_price": 99,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertEqual(client.orders[-1]["price"], "100.1")
 
     async def test_exchange_trade_fee_details_override_estimated_fee(self):
         client = FakeClient("100")

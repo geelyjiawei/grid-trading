@@ -345,8 +345,12 @@ class BinanceFuturesClient:
             "side": self._from_binance_side(str(item.get("side", ""))),
             "price": item.get("price", "0"),
             "qty": item.get("origQty", item.get("executedQty", "0")),
+            "avgPrice": item.get("avgPrice", "0"),
+            "executedQty": item.get("executedQty", "0"),
+            "cumQuote": item.get("cumQuote", "0"),
             "orderStatus": item.get("status", ""),
             "reduceOnly": item.get("reduceOnly", False),
+            "timeInForce": item.get("timeInForce", ""),
             "createdTime": str(item.get("time", "")),
         }
 
