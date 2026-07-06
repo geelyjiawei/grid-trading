@@ -361,6 +361,153 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.active_orders, {})
         self.assertIn("Reduce protection risk", engine.trigger_message)
 
+    async def test_reduce_protection_risk_queues_add_counter_orders(self):
+        client = FakeClient("100", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine.grid_levels = engine._calculate_levels()
+        engine.grid_position_net_qty = -2.0
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "1": {"qty": 1.0, "entry_value": 100.0},
+            "2": {"qty": 1.0, "entry_value": 100.0},
+        }
+        engine.active_orders = {
+            "wrong": {
+                "link_id": "wrong",
+                "order_id": "wrong",
+                "level_idx": 2,
+                "side": "Buy",
+                "price": "100",
+                "qty": "2",
+                "reduce_only": True,
+                "processed_fill_qty": 0,
+                "processed_fill_volume": 0,
+                "processed_fill_fee": 0,
+            }
+        }
+
+        reduce_fill = {
+            "link_id": "filled",
+            "order_id": "filled",
+            "level_idx": 1,
+            "side": "Buy",
+            "price": "95",
+            "qty": "1",
+            "reduce_only": True,
+            "processed_fill_qty": 0,
+            "processed_fill_volume": 0,
+            "processed_fill_fee": 0,
+        }
+        engine._record_execution_delta(
+            reduce_fill,
+            {
+                "price": 95,
+                "qty": 1,
+                "volume": 95,
+                "fee": 0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+            },
+        )
+
+        self.assertEqual(len(engine.paused_replacements), 1)
+        self.assertFalse(any(order.get("side") == "Sell" and not order.get("reduce_only") for order in client.orders))
+        self.assertIn("queued non-reducing counter order", engine.trigger_message)
+
+    async def test_reduce_protection_risk_still_places_reduce_counter_orders(self):
+        client = FakeClient("100", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine.grid_levels = engine._calculate_levels()
+        engine.grid_position_net_qty = -2.0
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "1": {"qty": 1.0, "entry_value": 100.0},
+            "2": {"qty": 1.0, "entry_value": 100.0},
+        }
+        engine.active_orders = {
+            "wrong": {
+                "link_id": "wrong",
+                "order_id": "wrong",
+                "level_idx": 2,
+                "side": "Buy",
+                "price": "100",
+                "qty": "2",
+                "reduce_only": True,
+                "processed_fill_qty": 0,
+                "processed_fill_volume": 0,
+                "processed_fill_fee": 0,
+            }
+        }
+
+        add_fill = {
+            "link_id": "filled",
+            "order_id": "filled",
+            "level_idx": 1,
+            "side": "Sell",
+            "price": "100",
+            "qty": "1",
+            "reduce_only": False,
+            "processed_fill_qty": 0,
+            "processed_fill_volume": 0,
+            "processed_fill_fee": 0,
+        }
+        engine._record_execution_delta(
+            add_fill,
+            {
+                "price": 100,
+                "qty": 1,
+                "volume": 100,
+                "fee": 0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+            },
+        )
+
+        reduce_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order.get("side") == "Buy" and order.get("reduce_only") and order.get("level_idx") == 1
+        ]
+        self.assertEqual(len(reduce_orders), 1)
+        self.assertEqual(float(reduce_orders[0]["qty"]), 1.0)
+        self.assertEqual(engine.paused_replacements, [])
+
     async def test_fixed_grid_qty_limit_open_uses_limit_price_for_initial_qty(self):
         client = FakeClient("1012", tick_size="0.1", qty_step="0.1", min_qty="0.1")
         engine = GridEngine(
@@ -3036,8 +3183,10 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await engine.initialize()
-        filled_buy = next(
-            order for order in engine.active_orders.values() if order["side"] == "Buy" and order["reduce_only"]
+        filled_link, filled_buy = next(
+            (link_id, order)
+            for link_id, order in engine.active_orders.items()
+            if order["side"] == "Buy" and order["reduce_only"]
         )
         before_open_sells = [
             order for order in client.orders if order.get("side") == "Sell" and not order.get("reduce_only")
@@ -3053,6 +3202,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(after_open_sells), len(before_open_sells))
         self.assertEqual(engine.get_status()["paused_replacements_count"], 1)
 
+        # Production reconciliation removes the terminal order before paused replacements resume.
+        engine.active_orders.pop(filled_link, None)
         engine.current_price = 100
         engine._resume_paused_replacements()
         resumed_open_sells = [
