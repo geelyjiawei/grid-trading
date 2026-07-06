@@ -116,6 +116,7 @@
               <label for="initial-order-type">开仓方式</label>
               <select id="initial-order-type" class="form-input">
                 <option value="market">市价开仓（立即成交）</option>
+                <option value="limit">限价开仓（GTC）</option>
                 <option value="post_only">Post Only 限价开仓（省手续费）</option>
               </select>
             </div>
@@ -143,6 +144,20 @@
 
           <div class="form-row">
             <div class="form-group">
+              <label for="position-sizing-mode">开仓数量模式</label>
+              <select id="position-sizing-mode" class="form-input">
+                <option value="investment">按投入金额 × 杠杆</option>
+                <option value="fixed_grid_qty">按每格固定数量</option>
+              </select>
+            </div>
+            <div id="grid-order-qty-group" class="form-group hidden">
+              <label for="grid-order-qty">每格开仓数量</label>
+              <input id="grid-order-qty" class="form-input" type="number" min="0" step="any" placeholder="例如 4" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div id="total-investment-group" class="form-group">
               <label for="total-investment">总投入金额（USDT）</label>
               <input id="total-investment" class="form-input" type="number" value="500" min="0" step="any" />
             </div>
@@ -409,6 +424,7 @@
                 <th>交易对</th>
                 <th>方向</th>
                 <th>模式</th>
+                <th>开仓明细</th>
                 <th>状态</th>
                 <th>净利润</th>
                 <th>手续费</th>
@@ -418,7 +434,7 @@
             </thead>
             <tbody id="history-body">
               <tr>
-                <td class="empty-state" colspan="9">暂无历史</td>
+                <td class="empty-state" colspan="10">暂无历史</td>
               </tr>
             </tbody>
           </table>

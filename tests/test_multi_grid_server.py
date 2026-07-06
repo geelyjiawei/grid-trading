@@ -207,6 +207,60 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["qty_per_grid_min"], 0.22)
         self.assertAlmostEqual(data["qty_per_grid_max"], 0.23)
 
+    def test_grid_preview_supports_fixed_grid_order_qty(self):
+        main._client = FakeClient("100", tick_size="0.1", qty_step="0.01", min_qty="0.01")
+        payload = {
+            "symbol": "MUUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 103,
+            "lower_price": 99,
+            "grid_count": 40,
+            "total_investment": 0,
+            "leverage": 5,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 4,
+            "fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "taker_fee_rate": 0.0005,
+            "initial_order_type": "limit",
+            "initial_order_price": 101,
+            "trigger_price": None,
+            "stop_loss_price": None,
+            "take_profit_price": None,
+        }
+
+        response = self.client.post("/api/grid/preview", json=payload)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["position_sizing_mode"], "fixed_grid_qty")
+        self.assertEqual(data["active_grid_count"], 20)
+        self.assertAlmostEqual(data["total_qty"], 80.0)
+        self.assertAlmostEqual(data["qty_per_grid_min"], 4.0)
+        self.assertAlmostEqual(data["qty_per_grid_max"], 4.0)
+
+    def test_grid_history_includes_opening_details(self):
+        payload = self._payload("BILLUSDT")
+        payload.update(
+            {
+                "initial_order_type": "limit",
+                "initial_order_price": 101,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "total_investment": 0,
+            }
+        )
+
+        start = self.client.post("/api/grid/start", json=payload)
+        history = self.client.get("/api/grid/history").json()
+
+        self.assertEqual(start.status_code, 200)
+        self.assertEqual(history["runs"][0]["initial_order_type"], "limit")
+        self.assertEqual(history["runs"][0]["initial_order_price"], 101)
+        self.assertEqual(history["runs"][0]["position_sizing_mode"], "fixed_grid_qty")
+        self.assertEqual(history["runs"][0]["grid_order_qty"], 1)
+
     def test_restore_trims_reduce_overcommit_without_event_loop_restart(self):
         main._client = FakeClient("15.95")
         main._client.positions = [{"side": "Buy", "size": "200", "avgPrice": "16.18"}]

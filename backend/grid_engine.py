@@ -430,6 +430,9 @@ class GridEngine:
         leverage = float(self.config["leverage"])
         return (total_investment * leverage) / reference_price
 
+    def _position_sizing_mode(self) -> str:
+        return str(self.config.get("position_sizing_mode") or "investment").lower().strip()
+
     def _fee_rate(self) -> float:
         return max(0.0, float(self.config.get("fee_rate", 0.0005) or 0))
 
@@ -1686,7 +1689,7 @@ class GridEngine:
         self._mark_fast_poll()
         self._persist_state()
 
-    def _place_limit_open(self, side: str, qty: float, price: float):
+    def _place_limit_open(self, side: str, qty: float, price: float, *, post_only: bool = True):
         qty_text = self._fq(qty)
         price_text = self._fp(price)
         link_id = f"open_{side[0]}_{uuid.uuid4().hex[:6]}"
@@ -1698,22 +1701,26 @@ class GridEngine:
             order_type="Limit",
             reduce_only=False,
             order_link_id=link_id,
-            time_in_force="PostOnly",
+            time_in_force="PostOnly" if post_only else None,
         )
         if result.get("retCode") != 0:
-            raise RuntimeError(result.get("retMsg", "Failed to place initial post-only order"))
+            raise RuntimeError(result.get("retMsg", "Failed to place initial limit order"))
 
         self.initial_side = side
         self.initial_qty = float(qty_text)
         self.initial_entry_price = 0.0
         self.waiting_initial_order = True
-        self.trigger_message = f"Waiting for post-only opening order at {price_text}"
+        order_label = "post-only" if post_only else "limit"
+        self.trigger_message = f"Waiting for {order_label} opening order at {price_text}"
         self.opening_order = {
             "link_id": link_id,
             "order_id": result["result"]["orderId"],
             "side": side,
             "price": price_text,
             "qty": qty_text,
+            "order_type": "Limit",
+            "time_in_force": "PostOnly" if post_only else "GTC",
+            "reduce_only": False,
         }
         self._mark_fast_poll()
         self._persist_state()
@@ -2038,11 +2045,13 @@ class GridEngine:
         total_qty = self._prepare_pending_targets(current_price)
 
         if direction in {"long", "short"}:
-            if self.config.get("initial_order_type", "market") == "post_only":
+            initial_order_type = str(self.config.get("initial_order_type", "market")).lower().strip()
+            if initial_order_type in {"post_only", "limit"}:
                 self._place_limit_open(
                     open_side,
                     total_qty,
                     self._initial_limit_price(open_side, current_price),
+                    post_only=initial_order_type == "post_only",
                 )
                 return
             self._place_market_open(open_side, total_qty)
@@ -2101,13 +2110,27 @@ class GridEngine:
         if target_count <= 0:
             raise RuntimeError("No valid grid targets were found around current price")
 
-        raw_total_qty = float(total_qty_override) if total_qty_override is not None else self._calc_total_qty(reference_price)
-        total_steps = self._qty_to_steps(raw_total_qty)
+        sizing_mode = self._position_sizing_mode()
+        if total_qty_override is not None:
+            raw_total_qty = float(total_qty_override)
+            total_steps = self._qty_to_steps(raw_total_qty)
+            allocated_qtys = self._allocate_qtys(raw_total_qty, target_count)
+        elif sizing_mode == "fixed_grid_qty":
+            per_grid_qty = float(self.config.get("grid_order_qty") or 0)
+            per_grid_steps = self._qty_to_steps(per_grid_qty)
+            if per_grid_steps <= 0:
+                raise RuntimeError("grid_order_qty is too small for this symbol")
+            allocated_qtys = [self._steps_to_qty(per_grid_steps) for _ in range(target_count)]
+            total_steps = per_grid_steps * target_count
+            raw_total_qty = self._steps_to_qty(total_steps)
+        else:
+            raw_total_qty = self._calc_total_qty(reference_price)
+            total_steps = self._qty_to_steps(raw_total_qty)
+            allocated_qtys = self._allocate_qtys(raw_total_qty, target_count)
         if total_steps < target_count:
             raise RuntimeError("Total investment is too small for this symbol and grid count")
 
         total_qty = self._steps_to_qty(total_steps)
-        allocated_qtys = self._allocate_qtys(raw_total_qty, target_count)
         qty_per_grid = total_qty / target_count
         fallback_steps = self._qty_to_steps(qty_per_grid)
         fallback_qty = self._steps_to_qty(max(1, fallback_steps))
@@ -2422,9 +2445,11 @@ class GridEngine:
         self.waiting_initial_order = False
         self.opening_order = None
         retry_price = self._initial_limit_price(side, current_price)
-        self._place_limit_open(side, qty, retry_price)
+        post_only = str(order.get("time_in_force") or "") == "PostOnly"
+        self._place_limit_open(side, qty, retry_price, post_only=post_only)
+        order_label = "Post-only" if post_only else "Limit"
         self.trigger_message = (
-            f"Post-only opening order ended as {status} without fills; "
+            f"{order_label} opening order ended as {status} without fills; "
             f"replaced at {self.opening_order['price']}."
         )
         self._persist_state()
@@ -2446,19 +2471,20 @@ class GridEngine:
         planned_qty = float(self.opening_order["qty"])
         snapshot = self._get_order_snapshot(self.opening_order)
         status = self._order_status_from_snapshot(snapshot)
+        liquidity_hint = self._order_liquidity_hint(self.opening_order)
         stats = self._get_trade_stats(
             order_id,
             fallback_price,
             planned_qty,
             allow_estimate=False,
-            liquidity_hint="maker",
+            liquidity_hint=liquidity_hint,
         )
         if not stats or stats["qty"] <= 0:
             stats = self._execution_stats_from_order_snapshot(
                 snapshot,
                 fallback_price,
                 planned_qty,
-                liquidity_hint="maker",
+                liquidity_hint=liquidity_hint,
             )
         if not stats or stats["qty"] <= 0:
             if status == "UNKNOWN":

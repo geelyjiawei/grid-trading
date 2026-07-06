@@ -93,10 +93,26 @@ function bindEvents() {
     updatePreview();
   });
 
-  ["upper-price", "lower-price", "grid-count", "total-investment", "maker-fee-rate", "taker-fee-rate", "grid-mode", "initial-order-type"].forEach((id) => {
+  [
+    "upper-price",
+    "lower-price",
+    "grid-count",
+    "total-investment",
+    "grid-order-qty",
+    "maker-fee-rate",
+    "taker-fee-rate",
+    "grid-mode",
+    "initial-order-type",
+    "initial-order-price",
+    "trigger-price",
+    "stop-loss-price",
+    "take-profit-price",
+  ].forEach((id) => {
     document.getElementById(id).addEventListener("input", updatePreview);
     document.getElementById(id).addEventListener("change", updatePreview);
   });
+  document.getElementById("position-sizing-mode").addEventListener("change", updateSizingModeVisibility);
+  updateSizingModeVisibility(false);
 
   document.getElementById("symbol-input").addEventListener("change", async () => {
     await fetchPrice();
@@ -108,6 +124,13 @@ function bindEvents() {
   });
 
   document.getElementById("cfg-exchange").addEventListener("change", renderConfigDraftHint);
+}
+
+function updateSizingModeVisibility(shouldPreview = true) {
+  const mode = document.getElementById("position-sizing-mode").value;
+  document.getElementById("total-investment-group").classList.toggle("hidden", mode === "fixed_grid_qty");
+  document.getElementById("grid-order-qty-group").classList.toggle("hidden", mode !== "fixed_grid_qty");
+  if (shouldPreview) updatePreview();
 }
 
 async function loadConfig() {
@@ -170,6 +193,8 @@ async function updatePreview() {
   const lower = parseFloat(document.getElementById("lower-price").value);
   const count = parseInt(document.getElementById("grid-count").value, 10);
   const investment = parseFloat(document.getElementById("total-investment").value);
+  const sizingMode = document.getElementById("position-sizing-mode").value;
+  const gridOrderQty = parseFloat(document.getElementById("grid-order-qty").value);
   const leverage = parseInt(document.getElementById("leverage").value, 10);
   const makerFeeRate = parsePercentRate("maker-fee-rate");
   const takerFeeRate = parsePercentRate("taker-fee-rate");
@@ -177,7 +202,10 @@ async function updatePreview() {
   const box = document.getElementById("grid-preview");
   const symbol = getSymbol();
 
-  if (!symbol || !upper || !lower || !count || !investment || upper <= lower) {
+  const hasSizingInput = sizingMode === "fixed_grid_qty"
+    ? gridOrderQty > 0
+    : investment > 0;
+  if (!symbol || !upper || !lower || !count || !hasSizingInput || upper <= lower) {
     box.classList.add("hidden");
     return;
   }
@@ -191,8 +219,10 @@ async function updatePreview() {
       upper_price: upper,
       lower_price: lower,
       grid_count: count,
-      total_investment: investment,
+      total_investment: sizingMode === "fixed_grid_qty" ? 0 : investment,
       leverage,
+      position_sizing_mode: sizingMode,
+      grid_order_qty: Number.isFinite(gridOrderQty) ? gridOrderQty : null,
       fee_rate: takerFeeRate,
       maker_fee_rate: makerFeeRate,
       taker_fee_rate: takerFeeRate,
@@ -265,6 +295,7 @@ async function fetchBalance() {
 }
 
 async function startGrid() {
+  const sizingMode = document.getElementById("position-sizing-mode").value;
   const payload = {
     symbol: getSymbol(),
     direction: currentDirection,
@@ -272,8 +303,10 @@ async function startGrid() {
     upper_price: parseFloat(document.getElementById("upper-price").value),
     lower_price: parseFloat(document.getElementById("lower-price").value),
     grid_count: parseInt(document.getElementById("grid-count").value, 10),
-    total_investment: parseFloat(document.getElementById("total-investment").value),
+    total_investment: sizingMode === "fixed_grid_qty" ? 0 : parseFloat(document.getElementById("total-investment").value),
     leverage: parseInt(document.getElementById("leverage").value, 10),
+    position_sizing_mode: sizingMode,
+    grid_order_qty: parseOptionalNumber("grid-order-qty"),
     fee_rate: parsePercentRate("taker-fee-rate"),
     maker_fee_rate: parsePercentRate("maker-fee-rate"),
     taker_fee_rate: parsePercentRate("taker-fee-rate"),
@@ -307,7 +340,12 @@ async function startGrid() {
     showToast("网格数量至少为 2", "error");
     return;
   }
-  if (!payload.total_investment || payload.total_investment <= 0) {
+  if (payload.position_sizing_mode === "fixed_grid_qty") {
+    if (!payload.grid_order_qty || payload.grid_order_qty <= 0) {
+      showToast("每格开仓数量必须大于 0", "error");
+      return;
+    }
+  } else if (!payload.total_investment || payload.total_investment <= 0) {
     showToast("总投入金额必须大于 0", "error");
     return;
   }
@@ -681,25 +719,35 @@ async function fetchGridHistory() {
     const data = await api("/api/grid/history?limit=100");
     renderGridHistory(data.runs || []);
   } catch (error) {
-    document.getElementById("history-body").innerHTML = `<tr><td class="empty-state" colspan="9">读取历史失败：${error.message}</td></tr>`;
+    document.getElementById("history-body").innerHTML = `<tr><td class="empty-state" colspan="10">读取历史失败：${error.message}</td></tr>`;
   }
 }
 
 function renderGridHistory(runs) {
   const tbody = document.getElementById("history-body");
   if (!runs.length) {
-    tbody.innerHTML = '<tr><td class="empty-state" colspan="9">暂无历史</td></tr>';
+    tbody.innerHTML = '<tr><td class="empty-state" colspan="10">暂无历史</td></tr>';
     return;
   }
 
   tbody.innerHTML = runs.map((run) => {
     const profit = Number(run.net_profit || 0);
+    const initialType = run.initial_order_type === "post_only"
+      ? "Post Only"
+      : run.initial_order_type === "limit"
+        ? "限价"
+        : "市价";
+    const sizingText = run.position_sizing_mode === "fixed_grid_qty"
+      ? `每格 ${formatOrderQty(run.grid_order_qty || 0)}`
+      : `投入 ${fmtNum(run.total_investment || 0)}U`;
+    const limitText = run.initial_order_price ? ` @ ${fmtMarket(run.initial_order_price)}` : "";
     return `
       <tr>
         <td>${formatTime(run.started_at)}</td>
         <td>${run.symbol || "--"}</td>
         <td>${mapDirection(run.direction)}</td>
         <td>${run.grid_mode === "geometric" ? "等比" : "等差"}</td>
+        <td>${initialType}${limitText}<br><span class="muted">${sizingText}</span></td>
         <td>${mapRunStatus(run.status)}</td>
         <td class="${profit >= 0 ? "positive" : "negative"}">${fmtNum(profit)}</td>
         <td>${fmtNum(run.total_fee || 0)}</td>

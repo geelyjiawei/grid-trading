@@ -248,6 +248,10 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
         "grid_count": config.get("grid_count"),
         "leverage": config.get("leverage"),
         "total_investment": config.get("total_investment"),
+        "position_sizing_mode": config.get("position_sizing_mode", "investment"),
+        "grid_order_qty": config.get("grid_order_qty"),
+        "initial_order_type": config.get("initial_order_type", "market"),
+        "initial_order_price": config.get("initial_order_price"),
         "status": status,
         "started_at": engine.start_time or time.time(),
         "updated_at": time.time(),
@@ -296,15 +300,20 @@ def _validate_fee_rates(cfg: "GridConfig"):
             raise HTTPException(status_code=400, detail=f"{field} must be between 0 and 0.01")
 
 
+def _position_sizing_mode(cfg: "GridConfig") -> str:
+    return str(cfg.position_sizing_mode or "investment").lower().strip()
+
+
 def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> dict:
     ticker = client.get_ticker(symbol)
     if ticker.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=ticker.get("retMsg", "Failed to fetch current price"))
     current_price = float(ticker["result"]["list"][0]["lastPrice"])
     initial_order_type = cfg.initial_order_type.lower().strip()
+    sizing_mode = _position_sizing_mode(cfg)
     reference_price = (
         float(cfg.initial_order_price)
-        if direction in {"long", "short"} and initial_order_type == "post_only" and cfg.initial_order_price
+        if direction in {"long", "short"} and initial_order_type in {"limit", "post_only"} and cfg.initial_order_price
         else current_price
     )
 
@@ -349,17 +358,24 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     if active_count <= 0:
         raise HTTPException(status_code=400, detail="No valid grid targets were found around current price")
 
-    raw_total_qty = (cfg.total_investment * cfg.leverage) / reference_price
-    total_steps = _round_down_steps(raw_total_qty, qty_step)
+    if sizing_mode == "fixed_grid_qty":
+        per_grid_steps = _round_down_steps(float(cfg.grid_order_qty or 0), qty_step)
+        if per_grid_steps <= 0:
+            raise HTTPException(status_code=400, detail="grid_order_qty is too small for this symbol")
+        total_steps = per_grid_steps * active_count
+        per_order_qtys = [_steps_to_qty(per_grid_steps, qty_step) for _ in range(active_count)]
+    else:
+        raw_total_qty = (cfg.total_investment * cfg.leverage) / reference_price
+        total_steps = _round_down_steps(raw_total_qty, qty_step)
+        base_steps = total_steps // active_count
+        remainder_steps = total_steps % active_count
+        per_order_qtys = [
+            _steps_to_qty(base_steps + (1 if index < remainder_steps else 0), qty_step)
+            for index in range(active_count)
+        ]
     if total_steps < active_count:
         raise HTTPException(status_code=400, detail="Total investment is too small for this symbol and grid count")
 
-    base_steps = total_steps // active_count
-    remainder_steps = total_steps % active_count
-    per_order_qtys = [
-        _steps_to_qty(base_steps + (1 if index < remainder_steps else 0), qty_step)
-        for index in range(active_count)
-    ]
     total_qty = _steps_to_qty(total_steps, qty_step)
 
     if grid_mode == "geometric":
@@ -384,6 +400,8 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         "symbol": symbol,
         "current_price": current_price,
         "reference_price": reference_price,
+        "position_sizing_mode": sizing_mode,
+        "grid_order_qty": cfg.grid_order_qty,
         "grid_step": grid_step,
         "grid_profit_pct": grid_profit_pct,
         "active_grid_count": active_count,
@@ -555,8 +573,10 @@ class GridConfig(BaseModel):
     upper_price: float
     lower_price: float
     grid_count: int
-    total_investment: float
-    leverage: int
+    total_investment: float = 0
+    leverage: int = 1
+    position_sizing_mode: str = "investment"
+    grid_order_qty: float | None = None
     fee_rate: float = DEFAULT_TAKER_FEE_RATE
     maker_fee_rate: float | None = DEFAULT_MAKER_FEE_RATE
     taker_fee_rate: float | None = DEFAULT_TAKER_FEE_RATE
@@ -757,13 +777,18 @@ def grid_preview(cfg: GridConfig):
     symbol = cfg.symbol.upper().strip()
     direction = cfg.direction.lower().strip()
     grid_mode = cfg.grid_mode.lower().strip()
+    sizing_mode = _position_sizing_mode(cfg)
 
     if cfg.upper_price <= cfg.lower_price:
         raise HTTPException(status_code=400, detail="upper_price must be greater than lower_price")
     if cfg.grid_count < 2 or cfg.grid_count > 100:
         raise HTTPException(status_code=400, detail="grid_count must be between 2 and 100")
-    if cfg.total_investment <= 0:
+    if sizing_mode not in {"investment", "fixed_grid_qty"}:
+        raise HTTPException(status_code=400, detail="position_sizing_mode must be investment or fixed_grid_qty")
+    if sizing_mode == "investment" and cfg.total_investment <= 0:
         raise HTTPException(status_code=400, detail="total_investment must be greater than 0")
+    if sizing_mode == "fixed_grid_qty" and (cfg.grid_order_qty is None or cfg.grid_order_qty <= 0):
+        raise HTTPException(status_code=400, detail="grid_order_qty must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
     _validate_fee_rates(cfg)
@@ -782,6 +807,7 @@ async def start_grid(cfg: GridConfig):
     direction = cfg.direction.lower().strip()
     grid_mode = cfg.grid_mode.lower().strip()
     initial_order_type = cfg.initial_order_type.lower().strip()
+    sizing_mode = _position_sizing_mode(cfg)
     existing_engine = _engines.get(symbol)
 
     if existing_engine and existing_engine.running:
@@ -790,8 +816,12 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="upper_price must be greater than lower_price")
     if cfg.grid_count < 2 or cfg.grid_count > 100:
         raise HTTPException(status_code=400, detail="grid_count must be between 2 and 100")
-    if cfg.total_investment <= 0:
+    if sizing_mode not in {"investment", "fixed_grid_qty"}:
+        raise HTTPException(status_code=400, detail="position_sizing_mode must be investment or fixed_grid_qty")
+    if sizing_mode == "investment" and cfg.total_investment <= 0:
         raise HTTPException(status_code=400, detail="total_investment must be greater than 0")
+    if sizing_mode == "fixed_grid_qty" and (cfg.grid_order_qty is None or cfg.grid_order_qty <= 0):
+        raise HTTPException(status_code=400, detail="grid_order_qty must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
     _validate_fee_rates(cfg)
@@ -799,10 +829,10 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
         raise HTTPException(status_code=400, detail="grid_mode must be arithmetic or geometric")
-    if initial_order_type not in {"market", "post_only"}:
-        raise HTTPException(status_code=400, detail="initial_order_type must be market or post_only")
+    if initial_order_type not in {"market", "limit", "post_only"}:
+        raise HTTPException(status_code=400, detail="initial_order_type must be market, limit, or post_only")
     if direction == "neutral" and initial_order_type != "market":
-        raise HTTPException(status_code=400, detail="post_only initial order is only supported for long or short grids")
+        raise HTTPException(status_code=400, detail="limit initial orders are only supported for long or short grids")
     if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
@@ -811,6 +841,7 @@ async def start_grid(cfg: GridConfig):
     engine_config["direction"] = direction
     engine_config["grid_mode"] = grid_mode
     engine_config["initial_order_type"] = initial_order_type
+    engine_config["position_sizing_mode"] = sizing_mode
     engine_config["run_id"] = f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
     engine = GridEngine(client, engine_config, state_callback=_save_engine_state)
 

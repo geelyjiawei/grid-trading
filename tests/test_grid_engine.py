@@ -229,6 +229,70 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             len(engine.active_orders),
         )
 
+    async def test_fixed_grid_qty_sets_initial_position_from_active_grid_count(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 2,
+                "leverage": 5,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        market_open = next(order for order in client.orders if order.get("order_type") == "Market")
+        reduce_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        ]
+        self.assertEqual(market_open["qty"], "4.0")
+        self.assertEqual(engine.config["active_grid_count"], 2)
+        self.assertEqual(sorted(order["qty"] for order in reduce_orders), ["2.0", "2.0"])
+
+    async def test_initial_limit_order_uses_gtc_not_post_only(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "initial_order_type": "limit",
+                "initial_order_price": 101,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        opening_order = next(order for order in client.orders if order.get("order_link_id", "").startswith("open_"))
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertEqual(opening_order["price"], "101.0")
+        self.assertIsNone(opening_order.get("time_in_force"))
+        self.assertEqual(engine.opening_order["time_in_force"], "GTC")
+
     async def test_fast_poll_window_wakes_loop_after_order_activity(self):
         client = FakeClient("100")
         engine = GridEngine(
