@@ -128,10 +128,9 @@ function bindEvents() {
 
 function updateSizingModeVisibility(shouldPreview = true) {
   const mode = document.getElementById("position-sizing-mode").value;
-  const investmentInput = document.getElementById("total-investment");
-  const qtyInput = document.getElementById("grid-order-qty");
-  investmentInput.placeholder = mode === "fixed_grid_qty" ? "固定数量模式可忽略" : "";
-  qtyInput.placeholder = mode === "fixed_grid_qty" ? "固定数量模式必填，例如 4" : "按投入金额模式可忽略";
+  const fixedQtyMode = mode === "fixed_grid_qty";
+  document.getElementById("total-investment-group").classList.toggle("hidden", fixedQtyMode);
+  document.getElementById("grid-order-qty-group").classList.toggle("hidden", !fixedQtyMode);
   if (shouldPreview) updatePreview();
 }
 
