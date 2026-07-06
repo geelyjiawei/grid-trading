@@ -2024,12 +2024,6 @@ class GridEngine:
         levels = self.grid_levels
         direction = self.config["direction"]
 
-        if not (levels[0] < current_price < levels[-1]):
-            raise RuntimeError(
-                f"Current price {current_price} must stay inside the configured range "
-                f"{levels[0]} - {levels[-1]}"
-            )
-
         self.waiting_trigger = False
         self.trigger_message = ""
 
@@ -2039,18 +2033,35 @@ class GridEngine:
         elif direction == "short":
             open_side = "Sell"
 
+        initial_order_type = str(self.config.get("initial_order_type", "market")).lower().strip()
+        limit_open_price = None
+        reference_price = current_price
+        if direction in {"long", "short"} and initial_order_type in {"post_only", "limit"}:
+            limit_open_price = self._initial_limit_price(open_side, current_price)
+            reference_price = limit_open_price
+
+        if not (levels[0] < current_price < levels[-1]):
+            raise RuntimeError(
+                f"Current price {current_price} must stay inside the configured range "
+                f"{levels[0]} - {levels[-1]}"
+            )
+        if not (levels[0] < reference_price < levels[-1]):
+            raise RuntimeError(
+                f"Reference price {reference_price} must stay inside the configured range "
+                f"{levels[0]} - {levels[-1]}"
+            )
+
         if direction in {"long", "short"}:
             self._capture_baseline_position(open_side)
 
-        total_qty = self._prepare_pending_targets(current_price)
+        total_qty = self._prepare_pending_targets(reference_price)
 
         if direction in {"long", "short"}:
-            initial_order_type = str(self.config.get("initial_order_type", "market")).lower().strip()
             if initial_order_type in {"post_only", "limit"}:
                 self._place_limit_open(
                     open_side,
                     total_qty,
-                    self._initial_limit_price(open_side, current_price),
+                    limit_open_price,
                     post_only=initial_order_type == "post_only",
                 )
                 return

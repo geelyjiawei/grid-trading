@@ -263,6 +263,40 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.config["active_grid_count"], 2)
         self.assertEqual(sorted(order["qty"] for order in reduce_orders), ["2.0", "2.0"])
 
+    async def test_fixed_grid_qty_limit_open_uses_limit_price_for_initial_qty(self):
+        client = FakeClient("1012", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 1020,
+                "lower_price": 1000,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 5,
+                "initial_order_type": "post_only",
+                "initial_order_price": 1014,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+
+        opening_order = next(order for order in client.orders if order.get("order_link_id", "").startswith("open_"))
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertEqual(opening_order["price"], "1014.0")
+        self.assertEqual(opening_order["qty"], "2.8")
+        self.assertEqual(engine.config["active_grid_count"], 14)
+        self.assertAlmostEqual(engine.config["derived_total_qty"], 2.8)
+        self.assertEqual(len(engine._pending_targets["profit_targets"]), 14)
+
     async def test_initial_limit_order_uses_gtc_not_post_only(self):
         client = FakeClient("100")
         engine = GridEngine(
