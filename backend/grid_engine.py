@@ -31,6 +31,7 @@ class GridEngine:
         self.completed_pairs = 0
         self.reduce_lots_by_level: dict[str, dict[str, float]] = {}
         self.reduce_lots_complete = False
+        self.target_qty_by_level: dict[str, float] = {}
         self.gross_profit = 0.0
         self.total_profit = 0.0
         self.total_fee = 0.0
@@ -83,6 +84,7 @@ class GridEngine:
             "completed_pairs": self.completed_pairs,
             "reduce_lots_by_level": self.reduce_lots_by_level,
             "reduce_lots_complete": self.reduce_lots_complete,
+            "target_qty_by_level": self.target_qty_by_level,
             "gross_profit": self.gross_profit,
             "total_profit": self.total_profit,
             "total_fee": self.total_fee,
@@ -119,6 +121,7 @@ class GridEngine:
         self.completed_pairs = int(state.get("completed_pairs") or 0)
         self.reduce_lots_by_level = self._normalize_reduce_lots(state.get("reduce_lots_by_level") or {})
         self.reduce_lots_complete = bool(state.get("reduce_lots_complete", bool(self.reduce_lots_by_level)))
+        self.target_qty_by_level = self._normalize_level_qtys(state.get("target_qty_by_level") or {})
         self.gross_profit = float(state.get("gross_profit") or 0)
         self.total_profit = float(state.get("total_profit") or 0)
         self.total_fee = float(state.get("total_fee") or 0)
@@ -353,6 +356,7 @@ class GridEngine:
             "filled_orders": self.filled_orders[-50:],
             "reduce_lots_complete": self.reduce_lots_complete,
             "reduce_lots_by_level": self.reduce_lots_by_level,
+            "target_qty_by_level": self.target_qty_by_level,
             "gross_profit": round(self.gross_profit, 4),
             "total_profit": round(self.total_profit, 4),
             "realized_net_profit": round(self.total_profit, 4),
@@ -1241,6 +1245,19 @@ class GridEngine:
             normalized[str(level_idx)] = {"qty": qty, "entry_value": entry_value}
         return normalized
 
+    @staticmethod
+    def _normalize_level_qtys(raw_qtys: dict) -> dict[str, float]:
+        normalized: dict[str, float] = {}
+        for raw_level, raw_qty in (raw_qtys or {}).items():
+            try:
+                level_idx = int(raw_level)
+                qty = float(raw_qty or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty > 0:
+                normalized[str(level_idx)] = qty
+        return normalized
+
     def _reduce_lot_decimal_map(self) -> dict[int, dict[str, Decimal]]:
         lots: dict[int, dict[str, Decimal]] = {}
         for raw_level, raw_lot in self.reduce_lots_by_level.items():
@@ -1291,7 +1308,9 @@ class GridEngine:
             self._pending_targets.get("profit_targets") or [],
             self._pending_targets.get("allocated_qtys") or [],
         ):
-            self._lot_add(lots, int(target[0]), Decimal(str(allocated_qty)), entry)
+            level_idx = int(target[0])
+            target_qty = self.target_qty_by_level.get(str(level_idx), allocated_qty)
+            self._lot_add(lots, level_idx, Decimal(str(target_qty)), entry)
         self._set_reduce_lot_decimal_map(lots)
         self.reduce_lots_complete = True
 
@@ -1352,7 +1371,9 @@ class GridEngine:
         lots: dict[int, dict[str, Decimal]] = {}
         entry_price = Decimal(str(self.initial_entry_price))
         for target, allocated_qty in zip(profit_targets, allocated_qtys):
-            self._lot_add(lots, int(target[0]), Decimal(str(allocated_qty)), entry_price)
+            level_idx = int(target[0])
+            target_qty = self.target_qty_by_level.get(str(level_idx), allocated_qty)
+            self._lot_add(lots, level_idx, Decimal(str(target_qty)), entry_price)
         return lots
 
     def _bootstrap_reduce_lots_from_legacy_state(self):
@@ -1649,6 +1670,22 @@ class GridEngine:
         self._mark_fast_poll()
         self._persist_state()
 
+    def _warn_reduce_limit_unplaced(self, side: str, price_text: str, qty: str, reason: str):
+        self.trigger_message = (
+            f"Reduce-only limit protection was not placed for {side} {qty} at {price_text}; "
+            "keeping the lot ledger and retrying/reconciling without market-closing."
+        )
+        logger.warning(
+            "Reduce-only limit protection not placed symbol=%s side=%s price=%s qty=%s reason=%s",
+            self.config.get("symbol"),
+            side,
+            price_text,
+            qty,
+            reason,
+        )
+        self._mark_fast_poll()
+        self._persist_state()
+
     def _place_limit_open(self, side: str, qty: float, price: float):
         qty_text = self._fq(qty)
         price_text = self._fp(price)
@@ -1762,14 +1799,12 @@ class GridEngine:
                 try:
                     result = submit_limit(False)
                 except Exception as retry_exc:
-                    logger.warning(
-                        "Reduce-only limit retry failed; placing market repair side=%s price=%s msg=%s",
-                        side,
-                        price_text,
-                        retry_exc,
-                    )
-                    return self._place_reduce_market(side, float(qty), "reduce limit placement failed")
+                    self._warn_reduce_limit_unplaced(side, price_text, qty, str(retry_exc))
+                    return None
             else:
+                if reduce_only:
+                    self._warn_reduce_limit_unplaced(side, price_text, qty, str(exc))
+                    return None
                 logger.warning(
                     "Place order failed side=%s price=%s reduce_only=%s msg=%s",
                     side,
@@ -1789,23 +1824,12 @@ class GridEngine:
             try:
                 result = submit_limit(False)
             except Exception as retry_exc:
-                logger.warning(
-                    "Reduce-only limit retry failed; placing market repair side=%s price=%s msg=%s",
-                    side,
-                    price_text,
-                    retry_exc,
-                )
-                self._place_reduce_market(side, float(qty), "reduce limit placement failed")
+                self._warn_reduce_limit_unplaced(side, price_text, qty, str(retry_exc))
                 return None
 
         if result.get("retCode") != 0 and reduce_only:
-            logger.warning(
-                "Reduce-only limit rejected; placing market repair side=%s price=%s msg=%s",
-                side,
-                price_text,
-                result.get("retMsg"),
-            )
-            return self._place_reduce_market(side, float(qty), "reduce limit rejected")
+            self._warn_reduce_limit_unplaced(side, price_text, qty, str(result.get("retMsg") or "rejected"))
+            return None
 
         if result.get("retCode") != 0:
             logger.warning(
@@ -2085,19 +2109,28 @@ class GridEngine:
         total_qty = self._steps_to_qty(total_steps)
         allocated_qtys = self._allocate_qtys(raw_total_qty, target_count)
         qty_per_grid = total_qty / target_count
+        fallback_steps = self._qty_to_steps(qty_per_grid)
+        fallback_qty = self._steps_to_qty(max(1, fallback_steps))
+        target_qty_by_level: dict[str, float] = {}
+        if direction in {"long", "short"}:
+            for target, allocated_qty in zip(profit_targets, allocated_qtys):
+                target_qty_by_level[str(target[0])] = allocated_qty
+            for target in add_targets:
+                target_qty_by_level.setdefault(str(target[0]), fallback_qty)
+        else:
+            for target, allocated_qty in zip(add_targets, allocated_qtys):
+                target_qty_by_level[str(target[0])] = allocated_qty
 
         self.config["active_grid_count"] = target_count
         self.config["derived_total_qty"] = total_qty
         self.config["qty_per_grid"] = qty_per_grid
+        self.target_qty_by_level = target_qty_by_level
 
         self._pending_targets = {
             "profit_targets": profit_targets,
             "add_targets": add_targets,
             "allocated_qtys": allocated_qtys,
-            "allocated_qty_by_level": {
-                str(target[0]): allocated_qty
-                for target, allocated_qty in zip(profit_targets, allocated_qtys)
-            },
+            "allocated_qty_by_level": target_qty_by_level,
             "qty_per_grid": qty_per_grid,
         }
         self._persist_state()
