@@ -66,6 +66,7 @@ class GridEngine:
         self._user_stream_listen_key = ""
         self._position_mismatch_seen_at = 0.0
         self._position_mismatch_signature: tuple[float, float, int] | None = None
+        self._reduce_warning_at_by_signature: dict[tuple, float] = {}
 
     def _persist_state(self):
         if self.state_callback:
@@ -1423,10 +1424,19 @@ class GridEngine:
             return self._reduce_lot_decimal_map(), ""
         return self._reduce_lots_from_fill_ledger()
 
+    def _should_log_reduce_warning(self, signature: tuple, interval: float = 60.0) -> bool:
+        now = time.time()
+        last_logged_at = self._reduce_warning_at_by_signature.get(signature, 0.0)
+        if now - last_logged_at >= interval:
+            self._reduce_warning_at_by_signature[signature] = now
+            return True
+        return False
+
     def _repair_missing_reduce_protection_from_ledger(self) -> bool:
         lots, reason = self._reduce_lots_for_repair()
         if lots is None:
-            if reason:
+            signature = ("ledger-unavailable", reason)
+            if reason and self._should_log_reduce_warning(signature):
                 logger.warning(
                     "Reduce-only protection ledger unavailable symbol=%s reason=%s",
                     self.config.get("symbol"),
@@ -1504,14 +1514,22 @@ class GridEngine:
             f"Reduce-only protection is short by {self._fq(missing_qty)}; "
             "waiting for complete order/fill ledger instead of placing guessed boundary orders."
         )
-        logger.warning(
-            "Reduce-only protection missing; not placing guessed boundary order symbol=%s side=%s grid_qty=%s active_reduce_qty=%s missing_qty=%s",
-            self.config.get("symbol"),
+        signature = (
+            "missing-reduce-protection",
             reduce_side,
             self._fq(grid_qty),
             self._fq(active_reduce_qty),
             self._fq(missing_qty),
         )
+        if self._should_log_reduce_warning(signature):
+            logger.warning(
+                "Reduce-only protection missing; not placing guessed boundary order symbol=%s side=%s grid_qty=%s active_reduce_qty=%s missing_qty=%s",
+                self.config.get("symbol"),
+                reduce_side,
+                self._fq(grid_qty),
+                self._fq(active_reduce_qty),
+                self._fq(missing_qty),
+            )
         self._persist_state()
 
     def _grid_position_qty(self) -> float:
