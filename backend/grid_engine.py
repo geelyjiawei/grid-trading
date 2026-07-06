@@ -597,6 +597,58 @@ class GridEngine:
             "taker_count": taker_count,
         }
 
+    def _fill_delta_stats(self, order: dict, stats: dict) -> dict | None:
+        planned_qty = Decimal(str(order.get("qty", 0) or 0))
+        total_qty = min(Decimal(str(stats.get("qty", 0) or 0)), planned_qty)
+        processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+        delta_qty = total_qty - processed_qty
+        if delta_qty < Decimal(str(self.min_qty)):
+            return None
+
+        total_volume = Decimal(str(stats.get("volume", 0) or 0))
+        total_fee = Decimal(str(stats.get("fee", 0) or 0))
+        processed_volume = Decimal(str(order.get("processed_fill_volume", 0) or 0))
+        processed_fee = Decimal(str(order.get("processed_fill_fee", 0) or 0))
+        delta_volume = total_volume - processed_volume
+        if delta_volume <= 0:
+            delta_volume = Decimal(str(stats.get("price", order.get("price", 0)) or 0)) * delta_qty
+        delta_fee = total_fee - processed_fee
+        delta_price = delta_volume / delta_qty if delta_qty > 0 else Decimal(str(stats.get("price", 0) or 0))
+
+        return {
+            **stats,
+            "price": float(delta_price),
+            "qty": float(delta_qty),
+            "volume": float(delta_volume),
+            "fee": float(delta_fee),
+        }
+
+    def _mark_order_fill_processed(self, order: dict, stats: dict):
+        planned_qty = Decimal(str(order.get("qty", 0) or 0))
+        processed_qty = min(Decimal(str(stats.get("qty", 0) or 0)), planned_qty)
+        order["processed_fill_qty"] = float(processed_qty)
+        order["processed_fill_volume"] = float(Decimal(str(stats.get("volume", 0) or 0)))
+        order["processed_fill_fee"] = float(Decimal(str(stats.get("fee", 0) or 0)))
+
+    def _record_execution_delta(self, order: dict, stats: dict) -> bool:
+        delta_stats = self._fill_delta_stats(order, stats)
+        self._mark_order_fill_processed(order, stats)
+        if not delta_stats:
+            return False
+
+        filled_order = {**order, "qty": str(delta_stats["qty"]), "fill_price": delta_stats["price"]}
+        self._record_fill(filled_order, delta_stats)
+        if self._in_grid_range() or self._counter_order_reduces_grid_position(filled_order):
+            self._place_counter_order(filled_order)
+        else:
+            self.paused_replacements.append(filled_order)
+            self.trigger_message = (
+                f"Price {self.current_price} is outside grid range; "
+                "counter order is queued until price returns."
+            )
+            self._persist_state()
+        return True
+
     @staticmethod
     def _liquidity_label(stats: dict) -> str:
         maker_count = int(stats.get("maker_count", 0) or 0)
@@ -990,6 +1042,9 @@ class GridEngine:
                 "time_in_force": "PostOnly" if str(item.get("timeInForce", "")) == "PostOnly" else "GTC",
                 "reduce_only": self._truthy(item.get("reduceOnly", False)),
                 "entry_price": None,
+                "processed_fill_qty": 0.0,
+                "processed_fill_volume": 0.0,
+                "processed_fill_fee": 0.0,
             }
             known_order_ids.add(order_id)
             adopted = True
@@ -1003,12 +1058,42 @@ class GridEngine:
             self._persist_state()
         return adopted
 
+    def _handle_order_execution_snapshot(self, order: dict, snapshot: dict) -> bool:
+        fallback_price = float(order["price"])
+        fallback_qty = float(order["qty"])
+        stats = self._get_trade_stats(
+            order["order_id"],
+            fallback_price,
+            fallback_qty,
+            allow_estimate=False,
+            liquidity_hint=self._order_liquidity_hint(order),
+        )
+        if not stats or stats["qty"] <= 0:
+            stats = self._execution_stats_from_order_snapshot(
+                snapshot,
+                fallback_price,
+                fallback_qty,
+                liquidity_hint=self._order_liquidity_hint(order),
+            )
+        if not stats or stats["qty"] <= 0:
+            return False
+        return self._record_execution_delta(order, stats)
+
     def _reconcile_exchange_open_orders(self, open_orders: list[dict] | None = None) -> bool:
         open_orders = self._fetch_open_orders() if open_orders is None else open_orders
         changed = self._adopt_exchange_grid_orders(open_orders)
         open_order_ids = {str(item.get("orderId", "")) for item in open_orders}
+        open_orders_by_id = {str(item.get("orderId", "")): item for item in open_orders}
         if self._stopping:
             return changed
+
+        for order in list(self.active_orders.values()):
+            order_id = str(order.get("order_id", "") or "")
+            snapshot = open_orders_by_id.get(order_id)
+            if not snapshot:
+                continue
+            if self._handle_order_execution_snapshot(order, snapshot):
+                changed = True
 
         closed_links = [
             link_id
@@ -1033,6 +1118,12 @@ class GridEngine:
                     )
                     or changed
                 )
+                continue
+            if self._is_partial_status(status):
+                snapshot = self._get_order_snapshot(order)
+                if self._handle_order_execution_snapshot(order, snapshot):
+                    changed = True
+                self._mark_fast_poll()
                 continue
             if status == "UNKNOWN":
                 # Unknown may be a temporary exchange/API gap. Only mutate state if trades prove a fill.
@@ -1061,21 +1152,25 @@ class GridEngine:
             allow_estimate=False,
             liquidity_hint=self._order_liquidity_hint(order),
         )
-        self.active_orders.pop(link_id, None)
 
         filled_qty = 0.0
         if stats and stats["qty"] > 0:
             filled_qty = min(float(stats["qty"]), fallback_qty)
-            filled_order = {**order, "qty": str(filled_qty), "fill_price": stats["price"]}
-            self._record_fill(filled_order, {**stats, "qty": filled_qty})
-            if self._in_grid_range() or self._counter_order_reduces_grid_position(filled_order):
-                self._place_counter_order(filled_order)
-            else:
-                self.paused_replacements.append(filled_order)
+            self._record_execution_delta(order, {**stats, "qty": filled_qty})
+        else:
+            filled_qty = float(order.get("processed_fill_qty", 0) or 0)
+
+        self.active_orders.pop(link_id, None)
 
         remaining_qty = fallback_qty - filled_qty
         if remaining_qty >= self.min_qty:
-            replacement = {**order, "qty": str(remaining_qty)}
+            replacement = {
+                **order,
+                "qty": str(remaining_qty),
+                "processed_fill_qty": 0.0,
+                "processed_fill_volume": 0.0,
+                "processed_fill_fee": 0.0,
+            }
             self._replace_cancelled_order(replacement)
         self._persist_state()
 
@@ -1988,6 +2083,9 @@ class GridEngine:
             "time_in_force": "PostOnly" if use_post_only else "GTC",
             "reduce_only": reduce_only,
             "entry_price": entry_price,
+            "processed_fill_qty": 0.0,
+            "processed_fill_volume": 0.0,
+            "processed_fill_fee": 0.0,
         }
         self._mark_fast_poll()
         self._persist_state()
@@ -2106,6 +2204,9 @@ class GridEngine:
                         "time_in_force": "GTC",
                         "reduce_only": state["reduce_only"],
                         "entry_price": state["entry_price"],
+                        "processed_fill_qty": 0.0,
+                        "processed_fill_volume": 0.0,
+                        "processed_fill_fee": 0.0,
                     }
                     placed_links.append(link_id)
                     continue
@@ -2647,6 +2748,15 @@ class GridEngine:
             self._mark_fast_poll()
             return
 
+        if self._is_partial_status(status):
+            self.trigger_message = (
+                f"Opening order partially filled {self._fq(stats['qty'])}/{self._fq(planned_qty)}; "
+                "waiting for final order status before deploying grid."
+            )
+            self._mark_fast_poll()
+            self._persist_state()
+            return
+
         qty_scale = stats["qty"] / planned_qty if planned_qty > 0 else 0
         if qty_scale <= 0:
             self.waiting_initial_order = False
@@ -2709,17 +2819,7 @@ class GridEngine:
         if not stats or stats["qty"] <= 0:
             return False
 
-        filled_order = {**order, "qty": str(stats["qty"]), "fill_price": stats["price"]}
-        self._record_fill(filled_order, stats)
-        if self._in_grid_range() or self._counter_order_reduces_grid_position(filled_order):
-            self._place_counter_order(filled_order)
-        else:
-            self.paused_replacements.append(filled_order)
-            self.trigger_message = (
-                f"Price {self.current_price} is outside grid range; "
-                "counter order is queued until price returns."
-            )
-            self._persist_state()
+        self._record_execution_delta(order, stats)
         return True
 
     def _resume_paused_replacements(self):
@@ -2859,7 +2959,11 @@ class GridEngine:
 
     @staticmethod
     def _is_filled_status(status: str) -> bool:
-        return status in {"FILLED", "FILLED_PARTIALLY"}
+        return status == "FILLED"
+
+    @staticmethod
+    def _is_partial_status(status: str) -> bool:
+        return status in {"PARTIALLY_FILLED", "FILLED_PARTIALLY", "PARTIAL_FILLED"}
 
     @staticmethod
     def _is_cancelled_status(status: str) -> bool:

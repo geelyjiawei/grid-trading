@@ -1393,6 +1393,143 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(engine._active_reduce_qty("Buy"), 338.0)
         self.assertEqual(len([qty for qty in reduce_qtys if qty != 100.0]), 1)
 
+    async def test_partial_grid_fill_is_processed_incrementally(self):
+        client = FakeClient("100", qty_step="1", min_qty="1")
+        client.trade_details = {}
+        client.get_order_trades = lambda symbol, order_id: {
+            "retCode": 0,
+            "result": {"list": client.trade_details.get(order_id, [])},
+        }
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        add_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"]
+        )
+        exchange_order = next(item for item in client.orders if item["orderId"] == add_order["order_id"])
+        client.open_limit_order_ids.discard(add_order["order_id"])
+        exchange_order["orderStatus"] = "PARTIALLY_FILLED"
+        client.trade_details[add_order["order_id"]] = [
+            {
+                "price": add_order["price"],
+                "qty": "42",
+                "volume": str(float(add_order["price"]) * 42),
+                "feeUsdt": "0",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        ]
+
+        changed = engine._reconcile_exchange_open_orders([])
+        changed_again = engine._reconcile_exchange_open_orders([])
+
+        self.assertTrue(changed)
+        self.assertFalse(changed_again)
+        self.assertIn(add_order["link_id"], engine.active_orders)
+        self.assertEqual(engine.active_orders[add_order["link_id"]]["processed_fill_qty"], 42.0)
+        self.assertEqual(
+            sum(1 for order in engine.filled_orders if order["side"] == "Sell" and not order["reduce_only"]),
+            1,
+        )
+
+        exchange_order["orderStatus"] = "FILLED"
+        client.trade_details[add_order["order_id"]].append(
+            {
+                "price": add_order["price"],
+                "qty": "58",
+                "volume": str(float(add_order["price"]) * 58),
+                "feeUsdt": "0",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        )
+
+        engine._reconcile_exchange_open_orders([])
+
+        self.assertNotIn(add_order["link_id"], engine.active_orders)
+        open_fill_qty = sum(
+            float(order["qty"])
+            for order in engine.filled_orders
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == add_order["level_idx"]
+        )
+        reduce_qty = sum(
+            float(order["qty"])
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"] and order["level_idx"] == add_order["level_idx"]
+        )
+        self.assertEqual(open_fill_qty, 100.0)
+        self.assertEqual(reduce_qty, 100.0)
+
+    async def test_partial_opening_order_waits_for_terminal_status(self):
+        client = FakeClient("100", qty_step="1", min_qty="1")
+        client.trade_details = {}
+        client.get_order_trades = lambda symbol, order_id: {
+            "retCode": 0,
+            "result": {"list": client.trade_details.get(order_id, [])},
+        }
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 100,
+                "leverage": 2,
+                "initial_order_type": "limit",
+                "initial_order_price": 100,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        opening_order = engine.opening_order
+        self.assertIsNotNone(opening_order)
+        exchange_order = next(item for item in client.orders if item["orderId"] == opening_order["order_id"])
+        client.open_limit_order_ids.discard(opening_order["order_id"])
+        exchange_order["orderStatus"] = "PARTIALLY_FILLED"
+        client.trade_details[opening_order["order_id"]] = [
+            {
+                "price": opening_order["price"],
+                "qty": "42",
+                "volume": str(float(opening_order["price"]) * 42),
+                "feeUsdt": "0",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        ]
+
+        await engine._check_initial_order()
+
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertFalse(engine.grid_ready)
+        self.assertIn("partially filled", engine.trigger_message)
+
     async def test_position_sync_waits_for_order_ledger_before_overcommit_check(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "75", "avgPrice": "100"}]
