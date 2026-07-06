@@ -629,7 +629,9 @@ async function selectGridSymbol(exchange, symbol) {
   activeExchange = exchange || activeExchange;
   syncExchangeInputs();
   document.getElementById("symbol-input").value = symbol;
+  showToast(`已切换到 ${exchangeDisplayName(activeExchange)} · ${symbol}`, "success");
   await fetchPrice();
+  await fetchBalance();
   await pollGridStatus();
 }
 
