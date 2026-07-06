@@ -21,6 +21,7 @@ from auth import (
     verify_session,
     verify_totp,
 )
+from aster_client import AsterFuturesClient
 from binance_client import BinanceFuturesClient
 from bybit_client import BybitClient
 from grid_engine import GridEngine
@@ -29,7 +30,7 @@ from secret_store import decrypt_text, encrypt_text, storage_backend
 
 logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
-SUPPORTED_EXCHANGES = {"bybit", "binance"}
+SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
 DEFAULT_TAKER_FEE_RATE = float(os.getenv("GRID_TAKER_FEE_RATE", "0.0005"))
 
@@ -65,9 +66,12 @@ def _normalize_exchange(exchange: str | None) -> str:
 
 def _load_env_api_config() -> dict | None:
     exchange = _normalize_exchange(os.getenv("GRID_EXCHANGE") or os.getenv("EXCHANGE"))
-    prefix = "BINANCE" if exchange == "binance" else "BYBIT"
+    prefix = {"binance": "BINANCE", "aster": "ASTER"}.get(exchange, "BYBIT")
     api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
     api_secret = os.getenv(f"{prefix}_API_SECRET", "").strip()
+    if exchange == "aster":
+        api_key = api_key or os.getenv("ASTER_USER_ADDRESS", "").strip()
+        api_secret = api_secret or os.getenv("ASTER_SIGNER_PRIVATE_KEY", "").strip()
 
     if not api_key and not api_secret and exchange == "bybit":
         binance_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -172,6 +176,8 @@ def _build_client_from_config(config: dict):
 def _build_client(exchange: str, api_key: str, api_secret: str, testnet: bool):
     if exchange == "binance":
         return BinanceFuturesClient(api_key, api_secret, testnet)
+    if exchange == "aster":
+        return AsterFuturesClient(api_key, api_secret, testnet)
     return BybitClient(api_key, api_secret, testnet)
 
 

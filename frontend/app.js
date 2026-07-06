@@ -134,6 +134,12 @@ function updateSizingModeVisibility(shouldPreview = true) {
   if (shouldPreview) updatePreview();
 }
 
+function exchangeDisplayName(exchange) {
+  if (exchange === "binance") return "Binance";
+  if (exchange === "aster") return "AsterDEX";
+  return "Bybit";
+}
+
 async function loadConfig() {
   try {
     const config = await api("/api/config");
@@ -161,7 +167,7 @@ function renderConfigStatus(config) {
   }
 
   const source = config.source === "env" ? "环境变量" : "本地加密文件";
-  const exchange = config.exchange === "binance" ? "Binance" : "Bybit";
+  const exchange = exchangeDisplayName(config.exchange);
   statusEl.textContent = `当前生效：${exchange} · ${config.api_key} · ${config.testnet ? "Testnet" : "Mainnet"} · ${source}`;
   statusEl.className = "config-status configured";
 }
@@ -171,8 +177,8 @@ function renderConfigDraftHint() {
   if (!hintEl) return;
 
   const selected = document.getElementById("cfg-exchange").value;
-  const selectedName = selected === "binance" ? "Binance" : "Bybit";
-  const activeName = activeExchange === "binance" ? "Binance" : "Bybit";
+  const selectedName = exchangeDisplayName(selected);
+  const activeName = exchangeDisplayName(activeExchange);
 
   if (selected === activeExchange) {
     hintEl.textContent = `正在编辑 ${selectedName} 配置。保存并验证成功后会继续使用 ${selectedName}。`;

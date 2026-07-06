@@ -18,6 +18,7 @@ if str(ROOT_DIR / "tests") not in sys.path:
 
 import main  # noqa: E402
 import pyotp  # noqa: E402
+from aster_client import AsterFuturesClient  # noqa: E402
 from binance_client import BinanceFuturesClient  # noqa: E402
 from bybit_client import BybitClient  # noqa: E402
 from auth import hash_password  # noqa: E402
@@ -39,6 +40,10 @@ class FakeBinanceConfigClient(FakeConfigClient):
 
 
 class FakeBybitConfigClient(FakeConfigClient):
+    pass
+
+
+class FakeAsterConfigClient(FakeConfigClient):
     pass
 
 
@@ -564,6 +569,34 @@ class MultiGridServerTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_aster_api_config_can_be_loaded_from_environment(self):
+        old_values = {
+            "GRID_EXCHANGE": os.environ.get("GRID_EXCHANGE"),
+            "ASTER_USER_ADDRESS": os.environ.get("ASTER_USER_ADDRESS"),
+            "ASTER_SIGNER_PRIVATE_KEY": os.environ.get("ASTER_SIGNER_PRIVATE_KEY"),
+            "ASTER_TESTNET": os.environ.get("ASTER_TESTNET"),
+        }
+        try:
+            os.environ["GRID_EXCHANGE"] = "aster"
+            os.environ["ASTER_USER_ADDRESS"] = "0x0000000000000000000000000000000000000abc"
+            os.environ["ASTER_SIGNER_PRIVATE_KEY"] = "0x" + "1" * 64
+            os.environ["ASTER_TESTNET"] = "false"
+
+            loaded = main._load_env_api_config()
+
+            self.assertEqual(loaded["exchange"], "aster")
+            self.assertEqual(loaded["api_key"], "0x0000000000000000000000000000000000000abc")
+            self.assertEqual(loaded["api_secret"], "0x" + "1" * 64)
+            self.assertFalse(loaded["testnet"])
+            self.assertEqual(loaded["source"], "env")
+            self.assertIsInstance(main._build_client_from_config(loaded), AsterFuturesClient)
+        finally:
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_saved_file_config_takes_priority_over_environment(self):
         original_path = main.API_CONFIG_FILE
         old_values = {
@@ -666,6 +699,34 @@ class MultiGridServerTests(unittest.TestCase):
                 main.API_CONFIG_FILE = original_path
                 main.BinanceFuturesClient = original_binance
                 main.BybitClient = original_bybit
+
+    def test_api_config_endpoint_saves_aster_and_uses_aster_client(self):
+        original_path = main.API_CONFIG_FILE
+        original_aster = main.AsterFuturesClient
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                main.API_CONFIG_FILE = str(Path(tmpdir) / "api_config.json")
+                main.AsterFuturesClient = FakeAsterConfigClient
+
+                response = self.client.post(
+                    "/api/config",
+                    json={
+                        "exchange": "aster",
+                        "api_key": "0x0000000000000000000000000000000000000abc",
+                        "api_secret": "0x" + "1" * 64,
+                        "testnet": False,
+                    },
+                )
+                config_response = self.client.get("/api/config")
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["message"], "Aster API config saved")
+                self.assertIsInstance(main._client, FakeAsterConfigClient)
+                self.assertEqual(main._api_config["exchange"], "aster")
+                self.assertEqual(config_response.json()["exchange"], "aster")
+            finally:
+                main.API_CONFIG_FILE = original_path
+                main.AsterFuturesClient = original_aster
 
     def test_binance_order_and_position_shapes_match_grid_engine_contract(self):
         client = BinanceFuturesClient("", "", True)
