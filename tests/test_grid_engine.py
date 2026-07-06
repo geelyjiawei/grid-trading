@@ -263,6 +263,104 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.config["active_grid_count"], 2)
         self.assertEqual(sorted(order["qty"] for order in reduce_orders), ["2.0", "2.0"])
 
+    async def test_reduce_protection_detects_level_gaps_even_when_total_matches(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine.grid_levels = engine._calculate_levels()
+        engine.grid_position_net_qty = -2.0
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "1": {"qty": 1.0, "entry_value": 100.0},
+            "2": {"qty": 1.0, "entry_value": 100.0},
+        }
+        engine.active_orders = {
+            "wrong": {
+                "link_id": "wrong",
+                "order_id": "old-1",
+                "level_idx": 2,
+                "side": "Buy",
+                "price": "103.3",
+                "qty": "2.0",
+                "reduce_only": True,
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "entry_price": 100,
+            }
+        }
+
+        snapshot = engine.reduce_protection_snapshot()
+
+        self.assertTrue(snapshot["has_risk"])
+        self.assertEqual(snapshot["missing_by_level"][0]["level"], 1)
+        self.assertEqual(snapshot["excess_by_level"][0]["level"], 2)
+
+        self.assertTrue(engine._handle_reduce_protection_level_risk())
+        self.assertEqual(engine.active_orders, {})
+        self.assertIn("old-1", client.cancelled_orders)
+
+        self.assertTrue(engine._handle_reduce_protection_level_risk())
+        reduce_orders = [
+            order for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        ]
+        self.assertEqual(
+            sorted((order["level_idx"], float(order["qty"])) for order in reduce_orders),
+            [(1, 1.0), (2, 1.0)],
+        )
+
+    async def test_reduce_protection_incomplete_ledger_warns_without_guessing_orders(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine.grid_levels = engine._calculate_levels()
+        engine.grid_position_net_qty = -1.0
+        engine.reduce_lots_complete = False
+        engine.reduce_lots_by_level = {}
+        engine.active_orders = {}
+
+        snapshot = engine.reduce_protection_snapshot()
+
+        self.assertTrue(snapshot["has_risk"])
+        self.assertFalse(snapshot["ledger_ok"])
+        self.assertTrue(engine._handle_reduce_protection_level_risk())
+        self.assertEqual(engine.active_orders, {})
+        self.assertIn("Reduce protection risk", engine.trigger_message)
+
     async def test_fixed_grid_qty_limit_open_uses_limit_price_for_initial_qty(self):
         client = FakeClient("1012", tick_size="0.1", qty_step="0.1", min_qty="0.1")
         engine = GridEngine(

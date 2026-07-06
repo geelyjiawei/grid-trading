@@ -1289,11 +1289,15 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     unmanaged_position = bool(positions and (not engine or not engine.running))
     unmanaged_delta_qty = 0.0
     expected_position_net_qty = 0.0
+    reduce_protection = {}
+    reduce_protection_risk = False
     if engine and engine.running:
         status = engine.get_status()
         expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
         unmanaged_delta_qty = actual_position_net_qty - expected_position_net_qty
         unmanaged_position = abs(unmanaged_delta_qty) >= max(float(engine.min_qty), 1e-12)
+        reduce_protection = status.get("reduce_protection") or {}
+        reduce_protection_risk = bool(reduce_protection.get("has_risk"))
     return {
         "symbol": symbol,
         "exchange": exchange,
@@ -1304,8 +1308,9 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "unmanaged_delta_qty": round(unmanaged_delta_qty, 8),
         "expected_position_net_qty": round(expected_position_net_qty, 8),
         "actual_position_net_qty": round(actual_position_net_qty, 8),
+        "reduce_protection": reduce_protection,
         "positions": positions,
-        "has_risk": bool(orphan_orders or unmanaged_position),
+        "has_risk": bool(orphan_orders or unmanaged_position or reduce_protection_risk),
     }
 
 

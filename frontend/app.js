@@ -498,6 +498,18 @@ function renderRiskSnapshot(risk) {
     .map((position) => `${position.side === "Buy" ? "多仓" : "空仓"} ${position.size}，均价 ${fmtMarket(position.entry_price)}`)
     .join("；");
   const messages = [];
+  const reduceProtection = risk.reduce_protection || {};
+  if (reduceProtection.has_risk) {
+    const missing = reduceProtection.missing_by_level || [];
+    const missingText = missing
+      .slice(0, 6)
+      .map((item) => `L${item.level}@${item.price}: ${fmtQty(item.missing_qty)}`)
+      .join("，");
+    const reason = reduceProtection.ledger_ok === false
+      ? `平仓保护账本异常：${reduceProtection.ledger_reason || "无法确认每格保护数量"}`
+      : "平仓保护挂单价位不完整";
+    messages.push(`<div>${reason}${missingText ? `，缺口 ${missingText}` : ""}。</div>`);
+  }
   if (orphanCount > 0) {
     messages.push(`<div><strong>${currentRiskSymbol}</strong> 有 ${orphanCount} 个程序历史挂单未被当前网格托管。</div>`);
   }

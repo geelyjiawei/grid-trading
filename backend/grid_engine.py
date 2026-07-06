@@ -356,6 +356,7 @@ class GridEngine:
             "filled_orders": self.filled_orders[-50:],
             "reduce_lots_complete": self.reduce_lots_complete,
             "reduce_lots_by_level": self.reduce_lots_by_level,
+            "reduce_protection": self.reduce_protection_snapshot(),
             "target_qty_by_level": self.target_qty_by_level,
             "gross_profit": round(self.gross_profit, 4),
             "total_profit": round(self.total_profit, 4),
@@ -713,6 +714,89 @@ class GridEngine:
             if order.get("side") == side and order.get("reduce_only")
         )
 
+    def reduce_protection_snapshot(self) -> dict:
+        direction = self.config.get("direction")
+        reduce_side = self._reduce_side()
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        min_qty = Decimal(str(self.min_qty))
+        active_total = Decimal(str(self._active_reduce_qty(reduce_side))) if reduce_side else Decimal("0")
+
+        snapshot = {
+            "enabled": direction in {"long", "short"} and bool(reduce_side),
+            "ledger_ok": True,
+            "ledger_reason": "",
+            "grid_qty": float(grid_qty),
+            "active_reduce_qty": float(active_total),
+            "expected_reduce_qty": 0.0,
+            "missing_by_level": [],
+            "excess_by_level": [],
+            "has_level_gap": False,
+            "has_risk": False,
+        }
+        if not snapshot["enabled"] or grid_qty < min_qty:
+            return snapshot
+
+        lots, reason = self._reduce_lots_for_repair()
+        if lots is None:
+            snapshot["ledger_ok"] = False
+            snapshot["ledger_reason"] = reason or "reduce protection ledger is incomplete"
+            stored_lots = self._reduce_lot_decimal_map()
+            if stored_lots:
+                lots = stored_lots
+            else:
+                snapshot["has_risk"] = active_total + min_qty < grid_qty
+                return snapshot
+
+        expected_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
+        snapshot["expected_reduce_qty"] = float(expected_total)
+        if abs(expected_total - grid_qty) >= min_qty:
+            snapshot["ledger_ok"] = False
+            snapshot["ledger_reason"] = (
+                f"reduce protection ledger qty {float(expected_total)} "
+                f"does not match grid qty {float(grid_qty)}"
+            )
+            snapshot["has_risk"] = True
+
+        level_indexes = set(lots)
+        for order in self.active_orders.values():
+            if order.get("side") == reduce_side and order.get("reduce_only"):
+                level_indexes.add(int(order.get("level_idx", 0) or 0))
+
+        for level_idx in sorted(level_indexes):
+            expected_qty = Decimal("0")
+            if level_idx in lots:
+                expected_qty = lots[level_idx]["qty"]
+            active_qty = Decimal(str(self._active_order_qty(reduce_side, level_idx, True)))
+            diff = expected_qty - active_qty
+            if diff >= min_qty:
+                snapshot["missing_by_level"].append(
+                    {
+                        "level": level_idx,
+                        "price": self._fp(self.grid_levels[level_idx])
+                        if 0 <= level_idx < len(self.grid_levels)
+                        else "",
+                        "expected_qty": float(expected_qty),
+                        "active_qty": float(active_qty),
+                        "missing_qty": float(diff),
+                    }
+                )
+            elif -diff >= min_qty:
+                snapshot["excess_by_level"].append(
+                    {
+                        "level": level_idx,
+                        "price": self._fp(self.grid_levels[level_idx])
+                        if 0 <= level_idx < len(self.grid_levels)
+                        else "",
+                        "expected_qty": float(expected_qty),
+                        "active_qty": float(active_qty),
+                        "excess_qty": float(-diff),
+                    }
+                )
+
+        snapshot["has_level_gap"] = bool(snapshot["missing_by_level"] or snapshot["excess_by_level"])
+        snapshot["has_risk"] = bool(snapshot["has_risk"] or snapshot["has_level_gap"])
+        return snapshot
+
     def _reduce_side(self) -> str:
         direction = self.config["direction"]
         if direction == "long":
@@ -851,8 +935,7 @@ class GridEngine:
                 f"Trimmed excess reduce-only protection: {reduce_side} {float(excess):g}"
             )
             self._persist_state()
-            if self._active_reduce_qty(reduce_side) - self._grid_position_qty() < self.min_qty:
-                return False
+            return True
         else:
             self._mark_fast_poll()
         return True
@@ -1432,6 +1515,8 @@ class GridEngine:
             return
         if self._trim_reduce_overcommit():
             return
+        if self._handle_reduce_protection_level_risk():
+            return
 
         reduce_side = self._reduce_side()
         if not reduce_side:
@@ -1738,6 +1823,113 @@ class GridEngine:
             )
             self._persist_state()
             return True
+        return False
+
+    def _cancel_excess_reduce_protection_by_level(self, reduce_side: str, excess_by_level: list[dict]) -> bool:
+        cancelled_count = 0
+        cancelled_qty = Decimal("0")
+        for excess in excess_by_level:
+            level_idx = int(excess.get("level", 0) or 0)
+            remaining_excess = Decimal(str(excess.get("excess_qty", 0) or 0))
+            if remaining_excess < Decimal(str(self.min_qty)):
+                continue
+            candidates = [
+                (link_id, order)
+                for link_id, order in list(self.active_orders.items())
+                if order.get("side") == reduce_side
+                and order.get("reduce_only")
+                and int(order.get("level_idx", 0) or 0) == level_idx
+            ]
+            for link_id, order in candidates:
+                if remaining_excess < Decimal(str(self.min_qty)):
+                    break
+                order_qty = Decimal(str(order.get("qty", 0) or 0))
+                order_id = str(order.get("order_id", "") or "")
+                try:
+                    result = {"retCode": 0}
+                    if order_id:
+                        result = self.client.cancel_order(self.config["symbol"], order_id)
+                    if result.get("retCode") != 0:
+                        raise RuntimeError(result.get("retMsg", "Failed to cancel excess reduce order"))
+                    self.active_orders.pop(link_id, None)
+                    cancelled_count += 1
+                    cancelled_qty += order_qty
+                    remaining_excess -= order_qty
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to cancel excess reduce protection symbol=%s level=%s order_id=%s msg=%s",
+                        self.config.get("symbol"),
+                        level_idx,
+                        order_id,
+                        exc,
+                    )
+                    self._mark_fast_poll()
+                    self._persist_state()
+                    return True
+
+        if cancelled_count:
+            self.trigger_message = (
+                f"Cancelled {cancelled_count} misplaced reduce-only order(s); "
+                "rebuilding level protection next poll."
+            )
+            logger.warning(
+                "Cancelled misplaced reduce-only protection symbol=%s orders=%s qty=%s",
+                self.config.get("symbol"),
+                cancelled_count,
+                self._fq(float(cancelled_qty)),
+            )
+            self._mark_fast_poll()
+            self._persist_state()
+            return True
+        return False
+
+    def _handle_reduce_protection_level_risk(self) -> bool:
+        snapshot = self.reduce_protection_snapshot()
+        if not snapshot.get("has_risk"):
+            return False
+
+        if not snapshot.get("ledger_ok", True):
+            reason = snapshot.get("ledger_reason") or "reduce protection ledger is incomplete"
+            self.trigger_message = (
+                f"Reduce protection risk: {reason}; manual review required "
+                "instead of placing guessed boundary orders."
+            )
+            signature = ("reduce-protection-ledger", reason)
+            if self._should_log_reduce_warning(signature):
+                logger.warning(
+                    "Reduce protection ledger risk symbol=%s reason=%s",
+                    self.config.get("symbol"),
+                    reason,
+                )
+            self._persist_state()
+            return True
+
+        reduce_side = self._reduce_side()
+        if snapshot.get("excess_by_level"):
+            return self._cancel_excess_reduce_protection_by_level(
+                reduce_side,
+                list(snapshot.get("excess_by_level") or []),
+            )
+
+        if snapshot.get("missing_by_level"):
+            if self._repair_missing_reduce_protection_from_ledger():
+                return True
+            missing_qty = sum(float(item.get("missing_qty", 0) or 0) for item in snapshot["missing_by_level"])
+            self.trigger_message = (
+                f"Reduce-only protection has level gaps: {self._fq(missing_qty)}; "
+                "waiting for safe reduce capacity."
+            )
+            signature = ("reduce-protection-level-gap", self._fq(missing_qty))
+            if self._should_log_reduce_warning(signature):
+                logger.warning(
+                    "Reduce protection level gaps symbol=%s missing_qty=%s gaps=%s",
+                    self.config.get("symbol"),
+                    self._fq(missing_qty),
+                    snapshot["missing_by_level"],
+                )
+            self._persist_state()
+            return True
+
         return False
 
     def _warn_missing_reduce_protection(self):
