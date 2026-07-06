@@ -1268,6 +1268,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.grid_levels = [90, 95, 100, 105, 110]
         engine.grid_position_net_qty = -0.2
         engine.completed_pairs = 10
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {"2": {"qty": 0.2, "entry_value": 21.0}}
         engine.active_orders = {
             "existing": {
                 "link_id": "existing",
@@ -1535,7 +1537,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(reopen_order["qty"], "100")
 
-    async def test_fixed_grid_reduce_normalization_keeps_single_remainder(self):
+    async def test_fixed_grid_reduce_normalization_does_not_hide_incomplete_ledger(self):
         client = FakeClient("0.418", tick_size="0.001", qty_step="1", min_qty="1")
         client.positions = [{"side": "Sell", "size": "338", "avgPrice": "0.4"}]
         engine = GridEngine(
@@ -1559,6 +1561,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         engine._fetch_precision()
         engine.grid_levels = [0.41, 0.412, 0.414, 0.416, 0.418, 0.42]
         engine.grid_position_net_qty = -338
+        engine.reduce_lots_complete = False
+        engine.reduce_lots_by_level = {}
         engine.active_orders = {
             "g_4_B_a": {
                 "link_id": "g_4_B_a",
@@ -1618,7 +1622,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 "level_idx": 0,
                 "side": "Buy",
                 "price": "0.410",
-                "qty": "100",
+                "qty": "102",
                 "status": "open",
                 "order_type": "Limit",
                 "time_in_force": "GTC",
@@ -1629,14 +1633,21 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         engine._reconcile_grid_position_protection()
 
-        reduce_qtys = sorted(
-            float(order["qty"])
+        reduce_qtys_by_level = sorted(
+            (order["level_idx"], float(order["qty"]))
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         )
-        self.assertEqual(reduce_qtys, [38.0, 100.0, 100.0, 100.0])
+        self.assertEqual(
+            reduce_qtys_by_level,
+            [(0, 102.0), (1, 39.0), (2, 56.0), (3, 100.0), (4, 41.0)],
+        )
         self.assertAlmostEqual(engine._active_reduce_qty("Buy"), 338.0)
-        self.assertEqual(len([qty for qty in reduce_qtys if qty != 100.0]), 1)
+        self.assertEqual(client.cancelled_orders, [])
+        self.assertIn("Reduce protection risk", engine.trigger_message)
+        snapshot = engine.reduce_protection_snapshot()
+        self.assertTrue(snapshot["has_risk"])
+        self.assertFalse(snapshot["ledger_ok"])
 
     async def test_partial_grid_fill_is_processed_incrementally(self):
         client = FakeClient("100", qty_step="1", min_qty="1")
