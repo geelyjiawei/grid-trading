@@ -29,6 +29,8 @@ class GridEngine:
         self.active_orders: dict[str, dict] = {}
         self.filled_orders: list[dict] = []
         self.completed_pairs = 0
+        self.reduce_lots_by_level: dict[str, dict[str, float]] = {}
+        self.reduce_lots_complete = False
         self.gross_profit = 0.0
         self.total_profit = 0.0
         self.total_fee = 0.0
@@ -78,6 +80,8 @@ class GridEngine:
             "active_orders": self.active_orders,
             "filled_orders": self.filled_orders[-200:],
             "completed_pairs": self.completed_pairs,
+            "reduce_lots_by_level": self.reduce_lots_by_level,
+            "reduce_lots_complete": self.reduce_lots_complete,
             "gross_profit": self.gross_profit,
             "total_profit": self.total_profit,
             "total_fee": self.total_fee,
@@ -112,6 +116,8 @@ class GridEngine:
         self.active_orders = dict(state.get("active_orders") or {})
         self.filled_orders = list(state.get("filled_orders") or [])
         self.completed_pairs = int(state.get("completed_pairs") or 0)
+        self.reduce_lots_by_level = self._normalize_reduce_lots(state.get("reduce_lots_by_level") or {})
+        self.reduce_lots_complete = bool(state.get("reduce_lots_complete", bool(self.reduce_lots_by_level)))
         self.gross_profit = float(state.get("gross_profit") or 0)
         self.total_profit = float(state.get("total_profit") or 0)
         self.total_fee = float(state.get("total_fee") or 0)
@@ -146,6 +152,7 @@ class GridEngine:
         try:
             self._fetch_precision()
             self.current_price = self._get_current_price()
+            self._bootstrap_reduce_lots_from_legacy_state()
             if saved_running:
                 self._migrate_baseline_position_from_exchange()
                 self._reconcile_exchange_open_orders()
@@ -343,6 +350,8 @@ class GridEngine:
             "completed_pairs": self.completed_pairs,
             "filled_count": len(self.filled_orders),
             "filled_orders": self.filled_orders[-50:],
+            "reduce_lots_complete": self.reduce_lots_complete,
+            "reduce_lots_by_level": self.reduce_lots_by_level,
             "gross_profit": round(self.gross_profit, 4),
             "total_profit": round(self.total_profit, 4),
             "realized_net_profit": round(self.total_profit, 4),
@@ -1140,6 +1149,7 @@ class GridEngine:
 
     def _apply_market_reduce_to_grid_position(self, side: str, qty: float):
         self._apply_grid_position_fill({"side": side, "reduce_only": True}, qty)
+        self.reduce_lots_complete = False
 
     def _sync_grid_position_with_exchange(self):
         if self.config["direction"] not in {"long", "short"}:
@@ -1180,6 +1190,7 @@ class GridEngine:
             self._baseline_position_net_qty(),
         )
         self.grid_position_net_qty = actual_grid_qty
+        self.reduce_lots_complete = False
         self._position_mismatch_seen_at = 0.0
         self._position_mismatch_signature = None
         self._persist_state()
@@ -1214,6 +1225,44 @@ class GridEngine:
         lot["qty"] += qty
         lot["entry_value"] += qty * entry_price
 
+    @staticmethod
+    def _normalize_reduce_lots(raw_lots: dict) -> dict[str, dict[str, float]]:
+        normalized: dict[str, dict[str, float]] = {}
+        for raw_level, raw_lot in (raw_lots or {}).items():
+            try:
+                level_idx = int(raw_level)
+                qty = float((raw_lot or {}).get("qty") or 0)
+                entry_value = float((raw_lot or {}).get("entry_value") or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            normalized[str(level_idx)] = {"qty": qty, "entry_value": entry_value}
+        return normalized
+
+    def _reduce_lot_decimal_map(self) -> dict[int, dict[str, Decimal]]:
+        lots: dict[int, dict[str, Decimal]] = {}
+        for raw_level, raw_lot in self.reduce_lots_by_level.items():
+            try:
+                level_idx = int(raw_level)
+                qty = Decimal(str(raw_lot.get("qty", 0) or 0))
+                entry_value = Decimal(str(raw_lot.get("entry_value", 0) or 0))
+            except Exception:
+                continue
+            if qty > 0:
+                lots[level_idx] = {"qty": qty, "entry_value": entry_value}
+        return lots
+
+    def _set_reduce_lot_decimal_map(self, lots: dict[int, dict[str, Decimal]]):
+        self.reduce_lots_by_level = {
+            str(level_idx): {
+                "qty": float(lot["qty"]),
+                "entry_value": float(lot["entry_value"]),
+            }
+            for level_idx, lot in sorted(lots.items())
+            if lot.get("qty", Decimal("0")) > 0
+        }
+
     def _lot_remove(self, lots: dict[int, dict[str, Decimal]], level_idx: int, qty: Decimal) -> bool:
         if qty <= 0:
             return True
@@ -1228,6 +1277,54 @@ class GridEngine:
         lot["qty"] -= qty
         lot["entry_value"] -= average_entry * qty
         return True
+
+    def _reset_reduce_lots_from_pending_targets(self, entry_price: float):
+        if self.config["direction"] not in {"long", "short"} or not self._pending_targets:
+            self.reduce_lots_by_level = {}
+            self.reduce_lots_complete = False
+            return
+
+        lots: dict[int, dict[str, Decimal]] = {}
+        entry = Decimal(str(entry_price or 0))
+        for target, allocated_qty in zip(
+            self._pending_targets.get("profit_targets") or [],
+            self._pending_targets.get("allocated_qtys") or [],
+        ):
+            self._lot_add(lots, int(target[0]), Decimal(str(allocated_qty)), entry)
+        self._set_reduce_lot_decimal_map(lots)
+        self.reduce_lots_complete = True
+
+    def _record_reduce_lot_fill(self, order: dict, qty: float, price: float):
+        if not self.reduce_lots_complete or self.config["direction"] not in {"long", "short"}:
+            return
+
+        try:
+            level_idx = int(order.get("level_idx", 0) or 0)
+            qty_decimal = Decimal(str(qty))
+            price_decimal = Decimal(str(price))
+        except Exception:
+            self.reduce_lots_complete = False
+            return
+
+        lots = self._reduce_lot_decimal_map()
+        direction = self.config["direction"]
+        side = order.get("side")
+        reduce_only = bool(order.get("reduce_only"))
+
+        if direction == "short":
+            if side == "Sell" and not reduce_only:
+                self._lot_add(lots, level_idx, qty_decimal, price_decimal)
+            elif side == "Buy" and reduce_only and not self._lot_remove(lots, level_idx, qty_decimal):
+                self.reduce_lots_complete = False
+                return
+        elif direction == "long":
+            if side == "Buy" and not reduce_only:
+                self._lot_add(lots, level_idx, qty_decimal, price_decimal)
+            elif side == "Sell" and reduce_only and not self._lot_remove(lots, level_idx, qty_decimal):
+                self.reduce_lots_complete = False
+                return
+
+        self._set_reduce_lot_decimal_map(lots)
 
     def _reduce_target_for_level(self, level_idx: int) -> tuple[str, float] | None:
         direction = self.config["direction"]
@@ -1256,6 +1353,32 @@ class GridEngine:
         for target, allocated_qty in zip(profit_targets, allocated_qtys):
             self._lot_add(lots, int(target[0]), Decimal(str(allocated_qty)), entry_price)
         return lots
+
+    def _bootstrap_reduce_lots_from_legacy_state(self):
+        if self.reduce_lots_complete or self.reduce_lots_by_level:
+            return
+        if self.config["direction"] not in {"long", "short"}:
+            return
+        lots, reason = self._reduce_lots_from_fill_ledger()
+        if lots is None:
+            logger.info(
+                "Reduce lot ledger unavailable from legacy state symbol=%s reason=%s",
+                self.config.get("symbol"),
+                reason,
+            )
+            return
+        ledger_qty = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        if abs(ledger_qty - grid_qty) >= Decimal(str(self.min_qty)):
+            logger.info(
+                "Reduce lot ledger from legacy state does not match grid position symbol=%s ledger_qty=%s grid_qty=%s",
+                self.config.get("symbol"),
+                float(ledger_qty),
+                float(grid_qty),
+            )
+            return
+        self._set_reduce_lot_decimal_map(lots)
+        self.reduce_lots_complete = True
 
     def _reduce_lots_from_fill_ledger(self) -> tuple[dict[int, dict[str, Decimal]] | None, str]:
         if self.config["direction"] not in {"long", "short"}:
@@ -1295,8 +1418,13 @@ class GridEngine:
 
         return lots, ""
 
+    def _reduce_lots_for_repair(self) -> tuple[dict[int, dict[str, Decimal]] | None, str]:
+        if self.reduce_lots_complete:
+            return self._reduce_lot_decimal_map(), ""
+        return self._reduce_lots_from_fill_ledger()
+
     def _repair_missing_reduce_protection_from_ledger(self) -> bool:
-        lots, reason = self._reduce_lots_from_fill_ledger()
+        lots, reason = self._reduce_lots_for_repair()
         if lots is None:
             if reason:
                 logger.warning(
@@ -1877,6 +2005,7 @@ class GridEngine:
                 return
             self._place_market_open(open_side, total_qty)
             self._prepare_pending_targets(self.initial_entry_price or current_price, self.initial_qty)
+            self._reset_reduce_lots_from_pending_targets(self.initial_entry_price or current_price)
             self._deploy_pending_targets()
 
         if direction == "neutral":
@@ -2327,6 +2456,7 @@ class GridEngine:
         self.initial_qty = stats["qty"]
         self.initial_entry_price = stats["price"]
         self._set_initial_grid_position(self.initial_side, stats["qty"])
+        self._reset_reduce_lots_from_pending_targets(stats["price"])
         self._record_trade_value(
             stats["price"],
             stats["qty"],
@@ -2556,6 +2686,7 @@ class GridEngine:
         qty = stats["qty"]
         price = stats["price"]
         gross_profit = 0.0
+        self._record_reduce_lot_fill(order, qty, price)
         self._apply_grid_position_fill(order, qty)
 
         if order["reduce_only"]:

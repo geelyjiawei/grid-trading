@@ -590,6 +590,82 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(repair_orders[0]["entry_price"]), 105.0)
         self.assertIn("from fill ledger", engine.trigger_message)
 
+    async def test_reconcile_repairs_missing_reduce_from_persisted_lot_ledger(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = -0.2
+        engine.completed_pairs = 100
+        engine.filled_orders = []
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {"2": {"qty": 0.2, "entry_value": 21.0}}
+
+        engine._reconcile_grid_position_protection()
+
+        repair_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        ]
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "100.0")
+        self.assertAlmostEqual(float(repair_orders[0]["qty"]), 0.2)
+        self.assertAlmostEqual(float(repair_orders[0]["entry_price"]), 105.0)
+
+    async def test_record_fill_updates_reduce_lot_ledger(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.reduce_lots_complete = True
+
+        engine._record_fill(
+            {"side": "Sell", "price": 105, "qty": "0.2", "level_idx": 2, "reduce_only": False},
+            {"price": 105, "qty": 0.2, "volume": 21.0, "fee": 0, "fee_asset": "USDT", "fee_source": "test"},
+        )
+
+        self.assertEqual(engine.reduce_lots_by_level, {"2": {"qty": 0.2, "entry_value": 21.0}})
+
+        engine._record_fill(
+            {"side": "Buy", "price": 100, "qty": "0.05", "level_idx": 2, "reduce_only": True},
+            {"price": 100, "qty": 0.05, "volume": 5.0, "fee": 0, "fee_asset": "USDT", "fee_source": "test"},
+        )
+
+        self.assertAlmostEqual(engine.reduce_lots_by_level["2"]["qty"], 0.15)
+        self.assertAlmostEqual(engine.reduce_lots_by_level["2"]["entry_value"], 15.75)
+
     async def test_reconcile_repairs_only_missing_reduce_deficit_from_fill_ledger(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
         client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
