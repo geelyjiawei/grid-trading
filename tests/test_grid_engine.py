@@ -490,7 +490,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["baseline_position"]["qty"], 793)
         self.assertEqual(status["expected_position_net_qty"], -1238)
 
-    async def test_reconcile_repairs_missing_short_reduce_protection_from_exchange_position(self):
+    async def test_reconcile_does_not_guess_missing_short_reduce_protection_price(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "528", "avgPrice": "0.6097"}]
         engine = GridEngine(
@@ -542,8 +542,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(len(repair_orders), 1)
-        self.assertEqual(float(repair_orders[0]["qty"]), 528)
+        self.assertEqual(repair_orders, [])
+        self.assertIn("instead of placing guessed boundary orders", engine.trigger_message)
 
     async def test_reconcile_clears_grid_position_when_exchange_is_flat(self):
         client = FakeClient("100")
@@ -738,7 +738,16 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.grid_ready)
         self.assertLessEqual(engine._active_reduce_qty("Buy"), 1.0)
         self.assertEqual(client.cancelled_orders, ["1"])
-        self.assertIn("Repaired missing reduce-only protection", engine.trigger_message)
+        self.assertAlmostEqual(engine._active_reduce_qty("Buy"), 1.0)
+        replacement_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        ]
+        self.assertEqual(len(replacement_orders), 1)
+        self.assertEqual(replacement_orders[0]["price"], "95.0")
+        self.assertAlmostEqual(float(replacement_orders[0]["qty"]), 1.0)
+        self.assertIn("Trimmed excess reduce-only protection", engine.trigger_message)
 
     async def test_position_sync_waits_for_order_ledger_before_overcommit_check(self):
         client = FakeClient("100")

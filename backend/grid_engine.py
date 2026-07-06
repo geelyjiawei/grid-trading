@@ -687,6 +687,9 @@ class GridEngine:
                 break
 
             order_qty = Decimal(str(order.get("qty", 0) or 0))
+            replacement_qty = Decimal("0")
+            if order_qty > remaining_excess:
+                replacement_qty = order_qty - remaining_excess
             order_id = str(order.get("order_id", "") or "")
             try:
                 result = {"retCode": 0}
@@ -695,7 +698,7 @@ class GridEngine:
                 if result.get("retCode") != 0:
                     raise RuntimeError(result.get("retMsg", "Failed to cancel excess reduce order"))
                 self.active_orders.pop(link_id, None)
-                remaining_excess -= order_qty
+                remaining_excess -= min(order_qty, remaining_excess)
                 changed = True
                 logger.warning(
                     "Cancelled excess reduce-only order symbol=%s order_id=%s link_id=%s qty=%s",
@@ -704,11 +707,28 @@ class GridEngine:
                     link_id,
                     order.get("qty"),
                 )
+                if replacement_qty >= Decimal(str(self.min_qty)):
+                    self._place(
+                        reduce_side,
+                        float(order.get("price", 0) or 0),
+                        int(order.get("level_idx", 0) or 0),
+                        reduce_only=True,
+                        qty_override=float(replacement_qty),
+                        entry_price=order.get("entry_price"),
+                        allow_duplicate=True,
+                    )
+                    logger.warning(
+                        "Replaced trimmed reduce-only remainder symbol=%s old_order_id=%s price=%s qty=%s",
+                        self.config.get("symbol"),
+                        order_id,
+                        order.get("price"),
+                        self._fq(float(replacement_qty)),
+                    )
             except Exception as exc:
                 status = self._get_order_status(order)
                 if self._is_cancelled_status(status):
                     self.active_orders.pop(link_id, None)
-                    remaining_excess -= order_qty
+                    remaining_excess -= min(order_qty, remaining_excess)
                     changed = True
                     continue
                 logger.warning(
@@ -1161,46 +1181,35 @@ class GridEngine:
         if self._trim_reduce_overcommit():
             return
 
+        self._warn_missing_reduce_protection()
+
+    def _warn_missing_reduce_protection(self):
         grid_qty = self._grid_position_qty()
         if grid_qty < self.min_qty:
             return
 
-        direction = self.config["direction"]
-        if direction == "short":
-            reduce_side = "Buy"
-            reduce_price = float(self.config["lower_price"])
-            level_idx = 0
-        else:
-            reduce_side = "Sell"
-            reduce_price = float(self.config["upper_price"])
-            level_idx = max(0, len(self.grid_levels) - 2)
+        reduce_side = self._reduce_side()
+        if not reduce_side:
+            return
 
         active_reduce_qty = self._active_reduce_qty(reduce_side)
         missing_qty = grid_qty - active_reduce_qty
         if missing_qty < self.min_qty:
             return
 
-        placed = self._place(
-            reduce_side,
-            reduce_price,
-            level_idx,
-            reduce_only=True,
-            qty_override=missing_qty,
-            entry_price=self.initial_entry_price or None,
-            allow_duplicate=True,
+        self.trigger_message = (
+            f"Reduce-only protection is short by {self._fq(missing_qty)}; "
+            "waiting for order/fill ledger instead of placing guessed boundary orders."
         )
-        if placed:
-            self.trigger_message = (
-                f"Repaired missing reduce-only protection: {reduce_side} {self._fq(missing_qty)}"
-            )
-            logger.warning(
-                "Missing reduce-only protection repaired symbol=%s side=%s qty=%s price=%s",
-                self.config.get("symbol"),
-                reduce_side,
-                self._fq(missing_qty),
-                self._fp(reduce_price),
-            )
-            self._persist_state()
+        logger.warning(
+            "Reduce-only protection missing; not placing guessed boundary order symbol=%s side=%s grid_qty=%s active_reduce_qty=%s missing_qty=%s",
+            self.config.get("symbol"),
+            reduce_side,
+            self._fq(grid_qty),
+            self._fq(active_reduce_qty),
+            self._fq(missing_qty),
+        )
+        self._persist_state()
 
     def _grid_position_qty(self) -> float:
         return abs(self._grid_position_net_qty())
