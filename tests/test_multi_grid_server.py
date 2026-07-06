@@ -207,6 +207,102 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["qty_per_grid_min"], 0.22)
         self.assertAlmostEqual(data["qty_per_grid_max"], 0.23)
 
+    def test_grid_preview_regular_limit_honors_marketable_user_price(self):
+        main._client = FakeClient("1012", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        payload = {
+            "symbol": "MUUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 1020,
+            "lower_price": 1000,
+            "grid_count": 20,
+            "total_investment": 0,
+            "leverage": 5,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 0.2,
+            "fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "taker_fee_rate": 0.0005,
+            "initial_order_type": "limit",
+            "initial_order_price": 1008,
+            "trigger_price": None,
+            "stop_loss_price": None,
+            "take_profit_price": None,
+        }
+
+        response = self.client.post("/api/grid/preview", json=payload)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["reference_price"], 1008)
+        self.assertEqual(data["active_grid_count"], 8)
+        self.assertAlmostEqual(data["total_qty"], 1.6)
+        self.assertAlmostEqual(data["qty_per_grid_min"], 0.2)
+        self.assertAlmostEqual(data["qty_per_grid_max"], 0.2)
+
+    def test_grid_preview_post_only_crossing_price_uses_maker_safe_reference(self):
+        main._client = FakeClient("1014", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        payload = {
+            "symbol": "MUUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 1020,
+            "lower_price": 1000,
+            "grid_count": 20,
+            "total_investment": 0,
+            "leverage": 5,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 0.2,
+            "fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "taker_fee_rate": 0.0005,
+            "initial_order_type": "post_only",
+            "initial_order_price": 1012,
+            "trigger_price": None,
+            "stop_loss_price": None,
+            "take_profit_price": None,
+        }
+
+        response = self.client.post("/api/grid/preview", json=payload)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertAlmostEqual(data["reference_price"], 1014.1)
+        self.assertEqual(data["active_grid_count"], 15)
+        self.assertAlmostEqual(data["total_qty"], 3.0)
+
+    def test_start_limit_open_allows_current_outside_range_when_limit_is_inside(self):
+        main._client = FakeClient("990", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        payload = {
+            "symbol": "MUUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 1020,
+            "lower_price": 1000,
+            "grid_count": 20,
+            "total_investment": 0,
+            "leverage": 5,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 0.2,
+            "fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "taker_fee_rate": 0.0005,
+            "initial_order_type": "limit",
+            "initial_order_price": 1014,
+            "trigger_price": None,
+            "stop_loss_price": None,
+            "take_profit_price": None,
+        }
+
+        response = self.client.post("/api/grid/start", json=payload)
+        opening_order = next(
+            order for order in main._client.orders if order.get("order_link_id", "").startswith("open_")
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(opening_order["price"], "1014.0")
+        self.assertEqual(opening_order["qty"], "2.8")
+
     def test_grid_preview_supports_fixed_grid_order_qty(self):
         main._client = FakeClient("100", tick_size="0.1", qty_step="0.01", min_qty="0.01")
         payload = {

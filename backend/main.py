@@ -311,18 +311,31 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     current_price = float(ticker["result"]["list"][0]["lastPrice"])
     initial_order_type = cfg.initial_order_type.lower().strip()
     sizing_mode = _position_sizing_mode(cfg)
-    reference_price = (
-        float(cfg.initial_order_price)
-        if direction in {"long", "short"} and initial_order_type in {"limit", "post_only"} and cfg.initial_order_price
-        else current_price
-    )
 
     info_resp = client.get_instrument_info(symbol)
     if info_resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=info_resp.get("retMsg", "Failed to fetch instrument info"))
     instrument = info_resp["result"]["list"][0]
+    tick_size = float(instrument["priceFilter"]["tickSize"])
     qty_step = instrument["lotSizeFilter"]["qtyStep"]
     min_qty = float(instrument["lotSizeFilter"]["minOrderQty"])
+
+    reference_price = current_price
+    if direction in {"long", "short"} and initial_order_type in {"limit", "post_only"}:
+        open_side = "Buy" if direction == "long" else "Sell"
+        maker_safe_price = current_price - tick_size if open_side == "Buy" else current_price + tick_size
+        if cfg.initial_order_price is not None:
+            configured_price = float(cfg.initial_order_price)
+            if initial_order_type == "limit":
+                reference_price = configured_price
+            elif open_side == "Buy" and configured_price < current_price:
+                reference_price = configured_price
+            elif open_side == "Sell" and configured_price > current_price:
+                reference_price = configured_price
+            else:
+                reference_price = maker_safe_price
+        else:
+            reference_price = maker_safe_price
 
     levels = _calculate_grid_levels(cfg.lower_price, cfg.upper_price, cfg.grid_count, grid_mode)
     if not (levels[0] < reference_price < levels[-1]):
@@ -796,6 +809,12 @@ def grid_preview(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
         raise HTTPException(status_code=400, detail="grid_mode must be arithmetic or geometric")
+    if cfg.initial_order_type.lower().strip() not in {"market", "limit", "post_only"}:
+        raise HTTPException(status_code=400, detail="initial_order_type must be market, limit, or post_only")
+    if direction == "neutral" and cfg.initial_order_type.lower().strip() != "market":
+        raise HTTPException(status_code=400, detail="limit initial orders are only supported for long or short grids")
+    if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
+        raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
     return _preview_grid(client, cfg, symbol, direction, grid_mode)
 

@@ -1725,10 +1725,13 @@ class GridEngine:
         self._mark_fast_poll()
         self._persist_state()
 
-    def _initial_limit_price(self, side: str, current_price: float) -> float:
+    def _initial_limit_price(self, side: str, current_price: float, *, post_only: bool = True) -> float:
         tick = float(self.tick_size)
         maker_safe_price = current_price - tick if side == "Buy" else current_price + tick
         configured_price = self.config.get("initial_order_price")
+        if configured_price is not None and not post_only:
+            return float(configured_price)
+
         if configured_price is not None:
             configured_price = float(configured_price)
             if side == "Buy" and configured_price < current_price:
@@ -2037,17 +2040,18 @@ class GridEngine:
         limit_open_price = None
         reference_price = current_price
         if direction in {"long", "short"} and initial_order_type in {"post_only", "limit"}:
-            limit_open_price = self._initial_limit_price(open_side, current_price)
+            limit_open_price = self._initial_limit_price(
+                open_side,
+                current_price,
+                post_only=initial_order_type == "post_only",
+            )
             reference_price = limit_open_price
 
-        if not (levels[0] < current_price < levels[-1]):
+        range_check_price = reference_price if limit_open_price is not None else current_price
+        range_label = "Reference price" if limit_open_price is not None else "Current price"
+        if not (levels[0] < range_check_price < levels[-1]):
             raise RuntimeError(
-                f"Current price {current_price} must stay inside the configured range "
-                f"{levels[0]} - {levels[-1]}"
-            )
-        if not (levels[0] < reference_price < levels[-1]):
-            raise RuntimeError(
-                f"Reference price {reference_price} must stay inside the configured range "
+                f"{range_label} {range_check_price} must stay inside the configured range "
                 f"{levels[0]} - {levels[-1]}"
             )
 
@@ -2455,8 +2459,8 @@ class GridEngine:
 
         self.waiting_initial_order = False
         self.opening_order = None
-        retry_price = self._initial_limit_price(side, current_price)
         post_only = str(order.get("time_in_force") or "") == "PostOnly"
+        retry_price = self._initial_limit_price(side, current_price, post_only=post_only)
         self._place_limit_open(side, qty, retry_price, post_only=post_only)
         order_label = "Post-only" if post_only else "Limit"
         self.trigger_message = (
