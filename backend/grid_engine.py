@@ -433,6 +433,28 @@ class GridEngine:
     def _position_sizing_mode(self) -> str:
         return str(self.config.get("position_sizing_mode") or "investment").lower().strip()
 
+    def _fixed_grid_qty_for_level(self, level_idx: int, fallback_qty: float | None = None) -> float:
+        if self._position_sizing_mode() != "fixed_grid_qty":
+            return float(fallback_qty or 0)
+
+        raw_qty = (
+            self.target_qty_by_level.get(str(level_idx))
+            or self.config.get("grid_order_qty")
+            or self.config.get("qty_per_grid")
+            or fallback_qty
+            or 0
+        )
+        steps = self._qty_to_steps(float(raw_qty))
+        if steps <= 0:
+            return float(fallback_qty or 0)
+        return self._steps_to_qty(steps)
+
+    def _counter_qty_for_order(self, order: dict) -> float:
+        qty = float(order["qty"])
+        if self._position_sizing_mode() != "fixed_grid_qty":
+            return qty
+        return self._fixed_grid_qty_for_level(int(order.get("level_idx", 0) or 0), qty)
+
     def _fee_rate(self) -> float:
         return max(0.0, float(self.config.get("fee_rate", 0.0005) or 0))
 
@@ -781,6 +803,107 @@ class GridEngine:
                 return False
         else:
             self._mark_fast_poll()
+        return True
+
+    def _normalize_fixed_reduce_protection(self) -> bool:
+        if self._position_sizing_mode() != "fixed_grid_qty":
+            return False
+
+        reduce_side = self._reduce_side()
+        if not reduce_side:
+            return False
+
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        min_qty = Decimal(str(self.min_qty))
+        if grid_qty < min_qty:
+            return False
+
+        orders = self._sort_reduce_orders_for_trim(reduce_side)
+        if not orders:
+            return False
+
+        minimum_diff = max(Decimal(str(self.qty_step)), min_qty)
+        remaining = grid_qty
+        replacements: list[tuple[str, dict, Decimal]] = []
+
+        for link_id, order in orders:
+            level_idx = int(order.get("level_idx", 0) or 0)
+            target_qty = Decimal(str(self._fixed_grid_qty_for_level(level_idx, float(order.get("qty", 0) or 0))))
+            if target_qty < min_qty:
+                target_qty = Decimal(str(order.get("qty", 0) or 0))
+
+            desired_qty = Decimal("0")
+            if remaining >= min_qty:
+                desired_qty = target_qty if remaining >= target_qty else remaining
+                remaining -= desired_qty
+
+            if desired_qty >= min_qty:
+                desired_qty = Decimal(self._fq(float(desired_qty)))
+
+            current_qty = Decimal(str(order.get("qty", 0) or 0))
+            if abs(current_qty - desired_qty) >= minimum_diff:
+                replacements.append((link_id, order, desired_qty))
+
+        if not replacements:
+            return False
+
+        planned_replacements: list[tuple[dict, Decimal]] = []
+        for link_id, order, desired_qty in replacements:
+            order_id = str(order.get("order_id", "") or "")
+            try:
+                result = {"retCode": 0}
+                if order_id:
+                    result = self.client.cancel_order(self.config["symbol"], order_id)
+                if result.get("retCode") != 0:
+                    raise RuntimeError(result.get("retMsg", "Failed to cancel fixed-grid reduce order"))
+                self.active_orders.pop(link_id, None)
+                if desired_qty >= min_qty:
+                    planned_replacements.append((order, desired_qty))
+            except Exception as exc:
+                status = self._get_order_status(order)
+                if self._is_cancelled_status(status):
+                    self.active_orders.pop(link_id, None)
+                    if desired_qty >= min_qty:
+                        planned_replacements.append((order, desired_qty))
+                    continue
+                logger.warning(
+                    "Failed to normalize fixed-grid reduce order symbol=%s order_id=%s link_id=%s status=%s msg=%s",
+                    self.config.get("symbol"),
+                    order_id,
+                    link_id,
+                    status,
+                    exc,
+                )
+                self._mark_fast_poll()
+                self._persist_state()
+                return True
+
+        placed_qty = Decimal("0")
+        for order, desired_qty in planned_replacements:
+            placed = self._place(
+                reduce_side,
+                float(order.get("price", 0) or 0),
+                int(order.get("level_idx", 0) or 0),
+                reduce_only=True,
+                qty_override=float(desired_qty),
+                entry_price=order.get("entry_price"),
+                allow_duplicate=True,
+            )
+            if placed:
+                placed_qty += desired_qty
+
+        self.trigger_message = (
+            f"Normalized fixed-grid reduce-only protection: "
+            f"{len(replacements)} order(s), replaced {self._fq(float(placed_qty))}"
+        )
+        logger.warning(
+            "Normalized fixed-grid reduce-only protection symbol=%s orders=%s replaced_qty=%s grid_qty=%s",
+            self.config.get("symbol"),
+            len(replacements),
+            self._fq(float(placed_qty)),
+            self._fq(float(grid_qty)),
+        )
+        self._persist_state()
         return True
 
     def _halt_if_baseline_breached(self) -> bool:
@@ -1209,6 +1332,8 @@ class GridEngine:
 
         self._sync_grid_position_with_exchange()
         if self._stopping:
+            return
+        if self._normalize_fixed_reduce_protection():
             return
         if self._trim_reduce_overcommit():
             return
@@ -2833,7 +2958,7 @@ class GridEngine:
         entry_price: float | None = None,
     ) -> bool:
         requested_qty = float(qty)
-        if not reduce_only:
+        if self._position_sizing_mode() == "fixed_grid_qty" or not reduce_only:
             deficit = self._active_order_qty_deficit(side, level_idx, reduce_only, requested_qty)
             if deficit <= 0:
                 return True
@@ -2865,7 +2990,7 @@ class GridEngine:
         direction = self.config["direction"]
         side = order["side"]
         level_idx = order["level_idx"]
-        qty = float(order["qty"])
+        qty = self._counter_qty_for_order(order)
 
         if direction == "long":
             if side == "Buy" and level_idx + 1 < len(self.grid_levels):

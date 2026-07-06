@@ -1249,6 +1249,150 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(replacement_orders[0]["qty"]), 1.0)
         self.assertIn("Trimmed excess reduce-only protection", engine.trigger_message)
 
+    async def test_fixed_grid_reduce_fill_reopens_full_grid_qty(self):
+        client = FakeClient("100", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        filled_reduce = {
+            "side": "Buy",
+            "price": "95",
+            "qty": "41",
+            "level_idx": 1,
+            "reduce_only": True,
+            "fill_price": 95,
+        }
+
+        placed = engine._place_counter_order(filled_reduce)
+
+        self.assertTrue(placed)
+        reopen_order = next(
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"] and order["level_idx"] == 1
+        )
+        self.assertEqual(reopen_order["qty"], "100")
+
+    async def test_fixed_grid_reduce_normalization_keeps_single_remainder(self):
+        client = FakeClient("0.418", tick_size="0.001", qty_step="1", min_qty="1")
+        client.positions = [{"side": "Sell", "size": "338", "avgPrice": "0.4"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "ANSEMUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.42,
+                "lower_price": 0.38,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.41, 0.412, 0.414, 0.416, 0.418, 0.42]
+        engine.grid_position_net_qty = -338
+        engine.active_orders = {
+            "g_4_B_a": {
+                "link_id": "g_4_B_a",
+                "order_id": "1",
+                "level_idx": 4,
+                "side": "Buy",
+                "price": "0.418",
+                "qty": "41",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.42,
+            },
+            "g_3_B_b": {
+                "link_id": "g_3_B_b",
+                "order_id": "2",
+                "level_idx": 3,
+                "side": "Buy",
+                "price": "0.416",
+                "qty": "100",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.42,
+            },
+            "g_2_B_c": {
+                "link_id": "g_2_B_c",
+                "order_id": "3",
+                "level_idx": 2,
+                "side": "Buy",
+                "price": "0.414",
+                "qty": "56",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.42,
+            },
+            "g_1_B_d": {
+                "link_id": "g_1_B_d",
+                "order_id": "4",
+                "level_idx": 1,
+                "side": "Buy",
+                "price": "0.412",
+                "qty": "39",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.42,
+            },
+            "g_0_B_e": {
+                "link_id": "g_0_B_e",
+                "order_id": "5",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "0.410",
+                "qty": "100",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.42,
+            },
+        }
+
+        engine._reconcile_grid_position_protection()
+
+        reduce_qtys = sorted(
+            float(order["qty"])
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        )
+        self.assertEqual(reduce_qtys, [38.0, 100.0, 100.0, 100.0])
+        self.assertAlmostEqual(engine._active_reduce_qty("Buy"), 338.0)
+        self.assertEqual(len([qty for qty in reduce_qtys if qty != 100.0]), 1)
+
     async def test_position_sync_waits_for_order_ledger_before_overcommit_check(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "75", "avgPrice": "100"}]
