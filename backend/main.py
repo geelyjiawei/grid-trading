@@ -31,6 +31,7 @@ from secret_store import decrypt_text, encrypt_text, storage_backend
 logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
 SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
+DEFAULT_EXCHANGE = "bybit"
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
 DEFAULT_TAKER_FEE_RATE = float(os.getenv("GRID_TAKER_FEE_RATE", "0.0005"))
 
@@ -60,27 +61,32 @@ def _cors_allowed_origins() -> list[str]:
 
 
 def _normalize_exchange(exchange: str | None) -> str:
-    normalized = str(exchange or "bybit").strip().lower()
-    return normalized if normalized in SUPPORTED_EXCHANGES else "bybit"
+    normalized = str(exchange or DEFAULT_EXCHANGE).strip().lower()
+    return normalized if normalized in SUPPORTED_EXCHANGES else DEFAULT_EXCHANGE
 
 
-def _load_env_api_config() -> dict | None:
-    exchange = _normalize_exchange(os.getenv("GRID_EXCHANGE") or os.getenv("EXCHANGE"))
-    prefix = {"binance": "BINANCE", "aster": "ASTER"}.get(exchange, "BYBIT")
+def _exchange_prefix(exchange: str) -> str:
+    return {"binance": "BINANCE", "aster": "ASTER"}.get(_normalize_exchange(exchange), "BYBIT")
+
+
+def _default_api_config(exchange: str = DEFAULT_EXCHANGE) -> dict:
+    return {
+        "exchange": _normalize_exchange(exchange),
+        "api_key": "",
+        "api_secret": "",
+        "testnet": False,
+        "source": "none",
+    }
+
+
+def _env_config_for_exchange(exchange: str) -> dict | None:
+    exchange = _normalize_exchange(exchange)
+    prefix = _exchange_prefix(exchange)
     api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
     api_secret = os.getenv(f"{prefix}_API_SECRET", "").strip()
     if exchange == "aster":
         api_key = api_key or os.getenv("ASTER_USER_ADDRESS", "").strip()
         api_secret = api_secret or os.getenv("ASTER_SIGNER_PRIVATE_KEY", "").strip()
-
-    if not api_key and not api_secret and exchange == "bybit":
-        binance_key = os.getenv("BINANCE_API_KEY", "").strip()
-        binance_secret = os.getenv("BINANCE_API_SECRET", "").strip()
-        if binance_key and binance_secret:
-            exchange = "binance"
-            prefix = "BINANCE"
-            api_key = binance_key
-            api_secret = binance_secret
 
     if not api_key or not api_secret:
         return None
@@ -94,37 +100,107 @@ def _load_env_api_config() -> dict | None:
     }
 
 
-def _load_api_config() -> dict:
-    file_config = _load_file_api_config()
-    if file_config and file_config.get("api_key") and file_config.get("api_secret"):
-        return file_config
+def _load_env_api_configs() -> dict[str, dict]:
+    configs: dict[str, dict] = {}
+    preferred = _normalize_exchange(os.getenv("GRID_EXCHANGE") or os.getenv("EXCHANGE"))
+    ordered = [preferred] + sorted(SUPPORTED_EXCHANGES - {preferred})
+    for exchange in ordered:
+        config = _env_config_for_exchange(exchange)
+        if config:
+            configs[exchange] = config
 
-    env_config = _load_env_api_config()
-    if env_config:
-        return env_config
+    # Backward compatibility: old Binance deployments often only set BINANCE_*
+    # without GRID_EXCHANGE. Pick it up even when Bybit is the default exchange.
+    if "binance" not in configs:
+        config = _env_config_for_exchange("binance")
+        if config:
+            configs["binance"] = config
+    return configs
 
-    return file_config or {"exchange": "bybit", "api_key": "", "api_secret": "", "testnet": False, "source": "none"}
+
+def _load_env_api_config() -> dict | None:
+    configs = _load_env_api_configs()
+    return _select_api_config(configs)
 
 
-def _load_file_api_config() -> dict | None:
-    if not os.path.exists(API_CONFIG_FILE):
+def _load_api_configs() -> dict[str, dict]:
+    file_configs = _load_file_api_configs()
+    env_configs = _load_env_api_configs()
+    merged = dict(env_configs)
+    for exchange, config in file_configs.items():
+        if config.get("api_key") and config.get("api_secret"):
+            merged[exchange] = config
+        elif exchange not in merged:
+            merged[exchange] = config
+    return merged
+
+
+def _select_api_config(configs: dict[str, dict], exchange: str | None = None) -> dict | None:
+    if not configs:
         return None
+    if exchange:
+        return configs.get(_normalize_exchange(exchange))
+    preferred = _normalize_exchange(os.getenv("GRID_EXCHANGE") or os.getenv("EXCHANGE"))
+    if preferred in configs:
+        return configs[preferred]
+    for candidate in ("binance", "aster", "bybit"):
+        if candidate in configs:
+            return configs[candidate]
+    return next(iter(configs.values()))
+
+
+def _load_api_config() -> dict:
+    file_configs = _load_file_api_configs()
+    if file_configs:
+        return _select_api_config(file_configs) or _default_api_config()
+    env_configs = _load_env_api_configs()
+    return _select_api_config(env_configs) or _default_api_config()
+
+
+def _load_file_api_configs() -> dict[str, dict]:
+    if not os.path.exists(API_CONFIG_FILE):
+        return {}
 
     try:
         with open(API_CONFIG_FILE, "r", encoding="utf-8") as file:
             config = json.load(file)
     except (OSError, json.JSONDecodeError):
-        return None
+        return {}
 
     try:
+        if isinstance(config.get("configs"), dict):
+            loaded: dict[str, dict] = {}
+            for exchange_key, item in config.get("configs", {}).items():
+                if not isinstance(item, dict):
+                    continue
+                exchange = _normalize_exchange(item.get("exchange") or exchange_key)
+                if item.get("encrypted"):
+                    loaded[exchange] = {
+                        "api_key": decrypt_text(str(item.get("api_key", ""))),
+                        "api_secret": decrypt_text(str(item.get("api_secret", ""))),
+                        "exchange": exchange,
+                        "testnet": bool(item.get("testnet", False)),
+                        "source": "file",
+                    }
+                else:
+                    loaded[exchange] = {
+                        "api_key": str(item.get("api_key", "")),
+                        "api_secret": str(item.get("api_secret", "")),
+                        "exchange": exchange,
+                        "testnet": bool(item.get("testnet", False)),
+                        "source": "file",
+                    }
+            return loaded
+
         if config.get("encrypted"):
-            return {
+            legacy = {
                 "api_key": decrypt_text(str(config.get("api_key", ""))),
                 "api_secret": decrypt_text(str(config.get("api_secret", ""))),
                 "exchange": _normalize_exchange(config.get("exchange")),
                 "testnet": bool(config.get("testnet", False)),
                 "source": "file",
             }
+            return {legacy["exchange"]: legacy}
 
         # One-time migration for configs saved before encrypted storage existed.
         migrated = {
@@ -136,19 +212,29 @@ def _load_file_api_config() -> dict | None:
         }
         if migrated["api_key"] or migrated["api_secret"]:
             _save_api_config(migrated)
-        return migrated
+        return {migrated["exchange"]: migrated}
     except Exception:
-        return None
+        return {}
 
 
-def _save_api_config(config: dict):
+def _write_api_configs(configs: dict[str, dict]):
+    encrypted_configs = {}
+    for exchange, config in configs.items():
+        exchange = _normalize_exchange(exchange)
+        encrypted_configs[exchange] = {
+            "encrypted": True,
+            "backend": storage_backend(),
+            "exchange": exchange,
+            "api_key": encrypt_text(str(config.get("api_key", ""))),
+            "api_secret": encrypt_text(str(config.get("api_secret", ""))),
+            "testnet": bool(config.get("testnet", False)),
+        }
+
     encrypted_config = {
+        "version": 2,
         "encrypted": True,
         "backend": storage_backend(),
-        "exchange": _normalize_exchange(config.get("exchange")),
-        "api_key": encrypt_text(str(config.get("api_key", ""))),
-        "api_secret": encrypt_text(str(config.get("api_secret", ""))),
-        "testnet": bool(config.get("testnet", False)),
+        "configs": encrypted_configs,
     }
     config_dir = os.path.dirname(API_CONFIG_FILE)
     if config_dir:
@@ -156,6 +242,19 @@ def _save_api_config(config: dict):
     with open(API_CONFIG_FILE, "w", encoding="utf-8") as file:
         json.dump(encrypted_config, file, ensure_ascii=False, indent=2)
     _private_chmod(API_CONFIG_FILE)
+
+
+def _save_api_config(config: dict):
+    exchange = _normalize_exchange(config.get("exchange"))
+    configs = _load_file_api_configs()
+    configs[exchange] = {
+        "exchange": exchange,
+        "api_key": str(config.get("api_key", "")),
+        "api_secret": str(config.get("api_secret", "")),
+        "testnet": bool(config.get("testnet", False)),
+        "source": "file",
+    }
+    _write_api_configs(configs)
 
 
 def _mask_api_key(api_key: str) -> str:
@@ -181,8 +280,80 @@ def _build_client(exchange: str, api_key: str, api_secret: str, testnet: bool):
     return BybitClient(api_key, api_secret, testnet)
 
 
-_api_config = _load_api_config()
-_client = _build_client_from_config(_api_config)
+def _engine_key(exchange: str, symbol: str) -> str:
+    return f"{_normalize_exchange(exchange)}:{str(symbol or '').upper().strip()}"
+
+
+def _engine_exchange(engine: GridEngine | None) -> str:
+    if not engine:
+        return _active_exchange
+    return _normalize_exchange(engine.config.get("exchange") or getattr(engine.client, "exchange", None))
+
+
+def _engine_symbol(engine: GridEngine | None) -> str:
+    if not engine:
+        return ""
+    return str(engine.config.get("symbol", "")).upper().strip()
+
+
+def _get_engine(exchange: str | None, symbol: str) -> GridEngine | None:
+    symbol = str(symbol or "").upper().strip()
+    if exchange:
+        return _engines.get(_engine_key(exchange, symbol))
+    matches = [engine for engine in _engines.values() if _engine_symbol(engine) == symbol]
+    if len(matches) == 1:
+        return matches[0]
+    return _engines.get(symbol)
+
+
+def _configured_exchange(config: dict | None) -> bool:
+    return bool(config and config.get("api_key") and config.get("api_secret"))
+
+
+def _refresh_active_exchange(exchange: str | None = None):
+    global _active_exchange, _api_config, _client
+    if exchange:
+        _active_exchange = _normalize_exchange(exchange)
+    elif _active_exchange not in _api_configs:
+        selected = _select_api_config(_api_configs)
+        _active_exchange = _normalize_exchange(selected.get("exchange") if selected else DEFAULT_EXCHANGE)
+    _api_config = _api_configs.get(_active_exchange) or _default_api_config(_active_exchange)
+    _client = _clients.get(_active_exchange)
+
+
+def _client_for_exchange(exchange: str | None = None, *, require_config: bool = True):
+    exchange = _normalize_exchange(exchange or _active_exchange)
+    # Compatibility for tests and legacy scripts that monkeypatch main._client.
+    if exchange == _active_exchange and _client and _client is not _clients.get(exchange):
+        return _client
+
+    client = _clients.get(exchange)
+    if client:
+        return client
+
+    config = _api_configs.get(exchange)
+    if _configured_exchange(config):
+        client = _build_client_from_config(config)
+        _clients[exchange] = client
+        return client
+
+    if exchange == _normalize_exchange(_api_config.get("exchange")) and _client:
+        return _client
+
+    if require_config:
+        raise HTTPException(status_code=400, detail=f"Please configure {exchange.title()} API first")
+    return _build_client(exchange, "", "", bool((config or {}).get("testnet", False)))
+
+
+_api_configs = _load_api_configs()
+_api_config = _select_api_config(_api_configs) or _default_api_config()
+_active_exchange = _normalize_exchange(_api_config.get("exchange"))
+_clients = {
+    exchange: _build_client_from_config(config)
+    for exchange, config in _api_configs.items()
+    if config.get("api_key") and config.get("api_secret")
+}
+_client = _clients.get(_active_exchange)
 
 
 def _load_grid_state_file() -> dict:
@@ -246,7 +417,7 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
     return {
         "run_id": config.get("run_id", ""),
         "symbol": str(config.get("symbol", "")).upper(),
-        "exchange": _normalize_exchange(_api_config.get("exchange")),
+        "exchange": _normalize_exchange(config.get("exchange") or _engine_exchange(engine)),
         "direction": config.get("direction", ""),
         "grid_mode": config.get("grid_mode", "arithmetic"),
         "lower_price": config.get("lower_price"),
@@ -469,45 +640,53 @@ def _save_engine_state(engine: GridEngine):
     if not symbol:
         return
 
+    exchange = _engine_exchange(engine)
+    engine.config["exchange"] = exchange
     state = _load_grid_state_file()
-    state["exchange"] = _normalize_exchange(_api_config.get("exchange"))
-    state["testnet"] = bool(_api_config.get("testnet", False))
     state["updated_at"] = time.time()
-    state.setdefault("grids", {})[symbol] = engine.to_state()
+    state.setdefault("grids", {})[_engine_key(exchange, symbol)] = engine.to_state()
     _write_grid_state_file(state)
     _upsert_grid_history(engine, "running" if engine.running else "saved")
 
 
-def _delete_engine_state(symbol: str):
+def _delete_engine_state(symbol: str, exchange: str | None = None):
     state = _load_grid_state_file()
     grids = state.setdefault("grids", {})
-    grids.pop(symbol.upper(), None)
+    symbol = symbol.upper()
+    if exchange:
+        grids.pop(_engine_key(exchange, symbol), None)
+    else:
+        for key in (symbol, *[item for item in list(grids) if item.endswith(f":{symbol}")]):
+            grids.pop(key, None)
     state["updated_at"] = time.time()
     _write_grid_state_file(state)
 
 
 def _restore_saved_engines():
-    if not _client:
-        return
-
     state = _load_grid_state_file()
-    if _normalize_exchange(state.get("exchange")) != _normalize_exchange(_api_config.get("exchange")):
-        return
-    if bool(state.get("testnet", False)) != bool(_api_config.get("testnet", False)):
-        return
+    legacy_exchange = _normalize_exchange(state.get("exchange"))
 
-    for symbol, engine_state in list(state.get("grids", {}).items()):
-        if symbol in _engines:
-            continue
+    for state_key, engine_state in list(state.get("grids", {}).items()):
         config = dict(engine_state.get("config") or {})
         if not config:
             continue
-        config["symbol"] = str(config.get("symbol") or symbol).upper()
-        engine = GridEngine(_client, config, state_callback=_save_engine_state)
+        symbol = str(config.get("symbol") or str(state_key).split(":")[-1]).upper()
+        exchange = _normalize_exchange(config.get("exchange") or engine_state.get("exchange") or legacy_exchange)
+        key = _engine_key(exchange, symbol)
+        if key in _engines:
+            continue
+        if not _configured_exchange(_api_configs.get(exchange)):
+            logger.warning("Saved grid skipped because API is not configured exchange=%s symbol=%s", exchange, symbol)
+            continue
+
+        config["symbol"] = symbol
+        config["exchange"] = exchange
+        engine = GridEngine(_client_for_exchange(exchange), config, state_callback=_save_engine_state)
         try:
             should_restart = bool(engine_state.get("running", False))
             engine.restore_state(engine_state)
-            _engines[config["symbol"]] = engine
+            engine.config["exchange"] = exchange
+            _engines[key] = engine
             can_restart = (
                 should_restart
                 and not engine._stopping
@@ -524,10 +703,17 @@ def _restore_saved_engines():
             else:
                 engine.running = False
                 engine._persist_state()
+            if state_key != key:
+                migrated_state = _load_grid_state_file()
+                grids = migrated_state.setdefault("grids", {})
+                if key in grids and state_key in grids:
+                    grids.pop(state_key, None)
+                    migrated_state["updated_at"] = time.time()
+                    _write_grid_state_file(migrated_state)
         except Exception as exc:
             # Keep the saved state on disk so the UI/risk checks can still show the problem.
             logger.exception("Failed to restore saved grid symbol=%s: %s", config.get("symbol"), exc)
-            _engines.pop(config["symbol"], None)
+            _engines.pop(key, None)
 
 
 @asynccontextmanager
@@ -587,6 +773,7 @@ class ApiConfig(BaseModel):
 
 
 class GridConfig(BaseModel):
+    exchange: str | None = None
     symbol: str
     direction: str
     upper_price: float
@@ -677,9 +864,23 @@ def auth_logout(response: Response):
 
 @app.get("/api/config")
 def get_config():
+    _refresh_active_exchange()
     api_key = _api_config.get("api_key", "")
+    configs = {}
+    for exchange in sorted(SUPPORTED_EXCHANGES):
+        config = _api_configs.get(exchange) or _default_api_config(exchange)
+        configs[exchange] = {
+            "exchange": exchange,
+            "api_key": _mask_api_key(config.get("api_key", "")),
+            "testnet": bool(config.get("testnet", False)),
+            "configured": bool(config.get("api_key")),
+            "source": config.get("source", "none"),
+        }
     return {
         "exchange": _normalize_exchange(_api_config.get("exchange")),
+        "active_exchange": _active_exchange,
+        "exchanges": sorted(SUPPORTED_EXCHANGES),
+        "configs": configs,
         "api_key": _mask_api_key(api_key),
         "testnet": _api_config.get("testnet", False),
         "configured": bool(api_key),
@@ -690,12 +891,12 @@ def get_config():
 
 @app.post("/api/config")
 def set_config(cfg: ApiConfig):
-    global _client, _api_config
-
-    if any(engine.running for engine in _engines.values()):
-        raise HTTPException(status_code=400, detail="Stop all running grids before changing exchange API config")
+    global _api_configs, _clients
 
     exchange = _normalize_exchange(cfg.exchange)
+    if any(engine.running and _engine_exchange(engine) == exchange for engine in _engines.values()):
+        raise HTTPException(status_code=400, detail=f"Stop running {exchange.title()} grids before changing this API config")
+
     candidate = _build_client(exchange, cfg.api_key.strip(), cfg.api_secret.strip(), cfg.testnet)
     try:
         balance = candidate.get_balance()
@@ -715,15 +916,16 @@ def set_config(cfg: ApiConfig):
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=f"API verified but not saved securely: {exc}") from exc
 
-    _client = candidate
-    _api_config = {**saved_config, "source": "file"}
+    _api_configs[exchange] = {**saved_config, "source": "file"}
+    _clients[exchange] = candidate
+    _refresh_active_exchange(exchange)
     return {"ok": True, "message": f"{exchange.title()} API config saved"}
 
 
 @app.get("/api/price/{symbol}")
-def get_price(symbol: str):
-    exchange = _normalize_exchange(_api_config.get("exchange"))
-    client = _client or _build_client(exchange, "", "", bool(_api_config.get("testnet", False)))
+def get_price(symbol: str, exchange: str | None = None):
+    exchange = _normalize_exchange(exchange or _active_exchange)
+    client = _client_for_exchange(exchange, require_config=False)
     resp = client.get_ticker(symbol.upper())
     if resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch ticker"))
@@ -731,6 +933,7 @@ def get_price(symbol: str):
     data = resp["result"]["list"][0]
     return {
         "symbol": data["symbol"],
+        "exchange": exchange,
         "last_price": data["lastPrice"],
         "index_price": data.get("indexPrice", ""),
         "mark_price": data.get("markPrice", ""),
@@ -740,8 +943,8 @@ def get_price(symbol: str):
 
 
 @app.get("/api/balance")
-def get_balance():
-    client = _get_client()
+def get_balance(exchange: str | None = None):
+    client = _get_client(exchange)
     resp = client.get_balance()
     if resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch balance"))
@@ -759,8 +962,8 @@ def get_balance():
 
 
 @app.get("/api/positions/{symbol}")
-def get_positions(symbol: str):
-    client = _get_client()
+def get_positions(symbol: str, exchange: str | None = None):
+    client = _get_client(exchange)
     resp = client.get_positions(symbol.upper())
     if resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch positions"))
@@ -792,7 +995,8 @@ def get_positions(symbol: str):
 
 @app.post("/api/grid/preview")
 def grid_preview(cfg: GridConfig):
-    client = _get_client()
+    exchange = _normalize_exchange(cfg.exchange or _active_exchange)
+    client = _get_client(exchange)
     symbol = cfg.symbol.upper().strip()
     direction = cfg.direction.lower().strip()
     grid_mode = cfg.grid_mode.lower().strip()
@@ -822,18 +1026,21 @@ def grid_preview(cfg: GridConfig):
     if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
-    return _preview_grid(client, cfg, symbol, direction, grid_mode)
+    preview = _preview_grid(client, cfg, symbol, direction, grid_mode)
+    preview["exchange"] = exchange
+    return preview
 
 
 @app.post("/api/grid/start")
 async def start_grid(cfg: GridConfig):
-    client = _get_client()
+    exchange = _normalize_exchange(cfg.exchange or _active_exchange)
+    client = _get_client(exchange)
     symbol = cfg.symbol.upper().strip()
     direction = cfg.direction.lower().strip()
     grid_mode = cfg.grid_mode.lower().strip()
     initial_order_type = cfg.initial_order_type.lower().strip()
     sizing_mode = _position_sizing_mode(cfg)
-    existing_engine = _engines.get(symbol)
+    existing_engine = _get_engine(exchange, symbol)
 
     if existing_engine and existing_engine.running:
         raise HTTPException(status_code=400, detail=f"A grid is already running for {symbol}")
@@ -862,6 +1069,7 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
     engine_config = cfg.model_dump()
+    engine_config["exchange"] = exchange
     engine_config["symbol"] = symbol
     engine_config["direction"] = direction
     engine_config["grid_mode"] = grid_mode
@@ -875,26 +1083,27 @@ async def start_grid(cfg: GridConfig):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _engines[symbol] = engine
+    _engines[_engine_key(exchange, symbol)] = engine
     engine.start()
     _save_engine_state(engine)
-    return {"ok": True, "message": f"{symbol} {direction} grid started"}
+    return {"ok": True, "message": f"{exchange.title()} {symbol} {direction} grid started"}
 
 
 @app.post("/api/grid/stop")
 async def stop_grid():
-    running_symbols = [symbol for symbol, engine in _engines.items() if engine.running]
-    if not running_symbols:
+    running = [engine for engine in _engines.values() if engine.running]
+    if not running:
         raise HTTPException(status_code=400, detail="No active grid")
-    if len(running_symbols) > 1:
+    if len(running) > 1:
         raise HTTPException(status_code=400, detail="Multiple grids are running; stop by symbol")
 
-    return await _stop_grid(running_symbols[0])
+    engine = running[0]
+    return await _stop_grid(_engine_symbol(engine), _engine_exchange(engine))
 
 
 @app.post("/api/grid/stop/{symbol}")
-async def stop_grid_symbol(symbol: str):
-    return await _stop_grid(symbol.upper().strip())
+async def stop_grid_symbol(symbol: str, exchange: str | None = None):
+    return await _stop_grid(symbol.upper().strip(), exchange)
 
 
 @app.post("/api/grid/stop-all")
@@ -905,25 +1114,27 @@ async def stop_all_grids():
 
     for engine in running:
         symbol = str(engine.config.get("symbol", "")).upper()
+        exchange = _engine_exchange(engine)
         await engine.stop()
         _upsert_grid_history(engine, "stopped")
         if symbol:
-            _delete_engine_state(symbol)
-            _engines.pop(symbol, None)
+            _delete_engine_state(symbol, exchange)
+            _engines.pop(_engine_key(exchange, symbol), None)
 
     return {"ok": True, "message": "All grids stopped and open orders cancelled"}
 
 
-async def _stop_grid(symbol: str):
-    engine = _engines.get(symbol)
+async def _stop_grid(symbol: str, exchange: str | None = None):
+    engine = _get_engine(exchange, symbol)
     if not engine or not engine.running:
         raise HTTPException(status_code=400, detail="No active grid")
 
+    exchange = _engine_exchange(engine)
     await engine.stop()
     _upsert_grid_history(engine, "stopped")
-    _delete_engine_state(symbol)
-    _engines.pop(symbol, None)
-    return {"ok": True, "message": f"{symbol} grid stopped and open orders cancelled"}
+    _delete_engine_state(symbol, exchange)
+    _engines.pop(_engine_key(exchange, symbol), None)
+    return {"ok": True, "message": f"{exchange.title()} {symbol} grid stopped and open orders cancelled"}
 
 
 @app.get("/api/grid/status")
@@ -938,21 +1149,23 @@ def grid_status():
 
 
 @app.get("/api/grid/status/{symbol}")
-def grid_symbol_status(symbol: str):
+def grid_symbol_status(symbol: str, exchange: str | None = None):
     symbol = symbol.upper().strip()
-    engine = _engines.get(symbol)
+    engine = _get_engine(exchange, symbol)
     if not engine:
-        return {"running": False, "symbol": symbol}
+        return {"running": False, "symbol": symbol, "exchange": _normalize_exchange(exchange or _active_exchange)}
     return _engine_status(engine)
 
 
 def _engine_status(engine: GridEngine) -> dict:
     status = engine.get_status()
+    exchange = _engine_exchange(engine)
+    status["exchange"] = exchange
     account_unrealised_pnl = 0.0
     actual_position_net_qty = 0.0
     mark_price = None
     try:
-        client = _get_client()
+        client = engine.client
         resp = client.get_positions(str(status.get("symbol", "")).upper())
         if resp.get("retCode") == 0:
             for item in resp.get("result", {}).get("list", []):
@@ -1020,10 +1233,11 @@ def _managed_order_ids(engine: GridEngine | None) -> set[str]:
     return {order_id for order_id in ids if order_id}
 
 
-def _risk_snapshot(symbol: str) -> dict:
-    client = _get_client()
+def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
+    exchange = _normalize_exchange(exchange or _active_exchange)
+    client = _get_client(exchange)
     symbol = symbol.upper().strip()
-    engine = _engines.get(symbol)
+    engine = _get_engine(exchange, symbol)
     managed_ids = _managed_order_ids(engine)
 
     open_resp = client.get_open_orders(symbol)
@@ -1082,6 +1296,7 @@ def _risk_snapshot(symbol: str) -> dict:
         unmanaged_position = abs(unmanaged_delta_qty) >= max(float(engine.min_qty), 1e-12)
     return {
         "symbol": symbol,
+        "exchange": exchange,
         "engine_running": bool(engine and engine.running),
         "orphan_order_count": len(orphan_orders),
         "orphan_orders": orphan_orders,
@@ -1095,14 +1310,14 @@ def _risk_snapshot(symbol: str) -> dict:
 
 
 @app.get("/api/risk/{symbol}")
-def risk_snapshot(symbol: str):
-    return _risk_snapshot(symbol)
+def risk_snapshot(symbol: str, exchange: str | None = None):
+    return _risk_snapshot(symbol, exchange)
 
 
 @app.post("/api/risk/cancel-orphans/{symbol}")
-def cancel_orphan_orders(symbol: str):
-    client = _get_client()
-    snapshot = _risk_snapshot(symbol)
+def cancel_orphan_orders(symbol: str, exchange: str | None = None):
+    snapshot = _risk_snapshot(symbol, exchange)
+    client = _get_client(snapshot["exchange"])
     cancelled = []
     for order in snapshot["orphan_orders"]:
         order_id = str(order.get("order_id", ""))
@@ -1116,8 +1331,8 @@ def cancel_orphan_orders(symbol: str):
 
 
 @app.get("/api/orders/history/{symbol}")
-def order_history(symbol: str):
-    client = _get_client()
+def order_history(symbol: str, exchange: str | None = None):
+    client = _get_client(exchange)
     resp = client.get_order_history(symbol.upper())
     if resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch order history"))
@@ -1137,8 +1352,8 @@ def order_history(symbol: str):
 
 
 @app.get("/api/trades/{symbol}")
-def recent_trades(symbol: str, limit: int = 100):
-    client = _get_client()
+def recent_trades(symbol: str, limit: int = 100, exchange: str | None = None):
+    client = _get_client(exchange)
     if not hasattr(client, "get_recent_trades"):
         raise HTTPException(status_code=400, detail="Exchange client does not support trade history")
 
@@ -1168,8 +1383,8 @@ def recent_trades(symbol: str, limit: int = 100):
 
 
 @app.get("/api/orders/open/{symbol}")
-def open_orders(symbol: str):
-    client = _get_client()
+def open_orders(symbol: str, exchange: str | None = None):
+    client = _get_client(exchange)
     resp = client.get_open_orders(symbol.upper())
     if resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch open orders"))
@@ -1191,18 +1406,17 @@ def open_orders(symbol: str):
 
 
 @app.post("/api/orders/cancel-all/{symbol}")
-def cancel_all_symbol_orders(symbol: str):
-    client = _get_client()
+def cancel_all_symbol_orders(symbol: str, exchange: str | None = None):
+    exchange = _normalize_exchange(exchange or _active_exchange)
+    client = _get_client(exchange)
     resp = client.cancel_all_orders(symbol.upper())
     if resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to cancel open orders"))
-    return {"ok": True, "message": f"All open orders for {symbol.upper()} were cancelled"}
+    return {"ok": True, "message": f"All open orders for {exchange.title()} {symbol.upper()} were cancelled"}
 
 
-def _get_client():
-    if not _client:
-        raise HTTPException(status_code=400, detail="Please configure API Key first")
-    return _client
+def _get_client(exchange: str | None = None):
+    return _client_for_exchange(exchange, require_config=True)
 
 
 if __name__ == "__main__":

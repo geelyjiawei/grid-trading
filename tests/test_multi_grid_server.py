@@ -109,6 +109,73 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertNotIn("BTCUSDT", by_symbol)
         self.assertTrue(by_symbol["ETHUSDT"]["running"])
 
+    def test_same_symbol_can_run_on_different_exchanges_independently(self):
+        old_configs = main._api_configs
+        old_clients = main._clients
+        old_active = main._active_exchange
+        old_api_config = main._api_config
+        old_client = main._client
+        try:
+            binance_client = FakeClient("100")
+            aster_client = FakeClient("100")
+            main._api_configs = {
+                "binance": {
+                    "exchange": "binance",
+                    "api_key": "binance-key",
+                    "api_secret": "binance-secret",
+                    "testnet": False,
+                    "source": "file",
+                },
+                "aster": {
+                    "exchange": "aster",
+                    "api_key": "0x0000000000000000000000000000000000000abc",
+                    "api_secret": "0x" + "1" * 64,
+                    "testnet": False,
+                    "source": "file",
+                },
+            }
+            main._clients = {"binance": binance_client, "aster": aster_client}
+            main._active_exchange = "binance"
+            main._api_config = main._api_configs["binance"]
+            main._client = binance_client
+
+            binance_payload = self._payload("MUUSDT")
+            binance_payload["exchange"] = "binance"
+            aster_payload = self._payload("MUUSDT")
+            aster_payload["exchange"] = "aster"
+            aster_payload["direction"] = "short"
+
+            binance_response = self.client.post("/api/grid/start", json=binance_payload)
+            aster_response = self.client.post("/api/grid/start", json=aster_payload)
+
+            self.assertEqual(binance_response.status_code, 200)
+            self.assertEqual(aster_response.status_code, 200)
+            self.assertIn(main._engine_key("binance", "MUUSDT"), main._engines)
+            self.assertIn(main._engine_key("aster", "MUUSDT"), main._engines)
+
+            status = self.client.get("/api/grid/status").json()
+            running = {(item["exchange"], item["symbol"]) for item in status["engines"] if item["running"]}
+            self.assertEqual(status["running_count"], 2)
+            self.assertIn(("binance", "MUUSDT"), running)
+            self.assertIn(("aster", "MUUSDT"), running)
+
+            stop_binance = self.client.post("/api/grid/stop/MUUSDT?exchange=binance")
+            self.assertEqual(stop_binance.status_code, 200)
+            status = self.client.get("/api/grid/status").json()
+            running = {(item["exchange"], item["symbol"]) for item in status["engines"] if item["running"]}
+            self.assertEqual(status["running_count"], 1)
+            self.assertNotIn(("binance", "MUUSDT"), running)
+            self.assertIn(("aster", "MUUSDT"), running)
+        finally:
+            for engine in list(main._engines.values()):
+                engine.running = False
+            main._engines.clear()
+            main._api_configs = old_configs
+            main._clients = old_clients
+            main._active_exchange = old_active
+            main._api_config = old_api_config
+            main._client = old_client
+
     def test_same_symbol_cannot_start_twice(self):
         first_response = self.client.post("/api/grid/start", json=self._payload("BTCUSDT"))
         second_response = self.client.post("/api/grid/start", json=self._payload("BTCUSDT"))
@@ -423,11 +490,14 @@ class MultiGridServerTests(unittest.TestCase):
 
         main._restore_saved_engines()
 
-        engine = main._engines["NOKUSDT"]
-        saved = main._load_grid_state_file()["grids"]["NOKUSDT"]
+        state_key = main._engine_key("bybit", "NOKUSDT")
+        engine = main._engines[state_key]
+        saved_grids = main._load_grid_state_file()["grids"]
+        saved = saved_grids[state_key]
         self.assertFalse(engine.running)
         self.assertTrue(engine.grid_ready)
         self.assertFalse(saved["running"])
+        self.assertNotIn("NOKUSDT", saved_grids)
         self.assertEqual(main._client.get_open_orders("NOKUSDT")["result"]["list"], [])
 
     def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
@@ -475,7 +545,7 @@ class MultiGridServerTests(unittest.TestCase):
 
             self.assertEqual(start.status_code, 200)
             self.assertEqual(response.status_code, 400)
-            self.assertIn("Stop all running grids", response.json()["detail"])
+            self.assertIn("Stop running", response.json()["detail"])
         finally:
             main.BinanceFuturesClient = original_binance
             main.BybitClient = original_bybit

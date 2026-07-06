@@ -10,6 +10,7 @@ let currentRiskSymbol = "";
 let previewRequestSeq = 0;
 let exchangeOpenOrders = [];
 let exchangeTrades = [];
+let exchangeConfigs = {};
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -123,6 +124,15 @@ function bindEvents() {
     await pollGridStatus();
   });
 
+  document.getElementById("active-exchange-select").addEventListener("change", async () => {
+    activeExchange = document.getElementById("active-exchange-select").value;
+    syncExchangeInputs();
+    await fetchPrice();
+    await fetchBalance();
+    await pollGridStatus();
+    updatePreview();
+  });
+
   document.getElementById("cfg-exchange").addEventListener("change", renderConfigDraftHint);
 }
 
@@ -140,15 +150,39 @@ function exchangeDisplayName(exchange) {
   return "Bybit";
 }
 
+function exchangeQuery(exchange = activeExchange) {
+  return `exchange=${encodeURIComponent(exchange || "bybit")}`;
+}
+
+function withExchange(url, exchange = activeExchange) {
+  return `${url}${url.includes("?") ? "&" : "?"}${exchangeQuery(exchange)}`;
+}
+
+function syncExchangeInputs() {
+  const activeSelect = document.getElementById("active-exchange-select");
+  const configSelect = document.getElementById("cfg-exchange");
+  const hint = document.getElementById("active-exchange-hint");
+  if (activeSelect) activeSelect.value = activeExchange;
+  if (configSelect && !configSelect.value) configSelect.value = activeExchange;
+  if (hint) {
+    hint.textContent = `当前工作区：${exchangeDisplayName(activeExchange)}。行情、余额、网格、挂单和风控都会使用该交易所。`;
+  }
+}
+
 async function loadConfig() {
   try {
     const config = await api("/api/config");
-    activeExchange = config.exchange || "bybit";
-    document.getElementById("cfg-exchange").value = config.exchange || "bybit";
-    document.getElementById("cfg-testnet").checked = Boolean(config.testnet);
+    exchangeConfigs = config.configs || {};
+    activeExchange = activeExchange || config.active_exchange || config.exchange || "bybit";
+    if (!config.configs?.[activeExchange]?.configured) {
+      activeExchange = config.active_exchange || config.exchange || activeExchange;
+    }
+    document.getElementById("cfg-exchange").value = activeExchange;
+    document.getElementById("cfg-testnet").checked = Boolean(config.configs?.[activeExchange]?.testnet ?? config.testnet);
+    syncExchangeInputs();
     renderConfigStatus(config);
     renderConfigDraftHint();
-    if (config.configured) {
+    if (config.configs?.[activeExchange]?.configured || config.configured) {
       await fetchBalance();
     }
   } catch (_) {
@@ -161,14 +195,21 @@ function renderConfigStatus(config) {
   if (!statusEl) return;
 
   if (!config.configured) {
-    statusEl.textContent = "当前未保存 API 配置";
+    const configured = Object.values(config.configs || {}).filter((item) => item.configured);
+    statusEl.textContent = configured.length
+      ? `已配置：${configured.map((item) => exchangeDisplayName(item.exchange)).join(" / ")}`
+      : "当前未保存 API 配置";
     statusEl.className = "config-status";
     return;
   }
 
-  const source = config.source === "env" ? "环境变量" : "本地加密文件";
-  const exchange = exchangeDisplayName(config.exchange);
-  statusEl.textContent = `当前生效：${exchange} · ${config.api_key} · ${config.testnet ? "Testnet" : "Mainnet"} · ${source}`;
+  const configs = config.configs || {};
+  const configured = Object.values(configs).filter((item) => item.configured);
+  const summary = configured.map((item) => {
+    const source = item.source === "env" ? "环境变量" : "本地加密文件";
+    return `${exchangeDisplayName(item.exchange)} · ${item.api_key} · ${item.testnet ? "Testnet" : "Mainnet"} · ${source}`;
+  }).join(" | ");
+  statusEl.textContent = summary || "当前未保存 API 配置";
   statusEl.className = "config-status configured";
 }
 
@@ -178,13 +219,7 @@ function renderConfigDraftHint() {
 
   const selected = document.getElementById("cfg-exchange").value;
   const selectedName = exchangeDisplayName(selected);
-  const activeName = exchangeDisplayName(activeExchange);
-
-  if (selected === activeExchange) {
-    hintEl.textContent = `正在编辑 ${selectedName} 配置。保存并验证成功后会继续使用 ${selectedName}。`;
-  } else {
-    hintEl.textContent = `当前生效是 ${activeName}。你正在编辑 ${selectedName}，必须填写 ${selectedName} API 并点击“保存并验证”，成功后才会切换。`;
-  }
+  hintEl.textContent = `正在编辑 ${selectedName} 配置。保存后只更新该交易所，不会影响其他交易所正在运行的网格。`;
 }
 
 function setDirection(direction) {
@@ -220,6 +255,7 @@ async function updatePreview() {
   const requestSeq = ++previewRequestSeq;
   try {
     const preview = await api("/api/grid/preview", "POST", {
+      exchange: activeExchange,
       symbol,
       direction: currentDirection,
       grid_mode: gridMode,
@@ -269,7 +305,7 @@ async function fetchPrice() {
   if (!symbol) return;
 
   try {
-    const data = await api(`/api/price/${symbol}`);
+    const data = await api(withExchange(`/api/price/${symbol}`));
     latestPrice = parseFloat(data.last_price);
     const markPrice = parseFloat(data.mark_price);
     const pct = parseFloat(data.price_24h_pcnt || "0") * 100;
@@ -288,8 +324,14 @@ async function fetchPrice() {
 }
 
 async function fetchBalance() {
+  if (exchangeConfigs[activeExchange] && !exchangeConfigs[activeExchange].configured) {
+    document.getElementById("balance-avail").textContent = "--";
+    document.getElementById("balance-equity").textContent = "--";
+    document.getElementById("balance-upnl").textContent = "--";
+    return;
+  }
   try {
-    const data = await api("/api/balance");
+    const data = await api(withExchange("/api/balance"));
     document.getElementById("balance-avail").textContent = fmtNum(data.available);
     document.getElementById("balance-equity").textContent = fmtNum(data.equity);
     const pnl = Number(data.unrealised_pnl || 0);
@@ -304,6 +346,7 @@ async function fetchBalance() {
 async function startGrid() {
   const sizingMode = document.getElementById("position-sizing-mode").value;
   const payload = {
+    exchange: activeExchange,
     symbol: getSymbol(),
     direction: currentDirection,
     grid_mode: document.getElementById("grid-mode").value,
@@ -372,7 +415,7 @@ async function stopGrid() {
   if (!window.confirm(`确认停止 ${symbol} 网格并撤销该交易对全部挂单吗？`)) return;
 
   try {
-    const result = await api(`/api/grid/stop/${symbol}`, "POST");
+    const result = await api(withExchange(`/api/grid/stop/${symbol}`), "POST");
     showToast(result.message, "success");
     await pollGridStatus();
     clearPositions();
@@ -385,7 +428,7 @@ async function pollGridStatus() {
   try {
     const summary = await api("/api/grid/status");
     allGridStatuses = Array.isArray(summary.engines) ? summary.engines : [];
-    const currentStatus = findStatusForSymbol(getSymbol()) || { running: false, symbol: getSymbol() };
+    const currentStatus = findStatusForSymbol(getSymbol(), activeExchange) || { running: false, symbol: getSymbol(), exchange: activeExchange };
     renderRunningGrids(allGridStatuses);
     if (currentStatus.running) {
       await fetchExchangeOrderData(getSymbol());
@@ -407,10 +450,11 @@ async function pollGridStatus() {
 
 async function fetchExchangeOrderData(symbol) {
   if (!symbol) return;
+  if (exchangeConfigs[activeExchange] && !exchangeConfigs[activeExchange].configured) return;
   try {
     const [openData, tradeData] = await Promise.all([
-      api(`/api/orders/open/${symbol}`),
-      api(`/api/trades/${symbol}?limit=100`),
+      api(withExchange(`/api/orders/open/${symbol}`)),
+      api(withExchange(`/api/trades/${symbol}?limit=100`)),
     ]);
     exchangeOpenOrders = Array.isArray(openData.orders) ? openData.orders : [];
     exchangeTrades = Array.isArray(tradeData.trades) ? tradeData.trades : [];
@@ -422,8 +466,12 @@ async function fetchExchangeOrderData(symbol) {
 
 async function fetchRiskSnapshot(symbol) {
   if (!symbol) return;
+  if (exchangeConfigs[activeExchange] && !exchangeConfigs[activeExchange].configured) {
+    renderRiskSnapshot({ has_risk: false });
+    return;
+  }
   try {
-    const risk = await api(`/api/risk/${symbol}`);
+    const risk = await api(withExchange(`/api/risk/${symbol}`));
     renderRiskSnapshot(risk);
   } catch (_) {
     renderRiskSnapshot({ has_risk: false });
@@ -467,7 +515,7 @@ async function cancelOrphanOrders() {
   if (!window.confirm(`确认撤销 ${symbol} 的未托管网格挂单？这不会平掉现有持仓。`)) return;
 
   try {
-    const result = await api(`/api/risk/cancel-orphans/${symbol}`, "POST");
+    const result = await api(withExchange(`/api/risk/cancel-orphans/${symbol}`), "POST");
     showToast(`已撤销 ${result.cancelled.length} 个孤儿挂单`, "success");
     await pollGridStatus();
   } catch (error) {
@@ -563,10 +611,10 @@ function renderRunningGrids(statuses) {
     const profit = Number(status.total_equity_profit ?? status.total_profit ?? 0);
     const completedPairs = Number(status.completed_pairs || 0);
     return `
-      <button class="grid-summary-item${status.symbol === getSymbol() ? " active" : ""}" type="button" onclick="selectGridSymbol('${status.symbol}')">
+      <button class="grid-summary-item${status.symbol === getSymbol() && status.exchange === activeExchange ? " active" : ""}" type="button" onclick="selectGridSymbol('${status.exchange || activeExchange}', '${status.symbol}')">
         <span>
           <strong>${status.symbol}</strong>
-          <small>${mapDirection(status.direction)} · ${status.grid_mode === "geometric" ? "等比" : "等差"}</small>
+          <small>${exchangeDisplayName(status.exchange)} · ${mapDirection(status.direction)} · ${status.grid_mode === "geometric" ? "等比" : "等差"}</small>
         </span>
         <span>
           <strong class="${profit >= 0 ? "positive" : "negative"}">${fmtNum(profit)}</strong>
@@ -577,7 +625,9 @@ function renderRunningGrids(statuses) {
   }).join("");
 }
 
-async function selectGridSymbol(symbol) {
+async function selectGridSymbol(exchange, symbol) {
+  activeExchange = exchange || activeExchange;
+  syncExchangeInputs();
   document.getElementById("symbol-input").value = symbol;
   await fetchPrice();
   await pollGridStatus();
@@ -767,8 +817,12 @@ function renderGridHistory(runs) {
 
 async function fetchPositions() {
   const symbol = getSymbol();
+  if (exchangeConfigs[activeExchange] && !exchangeConfigs[activeExchange].configured) {
+    clearPositions();
+    return;
+  }
   try {
-    const data = await api(`/api/positions/${symbol}`);
+    const data = await api(withExchange(`/api/positions/${symbol}`));
     const el = document.getElementById("positions-body");
     if (!data.positions.length) {
       el.innerHTML = '<div class="empty-state">暂无持仓</div>';
@@ -838,6 +892,7 @@ async function saveApiConfig() {
     errorEl.classList.add("hidden");
     document.getElementById("cfg-api-key").value = "";
     document.getElementById("cfg-api-secret").value = "";
+    activeExchange = exchange;
     await loadConfig();
     closeApiModal();
     showToast(result.message, "success");
@@ -898,8 +953,11 @@ function getSymbol() {
   return document.getElementById("symbol-input").value.trim().toUpperCase();
 }
 
-function findStatusForSymbol(symbol) {
-  return allGridStatuses.find((status) => String(status.symbol).toUpperCase() === symbol);
+function findStatusForSymbol(symbol, exchange = activeExchange) {
+  return allGridStatuses.find((status) =>
+    String(status.symbol).toUpperCase() === symbol
+    && String(status.exchange || activeExchange) === String(exchange || activeExchange)
+  );
 }
 
 function isSymbolRunning(symbol) {

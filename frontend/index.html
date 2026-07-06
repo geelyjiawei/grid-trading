@@ -40,6 +40,16 @@
           <input id="symbol-input" class="form-input symbol-input" type="text" value="BTCUSDT" placeholder="例如 BTCUSDT" />
         </div>
 
+        <div class="form-group">
+          <label for="active-exchange-select">交易所工作区</label>
+          <select id="active-exchange-select" class="form-input">
+            <option value="bybit">Bybit USDT 永续</option>
+            <option value="binance">Binance USDT-M Futures</option>
+            <option value="aster">AsterDEX USDT-M Futures</option>
+          </select>
+          <div id="active-exchange-hint" class="form-hint">选择后，行情、余额、网格启动、挂单、成交和风控检查都会使用该交易所。</div>
+        </div>
+
         <div class="price-row">
           <div id="last-price" class="price-value">--</div>
           <div id="price-change" class="price-change">--</div>
@@ -515,6 +525,6 @@
     </div>
   </div>
 
-    <script src="/static/app.js?v=20260517-exchange-orders"></script>
+    <script src="/static/app.js?v=20260707-multi-exchange"></script>
   </body>
 </html>
