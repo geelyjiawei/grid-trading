@@ -301,6 +301,12 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     if ticker.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=ticker.get("retMsg", "Failed to fetch current price"))
     current_price = float(ticker["result"]["list"][0]["lastPrice"])
+    initial_order_type = cfg.initial_order_type.lower().strip()
+    reference_price = (
+        float(cfg.initial_order_price)
+        if direction in {"long", "short"} and initial_order_type == "post_only" and cfg.initial_order_price
+        else current_price
+    )
 
     info_resp = client.get_instrument_info(symbol)
     if info_resp.get("retCode") != 0:
@@ -310,40 +316,40 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     min_qty = float(instrument["lotSizeFilter"]["minOrderQty"])
 
     levels = _calculate_grid_levels(cfg.lower_price, cfg.upper_price, cfg.grid_count, grid_mode)
-    if not (levels[0] < current_price < levels[-1]):
+    if not (levels[0] < reference_price < levels[-1]):
         raise HTTPException(
             status_code=400,
-            detail=f"Current price {current_price} must stay inside the configured range {levels[0]} - {levels[-1]}",
+            detail=f"Reference price {reference_price} must stay inside the configured range {levels[0]} - {levels[-1]}",
         )
 
     if direction == "long":
         active_targets = [
             (idx, levels[idx + 1], "Sell")
             for idx in range(len(levels) - 1)
-            if levels[idx + 1] > current_price
+            if levels[idx + 1] > reference_price
         ]
     elif direction == "short":
         active_targets = [
             (idx, levels[idx], "Buy")
             for idx in range(len(levels) - 1)
-            if levels[idx] < current_price
+            if levels[idx] < reference_price
         ]
     else:
         active_targets = [
             (idx, levels[idx], "Buy")
             for idx in range(len(levels) - 1)
-            if levels[idx] < current_price
+            if levels[idx] < reference_price
         ] + [
             (idx, levels[idx + 1], "Sell")
             for idx in range(len(levels) - 1)
-            if levels[idx + 1] > current_price
+            if levels[idx + 1] > reference_price
         ]
 
     active_count = len(active_targets)
     if active_count <= 0:
         raise HTTPException(status_code=400, detail="No valid grid targets were found around current price")
 
-    raw_total_qty = (cfg.total_investment * cfg.leverage) / current_price
+    raw_total_qty = (cfg.total_investment * cfg.leverage) / reference_price
     total_steps = _round_down_steps(raw_total_qty, qty_step)
     if total_steps < active_count:
         raise HTTPException(status_code=400, detail="Total investment is too small for this symbol and grid count")
@@ -359,24 +365,25 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     if grid_mode == "geometric":
         ratio = (levels[1] / levels[0]) if len(levels) > 1 else 1
         grid_profit_pct = (ratio - 1) * 100
-        grid_step = current_price * (ratio - 1)
+        grid_step = reference_price * (ratio - 1)
     else:
         grid_step = levels[1] - levels[0] if len(levels) > 1 else 0
-        grid_profit_pct = (grid_step / current_price) * 100 if current_price > 0 else 0
+        grid_profit_pct = (grid_step / reference_price) * 100 if reference_price > 0 else 0
 
     average_qty = total_qty / active_count
     maker_fee_rate = max(0.0, float(cfg.maker_fee_rate if cfg.maker_fee_rate is not None else cfg.fee_rate or 0))
     taker_fee_rate = max(0.0, float(cfg.taker_fee_rate if cfg.taker_fee_rate is not None else cfg.fee_rate or 0))
-    opening_fee_rate = maker_fee_rate if cfg.initial_order_type == "post_only" else taker_fee_rate
+    opening_fee_rate = maker_fee_rate if initial_order_type == "post_only" else taker_fee_rate
     grid_fee_rate = maker_fee_rate
     gross_profit = grid_step * average_qty
-    open_fee = average_qty * current_price * opening_fee_rate
-    close_fee = average_qty * current_price * grid_fee_rate
+    open_fee = average_qty * reference_price * opening_fee_rate
+    close_fee = average_qty * reference_price * grid_fee_rate
     fee = open_fee + close_fee
 
     return {
         "symbol": symbol,
         "current_price": current_price,
+        "reference_price": reference_price,
         "grid_step": grid_step,
         "grid_profit_pct": grid_profit_pct,
         "active_grid_count": active_count,

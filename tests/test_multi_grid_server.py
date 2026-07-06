@@ -175,6 +175,38 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["per_grid_close_fee"], 0.02)
         self.assertAlmostEqual(data["per_grid_fee"], 0.07)
 
+    def test_grid_preview_uses_post_only_initial_price_as_reference(self):
+        main._client = FakeClient("1010", tick_size="0.1", qty_step="0.01", min_qty="0.01")
+        payload = {
+            "symbol": "MUUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 1020,
+            "lower_price": 1000,
+            "grid_count": 20,
+            "total_investment": 500,
+            "leverage": 5,
+            "fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "taker_fee_rate": 0.0005,
+            "initial_order_type": "post_only",
+            "initial_order_price": 1011,
+            "trigger_price": None,
+            "stop_loss_price": None,
+            "take_profit_price": None,
+        }
+
+        response = self.client.post("/api/grid/preview", json=payload)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["current_price"], 1010)
+        self.assertEqual(data["reference_price"], 1011)
+        self.assertEqual(data["active_grid_count"], 11)
+        self.assertAlmostEqual(data["total_qty"], 2.47)
+        self.assertAlmostEqual(data["qty_per_grid_min"], 0.22)
+        self.assertAlmostEqual(data["qty_per_grid_max"], 0.23)
+
     def test_restore_trims_reduce_overcommit_without_event_loop_restart(self):
         main._client = FakeClient("15.95")
         main._client.positions = [{"side": "Buy", "size": "200", "avgPrice": "16.18"}]
