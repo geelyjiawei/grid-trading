@@ -647,6 +647,19 @@ class GridEngine:
         available = self._available_reduce_qty(side)
         return min(qty, available)
 
+    def _allocate_qtys(self, raw_total_qty: float, target_count: int) -> list[float]:
+        if target_count <= 0:
+            return []
+        total_steps = self._qty_to_steps(raw_total_qty)
+        if total_steps < target_count:
+            return []
+        base_steps = total_steps // target_count
+        remainder_steps = total_steps % target_count
+        return [
+            self._steps_to_qty(base_steps + (1 if index < remainder_steps else 0))
+            for index in range(target_count)
+        ]
+
     def _sort_reduce_orders_for_trim(self, reduce_side: str) -> list[tuple[str, dict]]:
         orders = [
             (link_id, order)
@@ -1181,7 +1194,162 @@ class GridEngine:
         if self._trim_reduce_overcommit():
             return
 
+        if self._repair_missing_reduce_protection_from_ledger():
+            return
+
         self._warn_missing_reduce_protection()
+
+    @staticmethod
+    def _lot_add(lots: dict[int, dict[str, Decimal]], level_idx: int, qty: Decimal, entry_price: Decimal):
+        if qty <= 0:
+            return
+        lot = lots.setdefault(level_idx, {"qty": Decimal("0"), "entry_value": Decimal("0")})
+        lot["qty"] += qty
+        lot["entry_value"] += qty * entry_price
+
+    def _lot_remove(self, lots: dict[int, dict[str, Decimal]], level_idx: int, qty: Decimal) -> bool:
+        if qty <= 0:
+            return True
+        lot = lots.get(level_idx)
+        minimum = Decimal(str(self.min_qty))
+        if not lot or lot["qty"] + minimum < qty:
+            return False
+        if lot["qty"] <= qty + minimum:
+            lots.pop(level_idx, None)
+            return True
+        average_entry = lot["entry_value"] / lot["qty"] if lot["qty"] > 0 else Decimal("0")
+        lot["qty"] -= qty
+        lot["entry_value"] -= average_entry * qty
+        return True
+
+    def _reduce_target_for_level(self, level_idx: int) -> tuple[str, float] | None:
+        direction = self.config["direction"]
+        if direction == "short":
+            if 0 <= level_idx < len(self.grid_levels):
+                return "Buy", self.grid_levels[level_idx]
+        elif direction == "long":
+            if 0 <= level_idx + 1 < len(self.grid_levels):
+                return "Sell", self.grid_levels[level_idx + 1]
+        return None
+
+    def _initial_reduce_lots_by_level(self) -> dict[int, dict[str, Decimal]] | None:
+        direction = self.config["direction"]
+        if direction not in {"long", "short"}:
+            return {}
+        if self.initial_qty < self.min_qty or self.initial_entry_price <= 0:
+            return {}
+
+        profit_targets, _ = self._target_orders_for_price(self.initial_entry_price)
+        allocated_qtys = self._allocate_qtys(self.initial_qty, len(profit_targets))
+        if len(allocated_qtys) != len(profit_targets):
+            return None
+
+        lots: dict[int, dict[str, Decimal]] = {}
+        entry_price = Decimal(str(self.initial_entry_price))
+        for target, allocated_qty in zip(profit_targets, allocated_qtys):
+            self._lot_add(lots, int(target[0]), Decimal(str(allocated_qty)), entry_price)
+        return lots
+
+    def _reduce_lots_from_fill_ledger(self) -> tuple[dict[int, dict[str, Decimal]] | None, str]:
+        if self.config["direction"] not in {"long", "short"}:
+            return {}, ""
+
+        reduce_fill_count = sum(1 for order in self.filled_orders if order.get("reduce_only"))
+        if int(self.completed_pairs or 0) > reduce_fill_count:
+            return None, "fill history is truncated"
+
+        lots = self._initial_reduce_lots_by_level()
+        if lots is None:
+            return None, "initial allocation is unavailable"
+
+        direction = self.config["direction"]
+        for order in self.filled_orders:
+            try:
+                level_idx = int(order.get("level_idx", 0) or 0)
+                qty = Decimal(str(order.get("qty", 0) or 0))
+                price = Decimal(str(order.get("price", 0) or 0))
+            except Exception:
+                return None, "fill ledger contains invalid values"
+            side = order.get("side")
+            reduce_only = bool(order.get("reduce_only"))
+
+            if direction == "short":
+                if side == "Sell" and not reduce_only:
+                    self._lot_add(lots, level_idx, qty, price)
+                elif side == "Buy" and reduce_only:
+                    if not self._lot_remove(lots, level_idx, qty):
+                        return None, "short reduce fill has no matching open lot"
+            elif direction == "long":
+                if side == "Buy" and not reduce_only:
+                    self._lot_add(lots, level_idx, qty, price)
+                elif side == "Sell" and reduce_only:
+                    if not self._lot_remove(lots, level_idx, qty):
+                        return None, "long reduce fill has no matching open lot"
+
+        return lots, ""
+
+    def _repair_missing_reduce_protection_from_ledger(self) -> bool:
+        lots, reason = self._reduce_lots_from_fill_ledger()
+        if lots is None:
+            if reason:
+                logger.warning(
+                    "Reduce-only protection ledger unavailable symbol=%s reason=%s",
+                    self.config.get("symbol"),
+                    reason,
+                )
+            return False
+
+        expected_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        if abs(expected_total - grid_qty) >= Decimal(str(self.min_qty)):
+            logger.warning(
+                "Reduce-only protection ledger does not match grid position symbol=%s ledger_qty=%s grid_qty=%s",
+                self.config.get("symbol"),
+                float(expected_total),
+                float(grid_qty),
+            )
+            return False
+
+        placed_count = 0
+        placed_qty = Decimal("0")
+        for level_idx in sorted(lots):
+            lot = lots[level_idx]
+            target = self._reduce_target_for_level(level_idx)
+            if not target:
+                continue
+            reduce_side, reduce_price = target
+            active_qty = Decimal(str(self._active_order_qty(reduce_side, level_idx, True)))
+            deficit = lot["qty"] - active_qty
+            if deficit < Decimal(str(self.min_qty)):
+                continue
+            entry_price = lot["entry_value"] / lot["qty"] if lot["qty"] > 0 else Decimal("0")
+            placed = self._place(
+                reduce_side,
+                reduce_price,
+                level_idx,
+                reduce_only=True,
+                qty_override=float(deficit),
+                entry_price=float(entry_price) if entry_price > 0 else None,
+                allow_duplicate=True,
+            )
+            if placed:
+                placed_count += 1
+                placed_qty += deficit
+
+        if placed_count:
+            self.trigger_message = (
+                f"Repaired {placed_count} missing reduce-only protection order(s) "
+                f"from fill ledger: {self._fq(float(placed_qty))}"
+            )
+            logger.warning(
+                "Repaired missing reduce-only protection from fill ledger symbol=%s orders=%s qty=%s",
+                self.config.get("symbol"),
+                placed_count,
+                self._fq(float(placed_qty)),
+            )
+            self._persist_state()
+            return True
+        return False
 
     def _warn_missing_reduce_protection(self):
         grid_qty = self._grid_position_qty()
@@ -1199,7 +1367,7 @@ class GridEngine:
 
         self.trigger_message = (
             f"Reduce-only protection is short by {self._fq(missing_qty)}; "
-            "waiting for order/fill ledger instead of placing guessed boundary orders."
+            "waiting for complete order/fill ledger instead of placing guessed boundary orders."
         )
         logger.warning(
             "Reduce-only protection missing; not placing guessed boundary order symbol=%s side=%s grid_qty=%s active_reduce_qty=%s missing_qty=%s",
@@ -1760,14 +1928,8 @@ class GridEngine:
         if total_steps < target_count:
             raise RuntimeError("Total investment is too small for this symbol and grid count")
 
-        base_steps = total_steps // target_count
-        remainder_steps = total_steps % target_count
-        per_grid_steps = [
-            base_steps + (1 if index < remainder_steps else 0)
-            for index in range(target_count)
-        ]
         total_qty = self._steps_to_qty(total_steps)
-        allocated_qtys = [self._steps_to_qty(steps) for steps in per_grid_steps]
+        allocated_qtys = self._allocate_qtys(raw_total_qty, target_count)
         qty_per_grid = total_qty / target_count
 
         self.config["active_grid_count"] = target_count

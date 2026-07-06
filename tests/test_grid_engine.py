@@ -545,6 +545,194 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repair_orders, [])
         self.assertIn("instead of placing guessed boundary orders", engine.trigger_message)
 
+    async def test_reconcile_repairs_missing_short_reduce_protection_from_fill_level(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = -0.2
+        engine.filled_orders = [
+            {
+                "side": "Sell",
+                "price": 105,
+                "qty": 0.2,
+                "level_idx": 2,
+                "reduce_only": False,
+            }
+        ]
+
+        engine._reconcile_grid_position_protection()
+
+        repair_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        ]
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "100.0")
+        self.assertAlmostEqual(float(repair_orders[0]["qty"]), 0.2)
+        self.assertAlmostEqual(float(repair_orders[0]["entry_price"]), 105.0)
+        self.assertIn("from fill ledger", engine.trigger_message)
+
+    async def test_reconcile_repairs_only_missing_reduce_deficit_from_fill_ledger(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = -0.2
+        engine.active_orders = {
+            "existing": {
+                "link_id": "existing",
+                "order_id": "existing",
+                "level_idx": 2,
+                "side": "Buy",
+                "price": "100.0",
+                "qty": "0.1",
+                "reduce_only": True,
+                "entry_price": 105,
+            }
+        }
+        engine.filled_orders = [
+            {
+                "side": "Sell",
+                "price": 105,
+                "qty": 0.2,
+                "level_idx": 2,
+                "reduce_only": False,
+            }
+        ]
+
+        engine._reconcile_grid_position_protection()
+
+        repair_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        ]
+        self.assertEqual(len(repair_orders), 2)
+        self.assertAlmostEqual(sum(float(order["qty"]) for order in repair_orders), 0.2)
+        self.assertEqual(sorted(float(order["qty"]) for order in repair_orders), [0.1, 0.1])
+
+    async def test_reconcile_repairs_missing_long_reduce_protection_from_fill_level(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        client.positions = [{"side": "Buy", "size": "0.2", "avgPrice": "100"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = 0.2
+        engine.filled_orders = [
+            {
+                "side": "Buy",
+                "price": 100,
+                "qty": 0.2,
+                "level_idx": 2,
+                "reduce_only": False,
+            }
+        ]
+
+        engine._reconcile_grid_position_protection()
+
+        repair_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and order["reduce_only"]
+        ]
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "105.0")
+        self.assertAlmostEqual(float(repair_orders[0]["qty"]), 0.2)
+        self.assertAlmostEqual(float(repair_orders[0]["entry_price"]), 100.0)
+        self.assertIn("from fill ledger", engine.trigger_message)
+
+    async def test_reconcile_does_not_repair_missing_reduce_when_fill_history_is_truncated(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = -0.2
+        engine.completed_pairs = 1
+        engine.filled_orders = [
+            {
+                "side": "Sell",
+                "price": 105,
+                "qty": 0.2,
+                "level_idx": 2,
+                "reduce_only": False,
+            }
+        ]
+
+        engine._reconcile_grid_position_protection()
+
+        repair_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order["side"] == "Buy" and order["reduce_only"]
+        ]
+        self.assertEqual(repair_orders, [])
+        self.assertIn("instead of placing guessed boundary orders", engine.trigger_message)
+
     async def test_reconcile_clears_grid_position_when_exchange_is_flat(self):
         client = FakeClient("100")
         engine = GridEngine(
