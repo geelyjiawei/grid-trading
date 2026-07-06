@@ -733,6 +733,51 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repair_orders, [])
         self.assertIn("instead of placing guessed boundary orders", engine.trigger_message)
 
+    async def test_reconcile_skips_fill_ledger_when_reduce_protection_is_complete(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = -0.2
+        engine.completed_pairs = 10
+        engine.active_orders = {
+            "existing": {
+                "link_id": "existing",
+                "order_id": "existing",
+                "level_idx": 2,
+                "side": "Buy",
+                "price": "100.0",
+                "qty": "0.2",
+                "reduce_only": True,
+                "entry_price": 105,
+            }
+        }
+
+        def fail_if_called():
+            raise AssertionError("fill ledger repair should not run when reduce protection is complete")
+
+        engine._repair_missing_reduce_protection_from_ledger = fail_if_called
+
+        engine._reconcile_grid_position_protection()
+
+        self.assertEqual(engine.trigger_message, "")
+
     async def test_reconcile_clears_grid_position_when_exchange_is_flat(self):
         client = FakeClient("100")
         engine = GridEngine(

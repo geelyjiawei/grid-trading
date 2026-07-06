@@ -1194,6 +1194,13 @@ class GridEngine:
         if self._trim_reduce_overcommit():
             return
 
+        reduce_side = self._reduce_side()
+        if not reduce_side:
+            return
+        missing_qty = self._grid_position_qty() - self._active_reduce_qty(reduce_side)
+        if missing_qty < self.min_qty:
+            return
+
         if self._repair_missing_reduce_protection_from_ledger():
             return
 
