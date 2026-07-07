@@ -1191,6 +1191,70 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repair_orders, [])
         self.assertIn("instead of placing guessed boundary orders", engine.trigger_message)
 
+    async def test_position_sync_clears_stale_reduce_lots(self):
+        client = FakeClient("100", qty_step="1", min_qty="1")
+        client.positions = [{"side": "Sell", "size": "3", "avgPrice": "100"}]
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine.grid_levels = [90, 95, 100, 105, 110]
+        engine.grid_position_net_qty = -2
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 1, "entry_value": 100},
+            "1": {"qty": 1, "entry_value": 100},
+        }
+
+        engine._sync_grid_position_with_exchange()
+
+        self.assertEqual(engine.grid_position_net_qty, -3)
+        self.assertFalse(engine.reduce_lots_complete)
+        self.assertEqual(engine.reduce_lots_by_level, {})
+
+    async def test_restore_discards_incomplete_reduce_lots(self):
+        client = FakeClient("100", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        engine.restore_state(
+            {
+                "config": engine.config,
+                "grid_levels": [90, 95, 100, 105, 110],
+                "reduce_lots_complete": False,
+                "reduce_lots_by_level": {"2": {"qty": 72, "entry_value": 29.232}},
+            }
+        )
+
+        self.assertFalse(engine.reduce_lots_complete)
+        self.assertEqual(engine.reduce_lots_by_level, {})
+
     async def test_reconcile_repairs_missing_short_reduce_protection_from_fill_level(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
         client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]

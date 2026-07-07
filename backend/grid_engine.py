@@ -119,8 +119,11 @@ class GridEngine:
         self.active_orders = dict(state.get("active_orders") or {})
         self.filled_orders = list(state.get("filled_orders") or [])
         self.completed_pairs = int(state.get("completed_pairs") or 0)
+        allow_reduce_lot_legacy_bootstrap = "reduce_lots_complete" not in state
         self.reduce_lots_by_level = self._normalize_reduce_lots(state.get("reduce_lots_by_level") or {})
         self.reduce_lots_complete = bool(state.get("reduce_lots_complete", bool(self.reduce_lots_by_level)))
+        if not self.reduce_lots_complete:
+            self.reduce_lots_by_level = {}
         self.target_qty_by_level = self._normalize_level_qtys(state.get("target_qty_by_level") or {})
         self.gross_profit = float(state.get("gross_profit") or 0)
         self.total_profit = float(state.get("total_profit") or 0)
@@ -156,7 +159,8 @@ class GridEngine:
         try:
             self._fetch_precision()
             self.current_price = self._get_current_price()
-            self._bootstrap_reduce_lots_from_legacy_state()
+            if allow_reduce_lot_legacy_bootstrap:
+                self._bootstrap_reduce_lots_from_legacy_state()
             if saved_running:
                 self._migrate_baseline_position_from_exchange()
                 self._reconcile_exchange_open_orders()
@@ -1419,6 +1423,7 @@ class GridEngine:
             self._baseline_position_net_qty(),
         )
         self.grid_position_net_qty = actual_grid_qty
+        self.reduce_lots_by_level = {}
         self.reduce_lots_complete = False
         self._position_mismatch_seen_at = 0.0
         self._position_mismatch_signature = None
