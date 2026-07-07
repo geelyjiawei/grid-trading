@@ -1357,6 +1357,13 @@ class GridEngine:
             return
 
         self._sync_grid_position_with_exchange()
+        if self._stopping or self._grid_position_qty() < self.min_qty:
+            return
+
+        if self._repair_missing_reduce_protection_from_ledger():
+            return
+
+        self._repair_missing_reduce_at_boundary()
 
     @staticmethod
     def _lot_add(lots: dict[int, dict[str, Decimal]], level_idx: int, qty: Decimal, entry_price: Decimal):
@@ -1784,6 +1791,69 @@ class GridEngine:
             self._persist_state()
             return True
         return False
+
+    def _grid_position_entry_price(self) -> float | None:
+        direction = self.config.get("direction")
+        position_side = "Buy" if direction == "long" else "Sell" if direction == "short" else ""
+        if not position_side:
+            return None
+        for position in self._position_snapshots():
+            if position.get("side") == position_side and float(position.get("entry_price") or 0) > 0:
+                return float(position["entry_price"])
+        if self.initial_entry_price > 0:
+            return self.initial_entry_price
+        return None
+
+    def _boundary_reduce_target_for_missing(self) -> tuple[str, float, int] | None:
+        direction = self.config.get("direction")
+        if direction == "short":
+            return "Buy", float(self.config["lower_price"]), 0
+        if direction == "long":
+            level_idx = max(0, len(self.grid_levels) - 2)
+            return "Sell", float(self.config["upper_price"]), level_idx
+        return None
+
+    def _repair_missing_reduce_at_boundary(self) -> bool:
+        reduce_side = self._reduce_side()
+        target = self._boundary_reduce_target_for_missing()
+        if not reduce_side or not target:
+            return False
+
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        active_reduce_qty = Decimal(str(self._active_reduce_qty(reduce_side)))
+        missing_qty = grid_qty - active_reduce_qty
+        if missing_qty < Decimal(str(self.min_qty)):
+            return False
+
+        side, price, level_idx = target
+        placed = self._place(
+            side,
+            price,
+            level_idx,
+            reduce_only=True,
+            qty_override=float(missing_qty),
+            entry_price=self._grid_position_entry_price(),
+            allow_duplicate=True,
+        )
+        if not placed:
+            self._mark_fast_poll()
+            return False
+
+        self.trigger_message = (
+            f"Placed boundary reduce-only fallback: {side} {self._fq(float(missing_qty))} "
+            f"at {self._fp(price)} because reduce ledger is incomplete."
+        )
+        logger.warning(
+            "Placed boundary reduce-only fallback symbol=%s side=%s price=%s qty=%s active_reduce_qty=%s grid_qty=%s",
+            self.config.get("symbol"),
+            side,
+            self._fp(price),
+            self._fq(float(missing_qty)),
+            self._fq(float(active_reduce_qty)),
+            self._fq(float(grid_qty)),
+        )
+        self._persist_state()
+        return True
 
     def _cancel_excess_reduce_protection_by_level(self, reduce_side: str, excess_by_level: list[dict]) -> bool:
         cancelled_count = 0

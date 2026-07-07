@@ -1173,7 +1173,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["baseline_position"]["qty"], 793)
         self.assertEqual(status["expected_position_net_qty"], -1238)
 
-    async def test_reconcile_does_not_guess_missing_short_reduce_protection_price(self):
+    async def test_reconcile_uses_boundary_reduce_when_short_reduce_level_unknown(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "528", "avgPrice": "0.6097"}]
         engine = GridEngine(
@@ -1225,8 +1225,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(repair_orders, [])
-        self.assertEqual(engine.trigger_message, "")
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "90.0")
+        self.assertEqual(repair_orders[0]["qty"], "528.0")
 
     async def test_position_sync_clears_stale_reduce_lots(self):
         client = FakeClient("100", qty_step="1", min_qty="1")
@@ -1331,8 +1332,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(repair_orders, [])
-        self.assertEqual(engine.trigger_message, "")
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "100.0")
+        self.assertEqual(repair_orders[0]["qty"], "0.20")
 
     async def test_reconcile_repairs_missing_reduce_from_persisted_lot_ledger(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
@@ -1368,7 +1370,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(repair_orders, [])
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "100.0")
+        self.assertEqual(repair_orders[0]["qty"], "0.20")
 
     async def test_record_fill_updates_reduce_lot_ledger(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
@@ -1458,9 +1462,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(len(repair_orders), 1)
-        self.assertAlmostEqual(sum(float(order["qty"]) for order in repair_orders), 0.1)
-        self.assertEqual(sorted(float(order["qty"]) for order in repair_orders), [0.1])
+        self.assertEqual(len(repair_orders), 2)
+        self.assertAlmostEqual(sum(float(order["qty"]) for order in repair_orders), 0.2)
+        self.assertEqual(sorted(float(order["qty"]) for order in repair_orders), [0.1, 0.1])
 
     async def test_reconcile_repairs_missing_long_reduce_protection_from_fill_level(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
@@ -1501,10 +1505,11 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Sell" and order["reduce_only"]
         ]
-        self.assertEqual(repair_orders, [])
-        self.assertEqual(engine.trigger_message, "")
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "105.0")
+        self.assertEqual(repair_orders[0]["qty"], "0.20")
 
-    async def test_reconcile_does_not_repair_missing_reduce_when_fill_history_is_truncated(self):
+    async def test_reconcile_places_boundary_reduce_when_fill_history_is_truncated(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
         client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
         engine = GridEngine(
@@ -1544,8 +1549,10 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(repair_orders, [])
-        self.assertEqual(engine.trigger_message, "")
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["price"], "90.0")
+        self.assertEqual(repair_orders[0]["qty"], "0.20")
+        self.assertIn("boundary reduce-only fallback", engine.trigger_message)
 
     async def test_reconcile_skips_fill_ledger_when_reduce_protection_is_complete(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
@@ -1586,9 +1593,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         }
 
         def fail_if_called():
-            raise AssertionError("fill ledger repair should not run when reduce protection is complete")
+            raise AssertionError("fill ledger rebuild should not run when reduce protection is complete")
 
-        engine._repair_missing_reduce_protection_from_ledger = fail_if_called
+        engine._reduce_lots_from_fill_ledger = fail_if_called
 
         engine._reconcile_grid_position_protection()
 
