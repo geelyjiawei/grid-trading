@@ -455,10 +455,10 @@ class GridEngine:
         return self._steps_to_qty(steps)
 
     def _counter_qty_for_order(self, order: dict) -> float:
-        qty = float(order["qty"])
-        if self._position_sizing_mode() != "fixed_grid_qty":
-            return qty
-        return self._fixed_grid_qty_for_level(int(order.get("level_idx", 0) or 0), qty)
+        # Counter orders must match the actual executed quantity. Upsizing a
+        # partial fill back to the fixed per-grid quantity creates overcommit,
+        # trimmed orders, and confusing extra same-level orders.
+        return float(order["qty"])
 
     def _fee_rate(self) -> float:
         return max(0.0, float(self.config.get("fee_rate", 0.0005) or 0))
@@ -821,10 +821,10 @@ class GridEngine:
         return float(available)
 
     def _cap_reduce_order_qty(self, side: str, qty: float) -> float:
-        if not self._is_grid_reduce_side(side, True):
-            return qty
-        available = self._available_reduce_qty(side)
-        return min(qty, available)
+        # Normal grid orders must be deterministic: place the requested grid
+        # quantity and let the exchange accept or reject it. Local capping made
+        # live order quantities drift from the configured grid.
+        return qty
 
     def _allocate_qtys(self, raw_total_qty: float, target_count: int) -> list[float]:
         if target_count <= 0:
@@ -853,96 +853,7 @@ class GridEngine:
         )
 
     def _trim_reduce_overcommit(self) -> bool:
-        reduce_side = self._reduce_side()
-        if not reduce_side:
-            return False
-
-        grid_qty = self._grid_position_qty()
-        active_reduce_qty = self._active_reduce_qty(reduce_side)
-        excess = active_reduce_qty - grid_qty
-        if excess < self.min_qty:
-            return False
-
-        logger.warning(
-            "Reduce-only overcommitted; trimming excess symbol=%s reduce_side=%s active_reduce_qty=%s grid_qty=%s excess=%s",
-            self.config.get("symbol"),
-            reduce_side,
-            active_reduce_qty,
-            grid_qty,
-            excess,
-        )
-
-        remaining_excess = Decimal(str(excess))
-        changed = False
-        for link_id, order in self._sort_reduce_orders_for_trim(reduce_side):
-            if remaining_excess < Decimal(str(self.min_qty)):
-                break
-
-            order_qty = Decimal(str(order.get("qty", 0) or 0))
-            replacement_qty = Decimal("0")
-            if order_qty > remaining_excess:
-                replacement_qty = order_qty - remaining_excess
-            order_id = str(order.get("order_id", "") or "")
-            try:
-                result = {"retCode": 0}
-                if order_id:
-                    result = self.client.cancel_order(self.config["symbol"], order_id)
-                if result.get("retCode") != 0:
-                    raise RuntimeError(result.get("retMsg", "Failed to cancel excess reduce order"))
-                self.active_orders.pop(link_id, None)
-                remaining_excess -= min(order_qty, remaining_excess)
-                changed = True
-                logger.warning(
-                    "Cancelled excess reduce-only order symbol=%s order_id=%s link_id=%s qty=%s",
-                    self.config.get("symbol"),
-                    order_id,
-                    link_id,
-                    order.get("qty"),
-                )
-                if replacement_qty >= Decimal(str(self.min_qty)):
-                    self._place(
-                        reduce_side,
-                        float(order.get("price", 0) or 0),
-                        int(order.get("level_idx", 0) or 0),
-                        reduce_only=True,
-                        qty_override=float(replacement_qty),
-                        entry_price=order.get("entry_price"),
-                        allow_duplicate=True,
-                    )
-                    logger.warning(
-                        "Replaced trimmed reduce-only remainder symbol=%s old_order_id=%s price=%s qty=%s",
-                        self.config.get("symbol"),
-                        order_id,
-                        order.get("price"),
-                        self._fq(float(replacement_qty)),
-                    )
-            except Exception as exc:
-                status = self._get_order_status(order)
-                if self._is_cancelled_status(status):
-                    self.active_orders.pop(link_id, None)
-                    remaining_excess -= min(order_qty, remaining_excess)
-                    changed = True
-                    continue
-                logger.warning(
-                    "Failed to cancel excess reduce-only order symbol=%s order_id=%s link_id=%s status=%s msg=%s",
-                    self.config.get("symbol"),
-                    order_id,
-                    link_id,
-                    status,
-                    exc,
-                )
-                self._mark_fast_poll()
-                break
-
-        if changed:
-            self.trigger_message = (
-                f"Trimmed excess reduce-only protection: {reduce_side} {float(excess):g}"
-            )
-            self._persist_state()
-            return True
-        else:
-            self._mark_fast_poll()
-        return True
+        return False
 
     def _normalize_fixed_reduce_protection(self) -> bool:
         # Never reshape reduce-only protection by total quantity alone. Safety
@@ -1049,6 +960,29 @@ class GridEngine:
             self._persist_state()
         return adopted
 
+    def _sync_active_order_from_exchange_snapshot(self, order: dict, snapshot: dict) -> bool:
+        """Keep the local order ledger aligned with the exchange-accepted order shape."""
+        updates: dict[str, Any] = {}
+        if snapshot.get("price") is not None:
+            updates["price"] = str(snapshot.get("price"))
+        if snapshot.get("qty") is not None:
+            updates["qty"] = str(snapshot.get("qty"))
+        status = snapshot.get("orderStatus") or snapshot.get("status")
+        current_status = str(order.get("status") or "")
+        if status and not (
+            current_status.lower() == "open" and str(status).upper() in {"NEW", "OPEN"}
+        ):
+            updates["status"] = str(status)
+        if snapshot.get("reduceOnly") is not None:
+            updates["reduce_only"] = self._truthy(snapshot.get("reduceOnly"))
+
+        changed = False
+        for key, value in updates.items():
+            if str(order.get(key)) != str(value):
+                order[key] = value
+                changed = True
+        return changed
+
     def _handle_order_execution_snapshot(self, order: dict, snapshot: dict) -> bool:
         fallback_price = float(order["price"])
         fallback_qty = float(order["qty"])
@@ -1083,6 +1017,8 @@ class GridEngine:
             snapshot = open_orders_by_id.get(order_id)
             if not snapshot:
                 continue
+            if self._sync_active_order_from_exchange_snapshot(order, snapshot):
+                changed = True
             status = str(snapshot.get("orderStatus") or snapshot.get("status") or "")
             if not self._is_partial_status(status):
                 continue
@@ -1421,26 +1357,6 @@ class GridEngine:
             return
 
         self._sync_grid_position_with_exchange()
-        if self._stopping:
-            return
-        if self._normalize_fixed_reduce_protection():
-            return
-        if self._trim_reduce_overcommit():
-            return
-        if self._handle_reduce_protection_level_risk():
-            return
-
-        reduce_side = self._reduce_side()
-        if not reduce_side:
-            return
-        missing_qty = self._grid_position_qty() - self._active_reduce_qty(reduce_side)
-        if missing_qty < self.min_qty:
-            return
-
-        if self._repair_missing_reduce_protection_from_ledger():
-            return
-
-        self._warn_missing_reduce_protection()
 
     @staticmethod
     def _lot_add(lots: dict[int, dict[str, Decimal]], level_idx: int, qty: Decimal, entry_price: Decimal):
@@ -2216,18 +2132,6 @@ class GridEngine:
         allow_duplicate: bool = False,
     ) -> Optional[str]:
         raw_qty = float(qty_override) if qty_override is not None else float(self.config["qty_per_grid"])
-        if reduce_only:
-            capped_qty = self._cap_reduce_order_qty(side, raw_qty)
-            if capped_qty < self.min_qty:
-                logger.warning(
-                    "Skipped reduce-only order with no grid allowance symbol=%s side=%s level=%s requested=%s",
-                    self.config.get("symbol"),
-                    side,
-                    level_idx,
-                    raw_qty,
-                )
-                return None
-            raw_qty = capped_qty
 
         qty = self._fq(raw_qty)
         price_text = self._fp(price)
@@ -2307,14 +2211,18 @@ class GridEngine:
             )
             return None
 
+        result_data = result.get("result", {})
+        accepted_qty = str(result_data.get("qty") or qty)
+        accepted_price = str(result_data.get("price") or price_text)
+        accepted_status = str(result_data.get("orderStatus") or "open")
         self.active_orders[link_id] = {
             "link_id": link_id,
-            "order_id": result["result"]["orderId"],
+            "order_id": result_data["orderId"],
             "level_idx": level_idx,
             "side": side,
-            "price": price_text,
-            "qty": qty,
-            "status": "open",
+            "price": accepted_price,
+            "qty": accepted_qty,
+            "status": accepted_status,
             "order_type": "Limit",
             "time_in_force": "PostOnly" if use_post_only else "GTC",
             "reduce_only": reduce_only,
@@ -2333,7 +2241,6 @@ class GridEngine:
 
     def _place_batch_limit_orders(self, order_specs: list[dict[str, Any]]) -> list[str]:
         planned = []
-        reduce_remaining_by_side: dict[str, float] = {}
 
         for spec in order_specs:
             side = str(spec["side"])
@@ -2346,20 +2253,6 @@ class GridEngine:
                 break
 
             raw_qty = float(spec.get("qty_override") or self.config["qty_per_grid"])
-            if reduce_only:
-                remaining = reduce_remaining_by_side.get(side)
-                if remaining is None:
-                    remaining = self._available_reduce_qty(side)
-                raw_qty = min(raw_qty, remaining)
-                reduce_remaining_by_side[side] = max(0.0, remaining - raw_qty)
-                if raw_qty < self.min_qty:
-                    logger.warning(
-                        "Skipped batch reduce-only order with no grid allowance symbol=%s side=%s level=%s",
-                        self.config.get("symbol"),
-                        side,
-                        level_idx,
-                    )
-                    continue
 
             qty = self._fq(raw_qty)
             price_text = self._fp(float(spec["price"]))
@@ -2428,14 +2321,18 @@ class GridEngine:
                 state = item["state"]
                 if order_result.get("retCode") == 0 and order_result.get("result", {}).get("orderId"):
                     link_id = state["link_id"]
+                    result_data = order_result["result"]
+                    accepted_qty = str(result_data.get("qty") or state["qty"])
+                    accepted_price = str(result_data.get("price") or state["price"])
+                    accepted_status = str(result_data.get("orderStatus") or "open")
                     self.active_orders[link_id] = {
                         "link_id": link_id,
-                        "order_id": str(order_result["result"]["orderId"]),
+                        "order_id": str(result_data["orderId"]),
                         "level_idx": state["level_idx"],
                         "side": state["side"],
-                        "price": state["price"],
-                        "qty": state["qty"],
-                        "status": "open",
+                        "price": accepted_price,
+                        "qty": accepted_qty,
+                        "status": accepted_status,
                         "order_type": "Limit",
                         "time_in_force": "GTC",
                         "reduce_only": state["reduce_only"],

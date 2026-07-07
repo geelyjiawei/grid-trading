@@ -79,6 +79,38 @@ class AsterClientTests(unittest.TestCase):
         self.assertIn("nonce", params)
         self.assertRegex(params["signature"], r"^[0-9a-f]{130}$")
 
+    def test_place_order_preserves_exchange_accepted_quantity(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.session = FakeSession(
+            FakeResponse(
+                {
+                    "orderId": 4770039,
+                    "clientOrderId": "g_0_B_test",
+                    "side": "BUY",
+                    "price": "0.3800000",
+                    "origQty": "70",
+                    "status": "NEW",
+                    "reduceOnly": True,
+                    "time": 123,
+                }
+            )
+        )
+
+        response = client.place_order(
+            symbol="ANSEMUSDT",
+            side="Buy",
+            qty="100",
+            price="0.3800000",
+            order_type="Limit",
+            reduce_only=True,
+            order_link_id="g_0_B_test",
+        )
+
+        self.assertEqual(response["result"]["orderId"], "4770039")
+        self.assertEqual(response["result"]["qty"], "70")
+        self.assertEqual(response["result"]["price"], "0.3800000")
+        self.assertTrue(response["result"]["reduceOnly"])
+
     def test_normalizes_order_trade_position_shapes(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
 

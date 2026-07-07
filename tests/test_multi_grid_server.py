@@ -429,7 +429,7 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(history["runs"][0]["position_sizing_mode"], "fixed_grid_qty")
         self.assertEqual(history["runs"][0]["grid_order_qty"], 1)
 
-    def test_restore_trims_reduce_overcommit_without_event_loop_restart(self):
+    def test_restore_keeps_reduce_orders_without_event_loop_restart(self):
         main._client = FakeClient("15.95")
         main._client.positions = [{"side": "Buy", "size": "200", "avgPrice": "16.18"}]
         placed = main._client.place_order(
@@ -498,7 +498,10 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertTrue(engine.grid_ready)
         self.assertFalse(saved["running"])
         self.assertNotIn("NOKUSDT", saved_grids)
-        self.assertEqual(main._client.get_open_orders("NOKUSDT")["result"]["list"], [])
+        open_orders = main._client.get_open_orders("NOKUSDT")["result"]["list"]
+        self.assertEqual(len(open_orders), 1)
+        self.assertEqual(open_orders[0]["orderId"], order_id)
+        self.assertEqual(open_orders[0]["qty"], "3.1")
 
     def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
         main._client.place_order(

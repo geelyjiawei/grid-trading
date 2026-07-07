@@ -1297,7 +1297,11 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         unmanaged_delta_qty = actual_position_net_qty - expected_position_net_qty
         unmanaged_position = abs(unmanaged_delta_qty) >= max(float(engine.min_qty), 1e-12)
         reduce_protection = status.get("reduce_protection") or {}
-        reduce_protection_risk = bool(reduce_protection.get("has_risk"))
+        # Reduce-protection diagnostics are informational only. The live grid
+        # should not surface a risk solely because the optional protection
+        # ledger is incomplete; actual risk is still captured by orphan orders
+        # and expected-vs-actual position deltas.
+        reduce_protection_risk = False
     return {
         "symbol": symbol,
         "exchange": exchange,

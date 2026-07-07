@@ -193,7 +193,9 @@ class BinanceFuturesClient:
         )
 
         result = self._request("POST", "/fapi/v1/order", params=params, auth=True)
-        return {"retCode": 0, "result": {"orderId": str(result.get("orderId", ""))}}
+        normalized = self._normalize_order(result)
+        normalized["orderId"] = str(result.get("orderId", normalized.get("orderId", "")))
+        return {"retCode": 0, "result": normalized}
 
     def place_orders(self, orders: list[dict[str, Any]]) -> dict:
         batch_orders = []
@@ -220,7 +222,9 @@ class BinanceFuturesClient:
         normalized = []
         for item in results if isinstance(results, list) else []:
             if "orderId" in item:
-                normalized.append({"retCode": 0, "result": {"orderId": str(item.get("orderId", ""))}})
+                normalized_item = self._normalize_order(item)
+                normalized_item["orderId"] = str(item.get("orderId", normalized_item.get("orderId", "")))
+                normalized.append({"retCode": 0, "result": normalized_item})
             else:
                 normalized.append(
                     {
