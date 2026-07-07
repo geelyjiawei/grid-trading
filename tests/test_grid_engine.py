@@ -571,7 +571,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine.reduce_lots_complete)
         self.assertNotIn("rebuilt from current exchange", engine.trigger_message)
 
-    async def test_reduce_protection_risk_queues_add_counter_orders(self):
+    async def test_reduce_protection_risk_still_restores_filled_counter_orders(self):
         client = FakeClient("100", qty_step="1", min_qty="1")
         engine = GridEngine(
             client,
@@ -638,9 +638,13 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        self.assertEqual(len(engine.paused_replacements), 1)
-        self.assertFalse(any(order.get("side") == "Sell" and not order.get("reduce_only") for order in client.orders))
-        self.assertIn("queued non-reducing counter order", engine.trigger_message)
+        open_orders = [
+            order
+            for order in engine.active_orders.values()
+            if order.get("side") == "Sell" and not order.get("reduce_only") and order.get("level_idx") == 1
+        ]
+        self.assertEqual(len(open_orders), 1)
+        self.assertEqual(engine.paused_replacements, [])
 
     async def test_reduce_protection_risk_still_places_reduce_counter_orders(self):
         client = FakeClient("100", qty_step="1", min_qty="1")

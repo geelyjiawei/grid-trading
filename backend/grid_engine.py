@@ -641,21 +641,8 @@ class GridEngine:
         if not delta_stats:
             return False
 
-        protection_blocked = (
-            self.config.get("direction") in {"long", "short"}
-            and self.reduce_protection_snapshot().get("has_risk")
-            and not self._counter_order_reduces_grid_position(order)
-        )
         filled_order = {**order, "qty": str(delta_stats["qty"]), "fill_price": delta_stats["price"]}
         self._record_fill(filled_order, delta_stats)
-        if protection_blocked:
-            self.paused_replacements.append(filled_order)
-            self.trigger_message = (
-                "Reduce protection risk is active; queued non-reducing counter order "
-                "instead of increasing grid exposure."
-            )
-            self._persist_state()
-            return True
         if self._should_place_counter_order_now(filled_order):
             self._place_counter_order(filled_order)
         else:
@@ -3079,13 +3066,6 @@ class GridEngine:
         remaining = []
         self.paused_replacements.clear()
         for order in pending:
-            if (
-                self.config.get("direction") in {"long", "short"}
-                and self.reduce_protection_snapshot().get("has_risk")
-                and not self._counter_order_reduces_grid_position(order)
-            ):
-                remaining.append(order)
-                continue
             if not self._should_place_counter_order_now(order):
                 remaining.append(order)
                 continue
