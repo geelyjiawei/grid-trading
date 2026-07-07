@@ -229,6 +229,38 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             len(engine.active_orders),
         )
 
+    async def test_reconcile_does_not_fetch_trade_details_for_new_open_orders(self):
+        client = FakeClient("100")
+        trade_detail_calls = []
+        client.get_order_trades = lambda symbol, order_id: trade_detail_calls.append(order_id) or {
+            "retCode": 0,
+            "result": {"list": []},
+        }
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+
+        await engine.initialize()
+        trade_detail_calls.clear()
+        changed = engine._reconcile_exchange_open_orders()
+
+        self.assertFalse(changed)
+        self.assertEqual(trade_detail_calls, [])
+
     async def test_fixed_grid_qty_sets_initial_position_from_active_grid_count(self):
         client = FakeClient("100")
         engine = GridEngine(

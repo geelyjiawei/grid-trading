@@ -1092,6 +1092,9 @@ class GridEngine:
             snapshot = open_orders_by_id.get(order_id)
             if not snapshot:
                 continue
+            status = str(snapshot.get("orderStatus") or snapshot.get("status") or "")
+            if not self._is_partial_status(status):
+                continue
             if self._handle_order_execution_snapshot(order, snapshot):
                 changed = True
 
