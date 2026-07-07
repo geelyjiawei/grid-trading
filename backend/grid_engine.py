@@ -643,6 +643,9 @@ class GridEngine:
 
         filled_order = {**order, "qty": str(delta_stats["qty"]), "fill_price": delta_stats["price"]}
         self._record_fill(filled_order, delta_stats)
+        if filled_order.get("tag") == "boundary_reduce_fallback":
+            self._repair_flat_open_side_grid()
+            return True
         if self._should_place_counter_order_now(filled_order):
             self._place_counter_order(filled_order)
         else:
@@ -701,6 +704,32 @@ class GridEngine:
             ):
                 total += Decimal(str(order.get("qty", 0) or 0))
         return float(total)
+
+    def _active_order_remaining_qty(self, side: str, level_idx: int, reduce_only: bool) -> float:
+        total = Decimal("0")
+        for order in self.active_orders.values():
+            if (
+                order.get("side") == side
+                and int(order.get("level_idx", 0) or 0) == level_idx
+                and bool(order.get("reduce_only")) == reduce_only
+            ):
+                planned = Decimal(str(order.get("qty", 0) or 0))
+                processed = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+                remaining = planned - processed
+                if remaining > 0:
+                    total += remaining
+        return float(total)
+
+    def _active_order_remaining_qty_deficit(
+        self, side: str, level_idx: int, reduce_only: bool, qty: float
+    ) -> float:
+        requested = Decimal(str(qty))
+        active = Decimal(str(self._active_order_remaining_qty(side, level_idx, reduce_only)))
+        deficit = requested - active
+        minimum_order_qty = max(Decimal(self.qty_step), Decimal(str(self.min_qty)))
+        if deficit < minimum_order_qty:
+            return 0.0
+        return float(deficit)
 
     def _active_order_qty_deficit(self, side: str, level_idx: int, reduce_only: bool, qty: float) -> float:
         requested = Decimal(str(qty))
@@ -1357,7 +1386,11 @@ class GridEngine:
             return
 
         self._sync_grid_position_with_exchange()
-        if self._stopping or self._grid_position_qty() < self.min_qty:
+        if self._stopping:
+            return
+
+        if self._grid_position_qty() < self.min_qty:
+            self._repair_flat_open_side_grid()
             return
 
         if self._repair_missing_reduce_protection_from_ledger():
@@ -1813,6 +1846,79 @@ class GridEngine:
             return "Sell", float(self.config["upper_price"]), level_idx
         return None
 
+    def _open_side_for_direction(self) -> str:
+        direction = self.config.get("direction")
+        if direction == "short":
+            return "Sell"
+        if direction == "long":
+            return "Buy"
+        return ""
+
+    def _open_price_for_level(self, level_idx: int) -> float | None:
+        if level_idx < 0 or level_idx + 1 >= len(self.grid_levels):
+            return None
+        if self.config.get("direction") == "short":
+            return float(self.grid_levels[level_idx + 1])
+        if self.config.get("direction") == "long":
+            return float(self.grid_levels[level_idx])
+        return None
+
+    def _target_open_qty_for_level(self, level_idx: int) -> float:
+        raw_qty = (
+            self.target_qty_by_level.get(str(level_idx))
+            or self.config.get("grid_order_qty")
+            or self.config.get("qty_per_grid")
+            or 0
+        )
+        steps = self._qty_to_steps(float(raw_qty))
+        if steps <= 0:
+            return 0.0
+        return self._steps_to_qty(steps)
+
+    def _repair_flat_open_side_grid(self) -> bool:
+        side = self._open_side_for_direction()
+        if not side or not self.grid_ready or len(self.grid_levels) < 2:
+            return False
+
+        placed_count = 0
+        placed_qty = Decimal("0")
+        for level_idx in range(len(self.grid_levels) - 1):
+            price = self._open_price_for_level(level_idx)
+            if price is None:
+                continue
+            target_qty = self._target_open_qty_for_level(level_idx)
+            if target_qty < self.min_qty:
+                continue
+            deficit = self._active_order_remaining_qty_deficit(side, level_idx, False, target_qty)
+            if deficit < self.min_qty:
+                continue
+            link_id = self._place(
+                side,
+                price,
+                level_idx,
+                reduce_only=False,
+                qty_override=deficit,
+                allow_duplicate=self._has_active_order(side, level_idx, False),
+            )
+            if link_id:
+                placed_count += 1
+                placed_qty += Decimal(str(deficit))
+
+        if placed_count:
+            self.trigger_message = (
+                f"Restored {placed_count} flat-grid open order(s): {self._fq(float(placed_qty))}"
+            )
+            logger.warning(
+                "Restored flat-grid open side coverage symbol=%s side=%s orders=%s qty=%s",
+                self.config.get("symbol"),
+                side,
+                placed_count,
+                self._fq(float(placed_qty)),
+            )
+            self._persist_state()
+            return True
+        return False
+
     def _repair_missing_reduce_at_boundary(self) -> bool:
         reduce_side = self._reduce_side()
         target = self._boundary_reduce_target_for_missing()
@@ -1834,6 +1940,7 @@ class GridEngine:
             qty_override=float(missing_qty),
             entry_price=self._grid_position_entry_price(),
             allow_duplicate=True,
+            tag="boundary_reduce_fallback",
         )
         if not placed:
             self._mark_fast_poll()
@@ -2200,6 +2307,7 @@ class GridEngine:
         qty_override: float | None = None,
         entry_price: float | None = None,
         allow_duplicate: bool = False,
+        tag: str | None = None,
     ) -> Optional[str]:
         raw_qty = float(qty_override) if qty_override is not None else float(self.config["qty_per_grid"])
 
@@ -2301,6 +2409,8 @@ class GridEngine:
             "processed_fill_volume": 0.0,
             "processed_fill_fee": 0.0,
         }
+        if tag:
+            self.active_orders[link_id]["tag"] = tag
         self._mark_fast_poll()
         self._persist_state()
         return link_id
@@ -3191,6 +3301,7 @@ class GridEngine:
             qty_override=float(order["qty"]),
             entry_price=order.get("entry_price"),
             allow_duplicate=bool(order["reduce_only"]),
+            tag=order.get("tag"),
         )
         if placed:
             logger.warning(
