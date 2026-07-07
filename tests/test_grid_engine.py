@@ -361,6 +361,184 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.active_orders, {})
         self.assertIn("Reduce protection risk", engine.trigger_message)
 
+    async def test_reduce_lot_ledger_rebuilds_from_exchange_open_reduce_orders(self):
+        client = FakeClient("0.386", tick_size="0.001", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.386,
+                "lower_price": 0.38,
+                "grid_count": 3,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.38, 0.382, 0.384, 0.386]
+        engine.grid_position_net_qty = -3
+        engine.reduce_lots_complete = False
+        engine.reduce_lots_by_level = {"0": {"qty": 1, "entry_value": 0.382}}
+        engine.completed_pairs = 1
+        engine.filled_orders = []
+        engine.active_orders = {
+            "g_1_B_a": {
+                "link_id": "g_1_B_a",
+                "order_id": "1",
+                "level_idx": 1,
+                "side": "Buy",
+                "price": "0.382",
+                "qty": "1",
+                "reduce_only": True,
+                "entry_price": 0.384,
+            },
+            "g_2_B_b": {
+                "link_id": "g_2_B_b",
+                "order_id": "2",
+                "level_idx": 2,
+                "side": "Buy",
+                "price": "0.384",
+                "qty": "2",
+                "reduce_only": True,
+                "entry_price": 0.386,
+            },
+        }
+        client.orders = [
+            {
+                "symbol": "TESTUSDT",
+                "orderId": "1",
+                "order_link_id": "g_1_B_a",
+                "side": "Buy",
+                "price": "0.382",
+                "qty": "1",
+                "reduce_only": True,
+                "order_type": "Limit",
+            },
+            {
+                "symbol": "TESTUSDT",
+                "orderId": "2",
+                "order_link_id": "g_2_B_b",
+                "side": "Buy",
+                "price": "0.384",
+                "qty": "2",
+                "reduce_only": True,
+                "order_type": "Limit",
+            },
+        ]
+        client.open_limit_order_ids = {"1", "2"}
+
+        snapshot = engine.reduce_protection_snapshot()
+
+        self.assertFalse(snapshot["has_risk"])
+        self.assertTrue(snapshot["ledger_ok"])
+        self.assertTrue(engine.reduce_lots_complete)
+        self.assertEqual(
+            engine.reduce_lots_by_level,
+            {
+                "1": {"qty": 1.0, "entry_value": 0.384},
+                "2": {"qty": 2.0, "entry_value": 0.772},
+            },
+        )
+        self.assertIn("rebuilt from current exchange", engine.trigger_message)
+
+    async def test_reduce_lot_ledger_does_not_rebuild_when_exchange_reduce_qty_mismatches(self):
+        client = FakeClient("0.386", tick_size="0.001", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.386,
+                "lower_price": 0.38,
+                "grid_count": 3,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.38, 0.382, 0.384, 0.386]
+        engine.grid_position_net_qty = -3
+        engine.completed_pairs = 1
+        client.orders = [
+            {
+                "symbol": "TESTUSDT",
+                "orderId": "1",
+                "order_link_id": "g_1_B_a",
+                "side": "Buy",
+                "price": "0.382",
+                "qty": "1",
+                "reduce_only": True,
+                "order_type": "Limit",
+            }
+        ]
+        client.open_limit_order_ids = {"1"}
+
+        snapshot = engine.reduce_protection_snapshot()
+
+        self.assertTrue(snapshot["has_risk"])
+        self.assertFalse(engine.reduce_lots_complete)
+        self.assertNotIn("rebuilt from current exchange", engine.trigger_message)
+
+    async def test_reduce_lot_ledger_does_not_rebuild_from_manual_reduce_order(self):
+        client = FakeClient("0.386", tick_size="0.001", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.386,
+                "lower_price": 0.38,
+                "grid_count": 3,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.38, 0.382, 0.384, 0.386]
+        engine.grid_position_net_qty = -1
+        engine.completed_pairs = 1
+        client.orders = [
+            {
+                "symbol": "TESTUSDT",
+                "orderId": "manual",
+                "order_link_id": "",
+                "side": "Buy",
+                "price": "0.382",
+                "qty": "1",
+                "reduce_only": True,
+                "order_type": "Limit",
+            }
+        ]
+        client.open_limit_order_ids = {"manual"}
+
+        snapshot = engine.reduce_protection_snapshot()
+
+        self.assertTrue(snapshot["has_risk"])
+        self.assertFalse(engine.reduce_lots_complete)
+        self.assertNotIn("rebuilt from current exchange", engine.trigger_message)
+
     async def test_reduce_protection_risk_queues_add_counter_orders(self):
         client = FakeClient("100", qty_step="1", min_qty="1")
         engine = GridEngine(

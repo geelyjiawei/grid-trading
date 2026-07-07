@@ -1665,10 +1665,142 @@ class GridEngine:
 
         return lots, ""
 
+    def _inferred_reduce_entry_price(self, level_idx: int) -> Decimal:
+        direction = self.config["direction"]
+        try:
+            if direction == "short" and 0 <= level_idx + 1 < len(self.grid_levels):
+                return Decimal(str(self.grid_levels[level_idx + 1]))
+            if direction == "long" and 0 <= level_idx < len(self.grid_levels):
+                return Decimal(str(self.grid_levels[level_idx]))
+        except Exception:
+            return Decimal("0")
+        return Decimal("0")
+
+    def _reduce_lots_from_exchange_open_orders(self) -> tuple[dict[int, dict[str, Decimal]] | None, str]:
+        """Rebuild protection lots from live exchange reduce-only orders.
+
+        This is deliberately stricter than a total-quantity normalization: every
+        reduce order must be a current exchange order with a grid link and the
+        correct grid-level price. No exchange orders are changed here.
+        """
+        if self.config["direction"] not in {"long", "short"}:
+            return {}, ""
+
+        reduce_side = self._reduce_side()
+        if not reduce_side:
+            return None, "reduce side is unavailable"
+
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        min_qty = Decimal(str(self.min_qty))
+        if grid_qty < min_qty:
+            return {}, ""
+
+        try:
+            open_orders = self._fetch_open_orders()
+        except Exception as exc:
+            return None, f"exchange open orders unavailable: {exc}"
+
+        self._adopt_exchange_grid_orders(open_orders)
+        local_by_id = {
+            str(order.get("order_id", "") or ""): order
+            for order in self.active_orders.values()
+            if order.get("order_id")
+        }
+
+        lots: dict[int, dict[str, Decimal]] = {}
+        total = Decimal("0")
+        for item in open_orders:
+            if not self._truthy(item.get("reduceOnly", False)):
+                continue
+            side = str(item.get("side") or "")
+            if side != reduce_side:
+                continue
+
+            link_id = str(item.get("orderLinkId", "") or "")
+            parsed = self._parse_grid_link_id(link_id)
+            if not parsed:
+                return None, f"active reduce order {item.get('orderId')} is not a grid order"
+            level_idx, side_from_link = parsed
+            if side_from_link != reduce_side:
+                return None, f"active reduce order {item.get('orderId')} link side does not match reduce side"
+
+            target = self._reduce_target_for_level(level_idx)
+            if not target or target[0] != reduce_side:
+                return None, f"active reduce order {item.get('orderId')} has invalid grid level"
+            try:
+                if self._fp(float(item.get("price", 0) or 0)) != self._fp(float(target[1])):
+                    return None, f"active reduce order {item.get('orderId')} price does not match grid level"
+                qty = Decimal(str(item.get("qty", 0) or 0))
+            except Exception:
+                return None, f"active reduce order {item.get('orderId')} contains invalid values"
+            if qty < min_qty:
+                return None, f"active reduce order {item.get('orderId')} quantity is too small"
+
+            local_order = self.active_orders.get(link_id) or local_by_id.get(str(item.get("orderId", "") or ""))
+            try:
+                entry_price = Decimal(str((local_order or {}).get("entry_price") or 0))
+            except Exception:
+                entry_price = Decimal("0")
+            if entry_price <= 0:
+                entry_price = self._inferred_reduce_entry_price(level_idx)
+            if entry_price <= 0:
+                return None, f"active reduce order {item.get('orderId')} entry price is unavailable"
+
+            self._lot_add(lots, level_idx, qty, entry_price)
+            total += qty
+
+        if not lots:
+            return None, "no active exchange reduce protection orders"
+        if abs(total - grid_qty) >= min_qty:
+            return None, f"active exchange reduce qty {float(total)} does not match grid qty {float(grid_qty)}"
+        return lots, ""
+
+    def _restore_reduce_lots_from_exchange_open_orders(self, source_reason: str = "") -> bool:
+        lots, reason = self._reduce_lots_from_exchange_open_orders()
+        if lots is None:
+            signature = ("exchange-open-reduce-ledger-unavailable", reason)
+            if reason and self._should_log_reduce_warning(signature):
+                logger.warning(
+                    "Exchange reduce protection ledger unavailable symbol=%s reason=%s",
+                    self.config.get("symbol"),
+                    reason,
+                )
+            return False
+
+        self._set_reduce_lot_decimal_map(lots)
+        self.reduce_lots_complete = True
+        self.trigger_message = (
+            "Reduce protection ledger rebuilt from current exchange reduce-only orders; "
+            "no orders were changed."
+        )
+        logger.warning(
+            "Rebuilt reduce protection ledger from exchange open orders symbol=%s levels=%s source_reason=%s",
+            self.config.get("symbol"),
+            sorted(lots),
+            source_reason,
+        )
+        self._persist_state()
+        return True
+
     def _reduce_lots_for_repair(self) -> tuple[dict[int, dict[str, Decimal]] | None, str]:
         if self.reduce_lots_complete:
             return self._reduce_lot_decimal_map(), ""
-        return self._reduce_lots_from_fill_ledger()
+
+        lots, reason = self._reduce_lots_from_fill_ledger()
+        if lots is None:
+            if self._restore_reduce_lots_from_exchange_open_orders(reason):
+                return self._reduce_lot_decimal_map(), ""
+            return None, reason
+
+        expected_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        if abs(expected_total - grid_qty) >= Decimal(str(self.min_qty)):
+            mismatch_reason = (
+                f"fill ledger qty {float(expected_total)} does not match grid qty {float(grid_qty)}"
+            )
+            if self._restore_reduce_lots_from_exchange_open_orders(mismatch_reason):
+                return self._reduce_lot_decimal_map(), ""
+        return lots, reason
 
     def _should_log_reduce_warning(self, signature: tuple, interval: float = 60.0) -> bool:
         now = time.time()
