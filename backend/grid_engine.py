@@ -3406,31 +3406,13 @@ class GridEngine:
                 }
         return None
 
-    def _counter_order_is_passive_boundary_reentry(self, order: dict) -> bool:
-        if self.config.get("direction") not in {"long", "short"}:
-            return False
-
-        plan = self._counter_order_plan(order)
-        if not plan or plan["reduce_only"]:
-            return False
-
-        price = float(plan["price"])
-        if not self._in_grid_range(price):
-            return False
-
-        current = float(self.current_price)
-        if plan["side"] == "Buy":
-            return price < current
-        if plan["side"] == "Sell":
-            return price > current
-        return False
-
     def _should_place_counter_order_now(self, order: dict) -> bool:
-        return (
-            self._in_grid_range()
-            or self._counter_order_reduces_grid_position(order)
-            or self._counter_order_is_passive_boundary_reentry(order)
-        )
+        # A completed grid leg must always restore its opposite grid order.
+        # Price being outside the configured range is not a reason to leave a
+        # permanent gap; if the limit is marketable, the taker fill is still
+        # part of maintaining the grid state. Risky ledger cases are blocked
+        # before this method by reduce-protection checks.
+        return True
 
     def _place_counter_order(self, order: dict) -> bool:
         plan = self._counter_order_plan(order)

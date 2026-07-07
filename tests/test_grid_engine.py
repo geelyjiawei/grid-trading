@@ -3391,7 +3391,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(after_open_sells), len(before_open_sells) + 1)
         self.assertEqual(engine.get_status()["paused_replacements_count"], 0)
 
-    async def test_short_reduce_fill_is_queued_above_upper_to_avoid_chasing(self):
+    async def test_short_reduce_fill_reopens_even_above_upper_when_marketable(self):
         client = FakeClient("100")
         engine = GridEngine(
             client,
@@ -3428,8 +3428,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             order for order in client.orders if order.get("side") == "Sell" and not order.get("reduce_only")
         ]
         self.assertTrue(handled)
-        self.assertEqual(len(after_open_sells), len(before_open_sells))
-        self.assertEqual(engine.get_status()["paused_replacements_count"], 1)
+        self.assertEqual(len(after_open_sells), len(before_open_sells) + 1)
+        self.assertEqual(engine.get_status()["paused_replacements_count"], 0)
 
     async def test_long_reduce_fill_reopens_passive_buy_above_upper(self):
         client = FakeClient("100")
