@@ -652,7 +652,7 @@ class GridEngine:
             )
             self._persist_state()
             return True
-        if self._in_grid_range() or self._counter_order_reduces_grid_position(filled_order):
+        if self._should_place_counter_order_now(filled_order):
             self._place_counter_order(filled_order)
         else:
             self.paused_replacements.append(filled_order)
@@ -3064,7 +3064,7 @@ class GridEngine:
         return True
 
     def _resume_paused_replacements(self):
-        if not self.paused_replacements or not self._in_grid_range() or self._stopping:
+        if not self.paused_replacements or self._stopping:
             return
 
         pending = list(self.paused_replacements)
@@ -3076,6 +3076,9 @@ class GridEngine:
                 and self.reduce_protection_snapshot().get("has_risk")
                 and not self._counter_order_reduces_grid_position(order)
             ):
+                remaining.append(order)
+                continue
+            if not self._should_place_counter_order_now(order):
                 remaining.append(order)
                 continue
             if not self._place_counter_order(order):
@@ -3338,47 +3341,106 @@ class GridEngine:
             return side == "Sell"
         return False
 
-    def _place_counter_order(self, order: dict) -> bool:
+    def _counter_order_plan(self, order: dict) -> dict | None:
         direction = self.config["direction"]
         side = order["side"]
-        level_idx = order["level_idx"]
+        level_idx = int(order.get("level_idx", 0) or 0)
         qty = self._counter_qty_for_order(order)
 
         if direction == "long":
             if side == "Buy" and level_idx + 1 < len(self.grid_levels):
-                return self._place_counter_leg(
-                    "Sell",
-                    self.grid_levels[level_idx + 1],
-                    level_idx,
-                    reduce_only=True,
-                    qty=qty,
-                    entry_price=float(order.get("fill_price") or order.get("price") or 0),
-                )
-            elif side == "Sell":
-                return self._place_counter_leg(
-                    "Buy", self.grid_levels[level_idx], level_idx, reduce_only=False, qty=qty
-                )
+                return {
+                    "side": "Sell",
+                    "price": self.grid_levels[level_idx + 1],
+                    "level_idx": level_idx,
+                    "reduce_only": True,
+                    "qty": qty,
+                    "entry_price": float(order.get("fill_price") or order.get("price") or 0),
+                }
+            if side == "Sell":
+                return {
+                    "side": "Buy",
+                    "price": self.grid_levels[level_idx],
+                    "level_idx": level_idx,
+                    "reduce_only": False,
+                    "qty": qty,
+                    "entry_price": None,
+                }
         elif direction == "short":
             if side == "Sell":
-                return self._place_counter_leg(
-                    "Buy",
-                    self.grid_levels[level_idx],
-                    level_idx,
-                    reduce_only=True,
-                    qty=qty,
-                    entry_price=float(order.get("fill_price") or order.get("price") or 0),
-                )
-            elif level_idx + 1 < len(self.grid_levels):
-                return self._place_counter_leg(
-                    "Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=False, qty=qty
-                )
+                return {
+                    "side": "Buy",
+                    "price": self.grid_levels[level_idx],
+                    "level_idx": level_idx,
+                    "reduce_only": True,
+                    "qty": qty,
+                    "entry_price": float(order.get("fill_price") or order.get("price") or 0),
+                }
+            if level_idx + 1 < len(self.grid_levels):
+                return {
+                    "side": "Sell",
+                    "price": self.grid_levels[level_idx + 1],
+                    "level_idx": level_idx,
+                    "reduce_only": False,
+                    "qty": qty,
+                    "entry_price": None,
+                }
         else:
             if side == "Buy" and level_idx + 1 < len(self.grid_levels):
-                return self._place_counter_leg(
-                    "Sell", self.grid_levels[level_idx + 1], level_idx, reduce_only=False, qty=qty
-                )
-            elif side == "Sell":
-                return self._place_counter_leg(
-                    "Buy", self.grid_levels[level_idx], level_idx, reduce_only=False, qty=qty
-                )
-        return True
+                return {
+                    "side": "Sell",
+                    "price": self.grid_levels[level_idx + 1],
+                    "level_idx": level_idx,
+                    "reduce_only": False,
+                    "qty": qty,
+                    "entry_price": None,
+                }
+            if side == "Sell":
+                return {
+                    "side": "Buy",
+                    "price": self.grid_levels[level_idx],
+                    "level_idx": level_idx,
+                    "reduce_only": False,
+                    "qty": qty,
+                    "entry_price": None,
+                }
+        return None
+
+    def _counter_order_is_passive_boundary_reentry(self, order: dict) -> bool:
+        if self.config.get("direction") not in {"long", "short"}:
+            return False
+
+        plan = self._counter_order_plan(order)
+        if not plan or plan["reduce_only"]:
+            return False
+
+        price = float(plan["price"])
+        if not self._in_grid_range(price):
+            return False
+
+        current = float(self.current_price)
+        if plan["side"] == "Buy":
+            return price < current
+        if plan["side"] == "Sell":
+            return price > current
+        return False
+
+    def _should_place_counter_order_now(self, order: dict) -> bool:
+        return (
+            self._in_grid_range()
+            or self._counter_order_reduces_grid_position(order)
+            or self._counter_order_is_passive_boundary_reentry(order)
+        )
+
+    def _place_counter_order(self, order: dict) -> bool:
+        plan = self._counter_order_plan(order)
+        if not plan:
+            return True
+        return self._place_counter_leg(
+            str(plan["side"]),
+            float(plan["price"]),
+            int(plan["level_idx"]),
+            reduce_only=bool(plan["reduce_only"]),
+            qty=float(plan["qty"]),
+            entry_price=plan.get("entry_price"),
+        )
