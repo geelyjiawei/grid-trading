@@ -2061,6 +2061,108 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(placed_by_level[19], "200")
         self.assertEqual(len(placed_open_orders), 20)
 
+        repaired_again = engine._repair_open_side_coverage_from_lots()
+        placed_open_orders_again = [
+            order
+            for order in client.orders
+            if order["side"] == "Sell" and not order["reduce_only"]
+        ]
+        self.assertFalse(repaired_again)
+        self.assertEqual(len(placed_open_orders_again), len(placed_open_orders))
+
+    async def test_long_open_side_coverage_repairs_missing_level_qty_from_lot_ledger(self):
+        client = FakeClient("100", tick_size="1", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 120,
+                "lower_price": 100,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 50,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [100, 105, 110, 115, 120]
+        engine.target_qty_by_level = {str(i): 50.0 for i in range(4)}
+        engine.grid_position_net_qty = 70
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 20.0, "entry_value": 2000.0},
+            "1": {"qty": 50.0, "entry_value": 5250.0},
+        }
+        engine.active_orders = {
+            "level0_reduce": {
+                "link_id": "level0_reduce",
+                "order_id": "level0_reduce",
+                "level_idx": 0,
+                "side": "Sell",
+                "price": "105",
+                "qty": "20",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 100,
+                "processed_fill_qty": 0.0,
+            },
+            "level1_reduce": {
+                "link_id": "level1_reduce",
+                "order_id": "level1_reduce",
+                "level_idx": 1,
+                "side": "Sell",
+                "price": "110",
+                "qty": "50",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 105,
+                "processed_fill_qty": 0.0,
+            },
+            "level0_open_partial": {
+                "link_id": "level0_open_partial",
+                "order_id": "level0_open_partial",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "100",
+                "qty": "10",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": False,
+                "entry_price": None,
+                "processed_fill_qty": 0.0,
+            },
+        }
+
+        repaired = engine._repair_open_side_coverage_from_lots()
+
+        placed_open_orders = [
+            order
+            for order in client.orders
+            if order["side"] == "Buy" and not order["reduce_only"]
+        ]
+        placed_by_level = {
+            int(order["order_link_id"].split("_")[1]): order["qty"]
+            for order in placed_open_orders
+        }
+        self.assertTrue(repaired)
+        self.assertEqual(placed_by_level[0], "20")
+        self.assertNotIn(1, placed_by_level)
+        self.assertEqual(placed_by_level[2], "50")
+        self.assertEqual(placed_by_level[3], "50")
+
     async def test_fixed_grid_reduce_normalization_does_not_hide_incomplete_ledger(self):
         client = FakeClient("0.418", tick_size="0.001", qty_step="1", min_qty="1")
         client.positions = [{"side": "Sell", "size": "338", "avgPrice": "0.4"}]
