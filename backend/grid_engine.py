@@ -741,11 +741,16 @@ class GridEngine:
         return float(deficit)
 
     def _active_reduce_qty(self, side: str) -> float:
-        return sum(
-            float(order.get("qty", 0) or 0)
-            for order in self.active_orders.values()
-            if order.get("side") == side and order.get("reduce_only")
-        )
+        total = Decimal("0")
+        for order in self.active_orders.values():
+            if order.get("side") != side or not order.get("reduce_only"):
+                continue
+            planned = Decimal(str(order.get("qty", 0) or 0))
+            processed = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+            remaining = planned - processed
+            if remaining > 0:
+                total += remaining
+        return float(total)
 
     def reduce_protection_snapshot(self) -> dict:
         direction = self.config.get("direction")
@@ -799,7 +804,7 @@ class GridEngine:
             expected_qty = Decimal("0")
             if level_idx in lots:
                 expected_qty = lots[level_idx]["qty"]
-            active_qty = Decimal(str(self._active_order_qty(reduce_side, level_idx, True)))
+            active_qty = Decimal(str(self._active_order_remaining_qty(reduce_side, level_idx, True)))
             diff = expected_qty - active_qty
             if diff >= min_qty:
                 snapshot["missing_by_level"].append(
@@ -1396,6 +1401,9 @@ class GridEngine:
         if self._repair_missing_reduce_protection_from_ledger():
             return
 
+        if self._repair_open_side_coverage_from_lots():
+            return
+
         self._repair_missing_reduce_at_boundary()
 
     @staticmethod
@@ -1792,7 +1800,7 @@ class GridEngine:
             if not target:
                 continue
             reduce_side, reduce_price = target
-            active_qty = Decimal(str(self._active_order_qty(reduce_side, level_idx, True)))
+            active_qty = Decimal(str(self._active_order_remaining_qty(reduce_side, level_idx, True)))
             deficit = lot["qty"] - active_qty
             if deficit < Decimal(str(self.min_qty)):
                 continue
@@ -1910,6 +1918,90 @@ class GridEngine:
             )
             logger.warning(
                 "Restored flat-grid open side coverage symbol=%s side=%s orders=%s qty=%s",
+                self.config.get("symbol"),
+                side,
+                placed_count,
+                self._fq(float(placed_qty)),
+            )
+            self._persist_state()
+            return True
+        return False
+
+    def _repair_open_side_coverage_from_lots(self) -> bool:
+        side = self._open_side_for_direction()
+        if (
+            not side
+            or not self.grid_ready
+            or len(self.grid_levels) < 2
+            or self.config.get("direction") not in {"long", "short"}
+        ):
+            return False
+
+        lots, reason = self._reduce_lots_for_repair()
+        if lots is None:
+            signature = ("open-coverage-ledger-unavailable", reason)
+            if reason and self._should_log_reduce_warning(signature):
+                logger.warning(
+                    "Open-side grid coverage ledger unavailable symbol=%s reason=%s",
+                    self.config.get("symbol"),
+                    reason,
+                )
+            return False
+
+        lot_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        if abs(lot_total - grid_qty) >= Decimal(str(self.min_qty)):
+            signature = ("open-coverage-ledger-mismatch", float(lot_total), float(grid_qty))
+            if self._should_log_reduce_warning(signature):
+                logger.warning(
+                    "Open-side grid coverage skipped because lot ledger mismatches position symbol=%s ledger_qty=%s grid_qty=%s",
+                    self.config.get("symbol"),
+                    float(lot_total),
+                    float(grid_qty),
+                )
+            return False
+
+        placed_count = 0
+        placed_qty = Decimal("0")
+        for level_idx in range(len(self.grid_levels) - 1):
+            target_qty = Decimal(str(self._target_open_qty_for_level(level_idx)))
+            if target_qty < Decimal(str(self.min_qty)):
+                continue
+
+            lot_qty = Decimal("0")
+            if level_idx in lots:
+                lot_qty = lots[level_idx]["qty"]
+            open_target = target_qty - lot_qty
+            if open_target < Decimal(str(self.min_qty)):
+                continue
+
+            active_open = Decimal(str(self._active_order_remaining_qty(side, level_idx, False)))
+            deficit = open_target - active_open
+            if deficit < Decimal(str(self.min_qty)):
+                continue
+
+            price = self._open_price_for_level(level_idx)
+            if price is None:
+                continue
+            link_id = self._place(
+                side,
+                price,
+                level_idx,
+                reduce_only=False,
+                qty_override=float(deficit),
+                allow_duplicate=self._has_active_order(side, level_idx, False),
+            )
+            if link_id:
+                placed_count += 1
+                placed_qty += deficit
+
+        if placed_count:
+            self.trigger_message = (
+                f"Restored {placed_count} open-side grid coverage order(s): "
+                f"{self._fq(float(placed_qty))}"
+            )
+            logger.warning(
+                "Restored open-side grid coverage from lot ledger symbol=%s side=%s orders=%s qty=%s",
                 self.config.get("symbol"),
                 side,
                 placed_count,
@@ -3379,8 +3471,8 @@ class GridEngine:
         entry_price: float | None = None,
     ) -> bool:
         requested_qty = float(qty)
-        if self._position_sizing_mode() == "fixed_grid_qty" or not reduce_only:
-            deficit = self._active_order_qty_deficit(side, level_idx, reduce_only, requested_qty)
+        if not reduce_only:
+            deficit = self._active_order_remaining_qty_deficit(side, level_idx, reduce_only, requested_qty)
             if deficit <= 0:
                 return True
             qty = deficit

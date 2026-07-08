@@ -1846,6 +1846,221 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(reopen_order["qty"], "41")
 
+    async def test_reduce_counter_order_does_not_net_against_existing_partial_reduce(self):
+        client = FakeClient("0.282", tick_size="0.00001", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "ANSEMUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.2877,
+                "lower_price": 0.2603,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 200,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.2603 + (0.2877 - 0.2603) / 20 * i for i in range(21)]
+        engine.active_orders = {
+            "existing_partial_reduce": {
+                "link_id": "existing_partial_reduce",
+                "order_id": "existing_partial_reduce",
+                "level_idx": 11,
+                "side": "Buy",
+                "price": str(engine.grid_levels[11]),
+                "qty": "119",
+                "status": "PARTIALLY_FILLED",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.27674,
+                "processed_fill_qty": 82.0,
+            }
+        }
+
+        placed = engine._place_counter_order(
+            {
+                "side": "Sell",
+                "price": "0.27674",
+                "qty": "82",
+                "level_idx": 11,
+                "reduce_only": False,
+                "fill_price": 0.27674,
+            }
+        )
+
+        placed_reduce_orders = [
+            order
+            for order in client.orders
+            if order["side"] == "Buy" and order["reduce_only"] and order["price"] == "0.27537"
+        ]
+        self.assertTrue(placed)
+        self.assertEqual(len(placed_reduce_orders), 1)
+        self.assertEqual(placed_reduce_orders[0]["qty"], "82")
+
+    async def test_reduce_protection_counts_partial_reduce_remaining_qty(self):
+        client = FakeClient("0.282", tick_size="0.00001", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "ANSEMUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.2877,
+                "lower_price": 0.2603,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 200,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.2603 + (0.2877 - 0.2603) / 20 * i for i in range(21)]
+        engine.grid_position_net_qty = -119
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {"11": {"qty": 119.0, "entry_value": 32.93206}}
+        engine.active_orders = {
+            "existing_partial_reduce": {
+                "link_id": "existing_partial_reduce",
+                "order_id": "existing_partial_reduce",
+                "level_idx": 11,
+                "side": "Buy",
+                "price": str(engine.grid_levels[11]),
+                "qty": "119",
+                "status": "PARTIALLY_FILLED",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.27674,
+                "processed_fill_qty": 82.0,
+            }
+        }
+
+        snapshot = engine.reduce_protection_snapshot()
+
+        self.assertTrue(snapshot["has_risk"])
+        self.assertEqual(snapshot["active_reduce_qty"], 37.0)
+        self.assertEqual(snapshot["missing_by_level"][0]["level"], 11)
+        self.assertEqual(snapshot["missing_by_level"][0]["active_qty"], 37.0)
+        self.assertEqual(snapshot["missing_by_level"][0]["missing_qty"], 82.0)
+
+        repaired = engine._repair_missing_reduce_protection_from_ledger()
+        repair_orders = [
+            order
+            for order in client.orders
+            if order["side"] == "Buy" and order["reduce_only"] and order["price"] == "0.27537"
+        ]
+        self.assertTrue(repaired)
+        self.assertEqual(len(repair_orders), 1)
+        self.assertEqual(repair_orders[0]["qty"], "82")
+
+    async def test_open_side_coverage_repairs_missing_level_qty_from_lot_ledger(self):
+        client = FakeClient("0.282", tick_size="0.00001", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "ANSEMUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.2877,
+                "lower_price": 0.2603,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 200,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [0.2603 + (0.2877 - 0.2603) / 20 * i for i in range(21)]
+        engine.target_qty_by_level = {str(i): 200.0 for i in range(20)}
+        engine.grid_position_net_qty = -300
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 120.0, "entry_value": 31.4},
+            "1": {"qty": 180.0, "entry_value": 47.2},
+        }
+        engine.active_orders = {
+            "level0_reduce": {
+                "link_id": "level0_reduce",
+                "order_id": "level0_reduce",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": str(engine.grid_levels[0]),
+                "qty": "120",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.26167,
+                "processed_fill_qty": 0.0,
+            },
+            "level1_reduce": {
+                "link_id": "level1_reduce",
+                "order_id": "level1_reduce",
+                "level_idx": 1,
+                "side": "Buy",
+                "price": str(engine.grid_levels[1]),
+                "qty": "180",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 0.26304,
+                "processed_fill_qty": 0.0,
+            },
+            "level0_open_partial": {
+                "link_id": "level0_open_partial",
+                "order_id": "level0_open_partial",
+                "level_idx": 0,
+                "side": "Sell",
+                "price": str(engine.grid_levels[1]),
+                "qty": "30",
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": False,
+                "entry_price": None,
+                "processed_fill_qty": 0.0,
+            },
+        }
+
+        repaired = engine._repair_open_side_coverage_from_lots()
+
+        placed_open_orders = [
+            order
+            for order in client.orders
+            if order["side"] == "Sell" and not order["reduce_only"]
+        ]
+        placed_by_level = {
+            int(order["order_link_id"].split("_")[1]): order["qty"]
+            for order in placed_open_orders
+        }
+        self.assertTrue(repaired)
+        self.assertEqual(placed_by_level[0], "50")
+        self.assertEqual(placed_by_level[1], "20")
+        self.assertEqual(placed_by_level[2], "200")
+        self.assertEqual(placed_by_level[19], "200")
+        self.assertEqual(len(placed_open_orders), 20)
+
     async def test_fixed_grid_reduce_normalization_does_not_hide_incomplete_ledger(self):
         client = FakeClient("0.418", tick_size="0.001", qty_step="1", min_qty="1")
         client.positions = [{"side": "Sell", "size": "338", "avgPrice": "0.4"}]
@@ -2042,7 +2257,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             if order["side"] == "Buy" and order["reduce_only"] and order["level_idx"] == add_order["level_idx"]
         )
         self.assertEqual(open_fill_qty, 100.0)
-        self.assertEqual(reduce_qty, 58.0)
+        self.assertEqual(reduce_qty, 100.0)
 
     async def test_partial_opening_order_waits_for_terminal_status(self):
         client = FakeClient("100", qty_step="1", min_qty="1")
