@@ -2506,6 +2506,111 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.orders, [])
         self.assertIn("automatic top-up is paused", engine.trigger_message)
 
+    async def test_restore_mu_mixed_coverage_reports_risk_without_mutating_orders(self):
+        client = FakeClient("995.78", tick_size="0.01", qty_step="0.01", min_qty="0.01")
+        client.positions = [{"side": "Sell", "size": "3.74", "avgPrice": "949.7754"}]
+        config = {
+            "exchange": "binance",
+            "symbol": "MUUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 955,
+            "lower_price": 935,
+            "grid_count": 20,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 0.2,
+            "leverage": 5,
+            "grid_order_post_only": False,
+        }
+        levels = [float(price) for price in range(935, 956)]
+        quantities = [
+            0.21,
+            0.20,
+            0.20,
+            0.20,
+            0.19,
+            0.19,
+            0.14,
+            0.20,
+            0.19,
+            0.20,
+            0.02,
+            0.20,
+            0.20,
+            0.20,
+            0.20,
+            0.20,
+            0.20,
+            0.20,
+            0.20,
+            0.20,
+        ]
+        active_orders = {}
+        for level_idx, qty in enumerate(quantities):
+            link_id = f"g_{level_idx}_B_mu_restore"
+            response = client.place_order(
+                symbol="MUUSDT",
+                side="Buy",
+                qty=str(qty),
+                price=str(levels[level_idx]),
+                order_type="Limit",
+                time_in_force="GTC",
+                reduce_only=True,
+                order_link_id=link_id,
+            )
+            active_orders[link_id] = {
+                "link_id": link_id,
+                "order_id": response["result"]["orderId"],
+                "level_idx": level_idx,
+                "side": "Buy",
+                "price": str(levels[level_idx]),
+                "qty": str(qty),
+                "status": "open",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 949.7754,
+            }
+
+        state = {
+            "running": True,
+            "config": config,
+            "grid_levels": levels,
+            "active_orders": active_orders,
+            "reduce_lots_complete": True,
+            "reduce_lots_by_level": {
+                str(level_idx): {"qty": qty, "entry_value": qty * 949.7754}
+                for level_idx, qty in enumerate(quantities)
+            },
+            "target_qty_by_level": {str(level_idx): 0.2 for level_idx in range(20)},
+            "grid_position_net_qty": -3.74,
+            "grid_ready": True,
+            "tick_size": "0.01",
+            "qty_step": "0.01",
+            "min_qty": 0.01,
+        }
+        seed_order_count = len(client.orders)
+        seed_open_ids = set(client.open_limit_order_ids)
+        engine = GridEngine(client, config)
+
+        engine.restore_state(state)
+
+        coverage = engine.grid_coverage_snapshot()
+        self.assertEqual(len(client.orders), seed_order_count)
+        self.assertEqual(client.cancelled_orders, [])
+        self.assertEqual(client.open_limit_order_ids, seed_open_ids)
+        self.assertAlmostEqual(coverage["target_qty"], 4.0)
+        self.assertAlmostEqual(coverage["coverage_qty"], 3.74)
+        self.assertAlmostEqual(
+            sum(item["missing_qty"] for item in coverage["missing_by_level"]),
+            0.27,
+        )
+        self.assertAlmostEqual(coverage["excess_by_level"][0]["excess_qty"], 0.01)
+        self.assertAlmostEqual(coverage["net_delta_qty"], -0.26)
+        self.assertTrue(coverage["has_risk"])
+        self.assertIn("automatic top-up is paused", engine.trigger_message)
+
     async def test_baseline_loss_of_one_qty_step_halts_even_when_below_min_order_quantity(self):
         client = FakeClient("100", qty_step="0.01", min_qty="1")
         client.positions = [{"side": "Sell", "size": "2.99", "avgPrice": "100"}]

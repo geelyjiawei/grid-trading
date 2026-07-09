@@ -51,18 +51,43 @@ class MultiGridServerTests(unittest.TestCase):
     def setUp(self):
         self._original_state_file = main.GRID_STATE_FILE
         self._original_history_file = main.GRID_HISTORY_FILE
+        self._original_api_config_file = main.API_CONFIG_FILE
+        self._original_api_configs = main._api_configs
+        self._original_clients = main._clients
+        self._original_active_exchange = main._active_exchange
+        self._original_api_config = main._api_config
+        self._original_client = main._client
         self._state_tmp = tempfile.TemporaryDirectory()
         main.GRID_STATE_FILE = str(Path(self._state_tmp.name) / "grid_state.json")
         main.GRID_HISTORY_FILE = str(Path(self._state_tmp.name) / "grid_history.json")
+        main.API_CONFIG_FILE = str(Path(self._state_tmp.name) / "api_config.json")
         main._engines.clear()
-        main._client = FakeClient("100")
+        fake_client = FakeClient("100")
+        main._api_configs = {
+            "binance": {
+                "exchange": "binance",
+                "api_key": "test-api-key",
+                "api_secret": "test-api-secret",
+                "testnet": False,
+                "source": "test",
+            }
+        }
+        main._clients = {"binance": fake_client}
+        main._active_exchange = "binance"
+        main._api_config = main._api_configs["binance"]
+        main._client = fake_client
         self.client = TestClient(main.app)
 
     def tearDown(self):
         main._engines.clear()
-        main._client = None
         main.GRID_STATE_FILE = self._original_state_file
         main.GRID_HISTORY_FILE = self._original_history_file
+        main.API_CONFIG_FILE = self._original_api_config_file
+        main._api_configs = self._original_api_configs
+        main._clients = self._original_clients
+        main._active_exchange = self._original_active_exchange
+        main._api_config = self._original_api_config
+        main._client = self._original_client
         self._state_tmp.cleanup()
         for key in (
             "AUTH_REQUIRED",
@@ -514,7 +539,7 @@ class MultiGridServerTests(unittest.TestCase):
 
         main._restore_saved_engines()
 
-        state_key = main._engine_key("bybit", "NOKUSDT")
+        state_key = main._engine_key(state["exchange"], "NOKUSDT")
         engine = main._engines[state_key]
         saved_grids = main._load_grid_state_file()["grids"]
         saved = saved_grids[state_key]
