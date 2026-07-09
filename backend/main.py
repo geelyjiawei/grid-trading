@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from threading import RLock
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,7 @@ from secret_store import decrypt_text, encrypt_text, storage_backend
 
 logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
+_engines_lock = RLock()
 SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
 DEFAULT_EXCHANGE = "bybit"
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
@@ -296,14 +298,20 @@ def _engine_symbol(engine: GridEngine | None) -> str:
     return str(engine.config.get("symbol", "")).upper().strip()
 
 
+def _engine_snapshot() -> list[GridEngine]:
+    with _engines_lock:
+        return list(_engines.values())
+
+
 def _get_engine(exchange: str | None, symbol: str) -> GridEngine | None:
     symbol = str(symbol or "").upper().strip()
-    if exchange:
-        return _engines.get(_engine_key(exchange, symbol))
-    matches = [engine for engine in _engines.values() if _engine_symbol(engine) == symbol]
-    if len(matches) == 1:
-        return matches[0]
-    return _engines.get(symbol)
+    with _engines_lock:
+        if exchange:
+            return _engines.get(_engine_key(exchange, symbol))
+        matches = [engine for engine in _engines.values() if _engine_symbol(engine) == symbol]
+        if len(matches) == 1:
+            return matches[0]
+        return _engines.get(symbol)
 
 
 def _configured_exchange(config: dict | None) -> bool:
@@ -673,8 +681,9 @@ def _restore_saved_engines():
         symbol = str(config.get("symbol") or str(state_key).split(":")[-1]).upper()
         exchange = _normalize_exchange(config.get("exchange") or engine_state.get("exchange") or legacy_exchange)
         key = _engine_key(exchange, symbol)
-        if key in _engines:
-            continue
+        with _engines_lock:
+            if key in _engines:
+                continue
         if not _configured_exchange(_api_configs.get(exchange)):
             logger.warning("Saved grid skipped because API is not configured exchange=%s symbol=%s", exchange, symbol)
             continue
@@ -686,7 +695,8 @@ def _restore_saved_engines():
             should_restart = bool(engine_state.get("running", False))
             engine.restore_state(engine_state)
             engine.config["exchange"] = exchange
-            _engines[key] = engine
+            with _engines_lock:
+                _engines[key] = engine
             can_restart = (
                 should_restart
                 and not engine._stopping
@@ -713,14 +723,15 @@ def _restore_saved_engines():
         except Exception as exc:
             # Keep the saved state on disk so the UI/risk checks can still show the problem.
             logger.exception("Failed to restore saved grid symbol=%s: %s", config.get("symbol"), exc)
-            _engines.pop(key, None)
+            with _engines_lock:
+                _engines.pop(key, None)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _restore_saved_engines()
     yield
-    for engine in list(_engines.values()):
+    for engine in _engine_snapshot():
         if engine.running:
             await engine.suspend()
 
@@ -894,7 +905,7 @@ def set_config(cfg: ApiConfig):
     global _api_configs, _clients
 
     exchange = _normalize_exchange(cfg.exchange)
-    if any(engine.running and _engine_exchange(engine) == exchange for engine in _engines.values()):
+    if any(engine.running and _engine_exchange(engine) == exchange for engine in _engine_snapshot()):
         raise HTTPException(status_code=400, detail=f"Stop running {exchange.title()} grids before changing this API config")
 
     candidate = _build_client(exchange, cfg.api_key.strip(), cfg.api_secret.strip(), cfg.testnet)
@@ -1083,7 +1094,8 @@ async def start_grid(cfg: GridConfig):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _engines[_engine_key(exchange, symbol)] = engine
+    with _engines_lock:
+        _engines[_engine_key(exchange, symbol)] = engine
     engine.start()
     _save_engine_state(engine)
     return {"ok": True, "message": f"{exchange.title()} {symbol} {direction} grid started"}
@@ -1091,7 +1103,7 @@ async def start_grid(cfg: GridConfig):
 
 @app.post("/api/grid/stop")
 async def stop_grid():
-    running = [engine for engine in _engines.values() if engine.running]
+    running = [engine for engine in _engine_snapshot() if engine.running]
     if not running:
         raise HTTPException(status_code=400, detail="No active grid")
     if len(running) > 1:
@@ -1108,7 +1120,7 @@ async def stop_grid_symbol(symbol: str, exchange: str | None = None):
 
 @app.post("/api/grid/stop-all")
 async def stop_all_grids():
-    running = [engine for engine in _engines.values() if engine.running]
+    running = [engine for engine in _engine_snapshot() if engine.running]
     if not running:
         raise HTTPException(status_code=400, detail="No active grid")
 
@@ -1119,7 +1131,8 @@ async def stop_all_grids():
         _upsert_grid_history(engine, "stopped")
         if symbol:
             _delete_engine_state(symbol, exchange)
-            _engines.pop(_engine_key(exchange, symbol), None)
+            with _engines_lock:
+                _engines.pop(_engine_key(exchange, symbol), None)
 
     return {"ok": True, "message": "All grids stopped and open orders cancelled"}
 
@@ -1133,13 +1146,14 @@ async def _stop_grid(symbol: str, exchange: str | None = None):
     await engine.stop()
     _upsert_grid_history(engine, "stopped")
     _delete_engine_state(symbol, exchange)
-    _engines.pop(_engine_key(exchange, symbol), None)
+    with _engines_lock:
+        _engines.pop(_engine_key(exchange, symbol), None)
     return {"ok": True, "message": f"{exchange.title()} {symbol} grid stopped and open orders cancelled"}
 
 
 @app.get("/api/grid/status")
 def grid_status():
-    statuses = [_engine_status(engine) for engine in _engines.values()]
+    statuses = [_engine_status(engine) for engine in _engine_snapshot()]
     return {
         "running": any(status["running"] for status in statuses),
         "engine_count": len(statuses),
@@ -1291,6 +1305,8 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     expected_position_net_qty = 0.0
     reduce_protection = {}
     reduce_protection_risk = False
+    grid_coverage = {}
+    grid_coverage_risk = False
     if engine and engine.running:
         status = engine.get_status()
         expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
@@ -1302,6 +1318,8 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         # ledger is incomplete; actual risk is still captured by orphan orders
         # and expected-vs-actual position deltas.
         reduce_protection_risk = False
+        grid_coverage = status.get("grid_coverage") or {}
+        grid_coverage_risk = bool(grid_coverage.get("has_risk"))
     return {
         "symbol": symbol,
         "exchange": exchange,
@@ -1313,8 +1331,14 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "expected_position_net_qty": round(expected_position_net_qty, 8),
         "actual_position_net_qty": round(actual_position_net_qty, 8),
         "reduce_protection": reduce_protection,
+        "grid_coverage": grid_coverage,
         "positions": positions,
-        "has_risk": bool(orphan_orders or unmanaged_position or reduce_protection_risk),
+        "has_risk": bool(
+            orphan_orders
+            or unmanaged_position
+            or reduce_protection_risk
+            or grid_coverage_risk
+        ),
     }
 
 

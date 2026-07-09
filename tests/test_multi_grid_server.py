@@ -74,6 +74,30 @@ class MultiGridServerTests(unittest.TestCase):
         ):
             os.environ.pop(key, None)
 
+    def test_grid_status_uses_stable_snapshot_when_registry_changes_during_render(self):
+        first = object()
+        second = object()
+        first_key = main._engine_key("binance", "FIRSTUSDT")
+        second_key = main._engine_key("aster", "SECONDUSDT")
+        main._engines[first_key] = first
+        main._engines[second_key] = second
+        original_engine_status = main._engine_status
+
+        def changing_status(engine):
+            if engine is first:
+                with main._engines_lock:
+                    main._engines.pop(second_key, None)
+            return {"running": True}
+
+        main._engine_status = changing_status
+        try:
+            status = main.grid_status()
+        finally:
+            main._engine_status = original_engine_status
+
+        self.assertEqual(status["engine_count"], 2)
+        self.assertEqual(status["running_count"], 2)
+
     def _payload(self, symbol):
         return {
             "symbol": symbol,
@@ -529,13 +553,95 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(len(cancelled.json()["cancelled"]), 1)
         self.assertEqual(after.json()["orphan_order_count"], 0)
 
+    def test_risk_endpoint_flags_per_level_grid_coverage_mismatch(self):
+        main._client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        main._client.positions = [{"side": "Sell", "size": "0.3", "avgPrice": "100"}]
+        exchange = main._active_exchange
+        engine = main.GridEngine(
+            main._client,
+            {
+                "symbol": "MUUSDT",
+                "exchange": exchange,
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 3,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.running = True
+        engine.grid_ready = True
+        engine.grid_levels = [90, 100, 110]
+        engine.target_qty_by_level = {"0": 0.2, "1": 0.2}
+        engine.grid_position_net_qty = -0.3
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 0.1, "entry_value": 10.0},
+            "1": {"qty": 0.2, "entry_value": 20.0},
+        }
+        engine.active_orders = {
+            "g_0_B_reduce": {
+                "link_id": "g_0_B_reduce",
+                "order_id": "1",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "90",
+                "qty": "0.1",
+                "status": "NEW",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 100,
+                "processed_fill_qty": 0.0,
+            },
+            "g_1_B_reduce": {
+                "link_id": "g_1_B_reduce",
+                "order_id": "2",
+                "level_idx": 1,
+                "side": "Buy",
+                "price": "100",
+                "qty": "0.2",
+                "status": "NEW",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 110,
+                "processed_fill_qty": 0.0,
+            },
+        }
+        main._engines[main._engine_key(exchange, "MUUSDT")] = engine
+
+        response = self.client.get(f"/api/risk/MUUSDT?exchange={exchange}")
+
+        self.assertEqual(response.status_code, 200)
+        snapshot = response.json()
+        self.assertTrue(snapshot["has_risk"])
+        self.assertFalse(snapshot["unmanaged_position"])
+        self.assertEqual(snapshot["orphan_order_count"], 0)
+        self.assertTrue(snapshot["grid_coverage"]["has_risk"])
+        self.assertEqual(snapshot["grid_coverage"]["missing_by_level"][0]["level"], 0)
+        self.assertAlmostEqual(
+            snapshot["grid_coverage"]["missing_by_level"][0]["missing_qty"],
+            0.1,
+        )
+
     def test_api_config_change_is_blocked_while_grid_is_running(self):
         original_binance = main.BinanceFuturesClient
         original_bybit = main.BybitClient
         try:
             main.BinanceFuturesClient = FakeBinanceConfigClient
             main.BybitClient = FakeBybitConfigClient
-            start = self.client.post("/api/grid/start", json=self._payload("BTCUSDT"))
+            payload = self._payload("BTCUSDT")
+            payload["exchange"] = "binance"
+            start = self.client.post("/api/grid/start", json=payload)
             response = self.client.post(
                 "/api/config",
                 json={

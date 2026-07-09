@@ -499,6 +499,7 @@ function renderRiskSnapshot(risk) {
     .join("；");
   const messages = [];
   const reduceProtection = risk.reduce_protection || {};
+  const gridCoverage = risk.grid_coverage || {};
   if (reduceProtection.has_risk) {
     const missing = reduceProtection.missing_by_level || [];
     const missingText = missing
@@ -510,13 +511,37 @@ function renderRiskSnapshot(risk) {
       : "平仓保护挂单价位不完整";
     messages.push(`<div>${reason}${missingText ? `，缺口 ${missingText}` : ""}。</div>`);
   }
+  if (gridCoverage.has_risk) {
+    const missingText = (gridCoverage.missing_by_level || [])
+      .slice(0, 8)
+      .map((item) => `L${item.level}: ${fmtQty(item.missing_qty)}`)
+      .join("，");
+    const excessText = (gridCoverage.excess_by_level || [])
+      .slice(0, 8)
+      .map((item) => `L${item.level}: ${fmtQty(item.excess_qty)}`)
+      .join("，");
+    const details = [
+      missingText ? `缺失 ${missingText}` : "",
+      excessText ? `超量 ${excessText}` : "",
+    ].filter(Boolean).join("；");
+    const reason = gridCoverage.ledger_ok === false
+      ? `固定网格持仓账本异常：${gridCoverage.ledger_reason || "无法核对逐格数量"}`
+      : `固定网格逐格数量不一致：目标 ${fmtQty(gridCoverage.target_qty)}，当前覆盖 ${fmtQty(gridCoverage.coverage_qty)}，净差 ${fmtQty(gridCoverage.net_delta_qty)}`;
+    messages.push(`<div>${reason}${details ? `；${details}` : ""}。</div>`);
+  }
   if (orphanCount > 0) {
     messages.push(`<div><strong>${currentRiskSymbol}</strong> 有 ${orphanCount} 个程序历史挂单未被当前网格托管。</div>`);
   }
   if (risk.unmanaged_position && positionText) {
     messages.push(`<div>当前还有未托管持仓：${positionText}。</div>`);
   }
-  messages.push("<div>建议先撤销孤儿挂单，再决定是否手动保留或平掉持仓。</div>");
+  if (orphanCount > 0) {
+    messages.push("<div>建议先撤销孤儿挂单，再决定是否手动保留或平掉持仓。</div>");
+  } else if (gridCoverage.has_risk) {
+    messages.push("<div>建议先停止策略并核对成交清单，避免异常格继续按错误数量循环。</div>");
+  } else if (risk.unmanaged_position) {
+    messages.push("<div>请确认该持仓是否需要手动保留或平掉。</div>");
+  }
   body.innerHTML = messages.join("");
   cancelBtn.classList.toggle("hidden", orphanCount <= 0);
 }

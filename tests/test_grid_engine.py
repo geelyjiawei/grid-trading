@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import random
 import sys
 import unittest
 from decimal import Decimal, ROUND_DOWN
@@ -1173,7 +1175,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["baseline_position"]["qty"], 793)
         self.assertEqual(status["expected_position_net_qty"], -1238)
 
-    async def test_reconcile_uses_boundary_reduce_when_short_reduce_level_unknown(self):
+    async def test_reconcile_does_not_guess_boundary_reduce_when_short_level_unknown(self):
         client = FakeClient("100")
         client.positions = [{"side": "Sell", "size": "528", "avgPrice": "0.6097"}]
         engine = GridEngine(
@@ -1225,9 +1227,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(len(repair_orders), 1)
-        self.assertEqual(repair_orders[0]["price"], "90.0")
-        self.assertEqual(repair_orders[0]["qty"], "528.0")
+        self.assertEqual(repair_orders, [])
 
     async def test_position_sync_clears_stale_reduce_lots(self):
         client = FakeClient("100", qty_step="1", min_qty="1")
@@ -1509,7 +1509,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repair_orders[0]["price"], "105.0")
         self.assertEqual(repair_orders[0]["qty"], "0.20")
 
-    async def test_reconcile_places_boundary_reduce_when_fill_history_is_truncated(self):
+    async def test_reconcile_does_not_guess_boundary_reduce_when_fill_history_is_truncated(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
         client.positions = [{"side": "Sell", "size": "0.2", "avgPrice": "105"}]
         engine = GridEngine(
@@ -1549,10 +1549,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             for order in engine.active_orders.values()
             if order["side"] == "Buy" and order["reduce_only"]
         ]
-        self.assertEqual(len(repair_orders), 1)
-        self.assertEqual(repair_orders[0]["price"], "90.0")
-        self.assertEqual(repair_orders[0]["qty"], "0.20")
-        self.assertIn("boundary reduce-only fallback", engine.trigger_message)
+        self.assertEqual(repair_orders, [])
+        self.assertNotIn("boundary reduce-only fallback", engine.trigger_message)
 
     async def test_reconcile_skips_fill_ledger_when_reduce_protection_is_complete(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
@@ -1805,7 +1803,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(replacement_orders[0]["qty"]), 1.5)
         self.assertEqual(engine.trigger_message, "")
 
-    async def test_fixed_grid_reduce_fill_reopens_full_grid_qty(self):
+    async def test_fixed_grid_partial_reduce_fill_reopens_exact_filled_qty(self):
         client = FakeClient("100", qty_step="1", min_qty="1")
         engine = GridEngine(
             client,
@@ -1834,6 +1832,10 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             "level_idx": 1,
             "reduce_only": True,
             "fill_price": 95,
+        }
+        engine.reduce_lots_by_level["1"] = {
+            "qty": 59.0,
+            "entry_value": float(engine.reduce_lots_by_level["1"]["entry_value"]) * 0.59,
         }
 
         placed = engine._place_counter_order(filled_reduce)
@@ -2162,6 +2164,505 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(1, placed_by_level)
         self.assertEqual(placed_by_level[2], "50")
         self.assertEqual(placed_by_level[3], "50")
+
+    async def test_fixed_grid_fragmented_reduce_fills_restore_exact_level_target(self):
+        client = FakeClient("100", tick_size="1", qty_step="0.01", min_qty="0.01")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "MUUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [90, 110]
+        engine.target_qty_by_level = {"0": 0.2}
+        engine.reduce_lots_complete = True
+
+        # The first reduce fragment leaves 0.18 in the position lot.
+        engine.reduce_lots_by_level = {"0": {"qty": 0.18, "entry_value": 19.8}}
+        self.assertTrue(
+            engine._place_counter_order(
+                {
+                    "side": "Buy",
+                    "price": "90",
+                    "qty": "0.02",
+                    "level_idx": 0,
+                    "reduce_only": True,
+                    "fill_price": 90,
+                }
+            )
+        )
+
+        # The second fragment closes the lot. Existing 0.02 plus the new
+        # counter must total 0.20, not shrink to 0.18.
+        engine.reduce_lots_by_level = {}
+        self.assertTrue(
+            engine._place_counter_order(
+                {
+                    "side": "Buy",
+                    "price": "90",
+                    "qty": "0.18",
+                    "level_idx": 0,
+                    "reduce_only": True,
+                    "fill_price": 90,
+                }
+            )
+        )
+
+        reopened_qty = sum(
+            float(order["qty"])
+            for order in engine.active_orders.values()
+            if order["side"] == "Sell" and not order["reduce_only"]
+        )
+        self.assertAlmostEqual(reopened_qty, 0.2)
+        self.assertEqual(sorted(float(order["qty"]) for order in client.orders), [0.02, 0.18])
+
+    async def test_fixed_grid_oversized_reduce_fill_reopens_only_level_target(self):
+        client = FakeClient("100", tick_size="1", qty_step="0.01", min_qty="0.01")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "MUUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [90, 110]
+        engine.target_qty_by_level = {"0": 0.2}
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {}
+
+        self.assertTrue(
+            engine._place_counter_order(
+                {
+                    "side": "Buy",
+                    "price": "90",
+                    "qty": "0.21",
+                    "level_idx": 0,
+                    "reduce_only": True,
+                    "fill_price": 90,
+                }
+            )
+        )
+
+        reopened = next(order for order in client.orders if not order["reduce_only"])
+        self.assertEqual(reopened["qty"], "0.20")
+
+    async def test_grid_coverage_snapshot_detects_mu_level_shrink_and_excess(self):
+        client = FakeClient("991", tick_size="1", qty_step="0.01", min_qty="0.01")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "MUUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 955,
+                "lower_price": 935,
+                "grid_count": 6,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [935, 938, 941, 944, 947, 950, 955]
+        engine.target_qty_by_level = {str(level): 0.2 for level in range(6)}
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 0.21, "entry_value": 196.6},
+            "1": {"qty": 0.19, "entry_value": 178.6},
+            "2": {"qty": 0.14, "entry_value": 132.0},
+            "3": {"qty": 0.02, "entry_value": 18.9},
+            "4": {"qty": 0.2, "entry_value": 190.0},
+            "5": {"qty": 0.2, "entry_value": 191.0},
+        }
+
+        snapshot = engine.grid_coverage_snapshot()
+
+        self.assertTrue(snapshot["has_risk"])
+        self.assertAlmostEqual(snapshot["target_qty"], 1.2)
+        self.assertAlmostEqual(snapshot["coverage_qty"], 0.96)
+        self.assertAlmostEqual(snapshot["net_delta_qty"], -0.24)
+        self.assertEqual([item["level"] for item in snapshot["missing_by_level"]], [1, 2, 3])
+        self.assertAlmostEqual(
+            sum(item["missing_qty"] for item in snapshot["missing_by_level"]),
+            0.25,
+        )
+        self.assertEqual(snapshot["excess_by_level"][0]["level"], 0)
+        self.assertAlmostEqual(snapshot["excess_by_level"][0]["excess_qty"], 0.01)
+
+    async def test_reduce_lot_keeps_remainder_equal_to_qty_step_below_min_order_quantity(self):
+        client = FakeClient("100", tick_size="1", qty_step="0.01", min_qty="0.1")
+        engine = GridEngine(client, {"symbol": "MUUSDT", "direction": "short"})
+        engine._fetch_precision()
+        lots = {
+            4: {
+                "qty": Decimal("0.20"),
+                "entry_value": Decimal("188.00"),
+            }
+        }
+
+        removed = engine._lot_remove(lots, 4, Decimal("0.19"))
+
+        self.assertTrue(removed)
+        self.assertEqual(lots[4]["qty"], Decimal("0.01"))
+        self.assertEqual(lots[4]["entry_value"], Decimal("9.40"))
+
+    async def test_partial_fill_below_min_order_quantity_is_recorded_without_rounding_up(self):
+        client = FakeClient("100", tick_size="1", qty_step="0.01", min_qty="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "MUUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "maker_fee_rate": 0,
+                "taker_fee_rate": 0,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [90, 110]
+        engine.target_qty_by_level = {"0": 0.2}
+        engine.reduce_lots_complete = True
+        order = {
+            "link_id": "g_0_S_partial",
+            "order_id": "open-1",
+            "level_idx": 0,
+            "side": "Sell",
+            "price": "110",
+            "qty": "0.20",
+            "status": "PARTIALLY_FILLED",
+            "order_type": "Limit",
+            "time_in_force": "GTC",
+            "reduce_only": False,
+            "entry_price": None,
+            "processed_fill_qty": 0.0,
+            "processed_fill_volume": 0.0,
+            "processed_fill_fee": 0.0,
+        }
+        engine.active_orders = {order["link_id"]: order}
+
+        recorded = engine._record_execution_delta(
+            order,
+            {
+                "price": 110.0,
+                "qty": 0.01,
+                "volume": 1.1,
+                "fee": 0.0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+
+        self.assertTrue(recorded)
+        self.assertEqual(order["processed_fill_qty"], 0.01)
+        self.assertEqual(engine.reduce_lots_by_level["0"]["qty"], 0.01)
+        self.assertEqual(engine.grid_position_net_qty, -0.01)
+        reduce_orders = [item for item in client.orders if item.get("reduce_only")]
+        self.assertEqual(len(reduce_orders), 1)
+        self.assertEqual(reduce_orders[0]["qty"], "0.01")
+        self.assertNotEqual(reduce_orders[0]["qty"], "0.10")
+
+    async def test_exchange_reduce_lot_rebuild_uses_remaining_not_original_quantity(self):
+        client = FakeClient("100", tick_size="1", qty_step="1", min_qty="5")
+        client.get_open_orders = lambda symbol: {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "orderId": "reduce-1",
+                        "orderLinkId": "g_1_B_partial",
+                        "side": "Buy",
+                        "price": "100",
+                        "qty": "10",
+                        "executedQty": "3",
+                        "orderStatus": "PARTIALLY_FILLED",
+                        "reduceOnly": True,
+                    }
+                ]
+            },
+        }
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 10,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 100, 110]
+        engine.grid_position_net_qty = -7
+        engine.active_orders = {
+            "g_1_B_partial": {
+                "link_id": "g_1_B_partial",
+                "order_id": "reduce-1",
+                "level_idx": 1,
+                "side": "Buy",
+                "price": "100",
+                "qty": "10",
+                "reduce_only": True,
+                "entry_price": 110,
+            }
+        }
+
+        lots, reason = engine._reduce_lots_from_exchange_open_orders()
+
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(lots)
+        self.assertEqual(lots[1]["qty"], Decimal("7"))
+        self.assertEqual(lots[1]["entry_value"], Decimal("770"))
+
+    async def test_mixed_missing_and_excess_grid_coverage_never_auto_adds_orders(self):
+        client = FakeClient("991", tick_size="1", qty_step="0.01", min_qty="0.01")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "MUUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 955,
+                "lower_price": 935,
+                "grid_count": 6,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 3,
+                "grid_order_post_only": False,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [935, 938, 941, 944, 947, 950, 955]
+        engine.target_qty_by_level = {str(level): 0.2 for level in range(6)}
+        engine.grid_position_net_qty = -0.96
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 0.21, "entry_value": 196.6},
+            "1": {"qty": 0.19, "entry_value": 178.6},
+            "2": {"qty": 0.14, "entry_value": 132.0},
+            "3": {"qty": 0.02, "entry_value": 18.9},
+            "4": {"qty": 0.2, "entry_value": 190.0},
+            "5": {"qty": 0.2, "entry_value": 191.0},
+        }
+
+        handled = engine._repair_open_side_coverage_from_lots()
+
+        self.assertTrue(handled)
+        self.assertEqual(client.orders, [])
+        self.assertIn("automatic top-up is paused", engine.trigger_message)
+
+    async def test_baseline_loss_of_one_qty_step_halts_even_when_below_min_order_quantity(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="1")
+        client.positions = [{"side": "Sell", "size": "2.99", "avgPrice": "100"}]
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "short"})
+        engine._fetch_precision()
+        engine.baseline_position_side = "Sell"
+        engine.baseline_position_qty = 3.0
+        engine.running = True
+        engine.grid_ready = True
+
+        halted = engine._halt_if_baseline_breached()
+
+        self.assertTrue(halted)
+        self.assertFalse(engine.running)
+        self.assertFalse(engine.grid_ready)
+
+    async def test_unrealized_pnl_uses_partial_reduce_order_remaining_quantity(self):
+        client = FakeClient("90", tick_size="1", qty_step="0.01", min_qty="0.1")
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "short"})
+        engine._fetch_precision()
+        engine.grid_position_net_qty = -0.05
+        engine.initial_entry_price = 100
+        engine.active_orders = {
+            "partial-reduce": {
+                "side": "Buy",
+                "qty": "0.10",
+                "processed_fill_qty": 0.05,
+                "reduce_only": True,
+                "entry_price": 100,
+            }
+        }
+
+        self.assertAlmostEqual(engine.estimate_grid_unrealized_pnl(90), 0.5)
+
+    async def test_fixed_grid_random_fill_and_cancel_sequences_preserve_level_quantity(self):
+        grid_logger = logging.getLogger("grid_engine")
+        logger_was_disabled = grid_logger.disabled
+        grid_logger.disabled = True
+        self.addCleanup(setattr, grid_logger, "disabled", logger_was_disabled)
+
+        for direction in ("short", "long"):
+            for seed in range(20):
+                rng = random.Random(seed)
+                client = FakeClient("100", tick_size="1", qty_step="1", min_qty="1")
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": direction,
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 20,
+                        "leverage": 3,
+                        "grid_order_post_only": False,
+                        "maker_fee_rate": 0,
+                        "taker_fee_rate": 0,
+                        "trigger_price": None,
+                        "stop_loss_price": None,
+                        "take_profit_price": None,
+                    },
+                )
+                engine._fetch_precision()
+                engine.grid_ready = True
+                engine.grid_levels = [90, 110]
+                engine.target_qty_by_level = {"0": 20.0}
+                engine.reduce_lots_complete = True
+                open_side = "Sell" if direction == "short" else "Buy"
+                open_price = 110 if direction == "short" else 90
+                self.assertIsNotNone(
+                    engine._place(
+                        open_side,
+                        open_price,
+                        0,
+                        reduce_only=False,
+                        qty_override=20,
+                    )
+                )
+
+                for _ in range(150):
+                    candidates = [
+                        order
+                        for order in engine.active_orders.values()
+                        if float(order.get("qty", 0))
+                        - float(order.get("processed_fill_qty", 0) or 0)
+                        >= engine.min_qty
+                    ]
+                    self.assertTrue(candidates)
+                    order = rng.choice(candidates)
+                    link_id = str(order["link_id"])
+                    planned = int(float(order["qty"]))
+                    processed = int(float(order.get("processed_fill_qty", 0) or 0))
+                    remaining = planned - processed
+
+                    if rng.random() < 0.2:
+                        client.open_limit_order_ids.discard(str(order["order_id"]))
+                        price = float(order["price"])
+
+                        def cancelled_trades(symbol, order_id, *, _processed=processed, _price=price):
+                            trades = []
+                            if _processed > 0:
+                                trades.append(
+                                    {
+                                        "qty": str(_processed),
+                                        "price": str(_price),
+                                        "volume": str(_processed * _price),
+                                        "feeUsdt": "0",
+                                        "feeAsset": "USDT",
+                                        "isMaker": True,
+                                    }
+                                )
+                            return {"retCode": 0, "result": {"list": trades}}
+
+                        client.get_order_trades = cancelled_trades
+                        engine._handle_cancelled_order(link_id, order)
+                    else:
+                        delta = rng.randint(1, remaining)
+                        cumulative = processed + delta
+                        price = float(order["price"])
+                        stats = {
+                            "price": price,
+                            "qty": cumulative,
+                            "volume": price * cumulative,
+                            "fee": 0.0,
+                            "fee_asset": "USDT",
+                            "fee_source": "exchange",
+                            "maker_count": 1,
+                            "taker_count": 0,
+                        }
+                        self.assertTrue(engine._record_execution_delta(order, stats))
+                        if cumulative == planned:
+                            engine.active_orders.pop(link_id, None)
+                            client.open_limit_order_ids.discard(str(order["order_id"]))
+
+                    engine._repair_missing_reduce_protection_from_ledger()
+                    engine._repair_open_side_coverage_from_lots()
+                    coverage = engine.grid_coverage_snapshot()
+                    protection = engine.reduce_protection_snapshot()
+                    lot_qty = sum(
+                        float(lot["qty"])
+                        for lot in engine.reduce_lots_by_level.values()
+                    )
+
+                    self.assertFalse(
+                        coverage["has_risk"],
+                        msg=f"direction={direction} seed={seed} coverage={coverage}",
+                    )
+                    self.assertFalse(
+                        protection["has_risk"],
+                        msg=f"direction={direction} seed={seed} protection={protection}",
+                    )
+                    self.assertAlmostEqual(coverage["coverage_qty"], 20.0)
+                    expected_position = -lot_qty if direction == "short" else lot_qty
+                    self.assertAlmostEqual(engine.grid_position_net_qty, expected_position)
 
     async def test_fixed_grid_reduce_normalization_does_not_hide_incomplete_ledger(self):
         client = FakeClient("0.418", tick_size="0.001", qty_step="1", min_qty="1")
@@ -4082,6 +4583,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 "leverage": 2,
                 "position_sizing_mode": "fixed_grid_qty",
                 "grid_order_qty": 100,
+                "boundary_reduce_fallback": True,
                 "trigger_price": None,
                 "stop_loss_price": None,
                 "take_profit_price": None,

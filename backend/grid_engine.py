@@ -361,6 +361,7 @@ class GridEngine:
             "reduce_lots_complete": self.reduce_lots_complete,
             "reduce_lots_by_level": self.reduce_lots_by_level,
             "reduce_protection": self.reduce_protection_snapshot(),
+            "grid_coverage": self.grid_coverage_snapshot(),
             "target_qty_by_level": self.target_qty_by_level,
             "gross_profit": round(self.gross_profit, 4),
             "total_profit": round(self.total_profit, 4),
@@ -607,7 +608,7 @@ class GridEngine:
         total_qty = min(Decimal(str(stats.get("qty", 0) or 0)), planned_qty)
         processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
         delta_qty = total_qty - processed_qty
-        if delta_qty < Decimal(str(self.min_qty)):
+        if delta_qty <= self._qty_tolerance_decimal():
             return None
 
         total_volume = Decimal(str(stats.get("volume", 0) or 0))
@@ -637,9 +638,9 @@ class GridEngine:
 
     def _record_execution_delta(self, order: dict, stats: dict) -> bool:
         delta_stats = self._fill_delta_stats(order, stats)
-        self._mark_order_fill_processed(order, stats)
         if not delta_stats:
             return False
+        self._mark_order_fill_processed(order, stats)
 
         filled_order = {**order, "qty": str(delta_stats["qty"]), "fill_price": delta_stats["price"]}
         self._record_fill(filled_order, delta_stats)
@@ -674,6 +675,25 @@ class GridEngine:
         step_decimal = Decimal(self.qty_step)
         return int((qty_decimal / step_decimal).quantize(Decimal("1"), rounding=ROUND_DOWN))
 
+    def _qty_step_decimal(self) -> Decimal:
+        try:
+            step = Decimal(str(self.qty_step))
+        except Exception:
+            step = Decimal("0")
+        if step <= 0:
+            step = Decimal(str(self.min_qty or 0))
+        return step if step > 0 else Decimal("1e-12")
+
+    def _qty_tolerance_decimal(self) -> Decimal:
+        return max(self._qty_step_decimal() * Decimal("1e-9"), Decimal("1e-18"))
+
+    def _qty_reaches_accounting_step(self, qty: Decimal | float) -> bool:
+        try:
+            amount = abs(Decimal(str(qty)))
+        except Exception:
+            return False
+        return amount + self._qty_tolerance_decimal() >= self._qty_step_decimal()
+
     def _steps_to_qty(self, steps: int) -> float:
         return float(Decimal(self.qty_step) * Decimal(steps))
 
@@ -681,8 +701,20 @@ class GridEngine:
         return self.client.round_to_step(value, self.tick_size)
 
     def _fq(self, value: float) -> str:
-        normalized = max(value, self.min_qty)
+        normalized = max(float(value), 0.0)
         return self.client.round_to_step(normalized, self.qty_step)
+
+    def _order_qty_text(self, value: float, *, reduce_only: bool) -> str:
+        qty_text = self._fq(value)
+        try:
+            qty = Decimal(str(qty_text))
+        except Exception:
+            return ""
+        if qty + self._qty_tolerance_decimal() < self._qty_step_decimal():
+            return ""
+        if not reduce_only and qty + self._qty_tolerance_decimal() < Decimal(str(self.min_qty)):
+            return ""
+        return qty_text
 
     def _has_active_order(self, side: str, level_idx: int, reduce_only: bool) -> bool:
         for order in self.active_orders.values():
@@ -756,7 +788,6 @@ class GridEngine:
         direction = self.config.get("direction")
         reduce_side = self._reduce_side()
         grid_qty = Decimal(str(self._grid_position_qty()))
-        min_qty = Decimal(str(self.min_qty))
         active_total = Decimal(str(self._active_reduce_qty(reduce_side))) if reduce_side else Decimal("0")
 
         snapshot = {
@@ -771,7 +802,7 @@ class GridEngine:
             "has_level_gap": False,
             "has_risk": False,
         }
-        if not snapshot["enabled"] or grid_qty < min_qty:
+        if not snapshot["enabled"] or not self._qty_reaches_accounting_step(grid_qty):
             return snapshot
 
         lots, reason = self._reduce_lots_for_repair()
@@ -787,7 +818,7 @@ class GridEngine:
 
         expected_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
         snapshot["expected_reduce_qty"] = float(expected_total)
-        if abs(expected_total - grid_qty) >= min_qty:
+        if self._qty_reaches_accounting_step(expected_total - grid_qty):
             snapshot["ledger_ok"] = False
             snapshot["ledger_reason"] = (
                 f"reduce protection ledger qty {float(expected_total)} "
@@ -806,7 +837,7 @@ class GridEngine:
                 expected_qty = lots[level_idx]["qty"]
             active_qty = Decimal(str(self._active_order_remaining_qty(reduce_side, level_idx, True)))
             diff = expected_qty - active_qty
-            if diff >= min_qty:
+            if diff > 0 and self._qty_reaches_accounting_step(diff):
                 snapshot["missing_by_level"].append(
                     {
                         "level": level_idx,
@@ -818,7 +849,7 @@ class GridEngine:
                         "missing_qty": float(diff),
                     }
                 )
-            elif -diff >= min_qty:
+            elif diff < 0 and self._qty_reaches_accounting_step(diff):
                 snapshot["excess_by_level"].append(
                     {
                         "level": level_idx,
@@ -833,6 +864,87 @@ class GridEngine:
 
         snapshot["has_level_gap"] = bool(snapshot["missing_by_level"] or snapshot["excess_by_level"])
         snapshot["has_risk"] = bool(snapshot["has_risk"] or snapshot["has_level_gap"])
+        return snapshot
+
+    def grid_coverage_snapshot(self) -> dict:
+        direction = self.config.get("direction")
+        open_side = self._open_side_for_direction()
+        enabled = (
+            direction in {"long", "short"}
+            and bool(open_side)
+            and self.grid_ready
+            and len(self.grid_levels) >= 2
+        )
+        snapshot = {
+            "enabled": enabled,
+            "ledger_ok": True,
+            "ledger_reason": "",
+            "open_side": open_side,
+            "target_qty": 0.0,
+            "position_lot_qty": 0.0,
+            "open_order_remaining_qty": 0.0,
+            "coverage_qty": 0.0,
+            "net_delta_qty": 0.0,
+            "missing_by_level": [],
+            "excess_by_level": [],
+            "has_risk": False,
+        }
+        if not enabled:
+            return snapshot
+
+        if not self.reduce_lots_complete:
+            snapshot["ledger_ok"] = False
+            snapshot["ledger_reason"] = "position lot ledger is incomplete"
+            snapshot["has_risk"] = True
+            return snapshot
+
+        lots = self._reduce_lot_decimal_map()
+        target_total = Decimal("0")
+        lot_total = Decimal("0")
+        open_total = Decimal("0")
+
+        for level_idx in range(len(self.grid_levels) - 1):
+            target_qty = Decimal(str(self._target_open_qty_for_level(level_idx)))
+            lot_qty = lots.get(level_idx, {}).get("qty", Decimal("0"))
+            active_open_qty = Decimal(
+                str(self._active_order_remaining_qty(open_side, level_idx, False))
+            )
+            coverage_qty = lot_qty + active_open_qty
+            delta = coverage_qty - target_qty
+
+            target_total += target_qty
+            lot_total += lot_qty
+            open_total += active_open_qty
+
+            details = {
+                "level": level_idx,
+                "target_qty": float(target_qty),
+                "position_lot_qty": float(lot_qty),
+                "open_order_remaining_qty": float(active_open_qty),
+                "coverage_qty": float(coverage_qty),
+            }
+            if delta < 0 and self._qty_reaches_accounting_step(delta):
+                snapshot["missing_by_level"].append(
+                    {**details, "missing_qty": float(-delta)}
+                )
+            elif delta > 0 and self._qty_reaches_accounting_step(delta):
+                snapshot["excess_by_level"].append(
+                    {**details, "excess_qty": float(delta)}
+                )
+
+        coverage_total = lot_total + open_total
+        snapshot.update(
+            {
+                "target_qty": float(target_total),
+                "position_lot_qty": float(lot_total),
+                "open_order_remaining_qty": float(open_total),
+                "coverage_qty": float(coverage_total),
+                "net_delta_qty": float(coverage_total - target_total),
+                "has_risk": bool(
+                    snapshot["missing_by_level"] or snapshot["excess_by_level"]
+                ),
+            }
+        )
         return snapshot
 
     def _reduce_side(self) -> str:
@@ -895,13 +1007,16 @@ class GridEngine:
         return False
 
     def _halt_if_baseline_breached(self) -> bool:
-        if not self.baseline_position_side or self.baseline_position_qty < self.min_qty:
+        if not self.baseline_position_side or not self._qty_reaches_accounting_step(
+            self.baseline_position_qty
+        ):
             return False
         if self.config["direction"] not in {"long", "short"}:
             return False
 
         actual_same_side_qty = self._position_size(self.baseline_position_side)
-        if actual_same_side_qty + self.min_qty >= self.baseline_position_qty:
+        shortfall = Decimal(str(self.baseline_position_qty)) - Decimal(str(actual_same_side_qty))
+        if shortfall <= 0 or not self._qty_reaches_accounting_step(shortfall):
             return False
 
         self.trigger_message = (
@@ -1191,7 +1306,7 @@ class GridEngine:
                 qty = abs(float(position.get("size", 0) or 0))
             except (TypeError, ValueError):
                 qty = 0.0
-            if side not in {"Buy", "Sell"} or qty < self.min_qty:
+            if side not in {"Buy", "Sell"} or not self._qty_reaches_accounting_step(qty):
                 continue
             try:
                 entry_price = float(
@@ -1206,7 +1321,7 @@ class GridEngine:
         return positions
 
     def _capture_baseline_position(self, open_side: str):
-        if self.baseline_position_qty >= self.min_qty or self.baseline_position_side:
+        if self._qty_reaches_accounting_step(self.baseline_position_qty) or self.baseline_position_side:
             return
 
         positions = self._position_snapshots()
@@ -1227,7 +1342,7 @@ class GridEngine:
             )
 
         total_qty = sum(position["qty"] for position in positions)
-        if total_qty < self.min_qty:
+        if not self._qty_reaches_accounting_step(total_qty):
             return
         weighted_entry = sum(position["qty"] * position["entry_price"] for position in positions)
         self.baseline_position_side = open_side
@@ -1237,17 +1352,17 @@ class GridEngine:
     def _migrate_baseline_position_from_exchange(self):
         if not self._allow_restore_baseline_migration:
             return
-        if self.baseline_position_qty >= self.min_qty or self.baseline_position_side:
+        if self._qty_reaches_accounting_step(self.baseline_position_qty) or self.baseline_position_side:
             return
 
         grid_net_qty = self._grid_position_net_qty()
-        if abs(grid_net_qty) < self.min_qty:
+        if not self._qty_reaches_accounting_step(grid_net_qty):
             return
 
         positions = self._position_snapshots()
         actual_net_qty = sum(self._signed_qty(item["side"], item["qty"]) for item in positions)
         baseline_net_qty = actual_net_qty - grid_net_qty
-        if abs(baseline_net_qty) < self.min_qty:
+        if not self._qty_reaches_accounting_step(baseline_net_qty):
             return
         if baseline_net_qty * grid_net_qty <= 0:
             return
@@ -1350,12 +1465,12 @@ class GridEngine:
 
         actual_grid_qty = self._actual_grid_position_net_qty()
         local_grid_qty = self._grid_position_net_qty()
-        if abs(actual_grid_qty - local_grid_qty) < self.min_qty:
+        if not self._qty_reaches_accounting_step(actual_grid_qty - local_grid_qty):
             self._position_mismatch_seen_at = 0.0
             self._position_mismatch_signature = None
             return
 
-        if self._active_reduce_qty(self._reduce_side()) >= self.min_qty:
+        if self._qty_reaches_accounting_step(self._active_reduce_qty(self._reduce_side())):
             signature = (round(local_grid_qty, 8), round(actual_grid_qty, 8), len(self.active_orders))
             now = time.time()
             if self._position_mismatch_signature != signature:
@@ -1394,7 +1509,7 @@ class GridEngine:
         if self._stopping:
             return
 
-        if self._grid_position_qty() < self.min_qty:
+        if not self._qty_reaches_accounting_step(self._grid_position_qty()):
             self._repair_flat_open_side_grid()
             return
 
@@ -1469,14 +1584,14 @@ class GridEngine:
         if qty <= 0:
             return True
         lot = lots.get(level_idx)
-        minimum = Decimal(str(self.min_qty))
-        if not lot or lot["qty"] + minimum < qty:
+        if not lot or qty - lot["qty"] > self._qty_tolerance_decimal():
             return False
-        if lot["qty"] <= qty + minimum:
+        remaining = lot["qty"] - qty
+        if remaining <= self._qty_tolerance_decimal():
             lots.pop(level_idx, None)
             return True
         average_entry = lot["entry_value"] / lot["qty"] if lot["qty"] > 0 else Decimal("0")
-        lot["qty"] -= qty
+        lot["qty"] = remaining
         lot["entry_value"] -= average_entry * qty
         return True
 
@@ -1575,7 +1690,7 @@ class GridEngine:
             return
         ledger_qty = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
         grid_qty = Decimal(str(self._grid_position_qty()))
-        if abs(ledger_qty - grid_qty) >= Decimal(str(self.min_qty)):
+        if self._qty_reaches_accounting_step(ledger_qty - grid_qty):
             logger.info(
                 "Reduce lot ledger from legacy state does not match grid position symbol=%s ledger_qty=%s grid_qty=%s",
                 self.config.get("symbol"),
@@ -1650,8 +1765,7 @@ class GridEngine:
             return None, "reduce side is unavailable"
 
         grid_qty = Decimal(str(self._grid_position_qty()))
-        min_qty = Decimal(str(self.min_qty))
-        if grid_qty < min_qty:
+        if not self._qty_reaches_accounting_step(grid_qty):
             return {}, ""
 
         try:
@@ -1689,11 +1803,17 @@ class GridEngine:
             try:
                 if self._fp(float(item.get("price", 0) or 0)) != self._fp(float(target[1])):
                     return None, f"active reduce order {item.get('orderId')} price does not match grid level"
-                qty = Decimal(str(item.get("qty", 0) or 0))
+                original_qty = Decimal(str(item.get("qty", 0) or 0))
+                executed_qty = Decimal(
+                    str(item.get("executedQty", item.get("cumExecQty", 0)) or 0)
+                )
+                qty = original_qty - executed_qty
             except Exception:
                 return None, f"active reduce order {item.get('orderId')} contains invalid values"
-            if qty < min_qty:
-                return None, f"active reduce order {item.get('orderId')} quantity is too small"
+            if qty <= self._qty_tolerance_decimal():
+                continue
+            if not self._qty_reaches_accounting_step(qty):
+                return None, f"active reduce order {item.get('orderId')} remaining quantity is invalid"
 
             local_order = self.active_orders.get(link_id) or local_by_id.get(str(item.get("orderId", "") or ""))
             try:
@@ -1710,7 +1830,7 @@ class GridEngine:
 
         if not lots:
             return None, "no active exchange reduce protection orders"
-        if abs(total - grid_qty) >= min_qty:
+        if self._qty_reaches_accounting_step(total - grid_qty):
             return None, f"active exchange reduce qty {float(total)} does not match grid qty {float(grid_qty)}"
         return lots, ""
 
@@ -1753,7 +1873,7 @@ class GridEngine:
 
         expected_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
         grid_qty = Decimal(str(self._grid_position_qty()))
-        if abs(expected_total - grid_qty) >= Decimal(str(self.min_qty)):
+        if self._qty_reaches_accounting_step(expected_total - grid_qty):
             mismatch_reason = (
                 f"fill ledger qty {float(expected_total)} does not match grid qty {float(grid_qty)}"
             )
@@ -1783,7 +1903,7 @@ class GridEngine:
 
         expected_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
         grid_qty = Decimal(str(self._grid_position_qty()))
-        if abs(expected_total - grid_qty) >= Decimal(str(self.min_qty)):
+        if self._qty_reaches_accounting_step(expected_total - grid_qty):
             logger.warning(
                 "Reduce-only protection ledger does not match grid position symbol=%s ledger_qty=%s grid_qty=%s",
                 self.config.get("symbol"),
@@ -1950,7 +2070,7 @@ class GridEngine:
 
         lot_total = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
         grid_qty = Decimal(str(self._grid_position_qty()))
-        if abs(lot_total - grid_qty) >= Decimal(str(self.min_qty)):
+        if self._qty_reaches_accounting_step(lot_total - grid_qty):
             signature = ("open-coverage-ledger-mismatch", float(lot_total), float(grid_qty))
             if self._should_log_reduce_warning(signature):
                 logger.warning(
@@ -1960,6 +2080,33 @@ class GridEngine:
                     float(grid_qty),
                 )
             return False
+
+        coverage = self.grid_coverage_snapshot()
+        if coverage.get("excess_by_level"):
+            excess_qty = sum(
+                Decimal(str(item.get("excess_qty", 0) or 0))
+                for item in coverage["excess_by_level"]
+            )
+            self.trigger_message = (
+                "Open-side coverage has excess level quantity; automatic top-up is paused "
+                "until the mixed ledger mismatch is reviewed."
+            )
+            signature = (
+                "open-coverage-excess",
+                tuple(
+                    (int(item.get("level", 0) or 0), str(item.get("excess_qty", 0) or 0))
+                    for item in coverage["excess_by_level"]
+                ),
+            )
+            if self._should_log_reduce_warning(signature):
+                logger.warning(
+                    "Open-side coverage top-up blocked by excess level quantity symbol=%s excess_qty=%s excess=%s",
+                    self.config.get("symbol"),
+                    float(excess_qty),
+                    coverage["excess_by_level"],
+                )
+            self._persist_state()
+            return True
 
         placed_count = 0
         placed_qty = Decimal("0")
@@ -2012,6 +2159,11 @@ class GridEngine:
         return False
 
     def _repair_missing_reduce_at_boundary(self) -> bool:
+        # A boundary order has no trustworthy grid-level ownership. Keep this
+        # legacy safeguard explicit so normal grids never create guessed lots.
+        if not bool(self.config.get("boundary_reduce_fallback", False)):
+            return False
+
         reduce_side = self._reduce_side()
         target = self._boundary_reduce_target_for_missing()
         if not reduce_side or not target:
@@ -2217,7 +2369,7 @@ class GridEngine:
     def estimate_grid_unrealized_pnl(self, mark_price: float) -> float:
         direction = self.config["direction"]
         grid_qty = self._grid_position_qty()
-        if direction not in {"long", "short"} or grid_qty < self.min_qty:
+        if direction not in {"long", "short"} or not self._qty_reaches_accounting_step(grid_qty):
             return 0.0
 
         reduce_side = "Sell" if direction == "long" else "Buy"
@@ -2226,9 +2378,14 @@ class GridEngine:
         for order in self.active_orders.values():
             if not order.get("reduce_only") or order.get("side") != reduce_side:
                 continue
-            if remaining < self.min_qty:
+            if not self._qty_reaches_accounting_step(remaining):
                 break
-            qty = min(remaining, float(order.get("qty", 0) or 0))
+            order_qty = Decimal(str(order.get("qty", 0) or 0))
+            processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+            order_remaining = max(Decimal("0"), order_qty - processed_qty)
+            if not self._qty_reaches_accounting_step(order_remaining):
+                continue
+            qty = min(remaining, float(order_remaining))
             entry_price = float(order.get("entry_price") or self.initial_entry_price or order.get("price") or 0)
             if direction == "long":
                 pnl += (mark_price - entry_price) * qty
@@ -2236,7 +2393,7 @@ class GridEngine:
                 pnl += (entry_price - mark_price) * qty
             remaining -= qty
 
-        if remaining >= self.min_qty and self.initial_entry_price > 0:
+        if self._qty_reaches_accounting_step(remaining) and self.initial_entry_price > 0:
             if direction == "long":
                 pnl += (mark_price - self.initial_entry_price) * remaining
             else:
@@ -2274,7 +2431,9 @@ class GridEngine:
         return str(result["result"].get("orderId") or "")
 
     def _place_market_open(self, side: str, qty: float):
-        qty_text = self._fq(qty)
+        qty_text = self._order_qty_text(qty, reduce_only=False)
+        if not qty_text:
+            raise RuntimeError(f"Initial market order quantity {qty} is below the exchange minimum")
         result = self.client.place_order(
             symbol=self.config["symbol"],
             side=side,
@@ -2331,7 +2490,9 @@ class GridEngine:
         self._persist_state()
 
     def _place_limit_open(self, side: str, qty: float, price: float, *, post_only: bool = True):
-        qty_text = self._fq(qty)
+        qty_text = self._order_qty_text(qty, reduce_only=False)
+        if not qty_text:
+            raise RuntimeError(f"Initial limit order quantity {qty} is below the exchange minimum")
         price_text = self._fp(price)
         link_id = f"open_{side[0]}_{uuid.uuid4().hex[:6]}"
         result = self.client.place_order(
@@ -2403,7 +2564,17 @@ class GridEngine:
     ) -> Optional[str]:
         raw_qty = float(qty_override) if qty_override is not None else float(self.config["qty_per_grid"])
 
-        qty = self._fq(raw_qty)
+        qty = self._order_qty_text(raw_qty, reduce_only=reduce_only)
+        if not qty:
+            logger.warning(
+                "Skipped grid order below exchange quantity precision symbol=%s side=%s level=%s requested=%s reduce_only=%s",
+                self.config.get("symbol"),
+                side,
+                level_idx,
+                raw_qty,
+                reduce_only,
+            )
+            return None
         price_text = self._fp(price)
         link_id = f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:6]}"
 
@@ -2526,7 +2697,17 @@ class GridEngine:
 
             raw_qty = float(spec.get("qty_override") or self.config["qty_per_grid"])
 
-            qty = self._fq(raw_qty)
+            qty = self._order_qty_text(raw_qty, reduce_only=reduce_only)
+            if not qty:
+                logger.warning(
+                    "Skipped batch grid order below exchange quantity precision symbol=%s side=%s level=%s requested=%s reduce_only=%s",
+                    self.config.get("symbol"),
+                    side,
+                    level_idx,
+                    raw_qty,
+                    reduce_only,
+                )
+                continue
             price_text = self._fp(float(spec["price"]))
             link_id = f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:6]}"
             planned.append(
@@ -3472,7 +3653,32 @@ class GridEngine:
     ) -> bool:
         requested_qty = float(qty)
         if not reduce_only:
-            deficit = self._active_order_remaining_qty_deficit(side, level_idx, reduce_only, requested_qty)
+            target_qty = requested_qty
+            if (
+                self._position_sizing_mode() == "fixed_grid_qty"
+                and self.config.get("direction") in {"long", "short"}
+            ):
+                if not self.reduce_lots_complete:
+                    logger.warning(
+                        "Skipped fixed-grid open counter because lot ledger is incomplete "
+                        "symbol=%s level=%s side=%s requested=%s",
+                        self.config.get("symbol"),
+                        level_idx,
+                        side,
+                        requested_qty,
+                    )
+                    return False
+                lots = self._reduce_lot_decimal_map()
+                level_target = Decimal(str(self._target_open_qty_for_level(level_idx)))
+                lot_qty = lots.get(level_idx, {}).get("qty", Decimal("0"))
+                target_qty = float(max(Decimal("0"), level_target - lot_qty))
+
+            deficit = self._active_order_remaining_qty_deficit(
+                side,
+                level_idx,
+                reduce_only,
+                target_qty,
+            )
             if deficit <= 0:
                 return True
             qty = deficit
@@ -3484,7 +3690,8 @@ class GridEngine:
                 reduce_only=reduce_only,
                 qty_override=qty,
                 entry_price=entry_price,
-                allow_duplicate=bool(reduce_only) or qty < requested_qty,
+                allow_duplicate=bool(reduce_only)
+                or self._has_active_order(side, level_idx, reduce_only),
             )
             is not None
         )
