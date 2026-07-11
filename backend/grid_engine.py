@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from itertools import pairwise
 from typing import Any, Callable, Optional
 
 import requests
@@ -27,6 +28,7 @@ SUBMISSION_REQUIRED_NOT_FOUND_CHECKS = 5
 SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS = 0.5
 MANAGED_CANCEL_MAX_ROUNDS = 5
 MANAGED_CANCEL_RETRY_SECONDS = 0.25
+ORDER_LINK_RANDOM_HEX_LENGTH = 16
 
 
 class GridEngine:
@@ -70,6 +72,7 @@ class GridEngine:
         self.pending_reduce_action: dict | None = None
         self.risk_shutdown_pending = False
         self.manual_stop_pending = False
+        self.initialization_in_progress = False
         self.initialization_failed = False
         self.ownership_conflicts: list[dict] = []
         self._pending_targets: dict | None = None
@@ -132,10 +135,13 @@ class GridEngine:
             "pending_reduce_action": self.pending_reduce_action,
             "risk_shutdown_pending": self.risk_shutdown_pending,
             "manual_stop_pending": self.manual_stop_pending,
+            "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
             "ownership_conflicts": self.ownership_conflicts,
             "pending_targets": self._pending_targets,
-            "paused_replacements": self.paused_replacements[-200:],
+            # This is live recovery work, not display history. Truncating it
+            # would permanently discard older missing grid legs after restart.
+            "paused_replacements": list(self.paused_replacements),
             "saved_at": time.time(),
         }
 
@@ -184,10 +190,23 @@ class GridEngine:
         self.pending_reduce_action = state.get("pending_reduce_action")
         self.risk_shutdown_pending = bool(state.get("risk_shutdown_pending", False))
         self.manual_stop_pending = bool(state.get("manual_stop_pending", False))
+        self.initialization_in_progress = bool(
+            state.get("initialization_in_progress", False)
+        )
         self.initialization_failed = bool(state.get("initialization_failed", False))
         self.ownership_conflicts = list(state.get("ownership_conflicts") or [])
         self._pending_targets = state.get("pending_targets")
         self.paused_replacements = list(state.get("paused_replacements") or [])
+
+        if self.initialization_in_progress and not self.grid_ready:
+            self.initialization_in_progress = False
+            self.initialization_failed = True
+            self.manual_stop_pending = True
+            self.trigger_message = (
+                "Grid initialization was interrupted after exchange work began. Managed "
+                "orders will be reconciled and cancelled; the retained position will not "
+                "be market-closed or reused by a new grid without explicit review."
+            )
 
         if not self.grid_levels:
             self.grid_levels = self._calculate_levels()
@@ -200,7 +219,8 @@ class GridEngine:
                 self._migrate_baseline_position_from_exchange()
                 if not self.risk_shutdown_pending and not self.manual_stop_pending:
                     self._reconcile_exchange_open_orders()
-                    self._reconcile_grid_position_protection()
+                    if not self.risk_shutdown_pending and not self.manual_stop_pending:
+                        self._reconcile_grid_position_protection()
         except Exception as exc:
             logger.warning("Restore refresh failed symbol=%s msg=%s", self.config.get("symbol"), exc)
         self._persist_state()
@@ -254,13 +274,19 @@ class GridEngine:
         )
         if open_snapshot and self._confirm_pending_submission(order, open_snapshot):
             return "confirmed"
+        if order.get("accepted_shape_mismatch") and order.get("order_id"):
+            return "confirmed"
 
         snapshot, authoritative = self._submission_snapshot_by_link(link_id)
         if snapshot and self._confirm_pending_submission(order, snapshot):
             return "confirmed"
+        if order.get("accepted_shape_mismatch") and order.get("order_id"):
+            return "confirmed"
 
         history_snapshot = self._submission_history_by_link({link_id}).get(link_id)
         if history_snapshot and self._confirm_pending_submission(order, history_snapshot):
+            return "confirmed"
+        if order.get("accepted_shape_mismatch") and order.get("order_id"):
             return "confirmed"
 
         now = time.time()
@@ -438,6 +464,7 @@ class GridEngine:
         self.risk_shutdown_pending = False
         self.manual_stop_pending = False
         self.initialization_failed = False
+        self.initialization_in_progress = False
         self.paused_replacements.clear()
         self.grid_ready = False
         self._persist_state()
@@ -495,8 +522,14 @@ class GridEngine:
                 await task
 
         listen_key = self._user_stream_listen_key
-        self._user_stream_listen_key = ""
-        if listen_key and hasattr(self.client, "close_user_stream"):
+        await self._close_user_stream_listen_key(listen_key)
+
+    async def _close_user_stream_listen_key(self, listen_key: str):
+        if not listen_key:
+            return
+        if self._user_stream_listen_key == listen_key:
+            self._user_stream_listen_key = ""
+        if hasattr(self.client, "close_user_stream"):
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(self.client.close_user_stream, listen_key)
 
@@ -523,6 +556,7 @@ class GridEngine:
 
         while self.running and not self._stopping:
             keepalive_task: asyncio.Task | None = None
+            listen_key = ""
             try:
                 listen_key = await asyncio.to_thread(self.client.start_user_stream)
                 if not listen_key:
@@ -558,6 +592,7 @@ class GridEngine:
                     keepalive_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await keepalive_task
+                await self._close_user_stream_listen_key(listen_key)
 
     def get_status(self) -> dict:
         return {
@@ -584,6 +619,7 @@ class GridEngine:
             "pending_reduce_action": self.pending_reduce_action,
             "risk_shutdown_pending": self.risk_shutdown_pending,
             "manual_stop_pending": self.manual_stop_pending,
+            "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
             "ownership_conflicts": self.ownership_conflicts,
             "paused_replacements": self.paused_replacements,
@@ -929,22 +965,36 @@ class GridEngine:
             filled_order,
             delta_stats,
             count_completed_pair=count_completed_pair,
+            persist_state=False,
         )
         if not place_counter:
+            self._persist_state()
             return True
         if filled_order.get("tag") == "boundary_reduce_fallback":
+            self._persist_state()
             self._repair_flat_open_side_grid()
             return True
-        if not self._should_place_counter_order_now(filled_order) or not self._place_counter_order(
-            filled_order
-        ):
-            self.paused_replacements.append(filled_order)
-            self.trigger_message = (
-                "Counter order was not confirmed; it is queued and will be retried "
-                "with exchange-order reconciliation."
-            )
-            self._mark_fast_poll()
+
+        plan = self._counter_order_plan(filled_order)
+        if not plan:
             self._persist_state()
+            return True
+
+        # Commit the execution and its exact counter-order identity together.
+        # A crash can then replay the counter safely without losing the grid leg
+        # or submitting a second order under a different client ID.
+        filled_order["replacement_mode"] = "counter_order"
+        filled_order["replacement_link_id"] = (
+            f"g_{int(plan['level_idx'])}_{str(plan['side'])[0]}_"
+            f"{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
+        )
+        self.paused_replacements.append(filled_order)
+        self.trigger_message = (
+            "Counter order is durably queued and awaiting exchange confirmation."
+        )
+        self._mark_fast_poll()
+        self._persist_state()
+        self._resume_paused_replacements()
         return True
 
     @staticmethod
@@ -1464,6 +1514,111 @@ class GridEngine:
             state["tag"] = tag
         return state
 
+    def _accepted_shape_mismatch_reason(self, order: dict, snapshot: dict) -> str:
+        snapshot_side = str(snapshot.get("side", "") or "")
+        expected_side = str(order.get("side", "") or "")
+        if snapshot_side and snapshot_side.lower() != expected_side.lower():
+            return f"side expected={expected_side} actual={snapshot_side}"
+
+        snapshot_reduce_only = snapshot.get("reduceOnly")
+        expected_reduce_only = bool(order.get("reduce_only", False))
+        if (
+            snapshot_reduce_only is not None
+            and self._truthy(snapshot_reduce_only) != expected_reduce_only
+        ):
+            return (
+                f"reduce-only expected={expected_reduce_only} "
+                f"actual={self._truthy(snapshot_reduce_only)}"
+            )
+
+        snapshot_qty = snapshot.get("qty")
+        if snapshot_qty not in (None, ""):
+            try:
+                expected_qty = Decimal(str(order.get("qty", 0) or 0))
+                accepted_qty = Decimal(str(snapshot_qty))
+            except Exception:
+                return f"quantity expected={order.get('qty')} actual={snapshot_qty}"
+            if (
+                accepted_qty < 0
+                or abs(accepted_qty - expected_qty) > self._qty_tolerance_decimal()
+            ):
+                return f"quantity expected={order.get('qty')} actual={snapshot_qty}"
+
+        snapshot_price = snapshot.get("price")
+        if (
+            str(order.get("order_type", "")).lower() == "limit"
+            and snapshot_price not in (None, "")
+        ):
+            try:
+                expected_price = Decimal(str(order.get("price", 0) or 0))
+                accepted_price = Decimal(str(snapshot_price))
+                tick = Decimal(str(self.tick_size or 0))
+                tolerance = max(abs(tick) * Decimal("1e-9"), Decimal("1e-18"))
+            except Exception:
+                return f"price expected={order.get('price')} actual={snapshot_price}"
+            if accepted_price <= 0 or abs(accepted_price - expected_price) > tolerance:
+                return f"price expected={order.get('price')} actual={snapshot_price}"
+
+        return ""
+
+    def _record_accepted_shape_mismatch(
+        self,
+        order: dict,
+        snapshot: dict,
+        reason: str,
+    ) -> None:
+        order_id = str(snapshot.get("orderId", "") or "")
+        if not order_id:
+            return
+        order["expected_side"] = order.get("side")
+        order["expected_price"] = order.get("price")
+        order["expected_qty"] = order.get("qty")
+        order["expected_reduce_only"] = bool(order.get("reduce_only", False))
+        order["order_id"] = order_id
+        order["status"] = "ACCEPTED_SHAPE_MISMATCH"
+        order["accepted_shape_mismatch"] = str(reason)
+        for source, target in (
+            ("side", "exchange_accepted_side"),
+            ("price", "exchange_accepted_price"),
+            ("qty", "exchange_accepted_qty"),
+            ("reduceOnly", "exchange_accepted_reduce_only"),
+        ):
+            if snapshot.get(source) not in (None, ""):
+                order[target] = snapshot.get(source)
+        accepted_side = str(snapshot.get("side", "") or "")
+        if accepted_side:
+            order["side"] = (
+                "Buy"
+                if accepted_side.upper() == "BUY"
+                else "Sell"
+                if accepted_side.upper() == "SELL"
+                else accepted_side
+            )
+        if snapshot.get("price") not in (None, ""):
+            order["price"] = str(snapshot.get("price"))
+        if snapshot.get("qty") not in (None, ""):
+            order["qty"] = str(snapshot.get("qty"))
+        if snapshot.get("reduceOnly") is not None:
+            order["reduce_only"] = self._truthy(snapshot.get("reduceOnly"))
+        for field in (
+            "submission_pending",
+            "submission_attempts",
+            "submission_not_found_count",
+            "submission_last_not_found_at",
+            "submission_updated_at",
+            "submission_retry_blocked",
+        ):
+            order.pop(field, None)
+        self.grid_ready = False
+        self.manual_stop_pending = True
+        self.trigger_message = (
+            f"Exchange accepted a grid order with a different shape ({reason}); "
+            "new placement is stopped and managed orders will be cancelled without "
+            "market-closing the retained position."
+        )
+        self._mark_fast_poll()
+        self._persist_state()
+
     def _confirm_pending_submission(self, order: dict, snapshot: dict) -> bool:
         snapshot_link_id = str(snapshot.get("orderLinkId", "") or "")
         if snapshot_link_id and snapshot_link_id != str(order.get("link_id", "")):
@@ -1475,75 +1630,17 @@ class GridEngine:
                 snapshot_link_id,
             )
             return False
-        snapshot_side = str(snapshot.get("side", "") or "")
-        if snapshot_side and snapshot_side.lower() != str(order.get("side", "")).lower():
+        mismatch_reason = self._accepted_shape_mismatch_reason(order, snapshot)
+        if mismatch_reason:
             logger.error(
-                "Pending submission lookup returned a different side symbol=%s link_id=%s "
-                "expected=%s actual=%s",
+                "Pending submission lookup returned a different immutable order shape "
+                "symbol=%s link_id=%s reason=%s",
                 self.config.get("symbol"),
                 order.get("link_id"),
-                order.get("side"),
-                snapshot_side,
+                mismatch_reason,
             )
+            self._record_accepted_shape_mismatch(order, snapshot, mismatch_reason)
             return False
-        if snapshot.get("reduceOnly") is not None and self._truthy(
-            snapshot.get("reduceOnly")
-        ) != bool(order.get("reduce_only", False)):
-            logger.error(
-                "Pending submission lookup returned different reduce-only semantics "
-                "symbol=%s link_id=%s",
-                self.config.get("symbol"),
-                order.get("link_id"),
-            )
-            return False
-        snapshot_qty = snapshot.get("qty")
-        if snapshot_qty not in (None, ""):
-            try:
-                expected_qty = Decimal(str(order.get("qty", 0) or 0))
-                accepted_qty = Decimal(str(snapshot_qty))
-            except Exception:
-                accepted_qty = Decimal("-1")
-                expected_qty = Decimal("0")
-            if (
-                accepted_qty < 0
-                or abs(accepted_qty - expected_qty) > self._qty_tolerance_decimal()
-            ):
-                logger.error(
-                    "Pending submission lookup returned different quantity symbol=%s "
-                    "link_id=%s expected=%s actual=%s",
-                    self.config.get("symbol"),
-                    order.get("link_id"),
-                    order.get("qty"),
-                    snapshot_qty,
-                )
-                return False
-        snapshot_price = snapshot.get("price")
-        if (
-            str(order.get("order_type", "")).lower() == "limit"
-            and snapshot_price not in (None, "")
-        ):
-            try:
-                expected_price = Decimal(str(order.get("price", 0) or 0))
-                accepted_price_value = Decimal(str(snapshot_price))
-                tick = Decimal(str(self.tick_size or 0))
-                price_tolerance = max(abs(tick) * Decimal("1e-9"), Decimal("1e-18"))
-            except Exception:
-                accepted_price_value = Decimal("-1")
-                expected_price = Decimal("0")
-                price_tolerance = Decimal("0")
-            if (
-                accepted_price_value <= 0
-                or abs(accepted_price_value - expected_price) > price_tolerance
-            ):
-                logger.error(
-                    "Pending submission lookup returned different limit price symbol=%s "
-                    "link_id=%s expected=%s actual=%s",
-                    self.config.get("symbol"),
-                    order.get("link_id"),
-                    order.get("price"),
-                    snapshot_price,
-                )
-                return False
         order_id = str(snapshot.get("orderId", "") or "")
         if not order_id:
             return False
@@ -1617,6 +1714,7 @@ class GridEngine:
             for marker in (
                 "execution status unknown",
                 "execution status is unknown",
+                "send status unknown",
                 "status is unknown",
                 "request status unknown",
                 "server timeout",
@@ -1625,6 +1723,16 @@ class GridEngine:
                 "response lost",
             )
         )
+
+    @staticmethod
+    def _is_uncertain_submission_result(result: dict[str, Any]) -> bool:
+        try:
+            code = int(result.get("retCode"))
+        except (TypeError, ValueError):
+            code = None
+        if code in {-1006, -1007, 10000, 10016}:
+            return True
+        return GridEngine._is_uncertain_submission_message(str(result.get("retMsg") or ""))
 
     @staticmethod
     def _is_duplicate_client_order_rejection(message: str) -> bool:
@@ -1746,16 +1854,17 @@ class GridEngine:
             order["submission_error"] = str(exc)
             self._persist_state()
             return "rejected"
-        if result.get("retCode") == 0 and self._confirm_pending_submission(
-            order, result.get("result", {})
-        ):
-            self._persist_state()
-            return "confirmed"
+        if result.get("retCode") == 0:
+            if self._confirm_pending_submission(order, result.get("result", {})):
+                self._persist_state()
+                return "confirmed"
+            if order.get("accepted_shape_mismatch"):
+                return "mismatch"
         message = str(result.get("retMsg") or "submission not confirmed")
         if (
             result.get("retCode") == 0
             or self._is_duplicate_client_order_rejection(message)
-            or self._is_uncertain_submission_message(message)
+            or self._is_uncertain_submission_result(result)
         ):
             self._mark_submission_unknown(order, message)
             return "pending"
@@ -1782,11 +1891,18 @@ class GridEngine:
             if snapshot and self._confirm_pending_submission(order, snapshot):
                 pending.pop(link_id, None)
                 changed = True
+            elif order.get("accepted_shape_mismatch"):
+                pending.pop(link_id, None)
+                changed = True
 
         not_found_check_time = time.time()
         for link_id, order in list(pending.items()):
             snapshot, authoritative = self._submission_snapshot_by_link(link_id)
             if snapshot and self._confirm_pending_submission(order, snapshot):
+                pending.pop(link_id, None)
+                changed = True
+                continue
+            if order.get("accepted_shape_mismatch"):
                 pending.pop(link_id, None)
                 changed = True
                 continue
@@ -1808,6 +1924,9 @@ class GridEngine:
             if snapshot and self._confirm_pending_submission(order, snapshot):
                 pending.pop(link_id, None)
                 changed = True
+            elif order.get("accepted_shape_mismatch"):
+                pending.pop(link_id, None)
+                changed = True
 
         now = time.time()
         for link_id, order in list(pending.items()):
@@ -1824,6 +1943,10 @@ class GridEngine:
                 self.active_orders.pop(link_id, None)
                 pending.pop(link_id, None)
                 changed = True
+                self._queue_exact_replacement(
+                    order,
+                    str(order.get("submission_error") or "pending submission rejected"),
+                )
                 logger.error(
                     "Pending submission was definitively rejected after exchange absence checks "
                     "symbol=%s link_id=%s msg=%s",
@@ -1831,6 +1954,9 @@ class GridEngine:
                     link_id,
                     order.get("submission_error"),
                 )
+            elif outcome == "mismatch":
+                pending.pop(link_id, None)
+                changed = True
 
         pending_count = sum(
             1 for order in self.active_orders.values() if order.get("submission_pending")
@@ -1862,16 +1988,22 @@ class GridEngine:
         if open_snapshot and self._confirm_pending_submission(order, open_snapshot):
             self._persist_state()
             return True
+        if order.get("accepted_shape_mismatch"):
+            return False
 
         snapshot, authoritative = self._submission_snapshot_by_link(link_id)
         if snapshot and self._confirm_pending_submission(order, snapshot):
             self._persist_state()
             return True
+        if order.get("accepted_shape_mismatch"):
+            return False
 
         history_snapshot = self._submission_history_by_link({link_id}).get(link_id)
         if history_snapshot and self._confirm_pending_submission(order, history_snapshot):
             self._persist_state()
             return True
+        if order.get("accepted_shape_mismatch"):
+            return False
 
         now = time.time()
         if authoritative:
@@ -1928,6 +2060,9 @@ class GridEngine:
                 if existing.get("submission_pending") and self._confirm_pending_submission(
                     existing, item
                 ):
+                    known_order_ids.add(order_id)
+                    adopted = True
+                elif existing.get("accepted_shape_mismatch"):
                     known_order_ids.add(order_id)
                     adopted = True
                 continue
@@ -1995,20 +2130,27 @@ class GridEngine:
         return adopted or ownership_changed
 
     def _sync_active_order_from_exchange_snapshot(self, order: dict, snapshot: dict) -> bool:
-        """Keep the local order ledger aligned with the exchange-accepted order shape."""
+        """Refresh mutable status while rejecting changes to the accepted order shape."""
+        if not order.get("accepted_shape_mismatch"):
+            mismatch_reason = self._accepted_shape_mismatch_reason(order, snapshot)
+            if mismatch_reason:
+                logger.error(
+                    "Confirmed order changed immutable exchange shape symbol=%s link_id=%s "
+                    "reason=%s",
+                    self.config.get("symbol"),
+                    order.get("link_id"),
+                    mismatch_reason,
+                )
+                self._record_accepted_shape_mismatch(order, snapshot, mismatch_reason)
+                return True
+
         updates: dict[str, Any] = {}
-        if snapshot.get("price") is not None:
-            updates["price"] = str(snapshot.get("price"))
-        if snapshot.get("qty") is not None:
-            updates["qty"] = str(snapshot.get("qty"))
         status = snapshot.get("orderStatus") or snapshot.get("status")
         current_status = str(order.get("status") or "")
         if status and not (
             current_status.lower() == "open" and str(status).upper() in {"NEW", "OPEN"}
         ):
             updates["status"] = str(status)
-        if snapshot.get("reduceOnly") is not None:
-            updates["reduce_only"] = self._truthy(snapshot.get("reduceOnly"))
 
         changed = False
         for key, value in updates.items():
@@ -2029,7 +2171,7 @@ class GridEngine:
         changed = self._resolve_pending_submissions(open_orders) or changed
         open_order_ids = {str(item.get("orderId", "")) for item in open_orders}
         open_orders_by_id = {str(item.get("orderId", "")): item for item in open_orders}
-        if self._stopping:
+        if self._stopping or self.manual_stop_pending or self.risk_shutdown_pending:
             return changed
 
         for order in list(self.active_orders.values()):
@@ -2416,6 +2558,7 @@ class GridEngine:
             self.config["direction"] not in {"long", "short"}
             or self._stopping
             or self.pending_reduce_action
+            or self.paused_replacements
             or self.risk_shutdown_pending
             or self.manual_stop_pending
             or self.ownership_conflicts
@@ -2521,13 +2664,21 @@ class GridEngine:
 
         lots: dict[int, dict[str, Decimal]] = {}
         entry = Decimal(str(entry_price or 0))
-        for target, allocated_qty in zip(
-            self._pending_targets.get("profit_targets") or [],
-            self._pending_targets.get("allocated_qtys") or [],
-        ):
-            level_idx = int(target[0])
-            target_qty = self.target_qty_by_level.get(str(level_idx), allocated_qty)
-            self._lot_add(lots, level_idx, Decimal(str(target_qty)), entry)
+        try:
+            plan = self._validated_pending_target_plan()
+        except Exception:
+            self.reduce_lots_by_level = {}
+            self.reduce_lots_complete = False
+            raise
+        for spec in plan:
+            if not spec["reduce_only"]:
+                continue
+            self._lot_add(
+                lots,
+                int(spec["level_idx"]),
+                Decimal(str(spec["qty_text"])),
+                entry,
+            )
         self._set_reduce_lot_decimal_map(lots)
         self.reduce_lots_complete = True
 
@@ -2587,7 +2738,7 @@ class GridEngine:
 
         lots: dict[int, dict[str, Decimal]] = {}
         entry_price = Decimal(str(self.initial_entry_price))
-        for target, allocated_qty in zip(profit_targets, allocated_qtys):
+        for target, allocated_qty in zip(profit_targets, allocated_qtys, strict=True):
             level_idx = int(target[0])
             target_qty = self.target_qty_by_level.get(str(level_idx), allocated_qty)
             self._lot_add(lots, level_idx, Decimal(str(target_qty)), entry_price)
@@ -3438,15 +3589,21 @@ class GridEngine:
         if open_snapshot and self._confirm_pending_submission(action, open_snapshot):
             self._persist_state()
             return True
+        if action.get("accepted_shape_mismatch"):
+            return True
 
         snapshot, authoritative = self._submission_snapshot_by_link(link_id)
         if snapshot and self._confirm_pending_submission(action, snapshot):
             self._persist_state()
             return True
+        if action.get("accepted_shape_mismatch"):
+            return True
 
         history_snapshot = self._submission_history_by_link({link_id}).get(link_id)
         if history_snapshot and self._confirm_pending_submission(action, history_snapshot):
             self._persist_state()
+            return True
+        if action.get("accepted_shape_mismatch"):
             return True
 
         now = time.time()
@@ -3466,6 +3623,8 @@ class GridEngine:
         ):
             outcome = self._retry_pending_submission(action)
             if outcome == "confirmed":
+                return True
+            if outcome == "mismatch":
                 return True
             if outcome == "rejected":
                 message = str(action.get("submission_error") or "Reduce-only market order rejected")
@@ -3537,7 +3696,7 @@ class GridEngine:
             )
             return ""
 
-        link_id = f"repair_{side[0]}_{uuid.uuid4().hex[:6]}"
+        link_id = f"repair_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
         self.pending_reduce_action = {
             "link_id": link_id,
             "order_id": "",
@@ -3588,7 +3747,7 @@ class GridEngine:
             message = str(
                 result.get("retMsg") or f"Failed to place reduce-only repair order: {reason}"
             )
-            if self._is_uncertain_submission_message(message):
+            if self._is_uncertain_submission_result(result):
                 self._mark_submission_unknown(self.pending_reduce_action, message)
                 return link_id
             self.pending_reduce_action = None
@@ -3597,6 +3756,9 @@ class GridEngine:
         if not self._confirm_pending_submission(
             self.pending_reduce_action, result.get("result", {})
         ):
+            if self.pending_reduce_action.get("accepted_shape_mismatch"):
+                self._resolve_pending_reduce_action()
+                return link_id
             self._mark_submission_unknown(
                 self.pending_reduce_action,
                 "successful reduce-only market response had no order ID",
@@ -3636,7 +3798,7 @@ class GridEngine:
                     f"market maximum {self.max_market_qty}; reduce the per-grid quantity or use a "
                     "limit opening order"
                 )
-        link_id = f"init_{side[0]}_{uuid.uuid4().hex[:6]}"
+        link_id = f"init_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
         self.initial_side = side
         self.initial_qty = float(qty_text)
         self.initial_entry_price = 0.0
@@ -3688,7 +3850,7 @@ class GridEngine:
             raise
         if result.get("retCode") != 0:
             message = str(result.get("retMsg") or "Failed to place initial market order")
-            if self._is_uncertain_submission_message(message):
+            if self._is_uncertain_submission_result(result):
                 self._mark_submission_unknown(self.opening_order, message)
                 return False
             self.opening_order = None
@@ -3696,6 +3858,8 @@ class GridEngine:
             self._persist_state()
             raise RuntimeError(message)
         if not self._confirm_pending_submission(self.opening_order, result.get("result", {})):
+            if self.opening_order.get("accepted_shape_mismatch"):
+                raise RuntimeError(self.trigger_message)
             self._mark_submission_unknown(
                 self.opening_order, "successful opening response had no order ID"
             )
@@ -3734,6 +3898,7 @@ class GridEngine:
         )
         self.opening_order = None
         self.waiting_initial_order = False
+        self.initialization_in_progress = True
         self._mark_fast_poll()
         self._persist_state()
         return True
@@ -3759,7 +3924,7 @@ class GridEngine:
         if not qty_text:
             raise RuntimeError(f"Initial limit order quantity {qty} is below the exchange minimum")
         price_text = self._fp(price)
-        link_id = f"open_{side[0]}_{uuid.uuid4().hex[:6]}"
+        link_id = f"open_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
         self.initial_side = side
         self.initial_qty = float(qty_text)
         self.initial_entry_price = 0.0
@@ -3815,7 +3980,7 @@ class GridEngine:
             raise
         if result.get("retCode") != 0:
             message = str(result.get("retMsg") or "Failed to place initial limit order")
-            if self._is_uncertain_submission_message(message):
+            if self._is_uncertain_submission_result(result):
                 self._mark_submission_unknown(self.opening_order, message)
                 return
             self.opening_order = None
@@ -3823,6 +3988,8 @@ class GridEngine:
             self._persist_state()
             raise RuntimeError(message)
         if not self._confirm_pending_submission(self.opening_order, result.get("result", {})):
+            if self.opening_order.get("accepted_shape_mismatch"):
+                raise RuntimeError(self.trigger_message)
             self._mark_submission_unknown(
                 self.opening_order, "successful opening response had no order ID"
             )
@@ -3869,6 +4036,7 @@ class GridEngine:
         entry_price: float | None = None,
         allow_duplicate: bool = False,
         tag: str | None = None,
+        link_id_override: str | None = None,
     ) -> Optional[str]:
         raw_qty = float(qty_override) if qty_override is not None else float(self.config["qty_per_grid"])
 
@@ -3884,11 +4052,31 @@ class GridEngine:
             )
             return None
         price_text = self._fp(price)
-        link_id = f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:6]}"
+        link_id = str(
+            link_id_override
+            or f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
+        )
+
+        if link_id in self.active_orders:
+            existing = self.active_orders[link_id]
+            if (
+                str(existing.get("side")) == side
+                and int(existing.get("level_idx", -1)) == level_idx
+                and bool(existing.get("reduce_only")) == reduce_only
+                and str(existing.get("price")) == price_text
+                and str(existing.get("qty")) == qty
+            ):
+                return link_id
+            raise RuntimeError(f"Grid client order ID {link_id} already has a different order shape")
 
         if not allow_duplicate and self._has_active_order(side, level_idx, reduce_only):
             return None
-        if self._stopping or self.ownership_conflicts:
+        if (
+            self._stopping
+            or self.manual_stop_pending
+            or self.risk_shutdown_pending
+            or self.ownership_conflicts
+        ):
             return None
 
         def submit_limit(use_post_only: bool):
@@ -3958,7 +4146,7 @@ class GridEngine:
 
         if result.get("retCode") != 0:
             message = str(result.get("retMsg") or "rejected")
-            if self._is_uncertain_submission_message(message):
+            if self._is_uncertain_submission_result(result):
                 self._mark_submission_unknown(pending_order, message)
                 return link_id
             self.active_orders.pop(link_id, None)
@@ -3976,6 +4164,8 @@ class GridEngine:
             return None
 
         if not self._confirm_pending_submission(pending_order, result.get("result", {})):
+            if pending_order.get("accepted_shape_mismatch"):
+                return link_id
             self._mark_submission_unknown(pending_order, "successful response had no order ID")
             logger.warning(
                 "Grid order acknowledgement had no order ID; preserving client order ID "
@@ -3997,6 +4187,7 @@ class GridEngine:
         if self.ownership_conflicts:
             return []
         planned = []
+        planned_keys: set[tuple[str, int, bool]] = set()
 
         for spec in order_specs:
             side = str(spec["side"])
@@ -4005,6 +4196,14 @@ class GridEngine:
             allow_duplicate = bool(spec.get("allow_duplicate", False))
             if not allow_duplicate and self._has_active_order(side, level_idx, reduce_only):
                 continue
+            planned_key = (side, level_idx, reduce_only)
+            if not allow_duplicate and planned_key in planned_keys:
+                raise RuntimeError(
+                    "Duplicate grid target detected before batch submission: "
+                    f"{side} level {level_idx} reduce_only={reduce_only}"
+                )
+            if not allow_duplicate:
+                planned_keys.add(planned_key)
             if self._stopping:
                 break
 
@@ -4022,7 +4221,10 @@ class GridEngine:
                 )
                 continue
             price_text = self._fp(float(spec["price"]))
-            link_id = f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:6]}"
+            link_id = (
+                f"g_{level_idx}_{side[0]}_"
+                f"{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
+            )
             planned.append(
                 {
                     "request": {
@@ -4096,7 +4298,7 @@ class GridEngine:
 
         for start in range(0, len(planned), BATCH_ORDER_CHUNK_SIZE):
             chunk = planned[start : start + BATCH_ORDER_CHUNK_SIZE]
-            if self._stopping:
+            if self._stopping or self.manual_stop_pending or self.risk_shutdown_pending:
                 break
 
             for item in chunk:
@@ -4143,7 +4345,7 @@ class GridEngine:
                 message = str(result.get("retMsg") or "Batch order failed")
                 if self._is_duplicate_client_order_rejection(
                     message
-                ) or self._is_uncertain_submission_message(message):
+                ) or self._is_uncertain_submission_result(result):
                     mark_unknown(chunk, message)
                     with contextlib.suppress(Exception):
                         self._reconcile_exchange_open_orders()
@@ -4170,6 +4372,8 @@ class GridEngine:
                 if order_result.get("retCode") == 0:
                     if self._confirm_pending_submission(state, order_result.get("result", {})):
                         remember_link(str(state["link_id"]))
+                    elif state.get("accepted_shape_mismatch"):
+                        remember_link(str(state["link_id"]))
                     else:
                         unconfirmed.append(item)
                     continue
@@ -4177,7 +4381,7 @@ class GridEngine:
                 message = str(order_result.get("retMsg") or "Batch order item rejected")
                 if self._is_duplicate_client_order_rejection(
                     message
-                ) or self._is_uncertain_submission_message(message):
+                ) or self._is_uncertain_submission_result(order_result):
                     unconfirmed.append(item)
                 else:
                     rejected.append((item, message))
@@ -4263,6 +4467,8 @@ class GridEngine:
             self._deploy_pending_targets()
 
         if direction == "neutral":
+            self.initialization_in_progress = True
+            self._persist_state()
             self._deploy_pending_targets()
 
         self.grid_ready = True
@@ -4332,6 +4538,10 @@ class GridEngine:
             allocated_qtys = self._allocate_qtys(raw_total_qty, target_count)
         if total_steps < target_count:
             raise RuntimeError("Total investment is too small for this symbol and grid count")
+        if len(allocated_qtys) != target_count:
+            raise RuntimeError(
+                "Grid target allocation count is inconsistent; no exchange order was submitted"
+            )
 
         total_qty = self._steps_to_qty(total_steps)
         qty_per_grid = total_qty / target_count
@@ -4339,12 +4549,12 @@ class GridEngine:
         fallback_qty = self._steps_to_qty(max(1, fallback_steps))
         target_qty_by_level: dict[str, float] = {}
         if direction in {"long", "short"}:
-            for target, allocated_qty in zip(profit_targets, allocated_qtys):
+            for target, allocated_qty in zip(profit_targets, allocated_qtys, strict=True):
                 target_qty_by_level[str(target[0])] = allocated_qty
             for target in add_targets:
                 target_qty_by_level.setdefault(str(target[0]), fallback_qty)
         else:
-            for target, allocated_qty in zip(add_targets, allocated_qtys):
+            for target, allocated_qty in zip(add_targets, allocated_qtys, strict=True):
                 target_qty_by_level[str(target[0])] = allocated_qty
 
         self.config["active_grid_count"] = target_count
@@ -4353,100 +4563,250 @@ class GridEngine:
         self.target_qty_by_level = target_qty_by_level
 
         self._pending_targets = {
+            "reference_price": float(reference_price),
             "profit_targets": profit_targets,
             "add_targets": add_targets,
             "allocated_qtys": allocated_qtys,
             "allocated_qty_by_level": target_qty_by_level,
             "qty_per_grid": qty_per_grid,
         }
+        # Validate the complete limit-order plan before a directional market
+        # opening can create exchange exposure.
+        self._validated_pending_target_plan()
         self._persist_state()
         return total_qty
 
-    def _deploy_pending_targets(self, qty_scale: float = 1.0):
+    def _validated_pending_target_plan(self, qty_scale: float = 1.0) -> list[dict[str, Any]]:
         if not self._pending_targets:
             raise RuntimeError("No pending grid targets were prepared")
 
+        pending = self._pending_targets
         direction = self.config["direction"]
-        profit_targets = self._pending_targets["profit_targets"]
-        add_targets = self._pending_targets["add_targets"]
-        allocated_qtys = [qty * qty_scale for qty in self._pending_targets["allocated_qtys"]]
-        qty_per_grid = self._pending_targets["qty_per_grid"] * qty_scale
-        allocated_qty_by_level = {
-            int(level_idx): float(qty) * qty_scale
-            for level_idx, qty in (self._pending_targets.get("allocated_qty_by_level") or {}).items()
-        }
-
-        def qty_for_level(level_idx: int) -> float:
-            return allocated_qty_by_level.get(level_idx, qty_per_grid)
-
-        batch_specs: list[dict[str, Any]] = []
-
-        def deploy_or_queue(
-            side: str,
-            price: float,
-            level_idx: int,
-            *,
-            reduce_only: bool,
-            qty_override: float,
-            entry_price: float | None = None,
+        try:
+            rounded_grid_prices = [Decimal(self._fp(level)) for level in self.grid_levels]
+        except Exception as exc:
+            raise RuntimeError("Grid prices cannot be represented by exchange precision") from exc
+        if any(
+            current <= previous
+            for previous, current in pairwise(rounded_grid_prices)
         ):
-            if self._supports_batch_orders():
-                batch_specs.append(
+            raise RuntimeError(
+                "Configured grid levels collapse to duplicate exchange prices; "
+                "reduce the grid count or widen the price range"
+            )
+        try:
+            scale = Decimal(str(qty_scale))
+        except Exception as exc:
+            raise RuntimeError("Invalid pending grid quantity scale") from exc
+        if not scale.is_finite() or scale <= 0:
+            raise RuntimeError("Pending grid quantity scale must be finite and greater than zero")
+
+        def normalize_targets(name: str) -> list[dict[str, Any]]:
+            raw_targets = pending.get(name)
+            if not isinstance(raw_targets, list):
+                raise RuntimeError(f"Pending grid {name} must be a list")
+            normalized: list[dict[str, Any]] = []
+            seen: set[tuple[int, str]] = set()
+            for position, target in enumerate(raw_targets):
+                if not isinstance(target, (list, tuple)) or len(target) != 3:
+                    raise RuntimeError(f"Pending grid {name}[{position}] is malformed")
+                try:
+                    level_idx = int(target[0])
+                    price = Decimal(str(target[1]))
+                except Exception as exc:
+                    raise RuntimeError(f"Pending grid {name}[{position}] has invalid values") from exc
+                side = str(target[2])
+                if level_idx < 0 or level_idx >= max(0, len(self.grid_levels) - 1):
+                    raise RuntimeError(f"Pending grid {name}[{position}] has an invalid level")
+                if not price.is_finite() or price <= 0:
+                    raise RuntimeError(f"Pending grid {name}[{position}] has an invalid price")
+                if side not in {"Buy", "Sell"}:
+                    raise RuntimeError(f"Pending grid {name}[{position}] has an invalid side")
+                identity = (level_idx, side)
+                if identity in seen:
+                    raise RuntimeError(
+                        f"Pending grid {name} contains duplicate {side} level {level_idx}"
+                    )
+                seen.add(identity)
+                normalized.append(
                     {
-                        "side": side,
-                        "price": price,
                         "level_idx": level_idx,
-                        "reduce_only": reduce_only,
-                        "qty_override": qty_override,
-                        "entry_price": entry_price,
+                        "price": float(price),
+                        "price_text": self._fp(float(price)),
+                        "side": side,
                     }
                 )
-                return
-            self._place(
-                side,
-                price,
-                level_idx,
-                reduce_only=reduce_only,
-                qty_override=qty_override,
-                entry_price=entry_price,
+            return normalized
+
+        profit_targets = normalize_targets("profit_targets")
+        add_targets = normalize_targets("add_targets")
+
+        reference_price = pending.get("reference_price")
+        if reference_price not in (None, ""):
+            try:
+                reference = Decimal(str(reference_price))
+            except Exception as exc:
+                raise RuntimeError("Pending grid reference price is invalid") from exc
+            if not reference.is_finite() or reference <= 0:
+                raise RuntimeError("Pending grid reference price is invalid")
+            expected_profit, expected_add = self._target_orders_for_price(float(reference))
+
+            def signature(targets: list[dict[str, Any]]) -> list[tuple[int, str, str]]:
+                return [
+                    (int(target["level_idx"]), str(target["price_text"]), str(target["side"]))
+                    for target in targets
+                ]
+
+            expected_profit_signature = [
+                (int(level_idx), self._fp(float(price)), str(side))
+                for level_idx, price, side in expected_profit
+            ]
+            expected_add_signature = [
+                (int(level_idx), self._fp(float(price)), str(side))
+                for level_idx, price, side in expected_add
+            ]
+            if signature(profit_targets) != expected_profit_signature:
+                raise RuntimeError("Pending profit targets do not match the prepared grid")
+            if signature(add_targets) != expected_add_signature:
+                raise RuntimeError("Pending add targets do not match the prepared grid")
+
+        raw_allocations = pending.get("allocated_qtys")
+        if not isinstance(raw_allocations, list):
+            raise RuntimeError("Pending grid allocated quantities must be a list")
+        allocation_targets = profit_targets if direction in {"long", "short"} else add_targets
+        if len(raw_allocations) != len(allocation_targets):
+            raise RuntimeError(
+                "Pending grid target and quantity counts differ; no exchange order was submitted"
+            )
+
+        allocated_qtys: list[Decimal] = []
+        for position, raw_qty in enumerate(raw_allocations):
+            try:
+                qty = Decimal(str(raw_qty)) * scale
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Pending grid allocated quantity {position} is invalid"
+                ) from exc
+            if not qty.is_finite() or qty <= 0:
+                raise RuntimeError(
+                    f"Pending grid allocated quantity {position} must be greater than zero"
+                )
+            allocated_qtys.append(qty)
+
+        try:
+            qty_per_grid = Decimal(str(pending.get("qty_per_grid"))) * scale
+        except Exception as exc:
+            raise RuntimeError("Pending grid fallback quantity is invalid") from exc
+        if not qty_per_grid.is_finite() or qty_per_grid <= 0:
+            raise RuntimeError("Pending grid fallback quantity must be greater than zero")
+
+        raw_qty_by_level = pending.get("allocated_qty_by_level") or {}
+        if not isinstance(raw_qty_by_level, dict):
+            raise RuntimeError("Pending grid level quantities must be an object")
+        allocated_qty_by_level: dict[int, Decimal] = {}
+        valid_levels = {
+            int(target["level_idx"]) for target in profit_targets + add_targets
+        }
+        for raw_level, raw_qty in raw_qty_by_level.items():
+            try:
+                level_idx = int(raw_level)
+                qty = Decimal(str(raw_qty)) * scale
+            except Exception as exc:
+                raise RuntimeError("Pending grid level quantity is invalid") from exc
+            if level_idx not in valid_levels or not qty.is_finite() or qty <= 0:
+                raise RuntimeError("Pending grid level quantity is inconsistent with its targets")
+            allocated_qty_by_level[level_idx] = qty
+
+        plan: list[dict[str, Any]] = []
+        plan_keys: set[tuple[str, int, bool]] = set()
+
+        def append_plan(target: dict[str, Any], raw_qty: Decimal, *, reduce_only: bool):
+            # Every initial quantity must support a complete grid round trip.
+            # A reduce-only residual may be accepted below the normal minimum,
+            # but its later non-reduce counter order would then be impossible.
+            qty_text = self._order_qty_text(float(raw_qty), reduce_only=False)
+            if not qty_text:
+                raise RuntimeError(
+                    "A pending grid order is below exchange quantity precision or minimum: "
+                    f"{target['side']} level {target['level_idx']} requested={raw_qty}"
+                )
+            plan_key = (str(target["side"]), int(target["level_idx"]), reduce_only)
+            if plan_key in plan_keys:
+                raise RuntimeError(
+                    "Pending grid plan contains a duplicate order target: "
+                    f"{target['side']} level {target['level_idx']} reduce_only={reduce_only}"
+                )
+            plan_keys.add(plan_key)
+            plan.append(
+                {
+                    "side": str(target["side"]),
+                    "price": float(target["price"]),
+                    "price_text": str(target["price_text"]),
+                    "level_idx": int(target["level_idx"]),
+                    "reduce_only": reduce_only,
+                    "qty_override": float(qty_text),
+                    "qty_text": qty_text,
+                    "entry_price": self.initial_entry_price if reduce_only else None,
+                }
             )
 
         if direction in {"long", "short"}:
-            for target, allocated_qty in zip(profit_targets, allocated_qtys):
-                idx, target_price, target_side = target
-                deploy_or_queue(
-                    target_side,
-                    target_price,
-                    idx,
-                    reduce_only=True,
-                    qty_override=allocated_qty,
-                    entry_price=self.initial_entry_price,
-                )
-
-            for idx, target_price, target_side in add_targets:
-                deploy_or_queue(
-                    target_side,
-                    target_price,
-                    idx,
+            for target, allocated_qty in zip(profit_targets, allocated_qtys, strict=True):
+                append_plan(target, allocated_qty, reduce_only=True)
+            for target in add_targets:
+                append_plan(
+                    target,
+                    allocated_qty_by_level.get(int(target["level_idx"]), qty_per_grid),
                     reduce_only=False,
-                    qty_override=qty_for_level(idx),
                 )
         else:
-            for target, allocated_qty in zip(add_targets, allocated_qtys):
-                idx, target_price, target_side = target
-                deploy_or_queue(
-                    target_side,
-                    target_price,
-                    idx,
-                    reduce_only=False,
-                    qty_override=allocated_qty,
-                )
+            for target, allocated_qty in zip(add_targets, allocated_qtys, strict=True):
+                append_plan(target, allocated_qty, reduce_only=False)
 
-        if batch_specs:
-            self._place_batch_limit_orders(batch_specs)
+        if not plan:
+            raise RuntimeError("Pending grid plan has no exchange orders")
+        return plan
+
+    def _deploy_pending_targets(self, qty_scale: float = 1.0):
+        plan = self._validated_pending_target_plan(qty_scale)
+        placed_links: list[str] = []
+
+        if self._supports_batch_orders():
+            placed_links.extend(self._place_batch_limit_orders(plan))
+        else:
+            for spec in plan:
+                link_id = self._place(
+                    str(spec["side"]),
+                    float(spec["price"]),
+                    int(spec["level_idx"]),
+                    reduce_only=bool(spec["reduce_only"]),
+                    qty_override=float(spec["qty_override"]),
+                    entry_price=spec.get("entry_price"),
+                )
+                if link_id:
+                    placed_links.append(link_id)
+
+        shape_mismatches = [
+            self.active_orders[link_id]
+            for link_id in set(placed_links)
+            if link_id in self.active_orders
+            and self.active_orders[link_id].get("accepted_shape_mismatch")
+        ]
+        if shape_mismatches:
+            raise RuntimeError(
+                "Initial grid deployment accepted an order with a different exchange shape; "
+                "the strategy was not marked ready and managed orders will be cancelled"
+            )
+        if len(set(placed_links)) != len(plan):
+            raise RuntimeError(
+                "Initial grid deployment is incomplete: "
+                f"prepared {len(plan)} order(s), exchange confirmed or retained "
+                f"{len(set(placed_links))}; the grid was not marked ready"
+            )
 
         self.grid_ready = True
         self.waiting_initial_order = False
+        self.initialization_in_progress = False
         self.trigger_message = ""
         self._pending_targets = None
         self._persist_state()
@@ -4707,7 +5067,31 @@ class GridEngine:
         self.opening_order = None
         post_only = str(order.get("time_in_force") or "") == "PostOnly"
         retry_price = self._initial_limit_price(side, current_price, post_only=post_only)
-        self._place_limit_open(side, qty, retry_price, post_only=post_only)
+        try:
+            self._place_limit_open(side, qty, retry_price, post_only=post_only)
+        except Exception as exc:
+            if self.opening_order:
+                self.grid_ready = False
+                self.waiting_initial_order = True
+                self.trigger_message = (
+                    f"Opening order replacement may already be on the exchange: {exc}. "
+                    "The original replacement client order ID is retained and will be "
+                    "reconciled without submitting another opening order."
+                )
+                self._mark_fast_poll()
+                with contextlib.suppress(Exception):
+                    self._persist_state()
+                return
+            self.running = False
+            self.grid_ready = False
+            self.waiting_initial_order = False
+            self.opening_order = None
+            self.trigger_message = (
+                f"Opening order replacement failed before any confirmed fill: {exc}. "
+                "The grid was stopped without submitting another opening order."
+            )
+            self._persist_state()
+            return
         order_label = "Post-only" if post_only else "Limit"
         self.trigger_message = (
             f"{order_label} opening order ended as {status} without fills; "
@@ -4807,28 +5191,15 @@ class GridEngine:
             self.waiting_initial_order = False
             self.running = False
             self.trigger_message = "Opening order fill quantity is too small; please restart the grid."
-            return
-
-        try:
-            self._prepare_pending_targets(stats["price"], stats["qty"])
-        except RuntimeError as exc:
-            self.waiting_initial_order = False
-            self.opening_order = None
-            self.running = False
-            self.trigger_message = str(exc)
             self._persist_state()
             return
-        allocated_qtys = self._pending_targets["allocated_qtys"] if self._pending_targets else []
-        if allocated_qtys and min(allocated_qtys) < self.min_qty:
-            self.waiting_initial_order = False
-            self.running = False
-            self.trigger_message = "Opening order partial fill is too small for grid allocation."
-            return
 
+        # The exchange fill is authoritative even if the subsequent grid plan
+        # cannot be deployed. Record ownership before any validation that can
+        # fail so a real position can never disappear from the local ledger.
         self.initial_qty = stats["qty"]
         self.initial_entry_price = stats["price"]
         self._set_initial_grid_position(self.initial_side, stats["qty"])
-        self._reset_reduce_lots_from_pending_targets(stats["price"])
         self._record_trade_value(
             stats["price"],
             stats["qty"],
@@ -4838,7 +5209,27 @@ class GridEngine:
             fee_source=stats["fee_source"],
         )
         self.opening_order = None
-        self._deploy_pending_targets()
+        self.waiting_initial_order = False
+        self.initialization_in_progress = True
+        self._persist_state()
+
+        try:
+            self._prepare_pending_targets(stats["price"], stats["qty"])
+            self._reset_reduce_lots_from_pending_targets(stats["price"])
+            self._deploy_pending_targets()
+        except Exception as exc:
+            self.initialization_in_progress = False
+            self.initialization_failed = True
+            self.manual_stop_pending = True
+            self.grid_ready = False
+            self.trigger_message = (
+                f"Opening fill was recorded, but grid deployment failed: {exc}. "
+                "Managed grid orders will be cancelled; the confirmed position is retained "
+                "for review and will not be market-closed automatically."
+            )
+            self._mark_fast_poll()
+            self._persist_state()
+            return
         self._persist_state()
 
     async def _check_fills(self):
@@ -4874,19 +5265,89 @@ class GridEngine:
             return
 
         pending = list(self.paused_replacements)
-        remaining = []
-        self.paused_replacements.clear()
+
+        def dequeue(order: dict) -> None:
+            self.paused_replacements = [
+                queued for queued in self.paused_replacements if queued is not order
+            ]
+
+        def durable_replacement_link(order: dict, side: str, level_idx: int) -> str:
+            link_id = str(order.get("replacement_link_id") or "")
+            if link_id:
+                return link_id
+            link_id = (
+                f"g_{level_idx}_{side[0]}_"
+                f"{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
+            )
+            order["replacement_link_id"] = link_id
+            # Persist the retry identity before any exchange write. The queue
+            # remains present until that same identity is in active_orders.
+            self._persist_state()
+            return link_id
+
+        def preserve_completion_marker(order: dict, link_id: str) -> None:
+            if order.get("completed_pair_counted") and link_id in self.active_orders:
+                self.active_orders[link_id]["completed_pair_counted"] = True
+
         for order in pending:
-            if not self._should_place_counter_order_now(order):
-                remaining.append(order)
+            if order.get("replacement_mode") == "same_order":
+                now = time.time()
+                if now < float(order.get("replacement_retry_after", 0) or 0):
+                    continue
+                side = str(order["side"])
+                level_idx = int(order["level_idx"])
+                replacement_link_id = durable_replacement_link(order, side, level_idx)
+                if replacement_link_id in self.active_orders:
+                    preserve_completion_marker(order, replacement_link_id)
+                    dequeue(order)
+                    self._persist_state()
+                    continue
+                placed = self._place(
+                    side,
+                    float(order["price"]),
+                    level_idx,
+                    reduce_only=bool(order.get("reduce_only")),
+                    qty_override=float(order["qty"]),
+                    entry_price=order.get("entry_price"),
+                    allow_duplicate=True,
+                    tag=order.get("tag"),
+                    link_id_override=replacement_link_id,
+                )
+                if placed:
+                    preserve_completion_marker(order, replacement_link_id)
+                    dequeue(order)
+                    self._persist_state()
+                else:
+                    attempts = int(order.get("replacement_retry_attempts", 0) or 0) + 1
+                    order["replacement_retry_attempts"] = attempts
+                    order["replacement_retry_after"] = now + min(
+                        30.0,
+                        NORMAL_POLL_SECONDS * (2 ** min(attempts, 4)),
+                    )
                 continue
-            if not self._place_counter_order(order):
-                remaining.append(order)
-        self.paused_replacements = remaining
+            if not self._should_place_counter_order_now(order):
+                continue
+            plan = self._counter_order_plan(order)
+            if plan:
+                replacement_link_id = durable_replacement_link(
+                    order,
+                    str(plan["side"]),
+                    int(plan["level_idx"]),
+                )
+                if replacement_link_id in self.active_orders:
+                    dequeue(order)
+                    self._persist_state()
+                    continue
+            if self._place_counter_order(order):
+                dequeue(order)
+                self._persist_state()
         self.trigger_message = (
             ""
-            if not remaining
-            else f"{len(remaining)} counter order(s) are still queued; retrying next poll."
+            if not self.paused_replacements
+            else (
+                f"{len(self.paused_replacements)} grid replacement order(s) are still queued; "
+                "retrying safely."
+            )
         )
         self._persist_state()
 
@@ -4980,7 +5441,6 @@ class GridEngine:
         if not snapshot:
             return None
 
-        status = self._order_status_from_snapshot(snapshot)
         qty = self._float_field(snapshot, "executedQty", "cumExecQty", "cumQty", "cum_exec_qty")
         if qty <= 0:
             return None
@@ -5035,27 +5495,93 @@ class GridEngine:
             "PARTIALLYFILLEDCANCELED",
         }
 
-    def _replace_cancelled_order(self, order: dict):
-        placed = self._place(
-            order["side"],
-            float(order["price"]),
-            int(order["level_idx"]),
-            reduce_only=bool(order["reduce_only"]),
-            qty_override=float(order["qty"]),
-            entry_price=order.get("entry_price"),
-            allow_duplicate=bool(order["reduce_only"]),
-            tag=order.get("tag"),
+    def _replace_cancelled_order(self, order: dict) -> bool:
+        queued = self._queue_exact_replacement(
+            order,
+            "exchange-confirmed cancellation",
+            retry_immediately=True,
         )
-        if placed and order.get("completed_pair_counted") and placed in self.active_orders:
-            self.active_orders[placed]["completed_pair_counted"] = True
-            self._persist_state()
+        if not queued:
+            return False
+        replacement_link_id = str(queued.get("replacement_link_id") or "")
+        self._resume_paused_replacements()
+        placed = replacement_link_id in self.active_orders
         if placed:
             logger.warning(
                 "Replaced cancelled grid order symbol=%s old_order_id=%s new_link_id=%s",
                 self.config.get("symbol"),
                 order.get("order_id"),
-                placed,
+                replacement_link_id,
             )
+            return True
+
+        if not self._stopping:
+            self.trigger_message = (
+                "A cancelled grid order could not be replaced; the exact order is queued "
+                "for persistent retry and the gap is not being treated as complete."
+            )
+            self._mark_fast_poll()
+            self._persist_state()
+        return False
+
+    def _queue_exact_replacement(
+        self,
+        order: dict,
+        reason: str,
+        *,
+        retry_immediately: bool = False,
+    ) -> dict | None:
+        if self._stopping:
+            return None
+        source_link_id = str(order.get("link_id", "") or "")
+        already_queued = next(
+            (
+                item
+                for item in self.paused_replacements
+                if item.get("replacement_mode") == "same_order"
+                and str(item.get("replacement_source_link_id", "") or "")
+                == source_link_id
+            ),
+            None,
+        )
+        if already_queued:
+            if retry_immediately:
+                already_queued["replacement_retry_after"] = 0.0
+                self._persist_state()
+            return already_queued
+
+        side = str(order["side"])
+        level_idx = int(order["level_idx"])
+        queued = dict(order)
+        for field in (
+            "submission_pending",
+            "submission_attempts",
+            "submission_not_found_count",
+            "submission_last_not_found_at",
+            "submission_updated_at",
+            "submission_retry_blocked",
+        ):
+            queued.pop(field, None)
+        queued.update(
+            {
+                "status": "QUEUED_REPLACEMENT",
+                "replacement_mode": "same_order",
+                "replacement_source_link_id": source_link_id,
+                "replacement_link_id": (
+                    f"g_{level_idx}_{side[0]}_"
+                    f"{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
+                ),
+                "replacement_retry_attempts": 0,
+                "replacement_retry_after": (
+                    0.0 if retry_immediately else time.time() + NORMAL_POLL_SECONDS
+                ),
+                "replacement_error": str(reason or "replacement rejected"),
+            }
+        )
+        self.paused_replacements.append(queued)
+        self._mark_fast_poll()
+        self._persist_state()
+        return queued
 
     def _record_fill(
         self,
@@ -5063,6 +5589,7 @@ class GridEngine:
         stats: dict | None = None,
         *,
         count_completed_pair: bool = True,
+        persist_state: bool = True,
     ):
         level_idx = order["level_idx"]
         fallback_qty = float(order["qty"])
@@ -5119,7 +5646,8 @@ class GridEngine:
                 "reduce_only": order["reduce_only"],
             }
         )
-        self._persist_state()
+        if persist_state:
+            self._persist_state()
 
     def _place_counter_leg(
         self,
@@ -5130,6 +5658,7 @@ class GridEngine:
         reduce_only: bool,
         qty: float,
         entry_price: float | None = None,
+        link_id_override: str | None = None,
     ) -> bool:
         requested_qty = float(qty)
         if not reduce_only:
@@ -5172,6 +5701,7 @@ class GridEngine:
                 entry_price=entry_price,
                 allow_duplicate=bool(reduce_only)
                 or self._has_active_order(side, level_idx, reduce_only),
+                link_id_override=link_id_override,
             )
             is not None
         )
@@ -5270,4 +5800,5 @@ class GridEngine:
             reduce_only=bool(plan["reduce_only"]),
             qty=float(plan["qty"]),
             entry_price=plan.get("entry_price"),
+            link_id_override=str(order.get("replacement_link_id") or "") or None,
         )

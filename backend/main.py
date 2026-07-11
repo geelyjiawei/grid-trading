@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from itertools import pairwise
 from threading import RLock
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -32,11 +33,20 @@ from secret_store import decrypt_text, encrypt_text, storage_backend
 logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
 _engines_lock = RLock()
+_state_files_lock = RLock()
 _starting_engine_keys: set[str] = set()
 SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
 DEFAULT_EXCHANGE = "bybit"
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
 DEFAULT_TAKER_FEE_RATE = float(os.getenv("GRID_TAKER_FEE_RATE", "0.0005"))
+HISTORY_STATE_UPDATE_INTERVAL_SECONDS = 1.0
+
+
+class GridStateIntegrityError(RuntimeError):
+    """Raised when the durable trading ledger cannot be read safely."""
+
+
+_grid_state_integrity_error = ""
 
 BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
@@ -56,6 +66,26 @@ def _private_chmod(path: str):
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _fsync_parent_directory(path: str):
+    if os.name == "nt":
+        return
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    descriptor = None
+    try:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        os.fsync(descriptor)
+    except OSError:
+        # The file itself is already durable. Some mounted filesystems do not
+        # allow directory fsync, so treat this final metadata barrier as best effort.
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _cors_allowed_origins() -> list[str]:
@@ -324,9 +354,12 @@ def _engine_requires_cleanup(engine: GridEngine | None) -> bool:
         or engine.active_orders
         or engine.opening_order
         or engine.pending_reduce_action
+        or engine.paused_replacements
+        or engine.initialization_in_progress
         or engine.risk_shutdown_pending
         or engine.manual_stop_pending
         or engine.initialization_failed
+        or engine._qty_reaches_accounting_step(engine._grid_position_qty())
     )
 
 
@@ -392,59 +425,99 @@ _client = _clients.get(_active_exchange)
 
 
 def _load_grid_state_file() -> dict:
-    if not os.path.exists(GRID_STATE_FILE):
-        return {"version": 1, "grids": {}}
+    global _grid_state_integrity_error
+    with _state_files_lock:
+        if not os.path.exists(GRID_STATE_FILE):
+            _grid_state_integrity_error = ""
+            return {"version": 1, "grids": {}}
 
-    try:
-        with open(GRID_STATE_FILE, "r", encoding="utf-8") as file:
-            state = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "grids": {}}
+        try:
+            with open(GRID_STATE_FILE, "r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            message = (
+                "The durable grid state file cannot be read safely. New grid starts are "
+                "blocked so existing exchange work cannot be mistaken for an empty account."
+            )
+            _grid_state_integrity_error = message
+            raise GridStateIntegrityError(message) from exc
 
-    if not isinstance(state, dict):
-        return {"version": 1, "grids": {}}
-    state.setdefault("version", 1)
-    state.setdefault("grids", {})
-    return state
+        if not isinstance(state, dict):
+            message = (
+                "The durable grid state file has an invalid root structure. New grid starts "
+                "are blocked until the ledger is reviewed."
+            )
+            _grid_state_integrity_error = message
+            raise GridStateIntegrityError(message)
+        grids = state.get("grids")
+        if grids is not None and not isinstance(grids, dict):
+            message = (
+                "The durable grid state file has an invalid grids structure. New grid starts "
+                "are blocked until the ledger is reviewed."
+            )
+            _grid_state_integrity_error = message
+            raise GridStateIntegrityError(message)
+        state.setdefault("version", 1)
+        state.setdefault("grids", {})
+        _grid_state_integrity_error = ""
+        return state
 
 
 def _write_grid_state_file(state: dict):
-    state_dir = os.path.dirname(GRID_STATE_FILE)
-    if state_dir:
-        os.makedirs(state_dir, exist_ok=True)
-    tmp_path = f"{GRID_STATE_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, GRID_STATE_FILE)
-    _private_chmod(GRID_STATE_FILE)
+    global _grid_state_integrity_error
+    with _state_files_lock:
+        state_dir = os.path.dirname(GRID_STATE_FILE)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        tmp_path = f"{GRID_STATE_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(state, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, GRID_STATE_FILE)
+        _fsync_parent_directory(GRID_STATE_FILE)
+        _private_chmod(GRID_STATE_FILE)
+        _grid_state_integrity_error = ""
+
+
+def _assert_grid_state_integrity():
+    try:
+        _load_grid_state_file()
+    except GridStateIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _load_grid_history_file() -> dict:
-    if not os.path.exists(GRID_HISTORY_FILE):
-        return {"version": 1, "runs": []}
+    with _state_files_lock:
+        if not os.path.exists(GRID_HISTORY_FILE):
+            return {"version": 1, "runs": []}
 
-    try:
-        with open(GRID_HISTORY_FILE, "r", encoding="utf-8") as file:
-            history = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "runs": []}
+        try:
+            with open(GRID_HISTORY_FILE, "r", encoding="utf-8") as file:
+                history = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            return {"version": 1, "runs": []}
 
-    if not isinstance(history, dict):
-        return {"version": 1, "runs": []}
-    history.setdefault("version", 1)
-    history.setdefault("runs", [])
-    return history
+        if not isinstance(history, dict):
+            return {"version": 1, "runs": []}
+        history.setdefault("version", 1)
+        history.setdefault("runs", [])
+        return history
 
 
 def _write_grid_history_file(history: dict):
-    history_dir = os.path.dirname(GRID_HISTORY_FILE)
-    if history_dir:
-        os.makedirs(history_dir, exist_ok=True)
-    tmp_path = f"{GRID_HISTORY_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as file:
-        json.dump(history, file, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, GRID_HISTORY_FILE)
-    _private_chmod(GRID_HISTORY_FILE)
+    with _state_files_lock:
+        history_dir = os.path.dirname(GRID_HISTORY_FILE)
+        if history_dir:
+            os.makedirs(history_dir, exist_ok=True)
+        tmp_path = f"{GRID_HISTORY_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(history, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, GRID_HISTORY_FILE)
+        _fsync_parent_directory(GRID_HISTORY_FILE)
+        _private_chmod(GRID_HISTORY_FILE)
 
 
 def _history_record_from_engine(engine: GridEngine, status: str = "running") -> dict:
@@ -533,7 +606,8 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     if info_resp.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=info_resp.get("retMsg", "Failed to fetch instrument info"))
     instrument = info_resp["result"]["list"][0]
-    tick_size = float(instrument["priceFilter"]["tickSize"])
+    tick_size_text = str(instrument["priceFilter"]["tickSize"])
+    tick_size = float(tick_size_text)
     lot_filter = instrument["lotSizeFilter"]
     explicit_market_filter = instrument.get("marketLotSizeFilter")
     market_filter = explicit_market_filter or lot_filter
@@ -569,6 +643,18 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
             reference_price = maker_safe_price
 
     levels = _calculate_grid_levels(cfg.lower_price, cfg.upper_price, cfg.grid_count, grid_mode)
+    rounded_levels = [float(client.round_to_step(level, tick_size_text)) for level in levels]
+    if any(
+        current <= previous
+        for previous, current in pairwise(rounded_levels)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Configured grid levels collapse to duplicate exchange prices; "
+                "reduce the grid count or widen the price range"
+            ),
+        )
     if not (levels[0] < reference_price < levels[-1]):
         raise HTTPException(
             status_code=400,
@@ -673,6 +759,16 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
             for index in range(active_count)
         ]
 
+    limit_qty_tolerance = max(float(qty_step) * 1e-9, 1e-18)
+    if min(per_order_qtys) + limit_qty_tolerance < min_qty:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Per-grid quantity {min(per_order_qtys)} is below the exchange limit-order "
+                f"minimum {min_qty}; increase the per-grid quantity or investment"
+            ),
+        )
+
     if grid_mode == "geometric":
         ratio = (levels[1] / levels[0]) if len(levels) > 1 else 1
         grid_profit_pct = (ratio - 1) * 100
@@ -725,22 +821,27 @@ def _upsert_grid_history(engine: GridEngine, status: str = "running"):
     if not run_id:
         return
 
-    history = _load_grid_history_file()
-    runs = history.setdefault("runs", [])
-    new_record = _history_record_from_engine(engine, status)
-    for index, record in enumerate(runs):
-        if record.get("run_id") == run_id:
-            new_record["started_at"] = record.get("started_at") or new_record["started_at"]
-            if status not in {"stopped", "closed"}:
-                new_record["stopped_at"] = record.get("stopped_at")
-            runs[index] = {**record, **new_record}
-            break
-    else:
-        runs.append(new_record)
+    with _state_files_lock:
+        history = _load_grid_history_file()
+        runs = history.setdefault("runs", [])
+        new_record = _history_record_from_engine(engine, status)
+        for index, record in enumerate(runs):
+            if record.get("run_id") == run_id:
+                new_record["started_at"] = record.get("started_at") or new_record["started_at"]
+                if status not in {"stopped", "closed"}:
+                    new_record["stopped_at"] = record.get("stopped_at")
+                runs[index] = {**record, **new_record}
+                break
+        else:
+            runs.append(new_record)
 
-    history["runs"] = sorted(runs, key=lambda item: float(item.get("started_at") or 0), reverse=True)[:500]
-    history["updated_at"] = time.time()
-    _write_grid_history_file(history)
+        history["runs"] = sorted(
+            runs,
+            key=lambda item: float(item.get("started_at") or 0),
+            reverse=True,
+        )[:500]
+        history["updated_at"] = time.time()
+        _write_grid_history_file(history)
 
 
 def _save_engine_state(engine: GridEngine):
@@ -750,28 +851,50 @@ def _save_engine_state(engine: GridEngine):
 
     exchange = _engine_exchange(engine)
     engine.config["exchange"] = exchange
-    state = _load_grid_state_file()
-    state["updated_at"] = time.time()
-    state.setdefault("grids", {})[_engine_key(exchange, symbol)] = engine.to_state()
-    _write_grid_state_file(state)
-    _upsert_grid_history(engine, "running" if engine.running else "saved")
+    history_status = "running" if engine.running else "saved"
+    with _state_files_lock:
+        state = _load_grid_state_file()
+        state["updated_at"] = time.time()
+        state.setdefault("grids", {})[_engine_key(exchange, symbol)] = engine.to_state()
+        _write_grid_state_file(state)
+
+        now = time.monotonic()
+        previous_status = getattr(engine, "_last_history_state_status", "")
+        try:
+            previous_write = float(
+                getattr(engine, "_last_history_state_write_at", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            previous_write = 0.0
+        if (
+            history_status != previous_status
+            or now - previous_write >= HISTORY_STATE_UPDATE_INTERVAL_SECONDS
+        ):
+            _upsert_grid_history(engine, history_status)
+            engine._last_history_state_status = history_status
+            engine._last_history_state_write_at = now
 
 
 def _delete_engine_state(symbol: str, exchange: str | None = None):
-    state = _load_grid_state_file()
-    grids = state.setdefault("grids", {})
-    symbol = symbol.upper()
-    if exchange:
-        grids.pop(_engine_key(exchange, symbol), None)
-    else:
-        for key in (symbol, *[item for item in list(grids) if item.endswith(f":{symbol}")]):
-            grids.pop(key, None)
-    state["updated_at"] = time.time()
-    _write_grid_state_file(state)
+    with _state_files_lock:
+        state = _load_grid_state_file()
+        grids = state.setdefault("grids", {})
+        symbol = symbol.upper()
+        if exchange:
+            grids.pop(_engine_key(exchange, symbol), None)
+        else:
+            for key in (symbol, *[item for item in list(grids) if item.endswith(f":{symbol}")]):
+                grids.pop(key, None)
+        state["updated_at"] = time.time()
+        _write_grid_state_file(state)
 
 
 def _restore_saved_engines():
-    state = _load_grid_state_file()
+    try:
+        state = _load_grid_state_file()
+    except GridStateIntegrityError as exc:
+        logger.critical("Grid state restore blocked by ledger integrity failure: %s", exc)
+        return
     legacy_exchange = _normalize_exchange(state.get("exchange"))
 
     for state_key, engine_state in list(state.get("grids", {}).items()):
@@ -792,22 +915,23 @@ def _restore_saved_engines():
         config["exchange"] = exchange
         engine = GridEngine(_client_for_exchange(exchange), config, state_callback=_save_engine_state)
         try:
-            should_restart = bool(engine_state.get("running", False))
             engine.restore_state(engine_state)
             engine.config["exchange"] = exchange
             with _engines_lock:
                 _engines[key] = engine
-            can_restart = (
-                should_restart
-                and not engine._stopping
-                and (
-                    engine.grid_ready
-                    or engine.waiting_trigger
-                    or engine.waiting_initial_order
-                    or engine.manual_stop_pending
-                    or engine.risk_shutdown_pending
-                    or engine.pending_reduce_action
-                )
+            cleanup_must_resume = bool(
+                engine.manual_stop_pending
+                or engine.risk_shutdown_pending
+                or engine.pending_reduce_action
+            )
+            strategy_can_resume = bool(
+                engine.grid_ready
+                or engine.waiting_trigger
+                or engine.waiting_initial_order
+            )
+            can_restart = not engine._stopping and (
+                cleanup_must_resume
+                or strategy_can_resume
             )
             if can_restart:
                 try:
@@ -821,12 +945,13 @@ def _restore_saved_engines():
                 engine.running = False
                 engine._persist_state()
             if state_key != key:
-                migrated_state = _load_grid_state_file()
-                grids = migrated_state.setdefault("grids", {})
-                if key in grids and state_key in grids:
-                    grids.pop(state_key, None)
-                    migrated_state["updated_at"] = time.time()
-                    _write_grid_state_file(migrated_state)
+                with _state_files_lock:
+                    migrated_state = _load_grid_state_file()
+                    grids = migrated_state.setdefault("grids", {})
+                    if key in grids and state_key in grids:
+                        grids.pop(state_key, None)
+                        migrated_state["updated_at"] = time.time()
+                        _write_grid_state_file(migrated_state)
         except Exception as exc:
             # Keep the saved state on disk so the UI/risk checks can still show the problem.
             logger.exception("Failed to restore saved grid symbol=%s: %s", config.get("symbol"), exc)
@@ -1183,6 +1308,10 @@ async def start_grid(cfg: GridConfig):
     if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
+    # Never interpret a damaged durable ledger as an empty account. This check
+    # runs before any exchange order or position-changing request.
+    _assert_grid_state_integrity()
+
     engine_config = cfg.model_dump()
     engine_config["exchange"] = exchange
     engine_config["symbol"] = symbol
@@ -1240,6 +1369,7 @@ async def start_grid(cfg: GridConfig):
             or engine._qty_reaches_accounting_step(engine._grid_position_qty())
         )
         if has_exchange_state:
+            engine.initialization_in_progress = False
             engine.initialization_failed = True
             engine.manual_stop_pending = True
             engine.grid_ready = False
@@ -1504,9 +1634,12 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     grid_coverage = {}
     grid_coverage_risk = False
     pending_submissions = []
+    queued_replacements = []
+    accepted_shape_mismatches = []
     risk_shutdown_pending = False
     manual_stop_pending = False
     initialization_failed = False
+    initialization_in_progress = False
     if engine:
         status = engine.get_status()
         expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
@@ -1524,6 +1657,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         risk_shutdown_pending = bool(status.get("risk_shutdown_pending"))
         manual_stop_pending = bool(status.get("manual_stop_pending"))
         initialization_failed = bool(status.get("initialization_failed"))
+        initialization_in_progress = bool(status.get("initialization_in_progress"))
         pending_submissions = [
             {
                 "order_link_id": order.get("link_id", ""),
@@ -1537,6 +1671,42 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
             }
             for order in submission_records
             if order.get("submission_pending") or order is engine.pending_reduce_action
+        ]
+        queued_replacements = [
+            {
+                "mode": item.get("replacement_mode", "counter_order"),
+                "side": item.get("side", ""),
+                "price": item.get("price", "0"),
+                "qty": item.get("qty", "0"),
+                "level_idx": item.get("level_idx"),
+                "reduce_only": bool(item.get("reduce_only", False)),
+                "attempts": int(item.get("replacement_retry_attempts", 0) or 0),
+            }
+            for item in engine.paused_replacements
+        ]
+        accepted_shape_mismatches = [
+            {
+                "order_id": order.get("order_id", ""),
+                "order_link_id": order.get("link_id", ""),
+                "reason": order.get("accepted_shape_mismatch", ""),
+                "expected_side": order.get("expected_side", order.get("side", "")),
+                "expected_price": order.get("expected_price", order.get("price", "0")),
+                "expected_qty": order.get("expected_qty", order.get("qty", "0")),
+                "expected_reduce_only": bool(
+                    order.get("expected_reduce_only", order.get("reduce_only", False))
+                ),
+                "actual_side": order.get("exchange_accepted_side", order.get("side", "")),
+                "actual_price": order.get("exchange_accepted_price", order.get("price", "0")),
+                "actual_qty": order.get("exchange_accepted_qty", order.get("qty", "0")),
+                "actual_reduce_only": bool(
+                    order.get(
+                        "exchange_accepted_reduce_only",
+                        order.get("reduce_only", False),
+                    )
+                ),
+            }
+            for order in submission_records
+            if order.get("accepted_shape_mismatch")
         ]
     return {
         "symbol": symbol,
@@ -1552,9 +1722,15 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "grid_coverage": grid_coverage,
         "pending_submission_count": len(pending_submissions),
         "pending_submissions": pending_submissions,
+        "queued_replacement_count": len(queued_replacements),
+        "queued_replacements": queued_replacements,
+        "accepted_shape_mismatch_count": len(accepted_shape_mismatches),
+        "accepted_shape_mismatches": accepted_shape_mismatches,
         "risk_shutdown_pending": risk_shutdown_pending,
         "manual_stop_pending": manual_stop_pending,
         "initialization_failed": initialization_failed,
+        "initialization_in_progress": initialization_in_progress,
+        "state_store_error": _grid_state_integrity_error,
         "positions": positions,
         "has_risk": bool(
             orphan_orders
@@ -1562,9 +1738,13 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
             or reduce_protection_risk
             or grid_coverage_risk
             or pending_submissions
+            or queued_replacements
+            or accepted_shape_mismatches
             or risk_shutdown_pending
             or manual_stop_pending
             or initialization_failed
+            or initialization_in_progress
+            or _grid_state_integrity_error
         ),
     }
 

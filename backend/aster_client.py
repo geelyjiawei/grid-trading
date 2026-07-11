@@ -17,6 +17,7 @@ from exchange_errors import ExchangeRequestUncertainError
 class AsterFuturesClient:
     exchange = "aster"
     ASSET_PRICE_TTL_SECONDS = 60
+    UNCERTAIN_EXECUTION_CODES = {-1006, -1007}
 
     def __init__(
         self,
@@ -123,8 +124,17 @@ class AsterFuturesClient:
             data = response.json()
         except ValueError:
             data = {"code": response.status_code, "msg": response.text}
+        message = data.get("msg") if isinstance(data, dict) else response.text
+        error_code = data.get("code") if isinstance(data, dict) else None
+        try:
+            normalized_error_code = int(error_code) if error_code is not None else None
+        except (TypeError, ValueError):
+            normalized_error_code = None
+        if normalized_error_code in self.UNCERTAIN_EXECUTION_CODES:
+            raise ExchangeRequestUncertainError(
+                str(message or f"Aster request execution status unknown ({normalized_error_code})")
+            )
         if response.status_code >= 400:
-            message = data.get("msg") if isinstance(data, dict) else response.text
             if response.status_code == 408 or response.status_code >= 500:
                 raise ExchangeRequestUncertainError(
                     message or f"Aster request status unknown after HTTP {response.status_code}"

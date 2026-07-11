@@ -474,7 +474,11 @@ async function fetchRiskSnapshot(symbol) {
     const risk = await api(withExchange(`/api/risk/${symbol}`));
     renderRiskSnapshot(risk);
   } catch (_) {
-    renderRiskSnapshot({ has_risk: false });
+    renderRiskSnapshot({
+      has_risk: true,
+      symbol,
+      snapshot_error: true,
+    });
   }
 }
 
@@ -501,11 +505,29 @@ function renderRiskSnapshot(risk) {
   const reduceProtection = risk.reduce_protection || {};
   const gridCoverage = risk.grid_coverage || {};
   const pendingSubmissionCount = Number(risk.pending_submission_count || 0);
+  const queuedReplacementCount = Number(risk.queued_replacement_count || 0);
+  const acceptedShapeMismatchCount = Number(risk.accepted_shape_mismatch_count || 0);
+  const stateStoreError = String(risk.state_store_error || "");
+  if (risk.snapshot_error) {
+    messages.push("<div>暂时无法从服务器和交易所核对挂单与持仓。当前状态不能视为安全或无风险，请稍后刷新并检查服务连接。</div>");
+  }
+  if (stateStoreError) {
+    messages.push("<div>交易账本文件无法安全读取。系统已禁止启动新网格，避免把旧订单或旧持仓误认为空账户；请先检查并恢复服务器上的网格状态文件。</div>");
+  }
+  if (risk.initialization_in_progress) {
+    messages.push("<div>策略正在完成开仓后的网格部署；在全部挂单确认前不会标记为运行就绪。</div>");
+  }
   if (risk.initialization_failed) {
     messages.push("<div>策略启动未完整完成，程序正在保留交易所现场并阻止重复启动。请先执行停止并完成核对，不要直接再次启动。</div>");
   }
   if (pendingSubmissionCount > 0) {
     messages.push(`<div>有 ${pendingSubmissionCount} 个下单结果尚未被交易所权威确认，程序不会猜测成交，也不会重复发送未知结果的市价单。</div>`);
+  }
+  if (queuedReplacementCount > 0) {
+    messages.push(`<div>有 ${queuedReplacementCount} 个网格挂单重建尚未被交易所确认，程序已保留原价、原方向和原数量并持续安全重试。</div>`);
+  }
+  if (acceptedShapeMismatchCount > 0) {
+    messages.push(`<div>有 ${acceptedShapeMismatchCount} 个订单的交易所实际价格、数量或方向与程序请求不一致。程序已停止继续下单并保留请求值与实际值供核对。</div>`);
   }
   if (risk.risk_shutdown_pending) {
     messages.push("<div>止盈/止损清理尚未完成，程序正在等待撤单或平仓成交确认。</div>");
@@ -552,6 +574,8 @@ function renderRiskSnapshot(risk) {
     messages.push("<div>建议先撤销孤儿挂单，再决定是否手动保留或平掉持仓。</div>");
   } else if (gridCoverage.has_risk) {
     messages.push("<div>建议先停止策略并核对成交清单，避免异常格继续按错误数量循环。</div>");
+  } else if (queuedReplacementCount > 0) {
+    messages.push("<div>请等待挂单重建完成；若持续失败，请停止策略并核对交易所拒单原因。</div>");
   } else if (risk.unmanaged_position) {
     messages.push("<div>请确认该持仓是否需要手动保留或平掉。</div>");
   }

@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -65,6 +67,7 @@ class MultiGridServerTests(unittest.TestCase):
         self._original_active_exchange = main._active_exchange
         self._original_api_config = main._api_config
         self._original_client = main._client
+        self._original_grid_state_integrity_error = main._grid_state_integrity_error
         self._state_tmp = tempfile.TemporaryDirectory()
         main.GRID_STATE_FILE = str(Path(self._state_tmp.name) / "grid_state.json")
         main.GRID_HISTORY_FILE = str(Path(self._state_tmp.name) / "grid_history.json")
@@ -85,6 +88,7 @@ class MultiGridServerTests(unittest.TestCase):
         main._active_exchange = "binance"
         main._api_config = main._api_configs["binance"]
         main._client = fake_client
+        main._grid_state_integrity_error = ""
         self.client = TestClient(main.app)
 
     def tearDown(self):
@@ -98,6 +102,7 @@ class MultiGridServerTests(unittest.TestCase):
         main._active_exchange = self._original_active_exchange
         main._api_config = self._original_api_config
         main._client = self._original_client
+        main._grid_state_integrity_error = self._original_grid_state_integrity_error
         self._state_tmp.cleanup()
         if self._original_grid_config_key is None:
             os.environ.pop("GRID_CONFIG_KEY", None)
@@ -289,6 +294,155 @@ class MultiGridServerTests(unittest.TestCase):
             1,
         )
 
+    def test_concurrent_engine_state_saves_preserve_both_grids(self):
+        original_load = main._load_grid_state_file
+
+        def slow_load():
+            state = original_load()
+            time.sleep(0.05)
+            return state
+
+        def fake_engine(symbol):
+            engine = Mock()
+            engine.config = {"symbol": symbol, "exchange": "binance"}
+            engine.running = True
+            engine.to_state.return_value = {
+                "config": dict(engine.config),
+                "running": True,
+            }
+            return engine
+
+        first = fake_engine("FIRSTUSDT")
+        second = fake_engine("SECONDUSDT")
+
+        with (
+            patch.object(main, "_load_grid_state_file", side_effect=slow_load),
+            patch.object(main, "_upsert_grid_history"),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            futures = [
+                pool.submit(main._save_engine_state, first),
+                pool.submit(main._save_engine_state, second),
+            ]
+            for future in futures:
+                future.result(timeout=5)
+
+        grids = original_load()["grids"]
+        self.assertEqual(
+            set(grids),
+            {
+                main._engine_key("binance", "FIRSTUSDT"),
+                main._engine_key("binance", "SECONDUSDT"),
+            },
+        )
+
+    def test_concurrent_history_upserts_preserve_both_runs(self):
+        original_load = main._load_grid_history_file
+
+        def slow_load():
+            history = original_load()
+            time.sleep(0.05)
+            return history
+
+        def history_record(engine, status):
+            run_id = engine.config["run_id"]
+            return {
+                "run_id": run_id,
+                "started_at": 1 if run_id == "run-first" else 2,
+                "status": status,
+            }
+
+        first = Mock()
+        first.config = {"run_id": "run-first"}
+        second = Mock()
+        second.config = {"run_id": "run-second"}
+
+        with (
+            patch.object(main, "_load_grid_history_file", side_effect=slow_load),
+            patch.object(main, "_history_record_from_engine", side_effect=history_record),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            futures = [
+                pool.submit(main._upsert_grid_history, first),
+                pool.submit(main._upsert_grid_history, second),
+            ]
+            for future in futures:
+                future.result(timeout=5)
+
+        history = original_load()
+        self.assertEqual(
+            {record["run_id"] for record in history["runs"]},
+            {"run-first", "run-second"},
+        )
+
+    def test_state_saves_throttle_history_but_persist_status_transitions(self):
+        engine = main.GridEngine(
+            main._client,
+            {
+                "symbol": "THROTTLEUSDT",
+                "exchange": "binance",
+                "direction": "short",
+                "run_id": "throttle-run",
+            },
+        )
+
+        with patch.object(main, "_upsert_grid_history") as upsert:
+            main._save_engine_state(engine)
+            main._save_engine_state(engine)
+            main._save_engine_state(engine)
+            self.assertEqual(upsert.call_count, 1)
+            self.assertEqual(upsert.call_args.args[1], "saved")
+
+            engine.running = True
+            main._save_engine_state(engine)
+            main._save_engine_state(engine)
+
+        self.assertEqual(upsert.call_count, 2)
+        self.assertEqual(upsert.call_args.args[1], "running")
+
+    def test_state_file_is_flushed_before_atomic_replace(self):
+        events = []
+        real_replace = os.replace
+
+        def record_fsync(_descriptor):
+            events.append("fsync")
+
+        def record_replace(source, destination):
+            events.append("replace")
+            return real_replace(source, destination)
+
+        with (
+            patch.object(main.os, "fsync", side_effect=record_fsync),
+            patch.object(main.os, "replace", side_effect=record_replace),
+        ):
+            main._write_grid_state_file({"version": 1, "grids": {}})
+
+        self.assertGreaterEqual(len(events), 2)
+        self.assertEqual(events[:2], ["fsync", "replace"])
+        self.assertTrue(Path(main.GRID_STATE_FILE).exists())
+
+    def test_corrupt_state_file_blocks_new_grid_without_overwriting_ledger(self):
+        corrupt_payload = '{"version": 1, "grids": '
+        Path(main.GRID_STATE_FILE).write_text(corrupt_payload, encoding="utf-8")
+
+        response = self.client.post(
+            "/api/grid/start", json=self._payload("CORRUPTUSDT")
+        )
+
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertIn("durable grid state file", response.json()["detail"])
+        self.assertEqual(main._client.orders, [])
+        self.assertEqual(
+            Path(main.GRID_STATE_FILE).read_text(encoding="utf-8"),
+            corrupt_payload,
+        )
+
+        risk = self.client.get(
+            "/api/risk/CORRUPTUSDT?exchange=binance"
+        ).json()
+        self.assertTrue(risk["has_risk"])
+        self.assertIn("durable grid state file", risk["state_store_error"])
+
     def test_initialization_failure_after_market_fill_is_retained_and_blocks_retry(self):
         original_save = main._save_engine_state
         save_calls = 0
@@ -334,6 +488,7 @@ class MultiGridServerTests(unittest.TestCase):
     def test_nonrunning_engine_with_unconfirmed_orders_blocks_restart_and_can_be_stopped(self):
         config = self._payload("MUUSDT")
         config["exchange"] = "binance"
+        config["direction"] = "short"
         engine = main.GridEngine(main._client, config, state_callback=main._save_engine_state)
         engine._fetch_precision()
         engine.grid_levels = [90, 110]
@@ -348,6 +503,57 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertIn("unconfirmed exchange work", restart.json()["detail"])
         self.assertEqual(stop.status_code, 200)
         self.assertNotIn(main._engine_key("binance", "MUUSDT"), main._engines)
+
+    def test_nonrunning_engine_with_queued_replacement_blocks_restart(self):
+        config = self._payload("MUUSDT")
+        config["exchange"] = "binance"
+        engine = main.GridEngine(main._client, config, state_callback=main._save_engine_state)
+        engine.running = False
+        engine.grid_levels = [90, 110]
+        engine.paused_replacements = [
+            {
+                "link_id": "g_0_B_filled",
+                "order_id": "old",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "90",
+                "qty": "1",
+                "fill_price": 90.0,
+                "reduce_only": False,
+            }
+        ]
+        key = main._engine_key("binance", "MUUSDT")
+        main._engines[key] = engine
+
+        restart = self.client.post("/api/grid/start", json=self._payload("MUUSDT"))
+        stop = self.client.post("/api/grid/stop/MUUSDT?exchange=binance")
+
+        self.assertEqual(restart.status_code, 400)
+        self.assertIn("unconfirmed exchange work", restart.json()["detail"])
+        self.assertEqual(stop.status_code, 200)
+        self.assertNotIn(key, main._engines)
+
+    def test_nonrunning_engine_with_retained_grid_position_blocks_restart(self):
+        config = self._payload("MUUSDT")
+        config["exchange"] = "binance"
+        config["direction"] = "short"
+        engine = main.GridEngine(main._client, config, state_callback=main._save_engine_state)
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.grid_position_net_qty = -1.0
+        engine.running = False
+        main._client.positions = [{"side": "Sell", "size": "1", "avgPrice": "100"}]
+        key = main._engine_key("binance", "MUUSDT")
+        main._engines[key] = engine
+
+        restart = self.client.post("/api/grid/start", json=self._payload("MUUSDT"))
+        stop = self.client.post("/api/grid/stop/MUUSDT?exchange=binance")
+
+        self.assertEqual(restart.status_code, 400)
+        self.assertIn("unconfirmed exchange work", restart.json()["detail"])
+        self.assertEqual(stop.status_code, 200)
+        self.assertNotIn(key, main._engines)
+        self.assertEqual(main._client.positions[0]["size"], "1")
 
     def test_start_is_blocked_by_existing_grid_tagged_exchange_order(self):
         existing = main._client.place_order(
@@ -601,6 +807,68 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["qty_per_grid_min"], 4.0)
         self.assertAlmostEqual(data["qty_per_grid_max"], 4.0)
 
+    def test_grid_preview_rejects_per_grid_qty_below_limit_minimum(self):
+        main._client = FakeClient("100", tick_size="1", qty_step="0.01", min_qty="0.1")
+        payload = self._payload("MUUSDT")
+        payload.update(
+            {
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.05,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("limit-order minimum", response.json()["detail"])
+        self.assertEqual(main._client.orders, [])
+
+    def test_grid_start_rejects_per_grid_qty_below_limit_minimum_without_opening(self):
+        client = FakeClient("100", tick_size="1", qty_step="0.01", min_qty="0.1")
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("MUUSDT")
+        payload.update(
+            {
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.05,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/start", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("below exchange quantity precision or minimum", response.json()["detail"])
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.positions, [])
+        self.assertNotIn(main._engine_key("binance", "MUUSDT"), main._engines)
+
+    def test_grid_preview_rejects_levels_that_round_to_duplicate_exchange_prices(self):
+        main._client = FakeClient("1010", tick_size="1", qty_step="0.1", min_qty="0.1")
+        payload = self._payload("MUUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 1000,
+                "upper_price": 1020,
+                "grid_count": 40,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("duplicate exchange prices", response.json()["detail"])
+        self.assertEqual(main._client.orders, [])
+
     def test_grid_preview_rejects_market_max_before_start(self):
         main._client = FakeClient(
             "100",
@@ -774,6 +1042,149 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(len(open_orders), 1)
         self.assertEqual(open_orders[0]["orderId"], order_id)
         self.assertEqual(open_orders[0]["qty"], "3.1")
+
+    def test_restore_resumes_incomplete_cleanup_even_when_saved_running_is_false(self):
+        symbol = "INTERRUPTUSDT"
+        exchange = "binance"
+        placed = main._client.place_order(
+            symbol=symbol,
+            side="Sell",
+            qty="1",
+            price="101",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id="g_0_S_interrupted",
+        )
+        order_id = str(placed["result"]["orderId"])
+        key = main._engine_key(exchange, symbol)
+        main._write_grid_state_file(
+            {
+                "version": 1,
+                "grids": {
+                    key: {
+                        "config": {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "direction": "short",
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 1,
+                            "total_investment": 100,
+                            "leverage": 2,
+                        },
+                        "running": False,
+                        "grid_ready": False,
+                        "grid_levels": [90, 110],
+                        "manual_stop_pending": True,
+                        "initialization_failed": True,
+                        "active_orders": {
+                            "g_0_S_interrupted": {
+                                "link_id": "g_0_S_interrupted",
+                                "order_id": order_id,
+                                "level_idx": 0,
+                                "side": "Sell",
+                                "price": "101",
+                                "qty": "1",
+                                "status": "open",
+                                "order_type": "Limit",
+                                "time_in_force": "GTC",
+                                "reduce_only": False,
+                                "processed_fill_qty": 0.0,
+                                "processed_fill_volume": 0.0,
+                                "processed_fill_fee": 0.0,
+                            }
+                        },
+                    }
+                },
+            }
+        )
+
+        async def restore_and_wait():
+            main._restore_saved_engines()
+            engine = main._engines[key]
+            for _ in range(100):
+                if engine._task and engine._task.done():
+                    break
+                await asyncio.sleep(0.01)
+            if engine._task:
+                await engine._task
+            return engine
+
+        engine = asyncio.run(restore_and_wait())
+
+        self.assertFalse(engine.running)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertEqual(engine.active_orders, {})
+        self.assertNotIn(order_id, main._client.open_limit_order_ids)
+
+    def test_restore_resumes_waiting_opening_order_when_saved_running_is_false(self):
+        symbol = "WAITOPENUSDT"
+        exchange = "binance"
+        link_id = "open_S_waiting"
+        placed = main._client.place_order(
+            symbol=symbol,
+            side="Sell",
+            qty="1",
+            price="101",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id=link_id,
+        )
+        order_id = str(placed["result"]["orderId"])
+        key = main._engine_key(exchange, symbol)
+        main._write_grid_state_file(
+            {
+                "version": 1,
+                "grids": {
+                    key: {
+                        "config": {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "direction": "short",
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 1,
+                            "total_investment": 100,
+                            "leverage": 2,
+                            "initial_order_type": "limit",
+                            "initial_order_price": 101,
+                        },
+                        "running": False,
+                        "grid_ready": False,
+                        "grid_levels": [90, 110],
+                        "waiting_initial_order": True,
+                        "opening_order": {
+                            "link_id": link_id,
+                            "order_id": order_id,
+                            "side": "Sell",
+                            "price": "101",
+                            "qty": "1",
+                            "status": "open",
+                            "order_type": "Limit",
+                            "time_in_force": "GTC",
+                            "reduce_only": False,
+                        },
+                    }
+                },
+            }
+        )
+
+        async def restore_observe_and_stop():
+            main._restore_saved_engines()
+            engine = main._engines[key]
+            await asyncio.sleep(0.05)
+            resumed = bool(engine.running and engine._task and not engine._task.done())
+            waiting = engine.waiting_initial_order
+            await engine.stop()
+            return resumed, waiting
+
+        resumed, waiting = asyncio.run(restore_observe_and_stop())
+
+        self.assertTrue(resumed)
+        self.assertTrue(waiting)
+        self.assertNotIn(order_id, main._client.open_limit_order_ids)
 
     def test_risk_endpoint_detects_and_cancels_orphan_grid_orders(self):
         main._client.place_order(
@@ -976,6 +1387,97 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(snapshot["pending_submissions"][0]["order_link_id"], link_id)
         self.assertEqual(snapshot["reduce_protection"]["pending_submission_count"], 1)
         self.assertTrue(snapshot["has_risk"])
+
+    def test_risk_endpoint_flags_persistently_queued_grid_replacement(self):
+        exchange = main._active_exchange
+        engine = main.GridEngine(
+            main._client,
+            {
+                "symbol": "QUEUEDUSDT",
+                "exchange": exchange,
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 100,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.running = True
+        engine.grid_ready = True
+        engine.grid_levels = [90, 100, 110]
+        engine.paused_replacements = [
+            {
+                "replacement_mode": "same_order",
+                "replacement_source_link_id": "g_0_B_old",
+                "side": "Buy",
+                "price": "90",
+                "qty": "1",
+                "level_idx": 0,
+                "reduce_only": False,
+                "replacement_retry_attempts": 2,
+                "replacement_retry_after": time.time() + 10,
+            }
+        ]
+        main._engines[main._engine_key(exchange, "QUEUEDUSDT")] = engine
+
+        response = self.client.get(f"/api/risk/QUEUEDUSDT?exchange={exchange}")
+
+        self.assertEqual(response.status_code, 200)
+        snapshot = response.json()
+        self.assertTrue(snapshot["has_risk"])
+        self.assertEqual(snapshot["queued_replacement_count"], 1)
+        self.assertEqual(snapshot["queued_replacements"][0]["mode"], "same_order")
+        self.assertEqual(snapshot["queued_replacements"][0]["attempts"], 2)
+
+    def test_risk_endpoint_exposes_exchange_accepted_shape_mismatch(self):
+        exchange = main._active_exchange
+        engine = main.GridEngine(
+            main._client,
+            {
+                "symbol": "SHAPEUSDT",
+                "exchange": exchange,
+                "direction": "short",
+            },
+        )
+        engine.running = True
+        engine.grid_ready = False
+        engine.manual_stop_pending = True
+        engine.active_orders = {
+            "g_0_S_shape": {
+                "link_id": "g_0_S_shape",
+                "order_id": "accepted-70",
+                "level_idx": 0,
+                "side": "Sell",
+                "price": "0.38",
+                "qty": "70",
+                "reduce_only": False,
+                "accepted_shape_mismatch": "qty expected=100 actual=70",
+                "expected_side": "Sell",
+                "expected_price": "0.38",
+                "expected_qty": "100",
+                "expected_reduce_only": False,
+                "exchange_accepted_side": "Sell",
+                "exchange_accepted_price": "0.38",
+                "exchange_accepted_qty": "70",
+                "exchange_accepted_reduce_only": False,
+            }
+        }
+        main._engines[main._engine_key(exchange, "SHAPEUSDT")] = engine
+
+        response = self.client.get(f"/api/risk/SHAPEUSDT?exchange={exchange}")
+
+        self.assertEqual(response.status_code, 200)
+        snapshot = response.json()
+        self.assertTrue(snapshot["has_risk"])
+        self.assertEqual(snapshot["accepted_shape_mismatch_count"], 1)
+        mismatch = snapshot["accepted_shape_mismatches"][0]
+        self.assertEqual(mismatch["order_id"], "accepted-70")
+        self.assertEqual(mismatch["expected_qty"], "100")
+        self.assertEqual(mismatch["actual_qty"], "70")
+        self.assertIn("expected=100 actual=70", mismatch["reason"])
 
     def test_api_config_change_is_blocked_while_grid_is_running(self):
         original_binance = main.BinanceFuturesClient
@@ -1388,6 +1890,60 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(calls[0][1], "/fapi/v1/userTrades")
         self.assertEqual(calls[0][2]["orderId"], "99")
         self.assertEqual(calls[0][2]["limit"], 1000)
+
+    def test_binance_batch_orders_preserve_each_client_id_and_item_result(self):
+        client = BinanceFuturesClient("", "", True)
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False, api_key=False):
+            calls.append((method, path, params, auth))
+            return [
+                {
+                    "orderId": 101,
+                    "clientOrderId": "g_0_B_batch",
+                    "side": "BUY",
+                    "price": "90",
+                    "origQty": "1",
+                    "status": "NEW",
+                    "reduceOnly": True,
+                },
+                {"code": -2010, "msg": "order rejected"},
+            ]
+
+        client._request = fake_request
+        response = client.place_orders(
+            [
+                {
+                    "symbol": "TESTUSDT",
+                    "side": "Buy",
+                    "qty": "1",
+                    "price": "90",
+                    "order_type": "Limit",
+                    "reduce_only": True,
+                    "order_link_id": "g_0_B_batch",
+                    "time_in_force": None,
+                },
+                {
+                    "symbol": "TESTUSDT",
+                    "side": "Sell",
+                    "qty": "1",
+                    "price": "110",
+                    "order_type": "Limit",
+                    "reduce_only": False,
+                    "order_link_id": "g_1_S_batch",
+                    "time_in_force": None,
+                },
+            ]
+        )
+
+        payload = json.loads(calls[0][2]["batchOrders"])
+        self.assertEqual(calls[0][1], "/fapi/v1/batchOrders")
+        self.assertEqual([item["newClientOrderId"] for item in payload], ["g_0_B_batch", "g_1_S_batch"])
+        self.assertEqual([item["timeInForce"] for item in payload], ["GTC", "GTC"])
+        self.assertEqual([item["reduceOnly"] for item in payload], ["true", "false"])
+        self.assertEqual(response["result"]["list"][0]["retCode"], 0)
+        self.assertEqual(response["result"]["list"][0]["result"]["orderLinkId"], "g_0_B_batch")
+        self.assertEqual(response["result"]["list"][1]["retCode"], -2010)
 
     def test_binance_http_503_is_an_unknown_request_outcome(self):
         client = BinanceFuturesClient("key", "secret", True)

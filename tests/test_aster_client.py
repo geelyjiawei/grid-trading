@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -37,6 +38,60 @@ class FakeSession:
 
 
 class AsterClientTests(unittest.TestCase):
+    def test_batch_orders_preserve_each_client_id_and_item_result(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            return [
+                {
+                    "orderId": 201,
+                    "clientOrderId": "g_0_B_batch",
+                    "side": "BUY",
+                    "price": "90",
+                    "origQty": "1",
+                    "status": "NEW",
+                    "reduceOnly": True,
+                },
+                {"code": -2010, "msg": "order rejected"},
+            ]
+
+        client._request = fake_request
+        response = client.place_orders(
+            [
+                {
+                    "symbol": "TESTUSDT",
+                    "side": "Buy",
+                    "qty": "1",
+                    "price": "90",
+                    "order_type": "Limit",
+                    "reduce_only": True,
+                    "order_link_id": "g_0_B_batch",
+                    "time_in_force": None,
+                },
+                {
+                    "symbol": "TESTUSDT",
+                    "side": "Sell",
+                    "qty": "1",
+                    "price": "110",
+                    "order_type": "Limit",
+                    "reduce_only": False,
+                    "order_link_id": "g_1_S_batch",
+                    "time_in_force": None,
+                },
+            ]
+        )
+
+        payload = json.loads(calls[0][2]["batchOrders"])
+        self.assertEqual(calls[0][1], "/fapi/v3/batchOrders")
+        self.assertEqual([item["newClientOrderId"] for item in payload], ["g_0_B_batch", "g_1_S_batch"])
+        self.assertEqual([item["timeInForce"] for item in payload], ["GTC", "GTC"])
+        self.assertEqual([item["reduceOnly"] for item in payload], ["true", "false"])
+        self.assertEqual(response["result"]["list"][0]["retCode"], 0)
+        self.assertEqual(response["result"]["list"][0]["result"]["orderLinkId"], "g_0_B_batch")
+        self.assertEqual(response["result"]["list"][1]["retCode"], -2010)
+
     def test_instrument_info_preserves_market_lot_rules(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
         client.session = FakeSession(
@@ -91,6 +146,44 @@ class AsterClientTests(unittest.TestCase):
                 price="0.5",
                 order_type="Limit",
                 order_link_id="g_1_B_unknown",
+            )
+
+    def test_http_200_unknown_execution_codes_are_not_treated_as_rejections(self):
+        for error_code, message in (
+            (-1006, "Unexpected response; execution status unknown"),
+            (-1007, "Timeout waiting for backend; send status unknown"),
+        ):
+            with self.subTest(error_code=error_code):
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                client.session = FakeSession(FakeResponse({"code": error_code, "msg": message}))
+
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.place_order(
+                        symbol="ASTERUSDT",
+                        side="Buy",
+                        qty="20",
+                        price="0.5",
+                        order_type="Limit",
+                        order_link_id=f"g_1_B_unknown_{abs(error_code)}",
+                    )
+
+    def test_http_200_definitive_order_rejection_remains_definitive(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.session = FakeSession(FakeResponse({"code": -2010, "msg": "Order rejected"}))
+
+        with self.assertRaisesRegex(RuntimeError, "Order rejected"):
+            client.place_order(
+                symbol="ASTERUSDT",
+                side="Buy",
+                qty="20",
+                price="0.5",
+                order_type="Limit",
+                order_link_id="g_1_B_rejected",
             )
 
     def test_signature_payload_uses_eip712_message_body(self):
