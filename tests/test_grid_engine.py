@@ -525,6 +525,85 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine._order_qty_text(3.139999, reduce_only=True), "3.13")
         self.assertEqual(engine._qty_to_steps(0.19999999999999996), 20)
 
+    async def test_fragmented_exchange_fills_keep_exact_counter_quantity(self):
+        client = FakeClient("100", tick_size="1", qty_step="0.01", min_qty="0.01")
+        client.get_order_trades = lambda symbol, order_id: {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "price": "110",
+                        "qty": "0.18",
+                        "volume": "19.80",
+                        "feeUsdt": "0",
+                        "feeAsset": "USDT",
+                        "isMaker": True,
+                    },
+                    {
+                        "price": "110",
+                        "qty": "0.02",
+                        "volume": "2.20",
+                        "feeUsdt": "0",
+                        "feeAsset": "USDT",
+                        "isMaker": True,
+                    },
+                ]
+            },
+        }
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "MUUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "leverage": 3,
+                "grid_order_post_only": False,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_ready = True
+        engine.grid_levels = [90, 110]
+        engine.target_qty_by_level = {"0": 0.2}
+        engine.reduce_lots_complete = True
+        order = {
+            "link_id": "g_0_S_mu_fragmented",
+            "order_id": "mu-fragmented",
+            "level_idx": 0,
+            "side": "Sell",
+            "price": "110",
+            "qty": "0.20",
+            "status": "FILLED",
+            "order_type": "Limit",
+            "time_in_force": "GTC",
+            "reduce_only": False,
+            "entry_price": None,
+            "processed_fill_qty": 0.0,
+            "processed_fill_volume": 0.0,
+            "processed_fill_fee": 0.0,
+        }
+
+        handled = engine._handle_closed_order(order, allow_estimate=False)
+
+        self.assertTrue(handled)
+        self.assertEqual(order["processed_fill_qty"], 0.2)
+        self.assertEqual(
+            Decimal(str(engine.reduce_lots_by_level["0"]["qty"])),
+            Decimal("0.2"),
+        )
+        self.assertEqual(Decimal(str(engine.grid_position_net_qty)), Decimal("-0.2"))
+        counter_orders = [item for item in client.orders if item["reduce_only"]]
+        self.assertEqual(len(counter_orders), 1)
+        self.assertEqual(counter_orders[0]["qty"], "0.20")
+
     async def test_reduce_protection_detects_level_gaps_even_when_total_matches(self):
         client = FakeClient("100")
         engine = GridEngine(

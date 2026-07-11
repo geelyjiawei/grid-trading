@@ -853,18 +853,24 @@ class GridEngine:
                 return None
             return stats
 
-        total_qty = 0.0
-        total_volume = 0.0
-        total_fee = 0.0
+        # Exchange quantities are decimal strings. Summing them as binary
+        # floats can turn an exact 0.18 + 0.02 fill into 0.19999999999999998;
+        # flooring that value to a 0.01 step then places only 0.19. Keep the
+        # cumulative execution exact until the public stats boundary.
+        total_qty = Decimal("0")
+        total_volume = Decimal("0")
+        total_fee = Decimal("0")
         fee_assets: set[str] = set()
         converted_all = True
         maker_count = 0
         taker_count = 0
 
         for trade in trades:
-            qty = float(trade.get("qty", 0) or 0)
-            price = float(trade.get("price", fallback_price) or fallback_price)
-            volume = float(trade.get("volume", 0) or (price * qty))
+            qty = Decimal(str(trade.get("qty", 0) or 0))
+            price = Decimal(
+                str(trade.get("price", fallback_price) or fallback_price)
+            )
+            volume = Decimal(str(trade.get("volume", 0) or (price * qty)))
             fee_usdt_text = trade.get("feeUsdt", "")
             fee_asset = str(trade.get("feeAsset", "USDT") or "USDT")
             fee_assets.add(fee_asset)
@@ -876,10 +882,17 @@ class GridEngine:
             total_qty += qty
             total_volume += volume
             if fee_usdt_text != "":
-                total_fee += float(fee_usdt_text)
+                total_fee += Decimal(str(fee_usdt_text))
             else:
                 converted_all = False
-                total_fee += self._estimate_fee(volume, "maker" if trade.get("isMaker") else "taker")
+                total_fee += Decimal(
+                    str(
+                        self._estimate_fee(
+                            float(volume),
+                            "maker" if trade.get("isMaker") else "taker",
+                        )
+                    )
+                )
 
         if total_qty <= 0 or total_volume <= 0:
             if not allow_estimate:
@@ -887,10 +900,10 @@ class GridEngine:
             return stats
 
         return {
-            "price": total_volume / total_qty,
-            "qty": total_qty,
-            "volume": total_volume,
-            "fee": total_fee,
+            "price": float(total_volume / total_qty),
+            "qty": float(total_qty),
+            "volume": float(total_volume),
+            "fee": float(total_fee),
             "fee_asset": ",".join(sorted(fee_assets)) if fee_assets else "USDT",
             "fee_source": "exchange" if converted_all else "mixed",
             "maker_count": maker_count,
