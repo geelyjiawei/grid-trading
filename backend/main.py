@@ -32,6 +32,7 @@ from secret_store import decrypt_text, encrypt_text, storage_backend
 logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
 _engines_lock = RLock()
+_starting_engine_keys: set[str] = set()
 SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
 DEFAULT_EXCHANGE = "bybit"
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
@@ -166,7 +167,12 @@ def _load_file_api_configs() -> dict[str, dict]:
     try:
         with open(API_CONFIG_FILE, "r", encoding="utf-8") as file:
             config = json.load(file)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error(
+            "Failed to read API configuration path=%s error_type=%s",
+            API_CONFIG_FILE,
+            type(exc).__name__,
+        )
         return {}
 
     try:
@@ -215,7 +221,14 @@ def _load_file_api_configs() -> dict[str, dict]:
         if migrated["api_key"] or migrated["api_secret"]:
             _save_api_config(migrated)
         return {migrated["exchange"]: migrated}
-    except Exception:
+    except Exception as exc:
+        # Never log decrypted values, but do surface that credentials were not
+        # restored instead of silently falling back to an unconfigured client.
+        logger.error(
+            "Failed to decrypt or migrate API configuration path=%s error_type=%s",
+            API_CONFIG_FILE,
+            type(exc).__name__,
+        )
         return {}
 
 
@@ -301,6 +314,20 @@ def _engine_symbol(engine: GridEngine | None) -> str:
 def _engine_snapshot() -> list[GridEngine]:
     with _engines_lock:
         return list(_engines.values())
+
+
+def _engine_requires_cleanup(engine: GridEngine | None) -> bool:
+    if not engine:
+        return False
+    return bool(
+        engine.running
+        or engine.active_orders
+        or engine.opening_order
+        or engine.pending_reduce_action
+        or engine.risk_shutdown_pending
+        or engine.manual_stop_pending
+        or engine.initialization_failed
+    )
 
 
 def _get_engine(exchange: str | None, symbol: str) -> GridEngine | None:
@@ -456,10 +483,15 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
 
 
 def _round_down_steps(value: float, step: str) -> int:
-    from decimal import Decimal, ROUND_DOWN
+    from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
     value_decimal = Decimal(str(value))
     step_decimal = Decimal(str(step))
+    nearest_steps = (value_decimal / step_decimal).to_integral_value(rounding=ROUND_HALF_UP)
+    nearest_value = nearest_steps * step_decimal
+    tolerance = max(abs(step_decimal) * Decimal("1e-9"), Decimal("1e-18"))
+    if abs(value_decimal - nearest_value) <= tolerance:
+        value_decimal = nearest_value
     return int((value_decimal / step_decimal).quantize(Decimal("1"), rounding=ROUND_DOWN))
 
 
@@ -502,8 +534,22 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         raise HTTPException(status_code=400, detail=info_resp.get("retMsg", "Failed to fetch instrument info"))
     instrument = info_resp["result"]["list"][0]
     tick_size = float(instrument["priceFilter"]["tickSize"])
-    qty_step = instrument["lotSizeFilter"]["qtyStep"]
-    min_qty = float(instrument["lotSizeFilter"]["minOrderQty"])
+    lot_filter = instrument["lotSizeFilter"]
+    explicit_market_filter = instrument.get("marketLotSizeFilter")
+    market_filter = explicit_market_filter or lot_filter
+    qty_step = lot_filter["qtyStep"]
+    min_qty = float(lot_filter["minOrderQty"])
+    market_qty_step = str(market_filter.get("qtyStep") or qty_step)
+    market_min_qty = float(market_filter.get("minOrderQty") or min_qty)
+    if explicit_market_filter:
+        raw_max_market_qty = explicit_market_filter.get("maxOrderQty")
+    else:
+        raw_max_market_qty = (
+            lot_filter.get("maxMktOrderQty")
+            or lot_filter.get("maxMarketOrderQty")
+            or lot_filter.get("maxOrderQty")
+        )
+    max_market_qty = float(raw_max_market_qty or 0)
 
     reference_price = current_price
     if direction in {"long", "short"} and initial_order_type in {"limit", "post_only"}:
@@ -576,6 +622,57 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
 
     total_qty = _steps_to_qty(total_steps, qty_step)
 
+    if direction in {"long", "short"} and initial_order_type == "market":
+        market_steps = _round_down_steps(total_qty, market_qty_step)
+        market_total_qty = _steps_to_qty(market_steps, market_qty_step)
+        if market_total_qty < market_min_qty:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Initial market quantity {market_total_qty} is below the exchange minimum "
+                    f"{market_min_qty}"
+                ),
+            )
+        if max_market_qty > 0 and market_total_qty > max_market_qty:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Initial market quantity {market_total_qty} exceeds the exchange single-order "
+                    f"maximum {max_market_qty}; reduce the per-grid quantity or use a limit opening order"
+                ),
+            )
+        if sizing_mode == "fixed_grid_qty":
+            tolerance = max(float(market_qty_step) * 1e-9, 1e-18)
+            if abs(market_total_qty - total_qty) > tolerance:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The requested fixed per-grid quantity cannot be represented exactly by the "
+                        "exchange market-order quantity step; use a compatible quantity or a limit opening order"
+                    ),
+                )
+
+        # A market fill must be fully representable by subsequent limit-grid orders.
+        coverable_steps = _round_down_steps(market_total_qty, qty_step)
+        coverable_qty = _steps_to_qty(coverable_steps, qty_step)
+        tolerance = max(float(qty_step) * 1e-9, 1e-18)
+        if abs(coverable_qty - market_total_qty) > tolerance:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "The exchange market quantity step is incompatible with its limit-order step; "
+                    "use a limit opening order so every filled unit can be protected"
+                ),
+            )
+        total_steps = coverable_steps
+        total_qty = coverable_qty
+        base_steps = total_steps // active_count
+        remainder_steps = total_steps % active_count
+        per_order_qtys = [
+            _steps_to_qty(base_steps + (1 if index < remainder_steps else 0), qty_step)
+            for index in range(active_count)
+        ]
+
     if grid_mode == "geometric":
         ratio = (levels[1] / levels[0]) if len(levels) > 1 else 1
         grid_profit_pct = (ratio - 1) * 100
@@ -610,6 +707,9 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         "qty_per_grid_max": max(per_order_qtys),
         "qty_step": qty_step,
         "min_qty": min_qty,
+        "market_qty_step": market_qty_step,
+        "market_min_qty": market_min_qty,
+        "max_market_qty": max_market_qty,
         "per_grid_gross_profit": gross_profit,
         "per_grid_open_fee": open_fee,
         "per_grid_close_fee": close_fee,
@@ -700,7 +800,14 @@ def _restore_saved_engines():
             can_restart = (
                 should_restart
                 and not engine._stopping
-                and (engine.grid_ready or engine.waiting_trigger or engine.waiting_initial_order)
+                and (
+                    engine.grid_ready
+                    or engine.waiting_trigger
+                    or engine.waiting_initial_order
+                    or engine.manual_stop_pending
+                    or engine.risk_shutdown_pending
+                    or engine.pending_reduce_action
+                )
             )
             if can_restart:
                 try:
@@ -1051,10 +1158,7 @@ async def start_grid(cfg: GridConfig):
     grid_mode = cfg.grid_mode.lower().strip()
     initial_order_type = cfg.initial_order_type.lower().strip()
     sizing_mode = _position_sizing_mode(cfg)
-    existing_engine = _get_engine(exchange, symbol)
-
-    if existing_engine and existing_engine.running:
-        raise HTTPException(status_code=400, detail=f"A grid is already running for {symbol}")
+    engine_key = _engine_key(exchange, symbol)
     if cfg.upper_price <= cfg.lower_price:
         raise HTTPException(status_code=400, detail="upper_price must be greater than lower_price")
     if cfg.grid_count < 2 or cfg.grid_count > 100:
@@ -1087,29 +1191,101 @@ async def start_grid(cfg: GridConfig):
     engine_config["initial_order_type"] = initial_order_type
     engine_config["position_sizing_mode"] = sizing_mode
     engine_config["run_id"] = f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
+    engine_config["strict_order_ownership"] = True
     engine = GridEngine(client, engine_config, state_callback=_save_engine_state)
 
-    try:
-        await engine.initialize()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     with _engines_lock:
-        _engines[_engine_key(exchange, symbol)] = engine
-    engine.start()
-    _save_engine_state(engine)
+        existing_engine = _engines.get(engine_key)
+        if engine_key in _starting_engine_keys or _engine_requires_cleanup(existing_engine):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"An existing grid for {symbol} still has running, initializing, or "
+                    "unconfirmed exchange work; stop and reconcile it before starting a new grid"
+                ),
+            )
+        _starting_engine_keys.add(engine_key)
+
+    try:
+        open_response = client.get_open_orders(symbol)
+        if open_response.get("retCode") != 0:
+            raise RuntimeError(
+                open_response.get("retMsg", "Failed to verify existing exchange orders")
+            )
+        existing_grid_orders = [
+            item
+            for item in open_response.get("result", {}).get("list", [])
+            if _is_grid_order(item)
+        ]
+        if existing_grid_orders:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Found {len(existing_grid_orders)} existing grid-tagged exchange order(s) "
+                    f"for {symbol}; review or cancel those orders before starting a new run"
+                ),
+            )
+        await engine.initialize()
+        with _engines_lock:
+            _engines[engine_key] = engine
+        engine.start()
+        _save_engine_state(engine)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        has_exchange_state = bool(
+            engine.active_orders
+            or engine.opening_order
+            or engine.pending_reduce_action
+            or engine._qty_reaches_accounting_step(engine._grid_position_qty())
+        )
+        if has_exchange_state:
+            engine.initialization_failed = True
+            engine.manual_stop_pending = True
+            engine.grid_ready = False
+            engine.trigger_message = (
+                f"Grid initialization failed after exchange work may have started: {exc}. "
+                "Managed orders are being cancelled; review the retained position before retrying."
+            )
+            with _engines_lock:
+                _engines[engine_key] = engine
+            try:
+                if not engine.running:
+                    engine.start()
+                else:
+                    engine._persist_state()
+            except Exception as recovery_exc:
+                logger.exception(
+                    "Failed to start initialization recovery exchange=%s symbol=%s: %s",
+                    exchange,
+                    symbol,
+                    recovery_exc,
+                )
+            raise HTTPException(status_code=409, detail=engine.trigger_message) from exc
+
+        engine.running = False
+        if engine._task:
+            engine._task.cancel()
+        with _engines_lock:
+            if _engines.get(engine_key) is engine:
+                _engines.pop(engine_key, None)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        with _engines_lock:
+            _starting_engine_keys.discard(engine_key)
+
     return {"ok": True, "message": f"{exchange.title()} {symbol} {direction} grid started"}
 
 
 @app.post("/api/grid/stop")
 async def stop_grid():
-    running = [engine for engine in _engine_snapshot() if engine.running]
-    if not running:
+    pending = [engine for engine in _engine_snapshot() if _engine_requires_cleanup(engine)]
+    if not pending:
         raise HTTPException(status_code=400, detail="No active grid")
-    if len(running) > 1:
+    if len(pending) > 1:
         raise HTTPException(status_code=400, detail="Multiple grids are running; stop by symbol")
 
-    engine = running[0]
+    engine = pending[0]
     return await _stop_grid(_engine_symbol(engine), _engine_exchange(engine))
 
 
@@ -1120,11 +1296,11 @@ async def stop_grid_symbol(symbol: str, exchange: str | None = None):
 
 @app.post("/api/grid/stop-all")
 async def stop_all_grids():
-    running = [engine for engine in _engine_snapshot() if engine.running]
-    if not running:
+    pending = [engine for engine in _engine_snapshot() if _engine_requires_cleanup(engine)]
+    if not pending:
         raise HTTPException(status_code=400, detail="No active grid")
 
-    for engine in running:
+    for engine in pending:
         symbol = str(engine.config.get("symbol", "")).upper()
         exchange = _engine_exchange(engine)
         await engine.stop()
@@ -1139,7 +1315,7 @@ async def stop_all_grids():
 
 async def _stop_grid(symbol: str, exchange: str | None = None):
     engine = _get_engine(exchange, symbol)
-    if not engine or not engine.running:
+    if not _engine_requires_cleanup(engine):
         raise HTTPException(status_code=400, detail="No active grid")
 
     exchange = _engine_exchange(engine)
@@ -1235,7 +1411,7 @@ def grid_history(limit: int = 100):
 
 def _is_grid_order(item: dict) -> bool:
     link_id = str(item.get("orderLinkId") or item.get("order_link_id") or "")
-    return link_id.startswith(("g_", "open_"))
+    return link_id.startswith(("g_", "open_", "init_", "repair_"))
 
 
 def _managed_order_ids(engine: GridEngine | None) -> set[str]:
@@ -1244,6 +1420,9 @@ def _managed_order_ids(engine: GridEngine | None) -> set[str]:
     ids = {str(order.get("order_id", "")) for order in engine.active_orders.values()}
     if engine.opening_order:
         ids.add(str(engine.opening_order.get("order_id", "")))
+    pending_reduce_action = getattr(engine, "pending_reduce_action", None)
+    if pending_reduce_action:
+        ids.add(str(pending_reduce_action.get("order_id", "")))
     return {order_id for order_id in ids if order_id}
 
 
@@ -1256,6 +1435,9 @@ def _managed_order_links(engine: GridEngine | None) -> set[str]:
     }
     if engine.opening_order:
         links.add(str(engine.opening_order.get("link_id", "") or ""))
+    pending_reduce_action = getattr(engine, "pending_reduce_action", None)
+    if pending_reduce_action:
+        links.add(str(pending_reduce_action.get("link_id", "") or ""))
     return {link_id for link_id in links if link_id}
 
 
@@ -1314,7 +1496,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
                 }
             )
 
-    unmanaged_position = bool(positions and (not engine or not engine.running))
+    unmanaged_position = bool(positions and not engine)
     unmanaged_delta_qty = 0.0
     expected_position_net_qty = 0.0
     reduce_protection = {}
@@ -1322,7 +1504,10 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     grid_coverage = {}
     grid_coverage_risk = False
     pending_submissions = []
-    if engine and engine.running:
+    risk_shutdown_pending = False
+    manual_stop_pending = False
+    initialization_failed = False
+    if engine:
         status = engine.get_status()
         expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
         unmanaged_delta_qty = actual_position_net_qty - expected_position_net_qty
@@ -1334,6 +1519,11 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         submission_records = list(engine.active_orders.values())
         if engine.opening_order:
             submission_records.append(engine.opening_order)
+        if engine.pending_reduce_action:
+            submission_records.append(engine.pending_reduce_action)
+        risk_shutdown_pending = bool(status.get("risk_shutdown_pending"))
+        manual_stop_pending = bool(status.get("manual_stop_pending"))
+        initialization_failed = bool(status.get("initialization_failed"))
         pending_submissions = [
             {
                 "order_link_id": order.get("link_id", ""),
@@ -1346,7 +1536,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
                 "error": order.get("submission_error", ""),
             }
             for order in submission_records
-            if order.get("submission_pending")
+            if order.get("submission_pending") or order is engine.pending_reduce_action
         ]
     return {
         "symbol": symbol,
@@ -1362,6 +1552,9 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "grid_coverage": grid_coverage,
         "pending_submission_count": len(pending_submissions),
         "pending_submissions": pending_submissions,
+        "risk_shutdown_pending": risk_shutdown_pending,
+        "manual_stop_pending": manual_stop_pending,
+        "initialization_failed": initialization_failed,
         "positions": positions,
         "has_risk": bool(
             orphan_orders
@@ -1369,6 +1562,9 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
             or reduce_protection_risk
             or grid_coverage_risk
             or pending_submissions
+            or risk_shutdown_pending
+            or manual_stop_pending
+            or initialization_failed
         ),
     }
 

@@ -11,6 +11,8 @@ import requests
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
+from exchange_errors import ExchangeRequestUncertainError
+
 
 class AsterFuturesClient:
     exchange = "aster"
@@ -123,6 +125,10 @@ class AsterFuturesClient:
             data = {"code": response.status_code, "msg": response.text}
         if response.status_code >= 400:
             message = data.get("msg") if isinstance(data, dict) else response.text
+            if response.status_code == 408 or response.status_code >= 500:
+                raise ExchangeRequestUncertainError(
+                    message or f"Aster request status unknown after HTTP {response.status_code}"
+                )
             raise RuntimeError(message or f"Aster request failed with {response.status_code}")
         if isinstance(data, dict) and data.get("code") not in (None, 0, "0", 200, "200"):
             raise RuntimeError(str(data.get("msg") or data))
@@ -167,6 +173,7 @@ class AsterFuturesClient:
         filters = {item.get("filterType"): item for item in instrument.get("filters", [])}
         price_filter = filters.get("PRICE_FILTER", {})
         lot_filter = filters.get("LOT_SIZE", {})
+        market_lot_filter = filters.get("MARKET_LOT_SIZE", lot_filter)
         result = {
             "retCode": 0,
             "result": {
@@ -176,6 +183,16 @@ class AsterFuturesClient:
                         "lotSizeFilter": {
                             "qtyStep": lot_filter.get("stepSize", "0.001"),
                             "minOrderQty": lot_filter.get("minQty", "0.001"),
+                            "maxOrderQty": lot_filter.get("maxQty", "0"),
+                        },
+                        "marketLotSizeFilter": {
+                            "qtyStep": market_lot_filter.get(
+                                "stepSize", lot_filter.get("stepSize", "0.001")
+                            ),
+                            "minOrderQty": market_lot_filter.get(
+                                "minQty", lot_filter.get("minQty", "0.001")
+                            ),
+                            "maxOrderQty": market_lot_filter.get("maxQty", "0"),
                         },
                     }
                 ]

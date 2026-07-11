@@ -5,10 +5,12 @@ import logging
 import re
 import time
 import uuid
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Callable, Optional
 
 import requests
+
+from exchange_errors import ExchangeRequestUncertainError
 
 
 logger = logging.getLogger(__name__)
@@ -19,10 +21,12 @@ FAST_POLL_WINDOW_SECONDS = 15.0
 USER_STREAM_KEEPALIVE_SECONDS = 30 * 60
 BATCH_ORDER_CHUNK_SIZE = 5
 POSITION_SYNC_GRACE_SECONDS = 2.0
-SUBMISSION_RETRY_SECONDS = 2.0
+SUBMISSION_RETRY_SECONDS = 10.0
 SUBMISSION_MAX_RETRIES = 3
-SUBMISSION_REQUIRED_NOT_FOUND_CHECKS = 2
+SUBMISSION_REQUIRED_NOT_FOUND_CHECKS = 5
 SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS = 0.5
+MANAGED_CANCEL_MAX_ROUNDS = 5
+MANAGED_CANCEL_RETRY_SECONDS = 0.25
 
 
 class GridEngine:
@@ -46,6 +50,9 @@ class GridEngine:
         self.tick_size = "0.1"
         self.qty_step = "0.001"
         self.min_qty = 0.001
+        self.market_qty_step = "0.001"
+        self.market_min_qty = 0.001
+        self.max_market_qty = 0.0
         self.current_price = 0.0
         self.initial_side = ""
         self.initial_qty = 0.0
@@ -60,6 +67,11 @@ class GridEngine:
         self.grid_ready = False
         self.waiting_initial_order = False
         self.opening_order: dict | None = None
+        self.pending_reduce_action: dict | None = None
+        self.risk_shutdown_pending = False
+        self.manual_stop_pending = False
+        self.initialization_failed = False
+        self.ownership_conflicts: list[dict] = []
         self._pending_targets: dict | None = None
         self.paused_replacements: list[dict] = []
         self._stopping = False
@@ -100,6 +112,9 @@ class GridEngine:
             "tick_size": self.tick_size,
             "qty_step": self.qty_step,
             "min_qty": self.min_qty,
+            "market_qty_step": self.market_qty_step,
+            "market_min_qty": self.market_min_qty,
+            "max_market_qty": self.max_market_qty,
             "current_price": self.current_price,
             "initial_side": self.initial_side,
             "initial_qty": self.initial_qty,
@@ -114,6 +129,11 @@ class GridEngine:
             "grid_ready": self.grid_ready,
             "waiting_initial_order": self.waiting_initial_order,
             "opening_order": self.opening_order,
+            "pending_reduce_action": self.pending_reduce_action,
+            "risk_shutdown_pending": self.risk_shutdown_pending,
+            "manual_stop_pending": self.manual_stop_pending,
+            "initialization_failed": self.initialization_failed,
+            "ownership_conflicts": self.ownership_conflicts,
             "pending_targets": self._pending_targets,
             "paused_replacements": self.paused_replacements[-200:],
             "saved_at": time.time(),
@@ -140,6 +160,9 @@ class GridEngine:
         self.tick_size = str(state.get("tick_size") or self.tick_size)
         self.qty_step = str(state.get("qty_step") or self.qty_step)
         self.min_qty = float(state.get("min_qty") or self.min_qty)
+        self.market_qty_step = str(state.get("market_qty_step") or self.qty_step)
+        self.market_min_qty = float(state.get("market_min_qty") or self.min_qty)
+        self.max_market_qty = float(state.get("max_market_qty") or 0)
         self.current_price = float(state.get("current_price") or 0)
         self.initial_side = str(state.get("initial_side") or "")
         self.initial_qty = float(state.get("initial_qty") or 0)
@@ -158,6 +181,11 @@ class GridEngine:
         self.grid_ready = bool(state.get("grid_ready", False))
         self.waiting_initial_order = bool(state.get("waiting_initial_order", False))
         self.opening_order = state.get("opening_order")
+        self.pending_reduce_action = state.get("pending_reduce_action")
+        self.risk_shutdown_pending = bool(state.get("risk_shutdown_pending", False))
+        self.manual_stop_pending = bool(state.get("manual_stop_pending", False))
+        self.initialization_failed = bool(state.get("initialization_failed", False))
+        self.ownership_conflicts = list(state.get("ownership_conflicts") or [])
         self._pending_targets = state.get("pending_targets")
         self.paused_replacements = list(state.get("paused_replacements") or [])
 
@@ -170,8 +198,9 @@ class GridEngine:
                 self._bootstrap_reduce_lots_from_legacy_state()
             if saved_running:
                 self._migrate_baseline_position_from_exchange()
-                self._reconcile_exchange_open_orders()
-                self._reconcile_grid_position_protection()
+                if not self.risk_shutdown_pending and not self.manual_stop_pending:
+                    self._reconcile_exchange_open_orders()
+                    self._reconcile_grid_position_protection()
         except Exception as exc:
             logger.warning("Restore refresh failed symbol=%s msg=%s", self.config.get("symbol"), exc)
         self._persist_state()
@@ -210,9 +239,173 @@ class GridEngine:
             self._user_stream_task = asyncio.create_task(self._user_stream_loop())
         self._persist_state()
 
+    def _resolve_pending_for_cancel(self, order: dict, open_orders: list[dict]) -> str:
+        if not order.get("submission_pending"):
+            return "confirmed"
+
+        link_id = str(order.get("link_id", "") or "")
+        open_snapshot = next(
+            (
+                item
+                for item in open_orders
+                if str(item.get("orderLinkId", "") or "") == link_id
+            ),
+            None,
+        )
+        if open_snapshot and self._confirm_pending_submission(order, open_snapshot):
+            return "confirmed"
+
+        snapshot, authoritative = self._submission_snapshot_by_link(link_id)
+        if snapshot and self._confirm_pending_submission(order, snapshot):
+            return "confirmed"
+
+        history_snapshot = self._submission_history_by_link({link_id}).get(link_id)
+        if history_snapshot and self._confirm_pending_submission(order, history_snapshot):
+            return "confirmed"
+
+        now = time.time()
+        if authoritative:
+            last_check = float(order.get("submission_last_not_found_at", 0) or 0)
+            if now - last_check >= SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS:
+                order["submission_not_found_count"] = int(
+                    order.get("submission_not_found_count", 0) or 0
+                ) + 1
+                order["submission_last_not_found_at"] = now
+            if (
+                int(order.get("submission_not_found_count", 0) or 0)
+                >= SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+            ):
+                return "absent"
+        return "pending"
+
+    def _record_opening_execution_for_stop(self, order: dict, stats: dict) -> bool:
+        delta_stats = self._fill_delta_stats(order, stats)
+        if not delta_stats:
+            return False
+        self._mark_order_fill_processed(order, stats)
+        self._record_trade_value(
+            delta_stats["price"],
+            delta_stats["qty"],
+            volume=delta_stats["volume"],
+            fee=delta_stats["fee"],
+            fee_asset=delta_stats["fee_asset"],
+            fee_source=delta_stats["fee_source"],
+        )
+        total_qty = float(order.get("processed_fill_qty", 0) or 0)
+        total_volume = float(order.get("processed_fill_volume", 0) or 0)
+        self.initial_side = str(order.get("side") or self.initial_side)
+        self.initial_qty = total_qty
+        self.initial_entry_price = total_volume / total_qty if total_qty > 0 else 0.0
+        self._set_initial_grid_position(self.initial_side, total_qty)
+        self._persist_state()
+        return True
+
+    def _terminal_order_accounted_for_stop(
+        self,
+        order: dict,
+        *,
+        opening: bool = False,
+        place_counter: bool = False,
+    ) -> bool:
+        snapshot = self._get_order_snapshot(order)
+        status = self._order_status_from_snapshot(snapshot)
+        stats = self._authoritative_execution_stats(order, snapshot)
+        if stats and stats.get("qty", 0) > 0:
+            if opening:
+                self._record_opening_execution_for_stop(order, stats)
+            else:
+                self._record_execution_delta(order, stats, place_counter=place_counter)
+
+        planned_qty = Decimal(str(order.get("qty", 0) or 0))
+        processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+        fully_accounted = processed_qty + self._qty_tolerance_decimal() >= planned_qty
+        if self._is_cancelled_status(status):
+            return True
+        if self._is_filled_status(status):
+            return fully_accounted
+        return fully_accounted and status == "UNKNOWN"
+
+    def _cancel_managed_order_once(
+        self,
+        order: dict,
+        open_orders: list[dict],
+        *,
+        opening: bool = False,
+        place_counter: bool = False,
+    ) -> str:
+        submission_state = self._resolve_pending_for_cancel(order, open_orders)
+        if submission_state == "absent":
+            return "done"
+        if submission_state == "pending":
+            return "pending"
+
+        order_id = str(order.get("order_id", "") or "")
+        link_id = str(order.get("link_id", "") or "")
+        open_ids = {str(item.get("orderId", "") or "") for item in open_orders}
+        open_links = {str(item.get("orderLinkId", "") or "") for item in open_orders}
+        should_cancel = bool(order_id and (order_id in open_ids or link_id in open_links))
+        if order_id and not should_cancel:
+            snapshot = self._get_order_snapshot(order)
+            status = self._order_status_from_snapshot(snapshot)
+            if self._is_filled_status(status) or self._is_cancelled_status(status):
+                return (
+                    "done"
+                    if self._terminal_order_accounted_for_stop(
+                        order,
+                        opening=opening,
+                        place_counter=place_counter,
+                    )
+                    else "pending"
+                )
+            should_cancel = status != "UNKNOWN"
+
+        if should_cancel:
+            try:
+                result = self.client.cancel_order(self.config["symbol"], order_id)
+                if result.get("retCode") != 0:
+                    raise RuntimeError(result.get("retMsg", "Managed order cancellation rejected"))
+            except Exception as exc:
+                logger.warning(
+                    "Managed order cancellation is unconfirmed symbol=%s order_id=%s link_id=%s msg=%s",
+                    self.config.get("symbol"),
+                    order_id,
+                    link_id,
+                    exc,
+                )
+
+        if self._terminal_order_accounted_for_stop(
+            order,
+            opening=opening,
+            place_counter=place_counter,
+        ):
+            return "done"
+        return "pending"
+
+    def _cancel_managed_orders_once(self) -> bool:
+        open_orders = self._fetch_open_orders()
+        for link_id, order in list(self.active_orders.items()):
+            outcome = self._cancel_managed_order_once(order, open_orders)
+            if outcome == "done":
+                self.active_orders.pop(link_id, None)
+
+        if self.opening_order:
+            outcome = self._cancel_managed_order_once(
+                self.opening_order,
+                open_orders,
+                opening=True,
+            )
+            if outcome == "done":
+                self.opening_order = None
+                self.waiting_initial_order = False
+
+        self._persist_state()
+        return not self.active_orders and self.opening_order is None
+
     async def stop(self):
         self._stopping = True
-        self.running = False
+        self.manual_stop_pending = True
+        self.running = True
+        self._persist_state()
         await self._stop_user_stream()
         if self._task:
             self._task.cancel()
@@ -220,14 +413,32 @@ class GridEngine:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
 
-        resp = self.client.cancel_all_orders(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to cancel open orders"))
+        completed = False
+        for attempt in range(MANAGED_CANCEL_MAX_ROUNDS):
+            if self.pending_reduce_action:
+                with contextlib.suppress(Exception):
+                    self._resolve_pending_reduce_action()
+            completed = self._cancel_managed_orders_once() and not self.pending_reduce_action
+            if completed:
+                break
+            if attempt + 1 < MANAGED_CANCEL_MAX_ROUNDS:
+                await asyncio.sleep(MANAGED_CANCEL_RETRY_SECONDS)
 
-        self.active_orders.clear()
-        self.opening_order = None
-        self.waiting_initial_order = False
+        if not completed:
+            self.trigger_message = (
+                "Stop is incomplete: one or more managed orders still lack terminal exchange "
+                "confirmation. State was retained for a safe retry."
+            )
+            self._persist_state()
+            raise RuntimeError(self.trigger_message)
+
+        self.running = False
+        self.risk_shutdown_pending = False
+        self.manual_stop_pending = False
+        self.initialization_failed = False
+        self.paused_replacements.clear()
         self.grid_ready = False
         self._persist_state()
 
@@ -363,7 +574,18 @@ class GridEngine:
             "pending_submission_count": sum(
                 1 for order in self.active_orders.values() if order.get("submission_pending")
             )
-            + int(bool(self.opening_order and self.opening_order.get("submission_pending"))),
+            + int(bool(self.opening_order and self.opening_order.get("submission_pending")))
+            + int(
+                bool(
+                    self.pending_reduce_action
+                    and self.pending_reduce_action.get("submission_pending")
+                )
+            ),
+            "pending_reduce_action": self.pending_reduce_action,
+            "risk_shutdown_pending": self.risk_shutdown_pending,
+            "manual_stop_pending": self.manual_stop_pending,
+            "initialization_failed": self.initialization_failed,
+            "ownership_conflicts": self.ownership_conflicts,
             "paused_replacements": self.paused_replacements,
             "paused_replacements_count": len(self.paused_replacements),
             "completed_pairs": self.completed_pairs,
@@ -384,6 +606,9 @@ class GridEngine:
             "taker_fee_rate": self._taker_fee_rate(),
             "start_time": self.start_time,
             "current_price": self.current_price,
+            "market_qty_step": self.market_qty_step,
+            "market_min_qty": self.market_min_qty,
+            "max_market_qty": self.max_market_qty,
             "initial_side": self.initial_side,
             "initial_qty": round(self.initial_qty, 8),
             "initial_entry_price": round(self.initial_entry_price, 10),
@@ -410,8 +635,26 @@ class GridEngine:
 
         info = resp["result"]["list"][0]
         self.tick_size = info["priceFilter"]["tickSize"]
-        self.qty_step = info["lotSizeFilter"]["qtyStep"]
-        self.min_qty = float(info["lotSizeFilter"]["minOrderQty"])
+        lot_filter = info["lotSizeFilter"]
+        explicit_market_filter = info.get("marketLotSizeFilter")
+        market_filter = explicit_market_filter or lot_filter
+        self.qty_step = lot_filter["qtyStep"]
+        self.min_qty = float(lot_filter["minOrderQty"])
+        self.market_qty_step = str(market_filter.get("qtyStep") or self.qty_step)
+        self.market_min_qty = float(
+            market_filter.get("minOrderQty") or self.min_qty
+        )
+        if explicit_market_filter:
+            max_market_qty = explicit_market_filter.get("maxOrderQty")
+        else:
+            # Bybit exposes market and limit maxima in the same lot-size object.
+            # The market-specific field must win over the larger limit maximum.
+            max_market_qty = (
+                lot_filter.get("maxMktOrderQty")
+                or lot_filter.get("maxMarketOrderQty")
+                or lot_filter.get("maxOrderQty")
+            )
+        self.max_market_qty = float(max_market_qty or 0)
 
     def _get_current_price(self) -> float:
         ticker = self.client.get_ticker(self.config["symbol"])
@@ -633,7 +876,10 @@ class GridEngine:
         delta_volume = total_volume - processed_volume
         if delta_volume <= 0:
             delta_volume = Decimal(str(stats.get("price", order.get("price", 0)) or 0)) * delta_qty
-        delta_fee = total_fee - processed_fee
+        # Exchange trade snapshots can be temporarily incomplete or fee-asset
+        # conversion can move between polls. Cumulative accounting must never
+        # reverse a fee that was already recorded.
+        delta_fee = max(Decimal("0"), total_fee - processed_fee)
         delta_price = delta_volume / delta_qty if delta_qty > 0 else Decimal(str(stats.get("price", 0) or 0))
 
         return {
@@ -648,17 +894,44 @@ class GridEngine:
         planned_qty = Decimal(str(order.get("qty", 0) or 0))
         processed_qty = min(Decimal(str(stats.get("qty", 0) or 0)), planned_qty)
         order["processed_fill_qty"] = float(processed_qty)
-        order["processed_fill_volume"] = float(Decimal(str(stats.get("volume", 0) or 0)))
-        order["processed_fill_fee"] = float(Decimal(str(stats.get("fee", 0) or 0)))
+        order["processed_fill_volume"] = float(
+            max(
+                Decimal(str(order.get("processed_fill_volume", 0) or 0)),
+                Decimal(str(stats.get("volume", 0) or 0)),
+            )
+        )
+        order["processed_fill_fee"] = float(
+            max(
+                Decimal(str(order.get("processed_fill_fee", 0) or 0)),
+                Decimal(str(stats.get("fee", 0) or 0)),
+            )
+        )
 
-    def _record_execution_delta(self, order: dict, stats: dict) -> bool:
+    def _record_execution_delta(
+        self,
+        order: dict,
+        stats: dict,
+        *,
+        place_counter: bool = True,
+    ) -> bool:
         delta_stats = self._fill_delta_stats(order, stats)
         if not delta_stats:
             return False
         self._mark_order_fill_processed(order, stats)
 
+        count_completed_pair = bool(order.get("reduce_only")) and not bool(
+            order.get("completed_pair_counted")
+        )
+        if count_completed_pair:
+            order["completed_pair_counted"] = True
         filled_order = {**order, "qty": str(delta_stats["qty"]), "fill_price": delta_stats["price"]}
-        self._record_fill(filled_order, delta_stats)
+        self._record_fill(
+            filled_order,
+            delta_stats,
+            count_completed_pair=count_completed_pair,
+        )
+        if not place_counter:
+            return True
         if filled_order.get("tag") == "boundary_reduce_fallback":
             self._repair_flat_open_side_grid()
             return True
@@ -687,9 +960,27 @@ class GridEngine:
         return "unknown"
 
     def _qty_to_steps(self, qty: float) -> int:
-        qty_decimal = Decimal(str(qty))
         step_decimal = Decimal(self.qty_step)
+        qty_decimal = self._normalized_qty_decimal(qty, step_decimal)
         return int((qty_decimal / step_decimal).quantize(Decimal("1"), rounding=ROUND_DOWN))
+
+    @staticmethod
+    def _normalized_qty_decimal(value: Decimal | float | str, step: Decimal | str) -> Decimal:
+        """Remove binary-float dust without rounding a genuinely smaller quantity up."""
+        try:
+            qty = max(Decimal(str(value)), Decimal("0"))
+            step_decimal = abs(Decimal(str(step)))
+        except Exception:
+            return Decimal("0")
+        if step_decimal <= 0:
+            return qty
+
+        nearest_steps = (qty / step_decimal).to_integral_value(rounding=ROUND_HALF_UP)
+        nearest_qty = nearest_steps * step_decimal
+        tolerance = max(step_decimal * Decimal("1e-9"), Decimal("1e-18"))
+        if abs(qty - nearest_qty) <= tolerance:
+            return nearest_qty
+        return qty
 
     def _qty_step_decimal(self) -> Decimal:
         try:
@@ -717,8 +1008,8 @@ class GridEngine:
         return self.client.round_to_step(value, self.tick_size)
 
     def _fq(self, value: float) -> str:
-        normalized = max(float(value), 0.0)
-        return self.client.round_to_step(normalized, self.qty_step)
+        normalized = self._normalized_qty_decimal(value, self.qty_step)
+        return self.client.round_to_step(str(normalized), self.qty_step)
 
     def _order_qty_text(self, value: float, *, reduce_only: bool) -> str:
         qty_text = self._fq(value)
@@ -729,6 +1020,21 @@ class GridEngine:
         if qty + self._qty_tolerance_decimal() < self._qty_step_decimal():
             return ""
         if not reduce_only and qty + self._qty_tolerance_decimal() < Decimal(str(self.min_qty)):
+            return ""
+        return qty_text
+
+    def _market_order_qty_text(self, value: float, *, reduce_only: bool) -> str:
+        step = Decimal(str(self.market_qty_step or self.qty_step))
+        normalized = self._normalized_qty_decimal(value, step)
+        qty_text = self.client.round_to_step(str(normalized), str(step))
+        try:
+            qty = Decimal(str(qty_text))
+        except Exception:
+            return ""
+        tolerance = max(abs(step) * Decimal("1e-9"), Decimal("1e-18"))
+        if qty + tolerance < step:
+            return ""
+        if not reduce_only and qty + tolerance < Decimal(str(self.market_min_qty)):
             return ""
         return qty_text
 
@@ -1065,20 +1371,33 @@ class GridEngine:
             self.baseline_position_qty,
             actual_same_side_qty,
         )
+        self._stopping = True
+        all_terminal = False
         try:
-            result = self.client.cancel_all_orders(self.config["symbol"])
-            if result.get("retCode") != 0:
-                raise RuntimeError(result.get("retMsg", "Failed to cancel orders after baseline breach"))
+            all_terminal = self._cancel_managed_orders_once()
+            if not all_terminal:
+                self.trigger_message += (
+                    " Managed orders with unconfirmed terminal status were retained for audit "
+                    "and safe retry."
+                )
         except Exception as exc:
             logger.warning(
-                "Failed to cancel orders after baseline breach symbol=%s msg=%s",
+                "Failed to reconcile managed orders after baseline breach symbol=%s msg=%s",
                 self.config.get("symbol"),
                 exc,
             )
-        self.active_orders.clear()
+            self.trigger_message += " Managed-order cancellation remains unconfirmed."
         self.grid_ready = False
-        self.running = False
-        self._stopping = True
+        if all_terminal and not self.pending_reduce_action:
+            self.running = False
+            self.manual_stop_pending = False
+        else:
+            # A one-shot cancellation failure must not leave live orders orphaned.
+            # Keep only the cleanup state machine running; normal grid placement
+            # stays disabled because _stopping and manual_stop_pending are set.
+            self.running = True
+            self.manual_stop_pending = True
+            self._mark_fast_poll()
         self._persist_state()
         return True
 
@@ -1096,6 +1415,10 @@ class GridEngine:
         if not match:
             return None
         return int(match.group(1)), "Buy" if match.group(2) == "B" else "Sell"
+
+    @staticmethod
+    def _is_grid_managed_link(link_id: str) -> bool:
+        return str(link_id or "").startswith(("g_", "open_", "init_", "repair_"))
 
     def _fetch_open_orders(self) -> list[dict]:
         resp = self.client.get_open_orders(self.config["symbol"])
@@ -1173,6 +1496,54 @@ class GridEngine:
                 order.get("link_id"),
             )
             return False
+        snapshot_qty = snapshot.get("qty")
+        if snapshot_qty not in (None, ""):
+            try:
+                expected_qty = Decimal(str(order.get("qty", 0) or 0))
+                accepted_qty = Decimal(str(snapshot_qty))
+            except Exception:
+                accepted_qty = Decimal("-1")
+                expected_qty = Decimal("0")
+            if (
+                accepted_qty < 0
+                or abs(accepted_qty - expected_qty) > self._qty_tolerance_decimal()
+            ):
+                logger.error(
+                    "Pending submission lookup returned different quantity symbol=%s "
+                    "link_id=%s expected=%s actual=%s",
+                    self.config.get("symbol"),
+                    order.get("link_id"),
+                    order.get("qty"),
+                    snapshot_qty,
+                )
+                return False
+        snapshot_price = snapshot.get("price")
+        if (
+            str(order.get("order_type", "")).lower() == "limit"
+            and snapshot_price not in (None, "")
+        ):
+            try:
+                expected_price = Decimal(str(order.get("price", 0) or 0))
+                accepted_price_value = Decimal(str(snapshot_price))
+                tick = Decimal(str(self.tick_size or 0))
+                price_tolerance = max(abs(tick) * Decimal("1e-9"), Decimal("1e-18"))
+            except Exception:
+                accepted_price_value = Decimal("-1")
+                expected_price = Decimal("0")
+                price_tolerance = Decimal("0")
+            if (
+                accepted_price_value <= 0
+                or abs(accepted_price_value - expected_price) > price_tolerance
+            ):
+                logger.error(
+                    "Pending submission lookup returned different limit price symbol=%s "
+                    "link_id=%s expected=%s actual=%s",
+                    self.config.get("symbol"),
+                    order.get("link_id"),
+                    order.get("price"),
+                    snapshot_price,
+                )
+                return False
         order_id = str(snapshot.get("orderId", "") or "")
         if not order_id:
             return False
@@ -1196,6 +1567,20 @@ class GridEngine:
         order["status"] = str(status)
         if snapshot.get("reduceOnly") is not None:
             order["reduce_only"] = self._truthy(snapshot.get("reduceOnly"))
+        for field in (
+            "executedQty",
+            "cumExecQty",
+            "cumQty",
+            "cum_exec_qty",
+            "cumQuote",
+            "cumExecValue",
+            "cum_exec_value",
+            "avgPrice",
+            "avg_price",
+            "averagePrice",
+        ):
+            if snapshot.get(field) not in (None, ""):
+                order[field] = snapshot.get(field)
         order.pop("submission_pending", None)
         order.pop("submission_error", None)
         order.pop("submission_attempts", None)
@@ -1212,7 +1597,34 @@ class GridEngine:
             requests.exceptions.ChunkedEncodingError,
             requests.exceptions.ContentDecodingError,
         )
-        return isinstance(exc, (TimeoutError, ConnectionError, *uncertain_request_errors))
+        if isinstance(
+            exc,
+            (
+                ExchangeRequestUncertainError,
+                TimeoutError,
+                ConnectionError,
+                *uncertain_request_errors,
+            ),
+        ):
+            return True
+        return GridEngine._is_uncertain_submission_message(str(exc))
+
+    @staticmethod
+    def _is_uncertain_submission_message(message: str) -> bool:
+        normalized = str(message or "").lower()
+        return any(
+            marker in normalized
+            for marker in (
+                "execution status unknown",
+                "execution status is unknown",
+                "status is unknown",
+                "request status unknown",
+                "server timeout",
+                "service unavailable",
+                "internal server error",
+                "response lost",
+            )
+        )
 
     @staticmethod
     def _is_duplicate_client_order_rejection(message: str) -> bool:
@@ -1282,6 +1694,21 @@ class GridEngine:
         }
 
     def _retry_pending_submission(self, order: dict) -> str:
+        if order.get("submission_retry_blocked"):
+            return "pending"
+        if str(order.get("order_type") or "Limit").lower() == "market":
+            # An exchange may allow a client order ID to be reused after the
+            # original market order has already filled. Resubmitting an unknown
+            # market write can therefore double the position even with the same
+            # ID. Keep reconciling; an operator can explicitly stop/restart if
+            # the exchange ultimately proves the original write never existed.
+            order["status"] = "SUBMIT_UNRESOLVED"
+            order["submission_retry_blocked"] = True
+            order["submission_error"] = (
+                "Automatic retry disabled for an unconfirmed market order"
+            )
+            self._persist_state()
+            return "pending"
         attempts = int(order.get("submission_attempts", 1) or 1)
         if attempts >= SUBMISSION_MAX_RETRIES:
             order["status"] = "SUBMIT_UNRESOLVED"
@@ -1325,7 +1752,11 @@ class GridEngine:
             self._persist_state()
             return "confirmed"
         message = str(result.get("retMsg") or "submission not confirmed")
-        if result.get("retCode") == 0 or self._is_duplicate_client_order_rejection(message):
+        if (
+            result.get("retCode") == 0
+            or self._is_duplicate_client_order_rejection(message)
+            or self._is_uncertain_submission_message(message)
+        ):
             self._mark_submission_unknown(order, message)
             return "pending"
         order["status"] = "SUBMIT_REJECTED"
@@ -1486,6 +1917,8 @@ class GridEngine:
             if str(order.get("order_id", ""))
         }
         adopted = False
+        strict_ownership = bool(self.config.get("strict_order_ownership", False))
+        ownership_conflicts: list[dict] = []
         for item in open_orders:
             order_id = str(item.get("orderId", "") or "")
             link_id = str(item.get("orderLinkId", "") or "")
@@ -1498,7 +1931,22 @@ class GridEngine:
                     known_order_ids.add(order_id)
                     adopted = True
                 continue
-            if not order_id or not parsed or order_id in known_order_ids:
+            if not order_id or order_id in known_order_ids:
+                continue
+
+            if strict_ownership and self._is_grid_managed_link(link_id):
+                ownership_conflicts.append(
+                    {
+                        "order_id": order_id,
+                        "link_id": link_id,
+                        "side": str(item.get("side") or ""),
+                        "price": str(item.get("price", "0")),
+                        "qty": str(item.get("qty", "0")),
+                        "reduce_only": self._truthy(item.get("reduceOnly", False)),
+                    }
+                )
+                continue
+            if not parsed:
                 continue
 
             level_idx, side_from_link = parsed
@@ -1527,9 +1975,24 @@ class GridEngine:
                 order_id,
                 link_id,
             )
-        if adopted:
+        ownership_changed = ownership_conflicts != self.ownership_conflicts
+        self.ownership_conflicts = ownership_conflicts
+        if ownership_conflicts:
+            self.trigger_message = (
+                f"Detected {len(ownership_conflicts)} exchange grid order(s) that are not in "
+                "this run's write-ahead ledger; new order placement is paused."
+            )
+            if ownership_changed:
+                logger.error(
+                    "Unowned exchange grid orders detected symbol=%s orders=%s",
+                    self.config.get("symbol"),
+                    ownership_conflicts,
+                )
+        elif ownership_changed and self.trigger_message.startswith("Detected "):
+            self.trigger_message = ""
+        if adopted or ownership_changed:
             self._persist_state()
-        return adopted
+        return adopted or ownership_changed
 
     def _sync_active_order_from_exchange_snapshot(self, order: dict, snapshot: dict) -> bool:
         """Keep the local order ledger aligned with the exchange-accepted order shape."""
@@ -1555,22 +2018,7 @@ class GridEngine:
         return changed
 
     def _handle_order_execution_snapshot(self, order: dict, snapshot: dict) -> bool:
-        fallback_price = float(order["price"])
-        fallback_qty = float(order["qty"])
-        stats = self._get_trade_stats(
-            order["order_id"],
-            fallback_price,
-            fallback_qty,
-            allow_estimate=False,
-            liquidity_hint=self._order_liquidity_hint(order),
-        )
-        if not stats or stats["qty"] <= 0:
-            stats = self._execution_stats_from_order_snapshot(
-                snapshot,
-                fallback_price,
-                fallback_qty,
-                liquidity_hint=self._order_liquidity_hint(order),
-            )
+        stats = self._authoritative_execution_stats(order, snapshot)
         if not stats or stats["qty"] <= 0:
             return False
         return self._record_execution_delta(order, stats)
@@ -1607,9 +2055,10 @@ class GridEngine:
             if self._stopping or link_id not in self.active_orders:
                 continue
             order = self.active_orders[link_id]
-            status = self._get_order_status(order)
+            order_snapshot = self._get_order_snapshot(order)
+            status = self._order_status_from_snapshot(order_snapshot)
             if self._is_cancelled_status(status):
-                self._handle_cancelled_order(link_id, order)
+                self._handle_cancelled_order(link_id, order, snapshot=order_snapshot)
                 changed = True
                 continue
             if self._is_filled_status(status):
@@ -1645,15 +2094,17 @@ class GridEngine:
             )
         return changed
 
-    def _handle_cancelled_order(self, link_id: str, order: dict):
+    def _handle_cancelled_order(
+        self,
+        link_id: str,
+        order: dict,
+        *,
+        snapshot: dict | None = None,
+    ):
         fallback_qty = float(order["qty"])
-        fallback_price = float(order["price"])
-        stats = self._get_trade_stats(
-            order["order_id"],
-            fallback_price,
-            fallback_qty,
-            allow_estimate=False,
-            liquidity_hint=self._order_liquidity_hint(order),
+        stats = self._authoritative_execution_stats(
+            order,
+            snapshot if snapshot is not None else self._get_order_snapshot(order),
         )
 
         filled_qty = 0.0
@@ -1685,9 +2136,19 @@ class GridEngine:
         self._persist_state()
 
     def _handle_confirmed_closed_order(self, link_id: str, order: dict, *, allow_estimate: bool) -> bool:
-        handled = self._handle_closed_order(order, allow_estimate=allow_estimate)
+        snapshot = self._get_order_snapshot(order)
+        handled = self._handle_closed_order(
+            order,
+            allow_estimate=allow_estimate,
+            snapshot=snapshot,
+        )
         if handled:
-            self.active_orders.pop(link_id, None)
+            planned_qty = Decimal(str(order.get("qty", 0) or 0))
+            processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+            if processed_qty + self._qty_tolerance_decimal() >= planned_qty:
+                self.active_orders.pop(link_id, None)
+            else:
+                self._mark_fast_poll()
             self._persist_state()
             return True
         logger.info(
@@ -1829,7 +2290,11 @@ class GridEngine:
         if direction in {"long", "short"}:
             reduce_side = "Sell" if direction == "long" else "Buy"
             reduce_qty = sum(
-                float(order.get("qty", 0) or 0)
+                max(
+                    0.0,
+                    float(order.get("qty", 0) or 0)
+                    - float(order.get("processed_fill_qty", 0) or 0),
+                )
                 for order in self.active_orders.values()
                 if order.get("side") == reduce_side and order.get("reduce_only")
             )
@@ -1856,6 +2321,7 @@ class GridEngine:
                     net_qty += qty
             return min(0.0, net_qty)
 
+        net_qty = 0.0
         for order in self.filled_orders:
             qty = float(order.get("qty", 0) or 0)
             net_qty += self._signed_qty(str(order.get("side") or ""), qty)
@@ -1946,7 +2412,14 @@ class GridEngine:
         return False
 
     def _reconcile_grid_position_protection(self):
-        if self.config["direction"] not in {"long", "short"} or self._stopping:
+        if (
+            self.config["direction"] not in {"long", "short"}
+            or self._stopping
+            or self.pending_reduce_action
+            or self.risk_shutdown_pending
+            or self.manual_stop_pending
+            or self.ownership_conflicts
+        ):
             return
 
         if not self._sync_grid_position_with_exchange():
@@ -2654,6 +3127,7 @@ class GridEngine:
     def _cancel_excess_reduce_protection_by_level(self, reduce_side: str, excess_by_level: list[dict]) -> bool:
         cancelled_count = 0
         cancelled_qty = Decimal("0")
+        open_orders = self._fetch_open_orders()
         for excess in excess_by_level:
             level_idx = int(excess.get("level", 0) or 0)
             remaining_excess = Decimal(str(excess.get("excess_qty", 0) or 0))
@@ -2670,23 +3144,32 @@ class GridEngine:
                 if remaining_excess < Decimal(str(self.min_qty)):
                     break
                 order_qty = Decimal(str(order.get("qty", 0) or 0))
-                order_id = str(order.get("order_id", "") or "")
                 try:
-                    result = {"retCode": 0}
-                    if order_id:
-                        result = self.client.cancel_order(self.config["symbol"], order_id)
-                    if result.get("retCode") != 0:
-                        raise RuntimeError(result.get("retMsg", "Failed to cancel excess reduce order"))
+                    outcome = self._cancel_managed_order_once(
+                        order,
+                        open_orders,
+                        place_counter=True,
+                    )
+                    if outcome != "done":
+                        self.trigger_message = (
+                            "Misplaced reduce-only cancellation is unconfirmed; retaining the "
+                            "order ledger and retrying before rebuilding protection."
+                        )
+                        self._mark_fast_poll()
+                        self._persist_state()
+                        return True
                     self.active_orders.pop(link_id, None)
+                    processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+                    cancelled_remaining = max(Decimal("0"), order_qty - processed_qty)
                     cancelled_count += 1
-                    cancelled_qty += order_qty
-                    remaining_excess -= order_qty
+                    cancelled_qty += cancelled_remaining
+                    remaining_excess -= cancelled_remaining
                 except Exception as exc:
                     logger.warning(
                         "Failed to cancel excess reduce protection symbol=%s level=%s order_id=%s msg=%s",
                         self.config.get("symbol"),
                         level_idx,
-                        order_id,
+                        order.get("order_id", ""),
                         exc,
                     )
                     self._mark_fast_poll()
@@ -2846,12 +3329,207 @@ class GridEngine:
                 pnl += (self.initial_entry_price - mark_price) * remaining
         return pnl
 
-    def _place_reduce_market(self, side: str, qty: float, reason: str) -> str:
-        capped_qty = self._cap_reduce_order_qty(side, qty)
-        qty_text = self._order_qty_text(capped_qty, reduce_only=True)
+    def _authoritative_execution_stats(
+        self,
+        order: dict,
+        snapshot: dict | None = None,
+        *,
+        allow_estimate: bool = False,
+    ) -> dict | None:
+        fallback_qty = float(order.get("qty", 0) or 0)
+        fallback_price = float(order.get("price", 0) or self.current_price or 0)
+        trade_stats = self._get_trade_stats(
+            str(order.get("order_id", "") or ""),
+            fallback_price,
+            fallback_qty,
+            allow_estimate=allow_estimate,
+            liquidity_hint=self._order_liquidity_hint(order),
+        )
+
+        snapshot = {**order, **(snapshot or {})}
+        executed_qty = self._float_field(
+            snapshot,
+            "executedQty",
+            "cumExecQty",
+            "cumQty",
+            "cum_exec_qty",
+        )
+        snapshot_stats = None
+        if executed_qty > 0:
+            snapshot_stats = self._execution_stats_from_order_snapshot(
+                snapshot,
+                fallback_price,
+                fallback_qty,
+                liquidity_hint=self._order_liquidity_hint(order),
+            )
+
+        if snapshot_stats and (
+            not trade_stats
+            or Decimal(str(snapshot_stats.get("qty", 0) or 0))
+            > Decimal(str(trade_stats.get("qty", 0) or 0)) + self._qty_tolerance_decimal()
+        ):
+            return snapshot_stats
+        return trade_stats
+
+    def _record_market_reduce_execution(self, action: dict, stats: dict) -> bool:
+        delta_stats = self._fill_delta_stats(action, stats)
+        if not delta_stats:
+            return False
+        self._mark_order_fill_processed(action, stats)
+
+        qty = float(delta_stats["qty"])
+        price = float(delta_stats["price"])
+        entry_price = float(action.get("entry_price", 0) or 0)
+        gross_profit = 0.0
+        if entry_price > 0:
+            if self.config["direction"] == "long" and action.get("side") == "Sell":
+                gross_profit = (price - entry_price) * qty
+            elif self.config["direction"] == "short" and action.get("side") == "Buy":
+                gross_profit = (entry_price - price) * qty
+
+        self._apply_market_reduce_to_grid_position(str(action.get("side") or ""), qty)
+        recorded = self._record_trade_value(
+            price,
+            qty,
+            gross_profit,
+            volume=delta_stats["volume"],
+            fee=delta_stats["fee"],
+            fee_asset=delta_stats["fee_asset"],
+            fee_source=delta_stats["fee_source"],
+        )
+        self.filled_orders.append(
+            {
+                "side": action.get("side", ""),
+                "price": price,
+                "qty": qty,
+                "level_idx": -1,
+                "volume": round(recorded["volume"], 4),
+                "fee": round(recorded["fee"], 4),
+                "fee_asset": recorded["fee_asset"],
+                "fee_source": recorded["fee_source"],
+                "maker_count": delta_stats.get("maker_count", 0),
+                "taker_count": delta_stats.get("taker_count", 0),
+                "liquidity": self._liquidity_label(delta_stats),
+                "gross_profit": round(recorded["gross_profit"], 4),
+                "profit": round(recorded["net_profit"], 4),
+                "time": time.time(),
+                "reduce_only": True,
+                "reason": action.get("reason", ""),
+                "tag": action.get("tag", "market_reduce"),
+            }
+        )
+        self._persist_state()
+        return True
+
+    def _resolve_pending_reduce_submission(self, action: dict) -> bool:
+        if not action.get("submission_pending"):
+            return True
+
+        link_id = str(action.get("link_id", "") or "")
+        open_orders = self._fetch_open_orders()
+        open_snapshot = next(
+            (
+                item
+                for item in open_orders
+                if str(item.get("orderLinkId", "") or "") == link_id
+            ),
+            None,
+        )
+        if open_snapshot and self._confirm_pending_submission(action, open_snapshot):
+            self._persist_state()
+            return True
+
+        snapshot, authoritative = self._submission_snapshot_by_link(link_id)
+        if snapshot and self._confirm_pending_submission(action, snapshot):
+            self._persist_state()
+            return True
+
+        history_snapshot = self._submission_history_by_link({link_id}).get(link_id)
+        if history_snapshot and self._confirm_pending_submission(action, history_snapshot):
+            self._persist_state()
+            return True
+
+        now = time.time()
+        if authoritative:
+            last_check = float(action.get("submission_last_not_found_at", 0) or 0)
+            if now - last_check >= SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS:
+                action["submission_not_found_count"] = int(
+                    action.get("submission_not_found_count", 0) or 0
+                ) + 1
+                action["submission_last_not_found_at"] = now
+
+        if (
+            now - float(action.get("submission_updated_at", 0) or 0)
+            >= SUBMISSION_RETRY_SECONDS
+            and int(action.get("submission_not_found_count", 0) or 0)
+            >= SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+        ):
+            outcome = self._retry_pending_submission(action)
+            if outcome == "confirmed":
+                return True
+            if outcome == "rejected":
+                message = str(action.get("submission_error") or "Reduce-only market order rejected")
+                self.pending_reduce_action = None
+                self._persist_state()
+                raise RuntimeError(message)
+
+        self._mark_fast_poll()
+        self._persist_state()
+        return False
+
+    def _resolve_pending_reduce_action(self) -> bool:
+        action = self.pending_reduce_action
+        if not action:
+            return True
+        if not self._resolve_pending_reduce_submission(action):
+            return False
+
+        snapshot = self._get_order_snapshot(action)
+        status = self._order_status_from_snapshot(snapshot)
+        if status == "UNKNOWN":
+            status = self._order_status_from_snapshot(action)
+        stats = self._authoritative_execution_stats(action, snapshot)
+        if stats and stats.get("qty", 0) > 0:
+            self._record_market_reduce_execution(action, stats)
+
+        planned_qty = Decimal(str(action.get("qty", 0) or 0))
+        processed_qty = Decimal(str(action.get("processed_fill_qty", 0) or 0))
+        fully_accounted = processed_qty + self._qty_tolerance_decimal() >= planned_qty
+        terminal = self._is_filled_status(status) or self._is_cancelled_status(status)
+        if fully_accounted or (terminal and not self._is_filled_status(status)):
+            self.pending_reduce_action = None
+            self._persist_state()
+            return True
+
+        if self._is_filled_status(status):
+            self.trigger_message = (
+                "Reduce-only market order is filled; waiting for authoritative execution "
+                "quantity before changing the position ledger."
+            )
+        else:
+            self.trigger_message = "Reduce-only market order is pending exchange confirmation."
+        self._mark_fast_poll()
+        self._persist_state()
+        return False
+
+    def _place_reduce_market(self, side: str, qty: float, reason: str, *, tag: str = "market_reduce") -> str:
+        if self.pending_reduce_action:
+            self._resolve_pending_reduce_action()
+            if self.pending_reduce_action:
+                return str(
+                    self.pending_reduce_action.get("order_id")
+                    or self.pending_reduce_action.get("link_id")
+                    or ""
+                )
+
+        capped_qty = Decimal(str(self._cap_reduce_order_qty(side, qty)))
+        if self.max_market_qty > 0:
+            capped_qty = min(capped_qty, Decimal(str(self.max_market_qty)))
+        qty_text = self._market_order_qty_text(float(capped_qty), reduce_only=True)
         if not qty_text:
             logger.warning(
-                "Skipped reduce-only market order with no grid allowance symbol=%s side=%s requested=%s reason=%s",
+                "Skipped reduce-only market order that is invalid under exchange market-lot rules "
+                "symbol=%s side=%s requested=%s reason=%s",
                 self.config.get("symbol"),
                 side,
                 qty,
@@ -2859,27 +3537,105 @@ class GridEngine:
             )
             return ""
 
-        result = self.client.place_order(
-            symbol=self.config["symbol"],
-            side=side,
-            qty=qty_text,
-            order_type="Market",
-            reduce_only=True,
-            order_link_id=f"repair_{side[0]}_{uuid.uuid4().hex[:6]}",
-        )
+        link_id = f"repair_{side[0]}_{uuid.uuid4().hex[:6]}"
+        self.pending_reduce_action = {
+            "link_id": link_id,
+            "order_id": "",
+            "side": side,
+            # A market order does not need a quote to submit. Actual execution
+            # price is reconciled from trades/order state before P&L is changed.
+            "price": str(self.current_price or 0),
+            "qty": qty_text,
+            "status": "SUBMITTING",
+            "order_type": "Market",
+            "time_in_force": "IOC",
+            "reduce_only": True,
+            "entry_price": self._grid_position_entry_price(),
+            "processed_fill_qty": 0.0,
+            "processed_fill_volume": 0.0,
+            "processed_fill_fee": 0.0,
+            "submission_pending": True,
+            "submission_attempts": 1,
+            "submission_not_found_count": 0,
+            "submission_last_not_found_at": 0.0,
+            "submission_updated_at": time.time(),
+            "reason": reason,
+            "tag": tag,
+        }
+        self._persist_state()
+        try:
+            result = self.client.place_order(
+                symbol=self.config["symbol"],
+                side=side,
+                qty=qty_text,
+                order_type="Market",
+                reduce_only=True,
+                order_link_id=link_id,
+            )
+        except Exception as exc:
+            if self._is_uncertain_submission_exception(exc):
+                self._mark_submission_unknown(self.pending_reduce_action, exc)
+                self.trigger_message = (
+                    "Reduce-only market submission is unconfirmed; checking the original "
+                    "client order ID without sending another close."
+                )
+                self._persist_state()
+                return link_id
+            self.pending_reduce_action = None
+            self._persist_state()
+            raise
         if result.get("retCode") != 0:
-            raise RuntimeError(result.get("retMsg", f"Failed to place reduce-only repair order: {reason}"))
-        self._apply_market_reduce_to_grid_position(side, float(qty_text))
-        self.trigger_message = f"Safety repair placed {side} reduce-only {qty_text}: {reason}"
+            message = str(
+                result.get("retMsg") or f"Failed to place reduce-only repair order: {reason}"
+            )
+            if self._is_uncertain_submission_message(message):
+                self._mark_submission_unknown(self.pending_reduce_action, message)
+                return link_id
+            self.pending_reduce_action = None
+            self._persist_state()
+            raise RuntimeError(message)
+        if not self._confirm_pending_submission(
+            self.pending_reduce_action, result.get("result", {})
+        ):
+            self._mark_submission_unknown(
+                self.pending_reduce_action,
+                "successful reduce-only market response had no order ID",
+            )
+            return link_id
+        order_id = str(self.pending_reduce_action.get("order_id", "") or "")
+        self._resolve_pending_reduce_action()
+        self.trigger_message = f"Safety reduce submitted {side} {qty_text}: {reason}"
         logger.warning(self.trigger_message)
         self._mark_fast_poll()
         self._persist_state()
-        return str(result["result"].get("orderId") or "")
+        return order_id or link_id
 
     def _place_market_open(self, side: str, qty: float) -> bool:
-        qty_text = self._order_qty_text(qty, reduce_only=False)
+        qty_text = self._market_order_qty_text(qty, reduce_only=False)
         if not qty_text:
             raise RuntimeError(f"Initial market order quantity {qty} is below the exchange minimum")
+        formatted_qty = Decimal(str(qty_text))
+        requested_qty = self._normalized_qty_decimal(qty, self.qty_step)
+        market_tolerance = max(
+            abs(Decimal(str(self.market_qty_step))) * Decimal("1e-9"),
+            Decimal("1e-18"),
+        )
+        if (
+            self._position_sizing_mode() == "fixed_grid_qty"
+            and abs(formatted_qty - requested_qty) > market_tolerance
+        ):
+            raise RuntimeError(
+                "The fixed per-grid quantity cannot be represented exactly by the exchange "
+                "market-order quantity step; use a compatible quantity or a limit opening order"
+            )
+        if self.max_market_qty > 0:
+            max_market_qty = Decimal(str(self.max_market_qty))
+            if formatted_qty > max_market_qty:
+                raise RuntimeError(
+                    f"Initial market order quantity {qty_text} exceeds the exchange single-order "
+                    f"market maximum {self.max_market_qty}; reduce the per-grid quantity or use a "
+                    "limit opening order"
+                )
         link_id = f"init_{side[0]}_{uuid.uuid4().hex[:6]}"
         self.initial_side = side
         self.initial_qty = float(qty_text)
@@ -2932,6 +3688,9 @@ class GridEngine:
             raise
         if result.get("retCode") != 0:
             message = str(result.get("retMsg") or "Failed to place initial market order")
+            if self._is_uncertain_submission_message(message):
+                self._mark_submission_unknown(self.opening_order, message)
+                return False
             self.opening_order = None
             self.waiting_initial_order = False
             self._persist_state()
@@ -2947,18 +3706,21 @@ class GridEngine:
             self._persist_state()
             return False
 
-        order_id = str(result.get("result", {}).get("orderId", ""))
-        stats = self._get_trade_stats(order_id, self.current_price, self.initial_qty, liquidity_hint="taker")
-        if stats is None:
-            volume = self.current_price * self.initial_qty
-            stats = {
-                "price": self.current_price,
-                "qty": self.initial_qty,
-                "volume": volume,
-                "fee": self._estimate_fee(volume, "taker"),
-                "fee_asset": "USDT estimated",
-                "fee_source": "estimated",
-            }
+        stats = self._authoritative_execution_stats(
+            self.opening_order,
+            result.get("result", {}) or {},
+            allow_estimate=not hasattr(self.client, "get_order_trades"),
+        )
+        planned_qty = Decimal(str(self.initial_qty))
+        confirmed_qty = Decimal(str((stats or {}).get("qty", 0) or 0))
+        if not stats or confirmed_qty + self._qty_tolerance_decimal() < planned_qty:
+            self.trigger_message = (
+                "Initial market order was accepted; waiting for the exchange to confirm "
+                "the full execution quantity and price before deploying the grid."
+            )
+            self._mark_fast_poll()
+            self._persist_state()
+            return False
         self.initial_qty = stats["qty"]
         self.initial_entry_price = stats["price"]
         self._set_initial_grid_position(side, stats["qty"])
@@ -3053,6 +3815,9 @@ class GridEngine:
             raise
         if result.get("retCode") != 0:
             message = str(result.get("retMsg") or "Failed to place initial limit order")
+            if self._is_uncertain_submission_message(message):
+                self._mark_submission_unknown(self.opening_order, message)
+                return
             self.opening_order = None
             self.waiting_initial_order = False
             self._persist_state()
@@ -3123,7 +3888,7 @@ class GridEngine:
 
         if not allow_duplicate and self._has_active_order(side, level_idx, reduce_only):
             return None
-        if self._stopping:
+        if self._stopping or self.ownership_conflicts:
             return None
 
         def submit_limit(use_post_only: bool):
@@ -3192,9 +3957,12 @@ class GridEngine:
             return None
 
         if result.get("retCode") != 0:
+            message = str(result.get("retMsg") or "rejected")
+            if self._is_uncertain_submission_message(message):
+                self._mark_submission_unknown(pending_order, message)
+                return link_id
             self.active_orders.pop(link_id, None)
             self._persist_state()
-            message = str(result.get("retMsg") or "rejected")
             if reduce_only:
                 self._warn_reduce_limit_unplaced(side, price_text, qty, message)
             else:
@@ -3226,6 +3994,8 @@ class GridEngine:
         return hasattr(self.client, "place_orders") and not bool(self.config.get("grid_order_post_only", False))
 
     def _place_batch_limit_orders(self, order_specs: list[dict[str, Any]]) -> list[str]:
+        if self.ownership_conflicts:
+            return []
         planned = []
 
         for spec in order_specs:
@@ -3371,7 +4141,9 @@ class GridEngine:
 
             if result.get("retCode") != 0:
                 message = str(result.get("retMsg") or "Batch order failed")
-                if self._is_duplicate_client_order_rejection(message):
+                if self._is_duplicate_client_order_rejection(
+                    message
+                ) or self._is_uncertain_submission_message(message):
                     mark_unknown(chunk, message)
                     with contextlib.suppress(Exception):
                         self._reconcile_exchange_open_orders()
@@ -3403,7 +4175,9 @@ class GridEngine:
                     continue
 
                 message = str(order_result.get("retMsg") or "Batch order item rejected")
-                if self._is_duplicate_client_order_rejection(message):
+                if self._is_duplicate_client_order_rejection(
+                    message
+                ) or self._is_uncertain_submission_message(message):
                     unconfirmed.append(item)
                 else:
                     rejected.append((item, message))
@@ -3706,65 +4480,115 @@ class GridEngine:
 
         return False
 
-    def _close_all_positions(self):
+    def _close_all_positions(self) -> bool:
+        if self.pending_reduce_action and not self._resolve_pending_reduce_action():
+            return False
+
         direction = self.config["direction"]
         if direction in {"long", "short"}:
             position_side = "Buy" if direction == "long" else "Sell"
-            close_side = "Sell" if position_side == "Buy" else "Buy"
-            size = self._safe_grid_close_qty(position_side)
-            qty_text = self._order_qty_text(size, reduce_only=True)
-            if not qty_text:
-                return
-            result = self.client.place_order(
-                symbol=self.config["symbol"],
-                side=close_side,
-                qty=qty_text,
-                order_type="Market",
-                reduce_only=True,
-                order_link_id=f"close_{close_side[0]}_{uuid.uuid4().hex[:6]}",
+        else:
+            grid_net_qty = self._grid_position_net_qty()
+            if not self._qty_reaches_accounting_step(grid_net_qty):
+                return True
+            position_side = "Buy" if grid_net_qty > 0 else "Sell"
+
+        close_side = "Sell" if position_side == "Buy" else "Buy"
+        size = self._safe_grid_close_qty(position_side)
+        if not self._qty_reaches_accounting_step(size):
+            if not self._qty_reaches_accounting_step(self._grid_position_qty()):
+                return True
+            self.trigger_message = (
+                "Risk close paused because exchange position and the grid-owned ledger do not "
+                "provide an authoritative close quantity."
             )
-            if result.get("retCode") != 0:
-                raise RuntimeError(result.get("retMsg", "Failed to close grid position"))
-            self.grid_position_net_qty = 0.0
-            return
+            self._persist_state()
+            return False
 
-        resp = self.client.get_positions(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to fetch positions"))
+        self._place_reduce_market(
+            close_side,
+            size,
+            "stop-loss/take-profit grid shutdown",
+            tag="risk_close",
+        )
+        if self.pending_reduce_action and not self._resolve_pending_reduce_action():
+            return False
+        return not self._qty_reaches_accounting_step(self._grid_position_qty())
 
-        for position in resp["result"].get("list", []):
-            size = float(position.get("size", 0))
-            qty_text = self._order_qty_text(size, reduce_only=True)
-            if not qty_text:
-                continue
-
-            close_side = "Sell" if position.get("side") == "Buy" else "Buy"
-            result = self.client.place_order(
-                symbol=self.config["symbol"],
-                side=close_side,
-                qty=qty_text,
-                order_type="Market",
-                reduce_only=True,
-                order_link_id=f"close_{close_side[0]}_{uuid.uuid4().hex[:6]}",
-            )
-            if result.get("retCode") != 0:
-                raise RuntimeError(result.get("retMsg", "Failed to close position"))
-
-    async def _shutdown_with_close(self):
+    async def _shutdown_with_close(self) -> bool:
+        self.risk_shutdown_pending = True
         self._stopping = True
-        self.running = False
         try:
-            self._close_all_positions()
-            self.client.cancel_all_orders(self.config["symbol"])
-            self.active_orders.clear()
+            if not self._cancel_managed_orders_once():
+                self.trigger_message = (
+                    "Risk shutdown is waiting for managed limit orders to reach terminal "
+                    "exchange status before closing the remaining grid position."
+                )
+                self._mark_fast_poll()
+                self._persist_state()
+                return False
+            if not self._close_all_positions():
+                self._mark_fast_poll()
+                self._persist_state()
+                return False
+
+            actual_delta = self._actual_position_net_qty() - self._baseline_position_net_qty()
+            if self._qty_reaches_accounting_step(actual_delta):
+                self.trigger_message = (
+                    "Risk shutdown close is exchange-terminal, but the actual position still "
+                    "differs from the protected baseline; no guessed follow-up order was sent."
+                )
+                self._mark_fast_poll()
+                self._persist_state()
+                return False
+
+            self.running = False
+            self.grid_ready = False
+            self.risk_shutdown_pending = False
+            self.paused_replacements.clear()
+            self._persist_state()
+            return True
         except Exception as exc:
             logger.exception("Risk shutdown failed: %s", exc)
-        finally:
+            self.trigger_message = f"Risk shutdown failed safely and will retry: {exc}"
+            self._mark_fast_poll()
             self._persist_state()
+            return False
 
     async def _run_loop(self):
         while self.running:
             try:
+                if self.manual_stop_pending:
+                    self._stopping = True
+                    if self.pending_reduce_action:
+                        self._resolve_pending_reduce_action()
+                    if self._cancel_managed_orders_once() and not self.pending_reduce_action:
+                        self.running = False
+                        self.grid_ready = False
+                        self.manual_stop_pending = False
+                        self.risk_shutdown_pending = False
+                        self.paused_replacements.clear()
+                        self._persist_state()
+                        break
+                    self.trigger_message = (
+                        "Manual stop recovery is reconciling managed orders; normal grid "
+                        "placement remains disabled."
+                    )
+                    self._mark_fast_poll()
+                    self._persist_state()
+                    await self._sleep_until_next_poll()
+                    continue
+
+                if self.risk_shutdown_pending:
+                    if await self._shutdown_with_close():
+                        break
+                    await self._sleep_until_next_poll()
+                    continue
+
+                if self.pending_reduce_action and not self._resolve_pending_reduce_action():
+                    await self._sleep_until_next_poll()
+                    continue
+
                 self.current_price = self._get_current_price()
 
                 if self.waiting_trigger and self._is_trigger_hit(self.current_price):
@@ -3774,8 +4598,10 @@ class GridEngine:
                     await self._check_initial_order()
 
                 if self.grid_ready and self._risk_hit(self.current_price):
-                    await self._shutdown_with_close()
-                    break
+                    if await self._shutdown_with_close():
+                        break
+                    await self._sleep_until_next_poll()
+                    continue
 
                 if self.grid_ready:
                     await self._check_fills()
@@ -3818,7 +4644,9 @@ class GridEngine:
 
         self._boundary_repair_in_progress = True
         try:
-            self._cancel_stale_reduce_orders(close_side)
+            if not self._cancel_stale_reduce_orders(close_side):
+                self._boundary_repair_retry_after = time.time() + 2
+                return
             refreshed_qty = self._safe_grid_close_qty(position_side)
             if self._qty_reaches_accounting_step(refreshed_qty):
                 self._place_reduce_market(close_side, refreshed_qty, reason)
@@ -3826,27 +4654,29 @@ class GridEngine:
         finally:
             self._boundary_repair_in_progress = False
 
-    def _cancel_stale_reduce_orders(self, side: str):
+    def _cancel_stale_reduce_orders(self, side: str) -> bool:
+        open_orders = self._fetch_open_orders()
+        all_terminal = True
         for link_id, order in list(self.active_orders.items()):
             if order.get("side") != side or not order.get("reduce_only"):
                 continue
 
-            order_id = str(order.get("order_id", ""))
             try:
-                result = {"retCode": 0}
-                if order_id:
-                    result = self.client.cancel_order(self.config["symbol"], order_id)
-                if result.get("retCode") != 0:
-                    raise RuntimeError(result.get("retMsg", "Failed to cancel stale reduce order"))
-                self.active_orders.pop(link_id, None)
+                outcome = self._cancel_managed_order_once(order, open_orders)
+                if outcome == "done":
+                    self.active_orders.pop(link_id, None)
+                else:
+                    all_terminal = False
             except Exception as exc:
+                all_terminal = False
                 logger.warning(
                     "Failed to cancel stale reduce order before boundary repair symbol=%s order_id=%s msg=%s",
                     self.config.get("symbol"),
-                    order_id,
+                    order.get("order_id", ""),
                     exc,
                 )
         self._persist_state()
+        return all_terminal
 
     def _replace_unfilled_opening_order(self, status: str):
         order = self.opening_order or {}
@@ -3905,25 +4735,10 @@ class GridEngine:
         if order_id in open_order_ids:
             return
 
-        fallback_price = float(self.opening_order["price"])
         planned_qty = float(self.opening_order["qty"])
-        snapshot = self._get_order_snapshot(self.opening_order)
+        snapshot = {**self.opening_order, **self._get_order_snapshot(self.opening_order)}
         status = self._order_status_from_snapshot(snapshot)
-        liquidity_hint = self._order_liquidity_hint(self.opening_order)
-        stats = self._get_trade_stats(
-            order_id,
-            fallback_price,
-            planned_qty,
-            allow_estimate=False,
-            liquidity_hint=liquidity_hint,
-        )
-        if not stats or stats["qty"] <= 0:
-            stats = self._execution_stats_from_order_snapshot(
-                snapshot,
-                fallback_price,
-                planned_qty,
-                liquidity_hint=liquidity_hint,
-            )
+        stats = self._authoritative_execution_stats(self.opening_order, snapshot)
         if not stats or stats["qty"] <= 0:
             if str(self.opening_order.get("order_type", "")).lower() == "market":
                 if self._is_filled_status(status):
@@ -3944,6 +4759,14 @@ class GridEngine:
                     )
                     self._persist_state()
                     return
+            if self._is_filled_status(status):
+                self.trigger_message = (
+                    "Opening order is filled; waiting for authoritative execution quantity "
+                    "and price before deploying the grid."
+                )
+                self._mark_fast_poll()
+                self._persist_state()
+                return
             if status == "UNKNOWN":
                 logger.info(
                     "Opening order absent from open orders but status is unknown; waiting symbol=%s order_id=%s",
@@ -3952,7 +4775,7 @@ class GridEngine:
                 )
                 self._mark_fast_poll()
                 return
-            if self._is_cancelled_status(status) or self._is_filled_status(status):
+            if self._is_cancelled_status(status):
                 self._replace_unfilled_opening_order(status)
                 return
             logger.info(
@@ -3964,7 +4787,13 @@ class GridEngine:
             self._mark_fast_poll()
             return
 
-        if self._is_partial_status(status):
+        confirmed_qty = Decimal(str(stats.get("qty", 0) or 0))
+        planned_qty_decimal = Decimal(str(planned_qty))
+        execution_complete = (
+            confirmed_qty + self._qty_tolerance_decimal() >= planned_qty_decimal
+        )
+        partial_execution_is_terminal = self._is_cancelled_status(status)
+        if not execution_complete and not partial_execution_is_terminal:
             self.trigger_message = (
                 f"Opening order partially filled {self._fq(stats['qty'])}/{self._fq(planned_qty)}; "
                 "waiting for final order status before deploying grid."
@@ -4020,17 +4849,19 @@ class GridEngine:
             if not changed or self._stopping:
                 break
 
-    def _handle_closed_order(self, order: dict, *, allow_estimate: bool | None = None) -> bool:
-        fallback_qty = float(order["qty"])
-        fallback_price = float(order["price"])
+    def _handle_closed_order(
+        self,
+        order: dict,
+        *,
+        allow_estimate: bool | None = None,
+        snapshot: dict | None = None,
+    ) -> bool:
         if allow_estimate is None:
             allow_estimate = not hasattr(self.client, "get_order_trades")
-        stats = self._get_trade_stats(
-            order["order_id"],
-            fallback_price,
-            fallback_qty,
+        stats = self._authoritative_execution_stats(
+            order,
+            snapshot,
             allow_estimate=allow_estimate,
-            liquidity_hint=self._order_liquidity_hint(order),
         )
         if not stats or stats["qty"] <= 0:
             return False
@@ -4151,8 +4982,6 @@ class GridEngine:
 
         status = self._order_status_from_snapshot(snapshot)
         qty = self._float_field(snapshot, "executedQty", "cumExecQty", "cumQty", "cum_exec_qty")
-        if qty <= 0 and self._is_filled_status(status):
-            qty = fallback_qty
         if qty <= 0:
             return None
 
@@ -4160,6 +4989,10 @@ class GridEngine:
         price = self._float_field(snapshot, "avgPrice", "avg_price", "averagePrice")
         if price <= 0 and volume > 0:
             price = volume / qty
+        if price <= 0 and liquidity_hint != "maker":
+            # A market or marketable GTC fill needs an exchange execution price;
+            # the requested/current price is not authoritative P&L evidence.
+            return None
         if price <= 0:
             price = fallback_price
         if volume <= 0:
@@ -4182,7 +5015,12 @@ class GridEngine:
 
     @staticmethod
     def _is_partial_status(status: str) -> bool:
-        return status in {"PARTIALLY_FILLED", "FILLED_PARTIALLY", "PARTIAL_FILLED"}
+        return status in {
+            "PARTIALLY_FILLED",
+            "PARTIALLYFILLED",
+            "FILLED_PARTIALLY",
+            "PARTIAL_FILLED",
+        }
 
     @staticmethod
     def _is_cancelled_status(status: str) -> bool:
@@ -4193,6 +5031,8 @@ class GridEngine:
             "EXPIRED",
             "EXPIRED_IN_MATCH",
             "DEACTIVATED",
+            "PARTIALLY_FILLED_CANCELED",
+            "PARTIALLYFILLEDCANCELED",
         }
 
     def _replace_cancelled_order(self, order: dict):
@@ -4206,6 +5046,9 @@ class GridEngine:
             allow_duplicate=bool(order["reduce_only"]),
             tag=order.get("tag"),
         )
+        if placed and order.get("completed_pair_counted") and placed in self.active_orders:
+            self.active_orders[placed]["completed_pair_counted"] = True
+            self._persist_state()
         if placed:
             logger.warning(
                 "Replaced cancelled grid order symbol=%s old_order_id=%s new_link_id=%s",
@@ -4214,7 +5057,13 @@ class GridEngine:
                 placed,
             )
 
-    def _record_fill(self, order: dict, stats: dict | None = None):
+    def _record_fill(
+        self,
+        order: dict,
+        stats: dict | None = None,
+        *,
+        count_completed_pair: bool = True,
+    ):
         level_idx = order["level_idx"]
         fallback_qty = float(order["qty"])
         fallback_price = float(order["price"])
@@ -4239,7 +5088,8 @@ class GridEngine:
                     gross_profit = (entry_price - price) * qty
             elif level_idx + 1 < len(self.grid_levels):
                 gross_profit = (self.grid_levels[level_idx + 1] - self.grid_levels[level_idx]) * qty
-            self.completed_pairs += 1
+            if count_completed_pair:
+                self.completed_pairs += 1
         recorded = self._record_trade_value(
             price,
             qty,

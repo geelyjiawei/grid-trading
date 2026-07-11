@@ -1,10 +1,13 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -21,6 +24,7 @@ import pyotp  # noqa: E402
 from aster_client import AsterFuturesClient  # noqa: E402
 from binance_client import BinanceFuturesClient  # noqa: E402
 from bybit_client import BybitClient  # noqa: E402
+from exchange_errors import ExchangeRequestUncertainError  # noqa: E402
 from auth import hash_password  # noqa: E402
 from test_grid_engine import FakeClient  # noqa: E402
 
@@ -49,6 +53,10 @@ class FakeAsterConfigClient(FakeConfigClient):
 
 class MultiGridServerTests(unittest.TestCase):
     def setUp(self):
+        self._original_grid_config_key = os.environ.get("GRID_CONFIG_KEY")
+        # A non-secret, test-only Fernet key makes secure-storage tests portable
+        # across Windows and the Linux production container.
+        os.environ["GRID_CONFIG_KEY"] = "sIhr5IiGxypCvGJCNqSWKTujXBi7mPYx68efWDYmPhs="
         self._original_state_file = main.GRID_STATE_FILE
         self._original_history_file = main.GRID_HISTORY_FILE
         self._original_api_config_file = main.API_CONFIG_FILE
@@ -62,6 +70,7 @@ class MultiGridServerTests(unittest.TestCase):
         main.GRID_HISTORY_FILE = str(Path(self._state_tmp.name) / "grid_history.json")
         main.API_CONFIG_FILE = str(Path(self._state_tmp.name) / "api_config.json")
         main._engines.clear()
+        main._starting_engine_keys.clear()
         fake_client = FakeClient("100")
         main._api_configs = {
             "binance": {
@@ -80,6 +89,7 @@ class MultiGridServerTests(unittest.TestCase):
 
     def tearDown(self):
         main._engines.clear()
+        main._starting_engine_keys.clear()
         main.GRID_STATE_FILE = self._original_state_file
         main.GRID_HISTORY_FILE = self._original_history_file
         main.API_CONFIG_FILE = self._original_api_config_file
@@ -89,6 +99,10 @@ class MultiGridServerTests(unittest.TestCase):
         main._api_config = self._original_api_config
         main._client = self._original_client
         self._state_tmp.cleanup()
+        if self._original_grid_config_key is None:
+            os.environ.pop("GRID_CONFIG_KEY", None)
+        else:
+            os.environ["GRID_CONFIG_KEY"] = self._original_grid_config_key
         for key in (
             "AUTH_REQUIRED",
             "ADMIN_USERNAME",
@@ -231,6 +245,136 @@ class MultiGridServerTests(unittest.TestCase):
 
         self.assertEqual(first_response.status_code, 200)
         self.assertEqual(second_response.status_code, 400)
+
+    def test_same_symbol_concurrent_start_is_reserved_before_exchange_calls_finish(self):
+        class BlockingLeverageClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def set_leverage(self, symbol, leverage):
+                self.entered.set()
+                if not self.release.wait(timeout=5):
+                    raise TimeoutError("test leverage barrier timed out")
+                return {"retCode": 0}
+
+        blocking_client = BlockingLeverageClient("100")
+        main._clients["binance"] = blocking_client
+        main._client = blocking_client
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                TestClient(main.app).post,
+                "/api/grid/start",
+                json=self._payload("RACEUSDT"),
+            )
+            self.assertTrue(blocking_client.entered.wait(timeout=2))
+            second_response = TestClient(main.app).post(
+                "/api/grid/start", json=self._payload("RACEUSDT")
+            )
+            blocking_client.release.set()
+            first_response = first_future.result(timeout=10)
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 400)
+        self.assertEqual(
+            len(
+                [
+                    order
+                    for order in blocking_client.orders
+                    if order.get("order_type") == "Market"
+                ]
+            ),
+            1,
+        )
+
+    def test_initialization_failure_after_market_fill_is_retained_and_blocks_retry(self):
+        original_save = main._save_engine_state
+        save_calls = 0
+
+        def fail_after_exchange_submission(engine):
+            nonlocal save_calls
+            save_calls += 1
+            if save_calls >= 3:
+                raise OSError("simulated state persistence failure")
+            return original_save(engine)
+
+        with patch.object(main, "_save_engine_state", side_effect=fail_after_exchange_submission):
+            response = self.client.post(
+                "/api/grid/start", json=self._payload("INITFAILUSDT")
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        key = main._engine_key("binance", "INITFAILUSDT")
+        engine = main._engines[key]
+        retry = self.client.post("/api/grid/start", json=self._payload("INITFAILUSDT"))
+
+        self.assertTrue(engine.initialization_failed)
+        self.assertEqual(retry.status_code, 400)
+        self.assertEqual(
+            len(
+                [
+                    order
+                    for order in main._client.orders
+                    if order.get("order_type") == "Market"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(float(main._client.positions[0]["size"]), 2.0)
+
+        engine.state_callback = original_save
+        stop = self.client.post("/api/grid/stop/INITFAILUSDT?exchange=binance")
+
+        self.assertEqual(stop.status_code, 200)
+        self.assertNotIn(key, main._engines)
+        self.assertEqual(float(main._client.positions[0]["size"]), 2.0)
+
+    def test_nonrunning_engine_with_unconfirmed_orders_blocks_restart_and_can_be_stopped(self):
+        config = self._payload("MUUSDT")
+        config["exchange"] = "binance"
+        engine = main.GridEngine(main._client, config, state_callback=main._save_engine_state)
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine._place("Sell", 110, 0, reduce_only=False, qty_override=1)
+        engine.running = False
+        main._engines[main._engine_key("binance", "MUUSDT")] = engine
+
+        restart = self.client.post("/api/grid/start", json=self._payload("MUUSDT"))
+        stop = self.client.post("/api/grid/stop/MUUSDT?exchange=binance")
+
+        self.assertEqual(restart.status_code, 400)
+        self.assertIn("unconfirmed exchange work", restart.json()["detail"])
+        self.assertEqual(stop.status_code, 200)
+        self.assertNotIn(main._engine_key("binance", "MUUSDT"), main._engines)
+
+    def test_start_is_blocked_by_existing_grid_tagged_exchange_order(self):
+        existing = main._client.place_order(
+            symbol="ORPHANUSDT",
+            side="Sell",
+            qty="1",
+            price="105",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id="g_1_S_oldrun",
+        )
+        order_count = len(main._client.orders)
+
+        response = self.client.post(
+            "/api/grid/start", json=self._payload("ORPHANUSDT")
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("existing grid-tagged", response.json()["detail"])
+        self.assertEqual(len(main._client.orders), order_count)
+        self.assertIn(str(existing["result"]["orderId"]), main._client.open_limit_order_ids)
+        self.assertNotIn(main._engine_key("binance", "ORPHANUSDT"), main._engines)
+
+    def test_risk_classifies_opening_and_repair_client_ids_as_grid_orders(self):
+        self.assertTrue(main._is_grid_order({"orderLinkId": "init_S_abcdef"}))
+        self.assertTrue(main._is_grid_order({"orderLinkId": "repair_B_abcdef"}))
+        self.assertFalse(main._is_grid_order({"orderLinkId": "manual_order"}))
 
     def test_grid_history_records_running_and_stopped_strategy_summary(self):
         start = self.client.post("/api/grid/start", json=self._payload("BILLUSDT"))
@@ -456,6 +600,85 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertAlmostEqual(data["total_qty"], 80.0)
         self.assertAlmostEqual(data["qty_per_grid_min"], 4.0)
         self.assertAlmostEqual(data["qty_per_grid_max"], 4.0)
+
+    def test_grid_preview_rejects_market_max_before_start(self):
+        main._client = FakeClient(
+            "100",
+            tick_size="1",
+            qty_step="0.1",
+            min_qty="0.1",
+            max_market_qty="0.4",
+        )
+        payload = self._payload("MUUSDT")
+        payload.update(
+            {
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("single-order maximum", response.json()["detail"])
+        self.assertEqual(main._client.orders, [])
+
+    def test_grid_preview_rejects_fixed_qty_market_step_drift(self):
+        main._client = FakeClient(
+            "100",
+            tick_size="1",
+            qty_step="0.1",
+            min_qty="0.1",
+            market_qty_step="0.3",
+            market_min_qty="0.3",
+        )
+        payload = self._payload("MUUSDT")
+        payload.update(
+            {
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 0.2,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot be represented exactly", response.json()["detail"])
+        self.assertEqual(main._client.orders, [])
+
+    def test_grid_preview_investment_mode_uses_market_quantity_rules(self):
+        main._client = FakeClient(
+            "100",
+            tick_size="1",
+            qty_step="0.1",
+            min_qty="0.1",
+            market_qty_step="0.3",
+            market_min_qty="0.3",
+            max_market_qty="2.0",
+        )
+        payload = self._payload("MUUSDT")
+        payload.update(
+            {
+                "total_investment": 105,
+                "leverage": 1,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertAlmostEqual(data["total_qty"], 0.9)
+        self.assertEqual(data["market_qty_step"], "0.3")
+        self.assertEqual(data["market_min_qty"], 0.3)
+        self.assertEqual(data["max_market_qty"], 2.0)
+        self.assertAlmostEqual(data["qty_per_grid_min"], 0.4)
+        self.assertAlmostEqual(data["qty_per_grid_max"], 0.5)
 
     def test_grid_history_includes_opening_details(self):
         payload = self._payload("BILLUSDT")
@@ -1078,6 +1301,43 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(trade["feeUsdt"], "0.600")
         self.assertTrue(trade["isMaker"])
 
+    def test_binance_instrument_info_preserves_market_lot_rules(self):
+        client = BinanceFuturesClient("", "", True)
+
+        def fake_request(method, path, *, params=None, auth=False, api_key=False):
+            return {
+                "symbols": [
+                    {
+                        "symbol": "TESTUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                            {
+                                "filterType": "LOT_SIZE",
+                                "stepSize": "0.1",
+                                "minQty": "0.1",
+                                "maxQty": "1000",
+                            },
+                            {
+                                "filterType": "MARKET_LOT_SIZE",
+                                "stepSize": "0.1",
+                                "minQty": "0.1",
+                                "maxQty": "120",
+                            },
+                        ],
+                    }
+                ]
+            }
+
+        client._request = fake_request
+
+        response = client.get_instrument_info("testusdt")
+        info = response["result"]["list"][0]
+
+        self.assertEqual(info["lotSizeFilter"]["maxOrderQty"], "1000")
+        self.assertEqual(info["marketLotSizeFilter"]["qtyStep"], "0.1")
+        self.assertEqual(info["marketLotSizeFilter"]["minOrderQty"], "0.1")
+        self.assertEqual(info["marketLotSizeFilter"]["maxOrderQty"], "120")
+
     def test_binance_get_order_by_link_uses_orig_client_order_id(self):
         client = BinanceFuturesClient("", "", True)
         calls = []
@@ -1112,6 +1372,43 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(response["result"]["orderId"], "99")
         self.assertEqual(response["result"]["orderLinkId"], "g_4_S_recover")
 
+    def test_binance_order_trade_query_uses_exchange_maximum_page_size(self):
+        client = BinanceFuturesClient("", "", True)
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            return []
+
+        client._request = fake_request
+
+        response = client.get_order_trades("TESTUSDT", "99")
+
+        self.assertEqual(response["retCode"], 0)
+        self.assertEqual(calls[0][1], "/fapi/v1/userTrades")
+        self.assertEqual(calls[0][2]["orderId"], "99")
+        self.assertEqual(calls[0][2]["limit"], 1000)
+
+    def test_binance_http_503_is_an_unknown_request_outcome(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 503
+        response.json.return_value = {
+            "code": -1007,
+            "msg": "Timeout waiting for backend; execution status unknown",
+        }
+        response.text = "timeout"
+        client.session.request = Mock(return_value=response)
+
+        with self.assertRaises(ExchangeRequestUncertainError):
+            client.place_order(
+                symbol="TESTUSDT",
+                side="Buy",
+                qty="1",
+                order_type="Market",
+                order_link_id="init_B_unknown",
+            )
+
     def test_bybit_get_order_by_link_falls_back_to_history(self):
         client = BybitClient("", "", True)
         calls = []
@@ -1143,6 +1440,96 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(calls[1][1], "/v5/order/history")
         self.assertIn("orderLinkId=g_2_B_recover", calls[1][2])
         self.assertEqual(response["result"]["orderId"], "bybit-1")
+
+    def test_bybit_open_orders_follows_every_cursor_page(self):
+        client = BybitClient("key", "secret")
+        calls = []
+
+        def fake_request(method, path, *, params=None, payload=None, auth=False):
+            calls.append(str(params or ""))
+            if "cursor=" not in str(params or ""):
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [{"orderId": str(index)} for index in range(50)],
+                        "nextPageCursor": "page%3D2%26offset%3D50",
+                    },
+                }
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [{"orderId": str(index)} for index in range(50, 75)],
+                    "nextPageCursor": "",
+                },
+            }
+
+        client._request = fake_request
+
+        response = client.get_open_orders("MUUSDT")
+
+        self.assertEqual(len(response["result"]["list"]), 75)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("limit=50", calls[0])
+        self.assertIn("cursor=page%3D2%26offset%3D50", calls[1])
+
+    def test_bybit_http_503_is_an_unknown_request_outcome(self):
+        client = BybitClient("key", "secret")
+        response = Mock()
+        response.status_code = 503
+        response.json.return_value = {"retCode": 10016, "retMsg": "Server timeout"}
+        response.text = "timeout"
+
+        with patch("bybit_client.requests.post", return_value=response):
+            with self.assertRaises(ExchangeRequestUncertainError):
+                client.place_order(
+                    symbol="TESTUSDT",
+                    side="Buy",
+                    qty="1",
+                    order_type="Market",
+                    order_link_id="init_B_unknown",
+                )
+
+    def test_bybit_order_trades_follows_cursor_and_normalizes_all_executions(self):
+        client = BybitClient("key", "secret")
+        calls = []
+
+        def trade(index):
+            return {
+                "execQty": "0.1",
+                "execPrice": "100",
+                "execValue": "10",
+                "execFee": "0.005",
+                "feeCurrency": "USDT",
+                "isMaker": False,
+                "orderId": "order-1",
+                "execId": str(index),
+            }
+
+        def fake_request(method, path, *, params=None, payload=None, auth=False):
+            calls.append(str(params or ""))
+            if "cursor=" not in str(params or ""):
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [trade(index) for index in range(100)],
+                        "nextPageCursor": "next%3A100",
+                    },
+                }
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [trade(index) for index in range(100, 130)],
+                    "nextPageCursor": "",
+                },
+            }
+
+        client._request = fake_request
+
+        response = client.get_order_trades("MUUSDT", "order-1")
+
+        self.assertEqual(len(response["result"]["list"]), 130)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(item["qty"] == "0.1" for item in response["result"]["list"]))
 
     def test_binance_fee_asset_price_cache_expires(self):
         client = BinanceFuturesClient("", "", True)

@@ -8,6 +8,8 @@ from urllib.parse import urlencode
 
 import requests
 
+from exchange_errors import ExchangeRequestUncertainError
+
 
 class BinanceFuturesClient:
     exchange = "binance"
@@ -56,6 +58,10 @@ class BinanceFuturesClient:
             data = {"code": response.status_code, "msg": response.text}
         if response.status_code >= 400:
             message = data.get("msg") if isinstance(data, dict) else response.text
+            if response.status_code == 408 or response.status_code >= 500:
+                raise ExchangeRequestUncertainError(
+                    message or f"Binance request status unknown after HTTP {response.status_code}"
+                )
             raise RuntimeError(message or f"Binance request failed with {response.status_code}")
         return data
 
@@ -95,6 +101,7 @@ class BinanceFuturesClient:
         filters = {item.get("filterType"): item for item in instrument.get("filters", [])}
         price_filter = filters.get("PRICE_FILTER", {})
         lot_filter = filters.get("LOT_SIZE", {})
+        market_lot_filter = filters.get("MARKET_LOT_SIZE", lot_filter)
         result = {
             "retCode": 0,
             "result": {
@@ -104,6 +111,16 @@ class BinanceFuturesClient:
                         "lotSizeFilter": {
                             "qtyStep": lot_filter.get("stepSize", "0.001"),
                             "minOrderQty": lot_filter.get("minQty", "0.001"),
+                            "maxOrderQty": lot_filter.get("maxQty", "0"),
+                        },
+                        "marketLotSizeFilter": {
+                            "qtyStep": market_lot_filter.get(
+                                "stepSize", lot_filter.get("stepSize", "0.001")
+                            ),
+                            "minOrderQty": market_lot_filter.get(
+                                "minQty", lot_filter.get("minQty", "0.001")
+                            ),
+                            "maxOrderQty": market_lot_filter.get("maxQty", "0"),
                         },
                     }
                 ]
@@ -330,7 +347,7 @@ class BinanceFuturesClient:
         trades = self._request(
             "GET",
             "/fapi/v1/userTrades",
-            params={"symbol": symbol.upper(), "orderId": order_id, "limit": 100},
+            params={"symbol": symbol.upper(), "orderId": order_id, "limit": 1000},
             auth=True,
         )
         return {

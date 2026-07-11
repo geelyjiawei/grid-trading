@@ -500,6 +500,19 @@ function renderRiskSnapshot(risk) {
   const messages = [];
   const reduceProtection = risk.reduce_protection || {};
   const gridCoverage = risk.grid_coverage || {};
+  const pendingSubmissionCount = Number(risk.pending_submission_count || 0);
+  if (risk.initialization_failed) {
+    messages.push("<div>策略启动未完整完成，程序正在保留交易所现场并阻止重复启动。请先执行停止并完成核对，不要直接再次启动。</div>");
+  }
+  if (pendingSubmissionCount > 0) {
+    messages.push(`<div>有 ${pendingSubmissionCount} 个下单结果尚未被交易所权威确认，程序不会猜测成交，也不会重复发送未知结果的市价单。</div>`);
+  }
+  if (risk.risk_shutdown_pending) {
+    messages.push("<div>止盈/止损清理尚未完成，程序正在等待撤单或平仓成交确认。</div>");
+  }
+  if (risk.manual_stop_pending) {
+    messages.push("<div>手动停止清理尚未完成，仍有订单状态需要交易所确认。</div>");
+  }
   if (reduceProtection.has_risk) {
     const missing = reduceProtection.missing_by_level || [];
     const missingText = missing

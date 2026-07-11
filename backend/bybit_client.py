@@ -7,6 +7,8 @@ from typing import Any
 
 import requests
 
+from exchange_errors import ExchangeRequestUncertainError
+
 
 class BybitClient:
     ASSET_PRICE_TTL_SECONDS = 60
@@ -57,8 +59,22 @@ class BybitClient:
         else:
             response = requests.post(url, headers=headers, data=body, timeout=10)
 
+        if response.status_code == 408 or response.status_code >= 500:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            message = data.get("retMsg") if isinstance(data, dict) else ""
+            raise ExchangeRequestUncertainError(
+                message or f"Bybit request status unknown after HTTP {response.status_code}"
+            )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        if data.get("retCode") in {10000, 10016}:
+            raise ExchangeRequestUncertainError(
+                str(data.get("retMsg") or "Bybit server timeout; request status unknown")
+            )
+        return data
 
     def get_ticker(self, symbol: str) -> dict:
         return self._request(
@@ -138,12 +154,48 @@ class BybitClient:
             auth=True,
         )
 
+    def _get_paginated(
+        self,
+        path: str,
+        *,
+        base_params: str,
+        page_size: int,
+        max_items: int | None = None,
+    ) -> dict:
+        items: list[dict] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        last_response: dict = {"retCode": 0, "result": {"list": []}}
+        for _ in range(100):
+            params = f"{base_params}&limit={page_size}"
+            if cursor:
+                params += f"&cursor={requests.utils.quote(cursor, safe='%')}"
+            response = self._request("GET", path, params=params, auth=True)
+            last_response = response
+            if response.get("retCode") != 0:
+                return response
+            result = response.get("result", {}) or {}
+            page_items = list(result.get("list", []) or [])
+            items.extend(page_items)
+            if max_items is not None and len(items) >= max_items:
+                items = items[:max_items]
+                break
+            next_cursor = str(result.get("nextPageCursor", "") or "")
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        result = dict(last_response.get("result", {}) or {})
+        result["list"] = items
+        result["nextPageCursor"] = ""
+        return {**last_response, "result": result}
+
     def get_open_orders(self, symbol: str) -> dict:
-        return self._request(
-            "GET",
+        return self._get_paginated(
             "/v5/order/realtime",
-            params=f"category=linear&symbol={symbol}&limit=50",
-            auth=True,
+            base_params=f"category=linear&symbol={symbol}&openOnly=0",
+            page_size=50,
         )
 
     def get_order(self, symbol: str, order_id: str) -> dict:
@@ -204,19 +256,19 @@ class BybitClient:
         )
 
     def get_order_history(self, symbol: str, limit: int = 50) -> dict:
-        return self._request(
-            "GET",
+        safe_limit = max(1, min(int(limit or 50), 1000))
+        return self._get_paginated(
             "/v5/order/history",
-            params=f"category=linear&symbol={symbol}&limit={limit}",
-            auth=True,
+            base_params=f"category=linear&symbol={symbol}",
+            page_size=min(50, safe_limit),
+            max_items=safe_limit,
         )
 
     def get_order_trades(self, symbol: str, order_id: str) -> dict:
-        resp = self._request(
-            "GET",
+        resp = self._get_paginated(
             "/v5/execution/list",
-            params=f"category=linear&symbol={symbol}&orderId={order_id}&limit=100",
-            auth=True,
+            base_params=f"category=linear&symbol={symbol}&orderId={order_id}",
+            page_size=100,
         )
         if resp.get("retCode") != 0:
             return resp

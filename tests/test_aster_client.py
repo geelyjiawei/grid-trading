@@ -8,6 +8,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from aster_client import AsterFuturesClient  # noqa: E402
+from exchange_errors import ExchangeRequestUncertainError  # noqa: E402
 
 
 PRIVATE_KEY = "0x" + "1" * 64
@@ -36,6 +37,62 @@ class FakeSession:
 
 
 class AsterClientTests(unittest.TestCase):
+    def test_instrument_info_preserves_market_lot_rules(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.session = FakeSession(
+            FakeResponse(
+                {
+                    "symbols": [
+                        {
+                            "symbol": "ASTERUSDT",
+                            "filters": [
+                                {"filterType": "PRICE_FILTER", "tickSize": "0.0001"},
+                                {
+                                    "filterType": "LOT_SIZE",
+                                    "stepSize": "1",
+                                    "minQty": "1",
+                                    "maxQty": "100000",
+                                },
+                                {
+                                    "filterType": "MARKET_LOT_SIZE",
+                                    "stepSize": "1",
+                                    "minQty": "1",
+                                    "maxQty": "5000",
+                                },
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+
+        response = client.get_instrument_info("asterusdt")
+        info = response["result"]["list"][0]
+
+        self.assertEqual(info["lotSizeFilter"]["maxOrderQty"], "100000")
+        self.assertEqual(info["marketLotSizeFilter"]["qtyStep"], "1")
+        self.assertEqual(info["marketLotSizeFilter"]["minOrderQty"], "1")
+        self.assertEqual(info["marketLotSizeFilter"]["maxOrderQty"], "5000")
+
+    def test_http_503_is_reported_as_unknown_submission_outcome(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.session = FakeSession(
+            FakeResponse(
+                {"code": -1007, "msg": "Timeout; execution status unknown"},
+                status_code=503,
+            )
+        )
+
+        with self.assertRaises(ExchangeRequestUncertainError):
+            client.place_order(
+                symbol="ASTERUSDT",
+                side="Buy",
+                qty="20",
+                price="0.5",
+                order_type="Limit",
+                order_link_id="g_1_B_unknown",
+            )
+
     def test_signature_payload_uses_eip712_message_body(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
 
