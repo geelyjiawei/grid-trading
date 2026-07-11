@@ -342,6 +342,21 @@ class AsterFuturesClient:
         )
         return {"retCode": 0, "result": self._normalize_order(order)}
 
+    def get_order_by_link(self, symbol: str, order_link_id: str) -> dict:
+        try:
+            order = self._request(
+                "GET",
+                "/fapi/v3/order",
+                params={"symbol": symbol.upper(), "origClientOrderId": order_link_id},
+                auth=True,
+            )
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "order does not exist" in message or "unknown order" in message:
+                return {"retCode": 0, "result": {}}
+            raise
+        return {"retCode": 0, "result": self._normalize_order(order)}
+
     def get_positions(self, symbol: str) -> dict:
         positions = self._request(
             "GET",

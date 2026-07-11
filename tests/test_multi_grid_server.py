@@ -658,6 +658,102 @@ class MultiGridServerTests(unittest.TestCase):
             0.1,
         )
 
+    def test_risk_endpoint_flags_qty_step_position_delta_below_min_qty(self):
+        main._client = FakeClient("100", qty_step="0.01", min_qty="0.1")
+        main._client.positions = [{"side": "Sell", "size": "0.01", "avgPrice": "100"}]
+        exchange = main._active_exchange
+        engine = main.GridEngine(
+            main._client,
+            {
+                "symbol": "STEPUSDT",
+                "exchange": exchange,
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.running = True
+        main._engines[main._engine_key(exchange, "STEPUSDT")] = engine
+
+        response = self.client.get(f"/api/risk/STEPUSDT?exchange={exchange}")
+
+        self.assertEqual(response.status_code, 200)
+        snapshot = response.json()
+        self.assertTrue(snapshot["unmanaged_position"])
+        self.assertEqual(snapshot["unmanaged_delta_qty"], -0.01)
+        self.assertTrue(snapshot["has_risk"])
+
+    def test_risk_endpoint_tracks_pending_submission_by_client_order_id(self):
+        main._client = FakeClient("100", qty_step="0.1", min_qty="0.1")
+        exchange = main._active_exchange
+        link_id = "g_0_B_pending"
+        main._client.place_order(
+            symbol="PENDINGUSDT",
+            side="Buy",
+            qty="1.0",
+            price="90",
+            order_type="Limit",
+            reduce_only=True,
+            order_link_id=link_id,
+        )
+        main._client.positions = [{"side": "Sell", "size": "1.0", "avgPrice": "100"}]
+        engine = main.GridEngine(
+            main._client,
+            {
+                "symbol": "PENDINGUSDT",
+                "exchange": exchange,
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.running = True
+        engine.grid_ready = True
+        engine.grid_levels = [90, 110]
+        engine.target_qty_by_level = {"0": 1.0}
+        engine.grid_position_net_qty = -1.0
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {"0": {"qty": 1.0, "entry_value": 100.0}}
+        engine.active_orders = {
+            link_id: engine._pending_limit_order_state(
+                link_id=link_id,
+                level_idx=0,
+                side="Buy",
+                price="90",
+                qty="1.0",
+                reduce_only=True,
+                entry_price=100,
+                time_in_force="GTC",
+            )
+        }
+        main._engines[main._engine_key(exchange, "PENDINGUSDT")] = engine
+
+        response = self.client.get(f"/api/risk/PENDINGUSDT?exchange={exchange}")
+
+        self.assertEqual(response.status_code, 200)
+        snapshot = response.json()
+        self.assertEqual(snapshot["orphan_order_count"], 0)
+        self.assertFalse(snapshot["unmanaged_position"])
+        self.assertEqual(snapshot["pending_submission_count"], 1)
+        self.assertEqual(snapshot["pending_submissions"][0]["order_link_id"], link_id)
+        self.assertEqual(snapshot["reduce_protection"]["pending_submission_count"], 1)
+        self.assertTrue(snapshot["has_risk"])
+
     def test_api_config_change_is_blocked_while_grid_is_running(self):
         original_binance = main.BinanceFuturesClient
         original_bybit = main.BybitClient
@@ -981,6 +1077,72 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(trade["feeAsset"], "BNB")
         self.assertEqual(trade["feeUsdt"], "0.600")
         self.assertTrue(trade["isMaker"])
+
+    def test_binance_get_order_by_link_uses_orig_client_order_id(self):
+        client = BinanceFuturesClient("", "", True)
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            return {
+                "orderId": 99,
+                "clientOrderId": "g_4_S_recover",
+                "side": "SELL",
+                "price": "101",
+                "origQty": "2",
+                "status": "NEW",
+                "reduceOnly": False,
+            }
+
+        client._request = fake_request
+
+        response = client.get_order_by_link("testusdt", "g_4_S_recover")
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "GET",
+                    "/fapi/v1/order",
+                    {"symbol": "TESTUSDT", "origClientOrderId": "g_4_S_recover"},
+                    True,
+                )
+            ],
+        )
+        self.assertEqual(response["result"]["orderId"], "99")
+        self.assertEqual(response["result"]["orderLinkId"], "g_4_S_recover")
+
+    def test_bybit_get_order_by_link_falls_back_to_history(self):
+        client = BybitClient("", "", True)
+        calls = []
+
+        def fake_request(method, path, *, params="", payload=None, auth=False):
+            calls.append((method, path, params, auth))
+            if path == "/v5/order/realtime":
+                return {"retCode": 0, "result": {"list": []}}
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "orderId": "bybit-1",
+                            "orderLinkId": "g_2_B_recover",
+                            "orderStatus": "Filled",
+                        }
+                    ]
+                },
+            }
+
+        client._request = fake_request
+
+        response = client.get_order_by_link("TESTUSDT", "g_2_B_recover")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], "/v5/order/realtime")
+        self.assertIn("orderLinkId=g_2_B_recover", calls[0][2])
+        self.assertEqual(calls[1][1], "/v5/order/history")
+        self.assertIn("orderLinkId=g_2_B_recover", calls[1][2])
+        self.assertEqual(response["result"]["orderId"], "bybit-1")
 
     def test_binance_fee_asset_price_cache_expires(self):
         client = BinanceFuturesClient("", "", True)

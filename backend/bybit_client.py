@@ -167,6 +167,34 @@ class BybitClient:
         items = history.get("result", {}).get("list", [])
         return {"retCode": 0, "result": items[0] if items else {}}
 
+    def get_order_by_link(self, symbol: str, order_link_id: str) -> dict:
+        resp = self._request(
+            "GET",
+            "/v5/order/realtime",
+            params=(
+                f"category=linear&symbol={symbol}&orderLinkId={order_link_id}"
+            ),
+            auth=True,
+        )
+        if resp.get("retCode") != 0:
+            return resp
+        items = resp.get("result", {}).get("list", [])
+        if items:
+            return {"retCode": 0, "result": items[0]}
+
+        history = self._request(
+            "GET",
+            "/v5/order/history",
+            params=(
+                f"category=linear&symbol={symbol}&orderLinkId={order_link_id}&limit=1"
+            ),
+            auth=True,
+        )
+        if history.get("retCode") != 0:
+            return history
+        items = history.get("result", {}).get("list", [])
+        return {"retCode": 0, "result": items[0] if items else {}}
+
     def get_positions(self, symbol: str) -> dict:
         return self._request(
             "GET",

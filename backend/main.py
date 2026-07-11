@@ -1247,12 +1247,25 @@ def _managed_order_ids(engine: GridEngine | None) -> set[str]:
     return {order_id for order_id in ids if order_id}
 
 
+def _managed_order_links(engine: GridEngine | None) -> set[str]:
+    if not engine:
+        return set()
+    links = {
+        str(order.get("link_id", "") or "")
+        for order in engine.active_orders.values()
+    }
+    if engine.opening_order:
+        links.add(str(engine.opening_order.get("link_id", "") or ""))
+    return {link_id for link_id in links if link_id}
+
+
 def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     exchange = _normalize_exchange(exchange or _active_exchange)
     client = _get_client(exchange)
     symbol = symbol.upper().strip()
     engine = _get_engine(exchange, symbol)
     managed_ids = _managed_order_ids(engine)
+    managed_links = _managed_order_links(engine)
 
     open_resp = client.get_open_orders(symbol)
     if open_resp.get("retCode") != 0:
@@ -1272,6 +1285,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         }
         for item in grid_orders
         if str(item.get("orderId", "")) not in managed_ids
+        and str(item.get("orderLinkId", "") or "") not in managed_links
     ]
 
     position_resp = client.get_positions(symbol)
@@ -1307,19 +1321,33 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     reduce_protection_risk = False
     grid_coverage = {}
     grid_coverage_risk = False
+    pending_submissions = []
     if engine and engine.running:
         status = engine.get_status()
         expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
         unmanaged_delta_qty = actual_position_net_qty - expected_position_net_qty
-        unmanaged_position = abs(unmanaged_delta_qty) >= max(float(engine.min_qty), 1e-12)
+        unmanaged_position = engine._qty_reaches_accounting_step(unmanaged_delta_qty)
         reduce_protection = status.get("reduce_protection") or {}
-        # Reduce-protection diagnostics are informational only. The live grid
-        # should not surface a risk solely because the optional protection
-        # ledger is incomplete; actual risk is still captured by orphan orders
-        # and expected-vs-actual position deltas.
-        reduce_protection_risk = False
+        reduce_protection_risk = bool(reduce_protection.get("has_risk"))
         grid_coverage = status.get("grid_coverage") or {}
         grid_coverage_risk = bool(grid_coverage.get("has_risk"))
+        submission_records = list(engine.active_orders.values())
+        if engine.opening_order:
+            submission_records.append(engine.opening_order)
+        pending_submissions = [
+            {
+                "order_link_id": order.get("link_id", ""),
+                "side": order.get("side", ""),
+                "price": order.get("price", "0"),
+                "qty": order.get("qty", "0"),
+                "status": order.get("status", "SUBMIT_UNKNOWN"),
+                "reduce_only": bool(order.get("reduce_only", False)),
+                "attempts": int(order.get("submission_attempts", 1) or 1),
+                "error": order.get("submission_error", ""),
+            }
+            for order in submission_records
+            if order.get("submission_pending")
+        ]
     return {
         "symbol": symbol,
         "exchange": exchange,
@@ -1332,12 +1360,15 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "actual_position_net_qty": round(actual_position_net_qty, 8),
         "reduce_protection": reduce_protection,
         "grid_coverage": grid_coverage,
+        "pending_submission_count": len(pending_submissions),
+        "pending_submissions": pending_submissions,
         "positions": positions,
         "has_risk": bool(
             orphan_orders
             or unmanaged_position
             or reduce_protection_risk
             or grid_coverage_risk
+            or pending_submissions
         ),
     }
 

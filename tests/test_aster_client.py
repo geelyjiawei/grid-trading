@@ -195,6 +195,42 @@ class AsterClientTests(unittest.TestCase):
         self.assertEqual(len(trades["result"]["list"]), 1)
         self.assertEqual(trades["result"]["list"][0]["orderId"], "2")
 
+    def test_get_order_by_link_uses_orig_client_order_id(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.session = FakeSession(
+            FakeResponse(
+                {
+                    "orderId": 88,
+                    "clientOrderId": "g_3_B_recover",
+                    "side": "BUY",
+                    "price": "0.38",
+                    "origQty": "100",
+                    "status": "NEW",
+                    "reduceOnly": "true",
+                }
+            )
+        )
+
+        response = client.get_order_by_link("ansemusdt", "g_3_B_recover")
+        call = client.session.calls[0]
+
+        self.assertEqual(call["method"], "GET")
+        self.assertEqual(call["url"], "https://example.test/fapi/v3/order")
+        self.assertEqual(call["params"]["symbol"], "ANSEMUSDT")
+        self.assertEqual(call["params"]["origClientOrderId"], "g_3_B_recover")
+        self.assertEqual(response["result"]["orderId"], "88")
+        self.assertEqual(response["result"]["orderLinkId"], "g_3_B_recover")
+
+    def test_get_order_by_link_returns_empty_for_definitive_not_found(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.session = FakeSession(
+            FakeResponse({"code": -2013, "msg": "Order does not exist."}, status_code=400)
+        )
+
+        response = client.get_order_by_link("ANSEMUSDT", "g_3_B_missing")
+
+        self.assertEqual(response, {"retCode": 0, "result": {}})
+
 
 if __name__ == "__main__":
     unittest.main()

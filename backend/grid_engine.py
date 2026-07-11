@@ -8,6 +8,8 @@ import uuid
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Callable, Optional
 
+import requests
+
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,10 @@ FAST_POLL_WINDOW_SECONDS = 15.0
 USER_STREAM_KEEPALIVE_SECONDS = 30 * 60
 BATCH_ORDER_CHUNK_SIZE = 5
 POSITION_SYNC_GRACE_SECONDS = 2.0
+SUBMISSION_RETRY_SECONDS = 2.0
+SUBMISSION_MAX_RETRIES = 3
+SUBMISSION_REQUIRED_NOT_FOUND_CHECKS = 2
+SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS = 0.5
 
 
 class GridEngine:
@@ -66,7 +72,8 @@ class GridEngine:
         self._user_stream_task: Optional[asyncio.Task] = None
         self._user_stream_listen_key = ""
         self._position_mismatch_seen_at = 0.0
-        self._position_mismatch_signature: tuple[float, float, int] | None = None
+        self._position_mismatch_signature: tuple[float, float, float] | None = None
+        self._last_actual_grid_position_net_qty = 0.0
         self._reduce_warning_at_by_signature: dict[tuple, float] = {}
 
     def _persist_state(self):
@@ -353,6 +360,10 @@ class GridEngine:
             "grid_mode": self.config.get("grid_mode", "arithmetic"),
             "grid_levels": self.grid_levels,
             "active_orders": list(self.active_orders.values()),
+            "pending_submission_count": sum(
+                1 for order in self.active_orders.values() if order.get("submission_pending")
+            )
+            + int(bool(self.opening_order and self.opening_order.get("submission_pending"))),
             "paused_replacements": self.paused_replacements,
             "paused_replacements_count": len(self.paused_replacements),
             "completed_pairs": self.completed_pairs,
@@ -384,6 +395,10 @@ class GridEngine:
             "grid_position_net_qty": round(self._grid_position_net_qty(), 8),
             "grid_position_qty": round(self._grid_position_qty(), 8),
             "expected_position_net_qty": round(self._expected_position_net_qty(), 8),
+            "actual_grid_position_net_qty": round(
+                self._last_actual_grid_position_net_qty, 8
+            ),
+            "position_ledger_consistent": self._position_mismatch_signature is None,
             "grid_profit_pct": round(self.grid_profit_pct, 6),
             "config": self.config,
         }
@@ -647,14 +662,15 @@ class GridEngine:
         if filled_order.get("tag") == "boundary_reduce_fallback":
             self._repair_flat_open_side_grid()
             return True
-        if self._should_place_counter_order_now(filled_order):
-            self._place_counter_order(filled_order)
-        else:
+        if not self._should_place_counter_order_now(filled_order) or not self._place_counter_order(
+            filled_order
+        ):
             self.paused_replacements.append(filled_order)
             self.trigger_message = (
-                f"Price {self.current_price} is outside grid range; "
-                "counter order is queued until price returns."
+                "Counter order was not confirmed; it is queued and will be retried "
+                "with exchange-order reconciliation."
             )
+            self._mark_fast_poll()
             self._persist_state()
         return True
 
@@ -789,6 +805,13 @@ class GridEngine:
         reduce_side = self._reduce_side()
         grid_qty = Decimal(str(self._grid_position_qty()))
         active_total = Decimal(str(self._active_reduce_qty(reduce_side))) if reduce_side else Decimal("0")
+        pending_submission_count = sum(
+            1
+            for order in self.active_orders.values()
+            if order.get("submission_pending")
+            and order.get("reduce_only")
+            and order.get("side") == reduce_side
+        )
 
         snapshot = {
             "enabled": direction in {"long", "short"} and bool(reduce_side),
@@ -800,7 +823,8 @@ class GridEngine:
             "missing_by_level": [],
             "excess_by_level": [],
             "has_level_gap": False,
-            "has_risk": False,
+            "pending_submission_count": pending_submission_count,
+            "has_risk": bool(pending_submission_count),
         }
         if not snapshot["enabled"] or not self._qty_reaches_accounting_step(grid_qty):
             return snapshot
@@ -869,6 +893,13 @@ class GridEngine:
     def grid_coverage_snapshot(self) -> dict:
         direction = self.config.get("direction")
         open_side = self._open_side_for_direction()
+        pending_submission_count = sum(
+            1
+            for order in self.active_orders.values()
+            if order.get("submission_pending")
+            and not order.get("reduce_only")
+            and order.get("side") == open_side
+        )
         enabled = (
             direction in {"long", "short"}
             and bool(open_side)
@@ -887,7 +918,8 @@ class GridEngine:
             "net_delta_qty": 0.0,
             "missing_by_level": [],
             "excess_by_level": [],
-            "has_risk": False,
+            "pending_submission_count": pending_submission_count,
+            "has_risk": bool(pending_submission_count),
         }
         if not enabled:
             return snapshot
@@ -941,7 +973,9 @@ class GridEngine:
                 "coverage_qty": float(coverage_total),
                 "net_delta_qty": float(coverage_total - target_total),
                 "has_risk": bool(
-                    snapshot["missing_by_level"] or snapshot["excess_by_level"]
+                    snapshot["has_risk"]
+                    or snapshot["missing_by_level"]
+                    or snapshot["excess_by_level"]
                 ),
             }
         )
@@ -1069,14 +1103,402 @@ class GridEngine:
             raise RuntimeError(resp.get("retMsg", "Failed to fetch open orders"))
         return list(resp.get("result", {}).get("list", []))
 
+    def _pending_limit_order_state(
+        self,
+        *,
+        link_id: str,
+        level_idx: int,
+        side: str,
+        price: str,
+        qty: str,
+        reduce_only: bool,
+        entry_price: float | None,
+        time_in_force: str,
+        tag: str | None = None,
+    ) -> dict:
+        state = {
+            "link_id": link_id,
+            "order_id": "",
+            "level_idx": level_idx,
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "status": "SUBMITTING",
+            "order_type": "Limit",
+            "time_in_force": time_in_force,
+            "reduce_only": reduce_only,
+            "entry_price": entry_price,
+            "processed_fill_qty": 0.0,
+            "processed_fill_volume": 0.0,
+            "processed_fill_fee": 0.0,
+            "submission_pending": True,
+            "submission_attempts": 1,
+            "submission_not_found_count": 0,
+            "submission_last_not_found_at": 0.0,
+            "submission_updated_at": time.time(),
+        }
+        if tag:
+            state["tag"] = tag
+        return state
+
+    def _confirm_pending_submission(self, order: dict, snapshot: dict) -> bool:
+        snapshot_link_id = str(snapshot.get("orderLinkId", "") or "")
+        if snapshot_link_id and snapshot_link_id != str(order.get("link_id", "")):
+            logger.error(
+                "Pending submission lookup returned a different client order ID "
+                "symbol=%s expected=%s actual=%s",
+                self.config.get("symbol"),
+                order.get("link_id"),
+                snapshot_link_id,
+            )
+            return False
+        snapshot_side = str(snapshot.get("side", "") or "")
+        if snapshot_side and snapshot_side.lower() != str(order.get("side", "")).lower():
+            logger.error(
+                "Pending submission lookup returned a different side symbol=%s link_id=%s "
+                "expected=%s actual=%s",
+                self.config.get("symbol"),
+                order.get("link_id"),
+                order.get("side"),
+                snapshot_side,
+            )
+            return False
+        if snapshot.get("reduceOnly") is not None and self._truthy(
+            snapshot.get("reduceOnly")
+        ) != bool(order.get("reduce_only", False)):
+            logger.error(
+                "Pending submission lookup returned different reduce-only semantics "
+                "symbol=%s link_id=%s",
+                self.config.get("symbol"),
+                order.get("link_id"),
+            )
+            return False
+        order_id = str(snapshot.get("orderId", "") or "")
+        if not order_id:
+            return False
+        order["order_id"] = order_id
+        accepted_price = snapshot.get("avgPrice")
+        try:
+            has_positive_average = float(accepted_price or 0) > 0
+        except (TypeError, ValueError):
+            has_positive_average = False
+        if not has_positive_average:
+            accepted_price = snapshot.get("price")
+        try:
+            has_positive_price = float(accepted_price or 0) > 0
+        except (TypeError, ValueError):
+            has_positive_price = False
+        if has_positive_price:
+            order["price"] = str(accepted_price)
+        if snapshot.get("qty") not in (None, ""):
+            order["qty"] = str(snapshot.get("qty"))
+        status = snapshot.get("orderStatus") or snapshot.get("status") or "open"
+        order["status"] = str(status)
+        if snapshot.get("reduceOnly") is not None:
+            order["reduce_only"] = self._truthy(snapshot.get("reduceOnly"))
+        order.pop("submission_pending", None)
+        order.pop("submission_error", None)
+        order.pop("submission_attempts", None)
+        order.pop("submission_not_found_count", None)
+        order.pop("submission_last_not_found_at", None)
+        order.pop("submission_updated_at", None)
+        return True
+
+    @staticmethod
+    def _is_uncertain_submission_exception(exc: Exception) -> bool:
+        uncertain_request_errors = (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ContentDecodingError,
+        )
+        return isinstance(exc, (TimeoutError, ConnectionError, *uncertain_request_errors))
+
+    @staticmethod
+    def _is_duplicate_client_order_rejection(message: str) -> bool:
+        normalized = str(message or "").lower()
+        return any(
+            marker in normalized
+            for marker in (
+                "client order id is not unique",
+                "clientorderid is not unique",
+                "duplicate client order",
+                "duplicate orderlinkid",
+                "duplicated orderlinkid",
+            )
+        )
+
+    def _mark_submission_unknown(self, order: dict, error: Exception | str) -> None:
+        order["status"] = "SUBMIT_UNKNOWN"
+        order["submission_error"] = str(error)
+        order["submission_updated_at"] = time.time()
+        order["submission_not_found_count"] = 0
+        order["submission_last_not_found_at"] = 0.0
+        self._mark_fast_poll()
+        self._persist_state()
+
+    def _submission_snapshot_by_link(self, link_id: str) -> tuple[dict | None, bool]:
+        getter = getattr(self.client, "get_order_by_link", None)
+        if not callable(getter):
+            return None, False
+        try:
+            response = getter(self.config["symbol"], link_id)
+        except Exception as exc:
+            logger.warning(
+                "Query pending submission by client order ID failed symbol=%s link_id=%s msg=%s",
+                self.config.get("symbol"),
+                link_id,
+                exc,
+            )
+            return None, False
+        if response.get("retCode") != 0:
+            return None, False
+        snapshot = response.get("result") or {}
+        if isinstance(snapshot, dict) and snapshot.get("list") is not None:
+            items = snapshot.get("list") or []
+            snapshot = items[0] if items else {}
+        if isinstance(snapshot, dict) and snapshot.get("orderId"):
+            return snapshot, True
+        return None, True
+
+    def _submission_history_by_link(self, links: set[str]) -> dict[str, dict]:
+        if not links or not hasattr(self.client, "get_order_history"):
+            return {}
+        try:
+            response = self.client.get_order_history(self.config["symbol"], limit=100)
+        except Exception as exc:
+            logger.warning(
+                "Fetch order history for pending submissions failed symbol=%s msg=%s",
+                self.config.get("symbol"),
+                exc,
+            )
+            return {}
+        if response.get("retCode") != 0:
+            return {}
+        return {
+            str(item.get("orderLinkId", "") or ""): item
+            for item in response.get("result", {}).get("list", [])
+            if str(item.get("orderLinkId", "") or "") in links
+        }
+
+    def _retry_pending_submission(self, order: dict) -> str:
+        attempts = int(order.get("submission_attempts", 1) or 1)
+        if attempts >= SUBMISSION_MAX_RETRIES:
+            order["status"] = "SUBMIT_UNRESOLVED"
+            return "pending"
+        order["submission_attempts"] = attempts + 1
+        order["submission_not_found_count"] = 0
+        order["submission_last_not_found_at"] = 0.0
+        order["submission_updated_at"] = time.time()
+        order["status"] = "SUBMITTING"
+        self._persist_state()
+        try:
+            order_type = str(order.get("order_type") or "Limit")
+            result = self.client.place_order(
+                symbol=self.config["symbol"],
+                side=str(order["side"]),
+                qty=str(order["qty"]),
+                price=str(order["price"]) if order_type.lower() == "limit" else None,
+                order_type=order_type,
+                reduce_only=bool(order.get("reduce_only", False)),
+                order_link_id=str(order["link_id"]),
+                time_in_force=(
+                    "PostOnly"
+                    if order_type.lower() == "limit"
+                    and order.get("time_in_force") == "PostOnly"
+                    else None
+                ),
+            )
+        except Exception as exc:
+            if self._is_uncertain_submission_exception(exc) or self._is_duplicate_client_order_rejection(
+                str(exc)
+            ):
+                self._mark_submission_unknown(order, exc)
+                return "pending"
+            order["status"] = "SUBMIT_REJECTED"
+            order["submission_error"] = str(exc)
+            self._persist_state()
+            return "rejected"
+        if result.get("retCode") == 0 and self._confirm_pending_submission(
+            order, result.get("result", {})
+        ):
+            self._persist_state()
+            return "confirmed"
+        message = str(result.get("retMsg") or "submission not confirmed")
+        if result.get("retCode") == 0 or self._is_duplicate_client_order_rejection(message):
+            self._mark_submission_unknown(order, message)
+            return "pending"
+        order["status"] = "SUBMIT_REJECTED"
+        order["submission_error"] = message
+        self._persist_state()
+        return "rejected"
+
+    def _resolve_pending_submissions(self, open_orders: list[dict]) -> bool:
+        pending = {
+            link_id: order
+            for link_id, order in self.active_orders.items()
+            if order.get("submission_pending")
+        }
+        if not pending:
+            return False
+
+        changed = False
+        open_by_link = {
+            str(item.get("orderLinkId", "") or ""): item for item in open_orders
+        }
+        for link_id, order in list(pending.items()):
+            snapshot = open_by_link.get(link_id)
+            if snapshot and self._confirm_pending_submission(order, snapshot):
+                pending.pop(link_id, None)
+                changed = True
+
+        not_found_check_time = time.time()
+        for link_id, order in list(pending.items()):
+            snapshot, authoritative = self._submission_snapshot_by_link(link_id)
+            if snapshot and self._confirm_pending_submission(order, snapshot):
+                pending.pop(link_id, None)
+                changed = True
+                continue
+            if authoritative:
+                last_check = float(order.get("submission_last_not_found_at", 0) or 0)
+                if (
+                    not_found_check_time - last_check
+                    >= SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS
+                ):
+                    order["submission_not_found_count"] = int(
+                        order.get("submission_not_found_count", 0) or 0
+                    ) + 1
+                    order["submission_last_not_found_at"] = not_found_check_time
+                    changed = True
+
+        history_by_link = self._submission_history_by_link(set(pending))
+        for link_id, order in list(pending.items()):
+            snapshot = history_by_link.get(link_id)
+            if snapshot and self._confirm_pending_submission(order, snapshot):
+                pending.pop(link_id, None)
+                changed = True
+
+        now = time.time()
+        for link_id, order in list(pending.items()):
+            updated_at = float(order.get("submission_updated_at", 0) or 0)
+            if now - updated_at < SUBMISSION_RETRY_SECONDS:
+                continue
+            if int(order.get("submission_not_found_count", 0) or 0) < SUBMISSION_REQUIRED_NOT_FOUND_CHECKS:
+                continue
+            outcome = self._retry_pending_submission(order)
+            if outcome == "confirmed":
+                pending.pop(link_id, None)
+                changed = True
+            elif outcome == "rejected":
+                self.active_orders.pop(link_id, None)
+                pending.pop(link_id, None)
+                changed = True
+                logger.error(
+                    "Pending submission was definitively rejected after exchange absence checks "
+                    "symbol=%s link_id=%s msg=%s",
+                    self.config.get("symbol"),
+                    link_id,
+                    order.get("submission_error"),
+                )
+
+        pending_count = sum(
+            1 for order in self.active_orders.values() if order.get("submission_pending")
+        )
+        if pending_count:
+            self.trigger_message = (
+                f"{pending_count} order submission(s) are unconfirmed; "
+                "reconciling by client order ID without creating duplicates."
+            )
+            self._mark_fast_poll()
+        if changed or pending_count:
+            self._persist_state()
+        return changed
+
+    def _resolve_opening_submission(self, open_orders: list[dict]) -> bool:
+        order = self.opening_order
+        if not order or not order.get("submission_pending"):
+            return bool(order)
+
+        link_id = str(order.get("link_id", "") or "")
+        open_snapshot = next(
+            (
+                item
+                for item in open_orders
+                if str(item.get("orderLinkId", "") or "") == link_id
+            ),
+            None,
+        )
+        if open_snapshot and self._confirm_pending_submission(order, open_snapshot):
+            self._persist_state()
+            return True
+
+        snapshot, authoritative = self._submission_snapshot_by_link(link_id)
+        if snapshot and self._confirm_pending_submission(order, snapshot):
+            self._persist_state()
+            return True
+
+        history_snapshot = self._submission_history_by_link({link_id}).get(link_id)
+        if history_snapshot and self._confirm_pending_submission(order, history_snapshot):
+            self._persist_state()
+            return True
+
+        now = time.time()
+        if authoritative:
+            last_check = float(order.get("submission_last_not_found_at", 0) or 0)
+            if now - last_check >= SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS:
+                order["submission_not_found_count"] = int(
+                    order.get("submission_not_found_count", 0) or 0
+                ) + 1
+                order["submission_last_not_found_at"] = now
+
+        updated_at = float(order.get("submission_updated_at", 0) or 0)
+        if (
+            now - updated_at >= SUBMISSION_RETRY_SECONDS
+            and int(order.get("submission_not_found_count", 0) or 0)
+            >= SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+        ):
+            outcome = self._retry_pending_submission(order)
+            if outcome == "confirmed":
+                return True
+            if outcome == "rejected":
+                self.waiting_initial_order = False
+                self.opening_order = None
+                self.running = False
+                self.trigger_message = (
+                    "Opening order was definitively rejected after submission recovery checks; "
+                    "the grid was not deployed."
+                )
+                self._persist_state()
+                return False
+
+        self.trigger_message = (
+            "Opening order submission is unconfirmed; reconciling by client order ID "
+            "without opening another position."
+        )
+        self._mark_fast_poll()
+        self._persist_state()
+        return False
+
     def _adopt_exchange_grid_orders(self, open_orders: list[dict]) -> bool:
-        known_order_ids = {str(order.get("order_id", "")) for order in self.active_orders.values()}
+        known_order_ids = {
+            str(order.get("order_id", ""))
+            for order in self.active_orders.values()
+            if str(order.get("order_id", ""))
+        }
         adopted = False
         for item in open_orders:
             order_id = str(item.get("orderId", "") or "")
             link_id = str(item.get("orderLinkId", "") or "")
             parsed = self._parse_grid_link_id(link_id)
-            if not order_id or not parsed or link_id in self.active_orders or order_id in known_order_ids:
+            existing = self.active_orders.get(link_id)
+            if existing:
+                if existing.get("submission_pending") and self._confirm_pending_submission(
+                    existing, item
+                ):
+                    known_order_ids.add(order_id)
+                    adopted = True
+                continue
+            if not order_id or not parsed or order_id in known_order_ids:
                 continue
 
             level_idx, side_from_link = parsed
@@ -1156,6 +1578,7 @@ class GridEngine:
     def _reconcile_exchange_open_orders(self, open_orders: list[dict] | None = None) -> bool:
         open_orders = self._fetch_open_orders() if open_orders is None else open_orders
         changed = self._adopt_exchange_grid_orders(open_orders)
+        changed = self._resolve_pending_submissions(open_orders) or changed
         open_order_ids = {str(item.get("orderId", "")) for item in open_orders}
         open_orders_by_id = {str(item.get("orderId", "")): item for item in open_orders}
         if self._stopping:
@@ -1177,7 +1600,8 @@ class GridEngine:
         closed_links = [
             link_id
             for link_id, order in list(self.active_orders.items())
-            if str(order.get("order_id", "")) not in open_order_ids
+            if not order.get("submission_pending")
+            and str(order.get("order_id", "")) not in open_order_ids
         ]
         for link_id in closed_links:
             if self._stopping or link_id not in self.active_orders:
@@ -1241,8 +1665,15 @@ class GridEngine:
 
         self.active_orders.pop(link_id, None)
 
-        remaining_qty = fallback_qty - filled_qty
-        if remaining_qty >= self.min_qty:
+        remaining_qty = max(0.0, fallback_qty - filled_qty)
+        if order.get("reduce_only"):
+            should_replace = self._qty_reaches_accounting_step(remaining_qty)
+        else:
+            should_replace = (
+                Decimal(str(remaining_qty)) + self._qty_tolerance_decimal()
+                >= Decimal(str(self.min_qty))
+            )
+        if should_replace:
             replacement = {
                 **order,
                 "qty": str(remaining_qty),
@@ -1456,56 +1887,70 @@ class GridEngine:
         self._apply_grid_position_fill({"side": side, "reduce_only": True}, qty)
         self.reduce_lots_complete = False
 
-    def _sync_grid_position_with_exchange(self):
+    def _sync_grid_position_with_exchange(self) -> bool:
         if self.config["direction"] not in {"long", "short"}:
-            return
+            return True
 
         if self._halt_if_baseline_breached():
-            return
+            return False
 
         actual_grid_qty = self._actual_grid_position_net_qty()
+        self._last_actual_grid_position_net_qty = actual_grid_qty
         local_grid_qty = self._grid_position_net_qty()
         if not self._qty_reaches_accounting_step(actual_grid_qty - local_grid_qty):
             self._position_mismatch_seen_at = 0.0
             self._position_mismatch_signature = None
-            return
+            if self.trigger_message.startswith("Position ledger mismatch"):
+                self.trigger_message = ""
+                self._persist_state()
+            return True
 
-        if self._qty_reaches_accounting_step(self._active_reduce_qty(self._reduce_side())):
-            signature = (round(local_grid_qty, 8), round(actual_grid_qty, 8), len(self.active_orders))
-            now = time.time()
-            if self._position_mismatch_signature != signature:
-                self._position_mismatch_signature = signature
-                self._position_mismatch_seen_at = now
-            if now - self._position_mismatch_seen_at < POSITION_SYNC_GRACE_SECONDS:
-                logger.info(
-                    "Delaying grid position sync until order ledger catches up symbol=%s local=%s actual=%s active_orders=%s",
-                    self.config.get("symbol"),
-                    local_grid_qty,
-                    actual_grid_qty,
-                    len(self.active_orders),
-                )
-                self._mark_fast_poll(POSITION_SYNC_GRACE_SECONDS)
-                return
-
-        logger.warning(
-            "Grid position ledger reconciled with exchange symbol=%s local=%s actual=%s baseline=%s",
-            self.config.get("symbol"),
-            local_grid_qty,
-            actual_grid_qty,
-            self._baseline_position_net_qty(),
+        signature = (
+            round(local_grid_qty, 8),
+            round(actual_grid_qty, 8),
+            round(self._baseline_position_net_qty(), 8),
         )
-        self.grid_position_net_qty = actual_grid_qty
-        self.reduce_lots_by_level = {}
-        self.reduce_lots_complete = False
-        self._position_mismatch_seen_at = 0.0
-        self._position_mismatch_signature = None
-        self._persist_state()
+        now = time.time()
+        if self._position_mismatch_signature != signature:
+            self._position_mismatch_signature = signature
+            self._position_mismatch_seen_at = now
+        if now - self._position_mismatch_seen_at < POSITION_SYNC_GRACE_SECONDS:
+            logger.info(
+                "Delaying position mismatch alert until order ledger catches up "
+                "symbol=%s local=%s actual=%s active_orders=%s",
+                self.config.get("symbol"),
+                local_grid_qty,
+                actual_grid_qty,
+                len(self.active_orders),
+            )
+            self._mark_fast_poll(POSITION_SYNC_GRACE_SECONDS)
+            return False
+
+        message = (
+            f"Position ledger mismatch: grid ledger {self._fq(abs(local_grid_qty))}, "
+            f"exchange grid portion {self._fq(abs(actual_grid_qty))}; "
+            "automatic coverage repair is paused and no position ownership was changed."
+        )
+        if self.trigger_message != message:
+            self.trigger_message = message
+            logger.error(
+                "Unexplained position mismatch; refusing to rewrite grid ownership "
+                "symbol=%s local=%s actual=%s baseline=%s",
+                self.config.get("symbol"),
+                local_grid_qty,
+                actual_grid_qty,
+                self._baseline_position_net_qty(),
+            )
+            self._persist_state()
+        self._mark_fast_poll()
+        return False
 
     def _reconcile_grid_position_protection(self):
         if self.config["direction"] not in {"long", "short"} or self._stopping:
             return
 
-        self._sync_grid_position_with_exchange()
+        if not self._sync_grid_position_with_exchange():
+            return
         if self._stopping:
             return
 
@@ -1922,7 +2367,7 @@ class GridEngine:
             reduce_side, reduce_price = target
             active_qty = Decimal(str(self._active_order_remaining_qty(reduce_side, level_idx, True)))
             deficit = lot["qty"] - active_qty
-            if deficit < Decimal(str(self.min_qty)):
+            if deficit <= 0 or not self._qty_reaches_accounting_step(deficit):
                 continue
             entry_price = lot["entry_value"] / lot["qty"] if lot["qty"] > 0 else Decimal("0")
             placed = self._place(
@@ -2172,7 +2617,7 @@ class GridEngine:
         grid_qty = Decimal(str(self._grid_position_qty()))
         active_reduce_qty = Decimal(str(self._active_reduce_qty(reduce_side)))
         missing_qty = grid_qty - active_reduce_qty
-        if missing_qty < Decimal(str(self.min_qty)):
+        if missing_qty <= 0 or not self._qty_reaches_accounting_step(missing_qty):
             return False
 
         side, price, level_idx = target
@@ -2315,7 +2760,7 @@ class GridEngine:
 
     def _warn_missing_reduce_protection(self):
         grid_qty = self._grid_position_qty()
-        if grid_qty < self.min_qty:
+        if not self._qty_reaches_accounting_step(grid_qty):
             return
 
         reduce_side = self._reduce_side()
@@ -2324,7 +2769,7 @@ class GridEngine:
 
         active_reduce_qty = self._active_reduce_qty(reduce_side)
         missing_qty = grid_qty - active_reduce_qty
-        if missing_qty < self.min_qty:
+        if not self._qty_reaches_accounting_step(missing_qty):
             return
 
         self.trigger_message = (
@@ -2354,14 +2799,15 @@ class GridEngine:
 
     def _safe_grid_close_qty(self, position_side: str) -> float:
         position_qty = self._position_size(position_side)
-        if position_qty < self.min_qty:
+        if not self._qty_reaches_accounting_step(position_qty):
             return 0.0
 
         available_qty = position_qty
         if self.baseline_position_side == position_side:
             available_qty = max(0.0, position_qty - self.baseline_position_qty)
 
-        return min(available_qty, self._grid_position_qty())
+        close_qty = min(available_qty, self._grid_position_qty())
+        return close_qty if self._qty_reaches_accounting_step(close_qty) else 0.0
 
     def _expected_position_net_qty(self) -> float:
         return self._baseline_position_net_qty() + self._grid_position_net_qty()
@@ -2402,7 +2848,8 @@ class GridEngine:
 
     def _place_reduce_market(self, side: str, qty: float, reason: str) -> str:
         capped_qty = self._cap_reduce_order_qty(side, qty)
-        if capped_qty < self.min_qty:
+        qty_text = self._order_qty_text(capped_qty, reduce_only=True)
+        if not qty_text:
             logger.warning(
                 "Skipped reduce-only market order with no grid allowance symbol=%s side=%s requested=%s reason=%s",
                 self.config.get("symbol"),
@@ -2412,7 +2859,6 @@ class GridEngine:
             )
             return ""
 
-        qty_text = self._fq(capped_qty)
         result = self.client.place_order(
             symbol=self.config["symbol"],
             side=side,
@@ -2430,23 +2876,77 @@ class GridEngine:
         self._persist_state()
         return str(result["result"].get("orderId") or "")
 
-    def _place_market_open(self, side: str, qty: float):
+    def _place_market_open(self, side: str, qty: float) -> bool:
         qty_text = self._order_qty_text(qty, reduce_only=False)
         if not qty_text:
             raise RuntimeError(f"Initial market order quantity {qty} is below the exchange minimum")
-        result = self.client.place_order(
-            symbol=self.config["symbol"],
-            side=side,
-            qty=qty_text,
-            order_type="Market",
-            reduce_only=False,
-            order_link_id=f"init_{side[0]}_{uuid.uuid4().hex[:6]}",
-        )
-        if result.get("retCode") != 0:
-            raise RuntimeError(result.get("retMsg", "Failed to place initial market order"))
-
+        link_id = f"init_{side[0]}_{uuid.uuid4().hex[:6]}"
         self.initial_side = side
         self.initial_qty = float(qty_text)
+        self.initial_entry_price = 0.0
+        self.waiting_initial_order = True
+        self.opening_order = {
+            "link_id": link_id,
+            "order_id": "",
+            "side": side,
+            "price": str(self.current_price),
+            "qty": qty_text,
+            "status": "SUBMITTING",
+            "order_type": "Market",
+            "time_in_force": "IOC",
+            "reduce_only": False,
+            "submission_pending": True,
+            "submission_attempts": 1,
+            "submission_not_found_count": 0,
+            "submission_last_not_found_at": 0.0,
+            "submission_updated_at": time.time(),
+        }
+        try:
+            self._persist_state()
+        except Exception:
+            self.opening_order = None
+            self.waiting_initial_order = False
+            raise
+
+        try:
+            result = self.client.place_order(
+                symbol=self.config["symbol"],
+                side=side,
+                qty=qty_text,
+                order_type="Market",
+                reduce_only=False,
+                order_link_id=link_id,
+            )
+        except Exception as exc:
+            if self._is_uncertain_submission_exception(exc):
+                self._mark_submission_unknown(self.opening_order, exc)
+                self.trigger_message = (
+                    "Initial market order submission is unconfirmed; checking the original "
+                    "client order ID without opening another position."
+                )
+                self._persist_state()
+                return False
+            self.opening_order = None
+            self.waiting_initial_order = False
+            self._persist_state()
+            raise
+        if result.get("retCode") != 0:
+            message = str(result.get("retMsg") or "Failed to place initial market order")
+            self.opening_order = None
+            self.waiting_initial_order = False
+            self._persist_state()
+            raise RuntimeError(message)
+        if not self._confirm_pending_submission(self.opening_order, result.get("result", {})):
+            self._mark_submission_unknown(
+                self.opening_order, "successful opening response had no order ID"
+            )
+            self.trigger_message = (
+                "Initial market order acknowledgement had no order ID; checking the original "
+                "client order ID without opening another position."
+            )
+            self._persist_state()
+            return False
+
         order_id = str(result.get("result", {}).get("orderId", ""))
         stats = self._get_trade_stats(order_id, self.current_price, self.initial_qty, liquidity_hint="taker")
         if stats is None:
@@ -2470,8 +2970,11 @@ class GridEngine:
             fee_asset=stats["fee_asset"],
             fee_source=stats["fee_source"],
         )
+        self.opening_order = None
+        self.waiting_initial_order = False
         self._mark_fast_poll()
         self._persist_state()
+        return True
 
     def _warn_reduce_limit_unplaced(self, side: str, price_text: str, qty: str, reason: str):
         self.trigger_message = (
@@ -2495,19 +2998,6 @@ class GridEngine:
             raise RuntimeError(f"Initial limit order quantity {qty} is below the exchange minimum")
         price_text = self._fp(price)
         link_id = f"open_{side[0]}_{uuid.uuid4().hex[:6]}"
-        result = self.client.place_order(
-            symbol=self.config["symbol"],
-            side=side,
-            qty=qty_text,
-            price=price_text,
-            order_type="Limit",
-            reduce_only=False,
-            order_link_id=link_id,
-            time_in_force="PostOnly" if post_only else None,
-        )
-        if result.get("retCode") != 0:
-            raise RuntimeError(result.get("retMsg", "Failed to place initial limit order"))
-
         self.initial_side = side
         self.initial_qty = float(qty_text)
         self.initial_entry_price = 0.0
@@ -2516,14 +3006,67 @@ class GridEngine:
         self.trigger_message = f"Waiting for {order_label} opening order at {price_text}"
         self.opening_order = {
             "link_id": link_id,
-            "order_id": result["result"]["orderId"],
+            "order_id": "",
             "side": side,
             "price": price_text,
             "qty": qty_text,
+            "status": "SUBMITTING",
             "order_type": "Limit",
             "time_in_force": "PostOnly" if post_only else "GTC",
             "reduce_only": False,
+            "submission_pending": True,
+            "submission_attempts": 1,
+            "submission_not_found_count": 0,
+            "submission_last_not_found_at": 0.0,
+            "submission_updated_at": time.time(),
         }
+        try:
+            self._persist_state()
+        except Exception:
+            self.opening_order = None
+            self.waiting_initial_order = False
+            raise
+
+        try:
+            result = self.client.place_order(
+                symbol=self.config["symbol"],
+                side=side,
+                qty=qty_text,
+                price=price_text,
+                order_type="Limit",
+                reduce_only=False,
+                order_link_id=link_id,
+                time_in_force="PostOnly" if post_only else None,
+            )
+        except Exception as exc:
+            if self._is_uncertain_submission_exception(exc):
+                self._mark_submission_unknown(self.opening_order, exc)
+                self.trigger_message = (
+                    f"{order_label.title()} opening order submission is unconfirmed; "
+                    "checking the original client order ID without opening another position."
+                )
+                self._persist_state()
+                return
+            self.opening_order = None
+            self.waiting_initial_order = False
+            self._persist_state()
+            raise
+        if result.get("retCode") != 0:
+            message = str(result.get("retMsg") or "Failed to place initial limit order")
+            self.opening_order = None
+            self.waiting_initial_order = False
+            self._persist_state()
+            raise RuntimeError(message)
+        if not self._confirm_pending_submission(self.opening_order, result.get("result", {})):
+            self._mark_submission_unknown(
+                self.opening_order, "successful opening response had no order ID"
+            )
+            self.trigger_message = (
+                f"{order_label.title()} opening order acknowledgement had no order ID; "
+                "checking the original client order ID without opening another position."
+            )
+            self._persist_state()
+            return
         self._mark_fast_poll()
         self._persist_state()
 
@@ -2585,37 +3128,60 @@ class GridEngine:
 
         def submit_limit(use_post_only: bool):
             return self.client.place_order(
-                    symbol=self.config["symbol"],
-                    side=side,
-                    qty=qty,
-                    price=price_text,
-                    order_type="Limit",
-                    reduce_only=reduce_only,
-                    order_link_id=link_id,
-                    time_in_force="PostOnly" if use_post_only else None,
-                )
+                symbol=self.config["symbol"],
+                side=side,
+                qty=qty,
+                price=price_text,
+                order_type="Limit",
+                reduce_only=reduce_only,
+                order_link_id=link_id,
+                time_in_force="PostOnly" if use_post_only else None,
+            )
 
         # Reduce-only orders are safety exits; never let maker-only rules prevent them.
         use_post_only = bool(self.config.get("grid_order_post_only", False)) and not reduce_only
+        pending_order = self._pending_limit_order_state(
+            link_id=link_id,
+            level_idx=level_idx,
+            side=side,
+            price=price_text,
+            qty=qty,
+            reduce_only=reduce_only,
+            entry_price=entry_price,
+            time_in_force="PostOnly" if use_post_only else "GTC",
+            tag=tag,
+        )
+        self.active_orders[link_id] = pending_order
+        try:
+            # The local write-ahead record must be durable before the exchange request.
+            self._persist_state()
+        except Exception:
+            self.active_orders.pop(link_id, None)
+            raise
+
         try:
             result = submit_limit(use_post_only)
         except Exception as exc:
-            if reduce_only and use_post_only:
+            if self._is_uncertain_submission_exception(exc):
+                self._mark_submission_unknown(pending_order, exc)
                 logger.warning(
-                    "Post-only reduce order failed; retrying as normal reduce-only limit side=%s price=%s msg=%s",
+                    "Grid order response is uncertain; preserving client order ID for reconciliation "
+                    "symbol=%s side=%s price=%s qty=%s reduce_only=%s link_id=%s msg=%s",
+                    self.config.get("symbol"),
                     side,
                     price_text,
+                    qty,
+                    reduce_only,
+                    link_id,
                     exc,
                 )
-                try:
-                    result = submit_limit(False)
-                except Exception as retry_exc:
-                    self._warn_reduce_limit_unplaced(side, price_text, qty, str(retry_exc))
-                    return None
+                return link_id
+
+            self.active_orders.pop(link_id, None)
+            self._persist_state()
+            if reduce_only:
+                self._warn_reduce_limit_unplaced(side, price_text, qty, str(exc))
             else:
-                if reduce_only:
-                    self._warn_reduce_limit_unplaced(side, price_text, qty, str(exc))
-                    return None
                 logger.warning(
                     "Place order failed side=%s price=%s reduce_only=%s msg=%s",
                     side,
@@ -2623,57 +3189,34 @@ class GridEngine:
                     reduce_only,
                     exc,
                 )
-                return None
-
-        if result.get("retCode") != 0 and reduce_only and use_post_only:
-            logger.warning(
-                "Post-only reduce order rejected; retrying as normal reduce-only limit side=%s price=%s msg=%s",
-                side,
-                price_text,
-                result.get("retMsg"),
-            )
-            try:
-                result = submit_limit(False)
-            except Exception as retry_exc:
-                self._warn_reduce_limit_unplaced(side, price_text, qty, str(retry_exc))
-                return None
-
-        if result.get("retCode") != 0 and reduce_only:
-            self._warn_reduce_limit_unplaced(side, price_text, qty, str(result.get("retMsg") or "rejected"))
             return None
 
         if result.get("retCode") != 0:
-            logger.warning(
-                "Place order failed side=%s price=%s reduce_only=%s msg=%s",
-                side,
-                price_text,
-                reduce_only,
-                result.get("retMsg"),
-            )
+            self.active_orders.pop(link_id, None)
+            self._persist_state()
+            message = str(result.get("retMsg") or "rejected")
+            if reduce_only:
+                self._warn_reduce_limit_unplaced(side, price_text, qty, message)
+            else:
+                logger.warning(
+                    "Place order failed side=%s price=%s reduce_only=%s msg=%s",
+                    side,
+                    price_text,
+                    reduce_only,
+                    message,
+                )
             return None
 
-        result_data = result.get("result", {})
-        accepted_qty = str(result_data.get("qty") or qty)
-        accepted_price = str(result_data.get("price") or price_text)
-        accepted_status = str(result_data.get("orderStatus") or "open")
-        self.active_orders[link_id] = {
-            "link_id": link_id,
-            "order_id": result_data["orderId"],
-            "level_idx": level_idx,
-            "side": side,
-            "price": accepted_price,
-            "qty": accepted_qty,
-            "status": accepted_status,
-            "order_type": "Limit",
-            "time_in_force": "PostOnly" if use_post_only else "GTC",
-            "reduce_only": reduce_only,
-            "entry_price": entry_price,
-            "processed_fill_qty": 0.0,
-            "processed_fill_volume": 0.0,
-            "processed_fill_fee": 0.0,
-        }
-        if tag:
-            self.active_orders[link_id]["tag"] = tag
+        if not self._confirm_pending_submission(pending_order, result.get("result", {})):
+            self._mark_submission_unknown(pending_order, "successful response had no order ID")
+            logger.warning(
+                "Grid order acknowledgement had no order ID; preserving client order ID "
+                "symbol=%s link_id=%s",
+                self.config.get("symbol"),
+                link_id,
+            )
+            return link_id
+
         self._mark_fast_poll()
         self._persist_state()
         return link_id
@@ -2722,100 +3265,158 @@ class GridEngine:
                         "order_link_id": link_id,
                         "time_in_force": None,
                     },
-                    "state": {
-                        "link_id": link_id,
-                        "level_idx": level_idx,
-                        "side": side,
-                        "price": price_text,
-                        "qty": qty,
-                        "reduce_only": reduce_only,
-                        "entry_price": spec.get("entry_price"),
-                    },
+                    "state": self._pending_limit_order_state(
+                        link_id=link_id,
+                        level_idx=level_idx,
+                        side=side,
+                        price=price_text,
+                        qty=qty,
+                        reduce_only=reduce_only,
+                        entry_price=spec.get("entry_price"),
+                        time_in_force="GTC",
+                        tag=spec.get("tag"),
+                    ),
                     "fallback": spec,
                 }
             )
 
         placed_links: list[str] = []
+
+        def remember_link(link_id: str | None) -> None:
+            if link_id and link_id not in placed_links:
+                placed_links.append(link_id)
+
+        def fallback_single(item: dict[str, Any], message: str) -> None:
+            state = item["state"]
+            self.active_orders.pop(str(state["link_id"]), None)
+            self._persist_state()
+            fallback = item["fallback"]
+            logger.warning(
+                "Batch order item definitively failed; falling back to single order "
+                "symbol=%s side=%s price=%s msg=%s",
+                self.config.get("symbol"),
+                fallback.get("side"),
+                fallback.get("price"),
+                message,
+            )
+            link_id = self._place(
+                str(fallback["side"]),
+                float(fallback["price"]),
+                int(fallback["level_idx"]),
+                reduce_only=bool(fallback.get("reduce_only", False)),
+                qty_override=float(fallback.get("qty_override") or self.config["qty_per_grid"]),
+                entry_price=fallback.get("entry_price"),
+                allow_duplicate=bool(fallback.get("allow_duplicate", False)),
+                tag=fallback.get("tag"),
+            )
+            remember_link(link_id)
+
+        def mark_unknown(items: list[dict[str, Any]], message: str) -> None:
+            now = time.time()
+            for item in items:
+                state = item["state"]
+                state["status"] = "SUBMIT_UNKNOWN"
+                state["submission_error"] = message
+                state["submission_updated_at"] = now
+                state["submission_not_found_count"] = 0
+                state["submission_last_not_found_at"] = 0.0
+                remember_link(str(state["link_id"]))
+            self._mark_fast_poll()
+            self._persist_state()
+
         for start in range(0, len(planned), BATCH_ORDER_CHUNK_SIZE):
             chunk = planned[start : start + BATCH_ORDER_CHUNK_SIZE]
             if self._stopping:
                 break
+
+            for item in chunk:
+                state = item["state"]
+                self.active_orders[str(state["link_id"])] = state
+            try:
+                # Persist every client order ID before the exchange sees the batch.
+                self._persist_state()
+            except Exception:
+                for item in chunk:
+                    self.active_orders.pop(str(item["state"]["link_id"]), None)
+                raise
+
             try:
                 result = self.client.place_orders([item["request"] for item in chunk])
-                if result.get("retCode") != 0:
-                    raise RuntimeError(result.get("retMsg", "Batch order failed"))
-                result_items = result.get("result", {}).get("list", [])
-                if len(result_items) != len(chunk):
-                    raise RuntimeError("Batch order response size mismatch")
             except Exception as exc:
-                logger.warning(
-                    "Batch order placement failed; falling back to single orders symbol=%s msg=%s",
-                    self.config.get("symbol"),
-                    exc,
-                )
-                with contextlib.suppress(Exception):
-                    self._reconcile_exchange_open_orders()
-                for item in chunk:
-                    fallback = item["fallback"]
-                    link_id = self._place(
-                        str(fallback["side"]),
-                        float(fallback["price"]),
-                        int(fallback["level_idx"]),
-                        reduce_only=bool(fallback.get("reduce_only", False)),
-                        qty_override=float(fallback.get("qty_override") or self.config["qty_per_grid"]),
-                        entry_price=fallback.get("entry_price"),
-                        allow_duplicate=bool(fallback.get("allow_duplicate", False)),
+                message = str(exc)
+                if self._is_uncertain_submission_exception(
+                    exc
+                ) or self._is_duplicate_client_order_rejection(message):
+                    logger.warning(
+                        "Batch order response is uncertain; preserving original client order IDs "
+                        "symbol=%s orders=%s msg=%s",
+                        self.config.get("symbol"),
+                        len(chunk),
+                        message,
                     )
-                    if link_id:
-                        placed_links.append(link_id)
-                continue
-
-            for item, order_result in zip(chunk, result_items):
-                state = item["state"]
-                if order_result.get("retCode") == 0 and order_result.get("result", {}).get("orderId"):
-                    link_id = state["link_id"]
-                    result_data = order_result["result"]
-                    accepted_qty = str(result_data.get("qty") or state["qty"])
-                    accepted_price = str(result_data.get("price") or state["price"])
-                    accepted_status = str(result_data.get("orderStatus") or "open")
-                    self.active_orders[link_id] = {
-                        "link_id": link_id,
-                        "order_id": str(result_data["orderId"]),
-                        "level_idx": state["level_idx"],
-                        "side": state["side"],
-                        "price": accepted_price,
-                        "qty": accepted_qty,
-                        "status": accepted_status,
-                        "order_type": "Limit",
-                        "time_in_force": "GTC",
-                        "reduce_only": state["reduce_only"],
-                        "entry_price": state["entry_price"],
-                        "processed_fill_qty": 0.0,
-                        "processed_fill_volume": 0.0,
-                        "processed_fill_fee": 0.0,
-                    }
-                    placed_links.append(link_id)
+                    mark_unknown(chunk, message)
+                    with contextlib.suppress(Exception):
+                        self._reconcile_exchange_open_orders()
                     continue
 
-                fallback = item["fallback"]
                 logger.warning(
-                    "Batch order item failed; falling back to single order symbol=%s side=%s price=%s msg=%s",
+                    "Batch order request was definitively rejected; using single-order fallback "
+                    "symbol=%s msg=%s",
                     self.config.get("symbol"),
-                    fallback.get("side"),
-                    fallback.get("price"),
-                    order_result.get("retMsg"),
+                    message,
                 )
-                link_id = self._place(
-                    str(fallback["side"]),
-                    float(fallback["price"]),
-                    int(fallback["level_idx"]),
-                    reduce_only=bool(fallback.get("reduce_only", False)),
-                    qty_override=float(fallback.get("qty_override") or self.config["qty_per_grid"]),
-                    entry_price=fallback.get("entry_price"),
-                    allow_duplicate=bool(fallback.get("allow_duplicate", False)),
-                )
-                if link_id:
-                    placed_links.append(link_id)
+                for item in chunk:
+                    fallback_single(item, message)
+                continue
+
+            if result.get("retCode") != 0:
+                message = str(result.get("retMsg") or "Batch order failed")
+                if self._is_duplicate_client_order_rejection(message):
+                    mark_unknown(chunk, message)
+                    with contextlib.suppress(Exception):
+                        self._reconcile_exchange_open_orders()
+                    continue
+                for item in chunk:
+                    fallback_single(item, message)
+                continue
+
+            result_items = result.get("result", {}).get("list", []) or []
+            if not isinstance(result_items, list):
+                result_items = []
+            rejected: list[tuple[dict[str, Any], str]] = []
+            unconfirmed: list[dict[str, Any]] = []
+            for index, item in enumerate(chunk):
+                state = item["state"]
+                if index >= len(result_items):
+                    unconfirmed.append(item)
+                    continue
+
+                order_result = result_items[index]
+                if not isinstance(order_result, dict):
+                    unconfirmed.append(item)
+                    continue
+                if order_result.get("retCode") == 0:
+                    if self._confirm_pending_submission(state, order_result.get("result", {})):
+                        remember_link(str(state["link_id"]))
+                    else:
+                        unconfirmed.append(item)
+                    continue
+
+                message = str(order_result.get("retMsg") or "Batch order item rejected")
+                if self._is_duplicate_client_order_rejection(message):
+                    unconfirmed.append(item)
+                else:
+                    rejected.append((item, message))
+
+            if unconfirmed:
+                mark_unknown(unconfirmed, "batch response did not confirm every client order ID")
+                with contextlib.suppress(Exception):
+                    self._reconcile_exchange_open_orders()
+            else:
+                self._persist_state()
+
+            for item, message in rejected:
+                fallback_single(item, message)
 
         if placed_links:
             self._mark_fast_poll()
@@ -2881,7 +3482,8 @@ class GridEngine:
                     post_only=initial_order_type == "post_only",
                 )
                 return
-            self._place_market_open(open_side, total_qty)
+            if not self._place_market_open(open_side, total_qty):
+                return
             self._prepare_pending_targets(self.initial_entry_price or current_price, self.initial_qty)
             self._reset_reduce_lots_from_pending_targets(self.initial_entry_price or current_price)
             self._deploy_pending_targets()
@@ -3110,12 +3712,13 @@ class GridEngine:
             position_side = "Buy" if direction == "long" else "Sell"
             close_side = "Sell" if position_side == "Buy" else "Buy"
             size = self._safe_grid_close_qty(position_side)
-            if size < self.min_qty:
+            qty_text = self._order_qty_text(size, reduce_only=True)
+            if not qty_text:
                 return
             result = self.client.place_order(
                 symbol=self.config["symbol"],
                 side=close_side,
-                qty=self._fq(size),
+                qty=qty_text,
                 order_type="Market",
                 reduce_only=True,
                 order_link_id=f"close_{close_side[0]}_{uuid.uuid4().hex[:6]}",
@@ -3131,14 +3734,15 @@ class GridEngine:
 
         for position in resp["result"].get("list", []):
             size = float(position.get("size", 0))
-            if size <= 0:
+            qty_text = self._order_qty_text(size, reduce_only=True)
+            if not qty_text:
                 continue
 
             close_side = "Sell" if position.get("side") == "Buy" else "Buy"
             result = self.client.place_order(
                 symbol=self.config["symbol"],
                 side=close_side,
-                qty=self._fq(size),
+                qty=qty_text,
                 order_type="Market",
                 reduce_only=True,
                 order_link_id=f"close_{close_side[0]}_{uuid.uuid4().hex[:6]}",
@@ -3209,14 +3813,14 @@ class GridEngine:
             return
 
         position_qty = self._safe_grid_close_qty(position_side)
-        if position_qty < self.min_qty:
+        if not self._qty_reaches_accounting_step(position_qty):
             return
 
         self._boundary_repair_in_progress = True
         try:
             self._cancel_stale_reduce_orders(close_side)
             refreshed_qty = self._safe_grid_close_qty(position_side)
-            if refreshed_qty >= self.min_qty:
+            if self._qty_reaches_accounting_step(refreshed_qty):
                 self._place_reduce_market(close_side, refreshed_qty, reason)
                 self._boundary_repair_retry_after = time.time() + 2
         finally:
@@ -3289,7 +3893,14 @@ class GridEngine:
         if resp.get("retCode") != 0:
             raise RuntimeError(resp.get("retMsg", "Failed to fetch open orders"))
 
-        open_order_ids = {item["orderId"] for item in resp["result"].get("list", [])}
+        open_orders = list(resp["result"].get("list", []))
+        if self.opening_order.get("submission_pending"):
+            if not self._resolve_opening_submission(open_orders):
+                return
+            if not self.opening_order:
+                return
+
+        open_order_ids = {str(item.get("orderId", "")) for item in open_orders}
         order_id = self.opening_order["order_id"]
         if order_id in open_order_ids:
             return
@@ -3314,6 +3925,25 @@ class GridEngine:
                 liquidity_hint=liquidity_hint,
             )
         if not stats or stats["qty"] <= 0:
+            if str(self.opening_order.get("order_type", "")).lower() == "market":
+                if self._is_filled_status(status):
+                    self.trigger_message = (
+                        "Initial market order is filled; waiting for authoritative execution "
+                        "quantity and price before deploying the grid."
+                    )
+                    self._mark_fast_poll()
+                    self._persist_state()
+                    return
+                if self._is_cancelled_status(status):
+                    self.waiting_initial_order = False
+                    self.opening_order = None
+                    self.running = False
+                    self.trigger_message = (
+                        f"Initial market order ended as {status} without a confirmed fill; "
+                        "the grid was not deployed."
+                    )
+                    self._persist_state()
+                    return
             if status == "UNKNOWN":
                 logger.info(
                     "Opening order absent from open orders but status is unknown; waiting symbol=%s order_id=%s",
