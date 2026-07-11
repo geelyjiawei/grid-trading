@@ -178,9 +178,9 @@ class GridEngine:
         self.baseline_position_entry_price = float(state.get("baseline_position_entry_price") or 0)
         self._allow_restore_baseline_migration = "grid_position_net_qty" not in state
         if "grid_position_net_qty" in state:
-            self.grid_position_net_qty = float(state.get("grid_position_net_qty") or 0)
+            self._set_grid_position_net_qty(state.get("grid_position_net_qty") or 0)
         else:
-            self.grid_position_net_qty = self._derive_grid_position_net_qty()
+            self._set_grid_position_net_qty(self._derive_grid_position_net_qty())
         self.grid_profit_pct = float(state.get("grid_profit_pct") or 0)
         self.waiting_trigger = bool(state.get("waiting_trigger", False))
         self.trigger_message = str(state.get("trigger_message") or "")
@@ -2482,27 +2482,40 @@ class GridEngine:
             net_qty += self._signed_qty(str(order.get("side") or ""), qty)
         return net_qty
 
+    def _set_grid_position_net_qty(self, value: Decimal | float | str):
+        position = Decimal(str(value))
+        normalized = self._normalized_qty_decimal(
+            abs(position),
+            self._qty_step_decimal(),
+        )
+        if position < 0:
+            normalized = -normalized
+        self.grid_position_net_qty = float(normalized)
+
     def _set_initial_grid_position(self, side: str, qty: float):
-        self.grid_position_net_qty = self._signed_qty(side, qty)
+        self._set_grid_position_net_qty(self._signed_qty(side, qty))
 
     def _apply_grid_position_fill(self, order: dict, qty: float):
         direction = self.config["direction"]
         side = order.get("side")
         reduce_only = bool(order.get("reduce_only"))
+        position = Decimal(str(self.grid_position_net_qty))
+        fill_qty = Decimal(str(qty))
         if direction == "long":
             if side == "Buy" and not reduce_only:
-                self.grid_position_net_qty += qty
+                position += fill_qty
             elif side == "Sell" and reduce_only:
-                self.grid_position_net_qty -= qty
-            self.grid_position_net_qty = max(0.0, self.grid_position_net_qty)
+                position -= fill_qty
+            position = max(Decimal("0"), position)
         elif direction == "short":
             if side == "Sell" and not reduce_only:
-                self.grid_position_net_qty -= qty
+                position -= fill_qty
             elif side == "Buy" and reduce_only:
-                self.grid_position_net_qty += qty
-            self.grid_position_net_qty = min(0.0, self.grid_position_net_qty)
+                position += fill_qty
+            position = min(Decimal("0"), position)
         else:
-            self.grid_position_net_qty += self._signed_qty(str(side or ""), qty)
+            position += Decimal(str(self._signed_qty(str(side or ""), qty)))
+        self._set_grid_position_net_qty(position)
 
     def _apply_market_reduce_to_grid_position(self, side: str, qty: float):
         self._apply_grid_position_fill({"side": side, "reduce_only": True}, qty)

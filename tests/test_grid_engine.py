@@ -604,6 +604,39 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(counter_orders), 1)
         self.assertEqual(counter_orders[0]["qty"], "0.20")
 
+    async def test_repeated_position_updates_remain_exact_on_quantity_step(self):
+        for direction, open_side, reduce_side, expected in (
+            ("short", "Sell", "Buy", Decimal("-3.74")),
+            ("long", "Buy", "Sell", Decimal("3.74")),
+        ):
+            client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+            engine = GridEngine(client, {"symbol": "MUUSDT", "direction": direction})
+            engine._fetch_precision()
+
+            for _ in range(374):
+                engine._apply_grid_position_fill(
+                    {"side": open_side, "reduce_only": False},
+                    0.01,
+                )
+
+            self.assertEqual(
+                Decimal(str(engine.grid_position_net_qty)),
+                expected,
+                msg=direction,
+            )
+
+            for _ in range(374):
+                engine._apply_grid_position_fill(
+                    {"side": reduce_side, "reduce_only": True},
+                    0.01,
+                )
+
+            self.assertEqual(
+                Decimal(str(engine.grid_position_net_qty)),
+                Decimal("0"),
+                msg=direction,
+            )
+
     async def test_reduce_protection_detects_level_gaps_even_when_total_matches(self):
         client = FakeClient("100")
         engine = GridEngine(
