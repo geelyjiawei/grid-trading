@@ -3736,6 +3736,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(halted)
         self.assertFalse(engine.running)
         self.assertFalse(engine.grid_ready)
+        self.assertTrue(engine.stop_finalize_pending)
+        self.assertEqual(engine.finalize_history_status, "failed")
 
     async def test_baseline_breach_keeps_cleanup_running_when_cancel_is_unconfirmed(self):
         class UnconfirmedCancelClient(FakeClient):
@@ -3759,6 +3761,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.manual_stop_pending)
         self.assertFalse(engine.grid_ready)
         self.assertIn(link_id, engine.active_orders)
+        self.assertTrue(engine.stop_finalize_pending)
+        self.assertEqual(engine.finalize_history_status, "failed")
 
     async def test_invalid_position_snapshots_are_rejected_before_accounting(self):
         class PositionResponseClient(FakeClient):
@@ -7611,12 +7615,57 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.initialization_failed)
         self.assertTrue(engine.manual_stop_pending)
         self.assertFalse(engine.initial_grid_deployment_pending)
+        self.assertTrue(engine.initial_grid_deployment_ledger)
         self.assertFalse(engine.grid_ready)
         self.assertEqual(
             len([order for order in client.orders if order.get("order_type") == "Limit"]),
             limit_count_before,
         )
         self.assertEqual(float(client.positions[0]["size"]), 10.0)
+
+    async def test_stale_initial_deployment_ledger_cannot_be_overwritten(self):
+        client = FakeClient("100", tick_size="1", qty_step="0.1", min_qty="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 100, 110]
+        engine.current_price = 100
+        engine._pending_targets = {
+            "profit_targets": [],
+            "add_targets": [(1, 110, "Sell")],
+            "allocated_qtys": [1],
+            "qty_per_grid": 1,
+        }
+        engine.initial_grid_deployment_ledger = {
+            "Sell|1|110|1|0": {
+                "link_id": "g_1_S_stale",
+                "side": "Sell",
+                "level_idx": 1,
+                "price": "110",
+                "qty": "1",
+                "reduce_only": False,
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "ledger is not empty"):
+            engine._deploy_pending_targets()
+
+        self.assertEqual(client.orders, [])
+        self.assertIn("Sell|1|110|1|0", engine.initial_grid_deployment_ledger)
 
     async def test_initial_batch_rate_limit_every_chunk_boundary_resumes_exactly(self):
         class RateLimitedBatchClient(BatchFakeClient):

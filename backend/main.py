@@ -550,6 +550,7 @@ def _engine_requires_cleanup(engine: GridEngine | None) -> bool:
         or engine.manual_stop_pending
         or engine.stop_finalize_pending
         or engine.initialization_failed
+        or engine.initial_grid_deployment_ledger
         or engine._qty_reaches_accounting_step(engine._grid_position_qty())
     )
 
@@ -1276,6 +1277,7 @@ def _stop_finalization_ready(engine: GridEngine) -> bool:
         and not engine.risk_shutdown_pending
         and not engine.initialization_in_progress
         and not engine.initial_grid_deployment_pending
+        and not engine.initial_grid_deployment_ledger
     )
 
 
@@ -1326,11 +1328,19 @@ def _save_engine_state(engine: GridEngine):
         getattr(engine, "stop_finalize_pending", False) is True
     )
     finalize_stop = registered and _stop_finalization_ready(engine)
+    requested_history_status = str(
+        getattr(engine, "finalize_history_status", "") or ""
+    ).lower()
+    if requested_history_status not in {"failed", "closed", "stopped"}:
+        requested_history_status = ""
     history_status = (
         (
-            "failed"
-            if getattr(engine, "initialization_failed", False) is True
-            else "stopped"
+            requested_history_status
+            or (
+                "failed"
+                if getattr(engine, "initialization_failed", False) is True
+                else "stopped"
+            )
         )
         if finalize_stop
         else ("running" if engine.running else "saved")
@@ -1375,7 +1385,11 @@ def _save_engine_state(engine: GridEngine):
                 finalization_label = (
                     "failed grid start"
                     if history_status == "failed"
-                    else "stopped grid"
+                    else (
+                        "closed grid"
+                        if history_status == "closed"
+                        else "stopped grid"
+                    )
                 )
                 engine.trigger_message = (
                     f"The {finalization_label} history could not "
@@ -1392,6 +1406,7 @@ def _save_engine_state(engine: GridEngine):
 
     if finalized:
         engine.stop_finalize_pending = False
+        engine.finalize_history_status = ""
         engine.trigger_message = ""
         with _engines_lock:
             if _engines.get(engine_key) is engine:
@@ -1982,6 +1997,7 @@ async def start_grid(cfg: GridConfig):
         engine.manual_stop_pending = False
         engine.grid_ready = False
         engine.stop_finalize_pending = True
+        engine.finalize_history_status = "failed"
         engine.trigger_message = (
             f"Grid initialization failed before any exchange order or position was created: "
             f"{exc}. Archiving the failed start without leaving a saved grid."
@@ -2091,9 +2107,11 @@ async def _stop_and_finalize_engine(engine: GridEngine):
             f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
         )
     previous_stop_finalize_pending = engine.stop_finalize_pending
+    previous_finalize_history_status = engine.finalize_history_status
     previous_manual_stop_pending = engine.manual_stop_pending
     previous_trigger_message = engine.trigger_message
     engine.stop_finalize_pending = True
+    engine.finalize_history_status = "stopped"
     engine.manual_stop_pending = True
     engine.trigger_message = (
         "Stop requested; exchange cleanup and durable history finalization are pending."
@@ -2115,6 +2133,7 @@ async def _stop_and_finalize_engine(engine: GridEngine):
             else:
                 engine.config.pop("run_id", None)
             engine.stop_finalize_pending = previous_stop_finalize_pending
+            engine.finalize_history_status = previous_finalize_history_status
             engine.manual_stop_pending = previous_manual_stop_pending
             engine.trigger_message = previous_trigger_message
             logger.exception(

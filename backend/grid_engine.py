@@ -100,6 +100,7 @@ class GridEngine:
         self.risk_shutdown_pending = False
         self.manual_stop_pending = False
         self.stop_finalize_pending = False
+        self.finalize_history_status = ""
         self.initialization_in_progress = False
         self.initialization_failed = False
         self.initial_grid_deployment_pending = False
@@ -133,6 +134,13 @@ class GridEngine:
     def _persist_state(self):
         if self.state_callback:
             self.state_callback(self)
+
+    def _mark_terminal_finalization(self, status: str) -> None:
+        status = str(status or "").lower().strip()
+        if status not in {"failed", "closed", "stopped"}:
+            raise ValueError(f"Unsupported terminal history status: {status}")
+        self.stop_finalize_pending = True
+        self.finalize_history_status = status
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -181,6 +189,7 @@ class GridEngine:
             "risk_shutdown_pending": self.risk_shutdown_pending,
             "manual_stop_pending": self.manual_stop_pending,
             "stop_finalize_pending": self.stop_finalize_pending,
+            "finalize_history_status": self.finalize_history_status,
             "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
             "initial_grid_deployment_pending": self.initial_grid_deployment_pending,
@@ -261,6 +270,14 @@ class GridEngine:
         self.risk_shutdown_pending = bool(state.get("risk_shutdown_pending", False))
         self.manual_stop_pending = bool(state.get("manual_stop_pending", False))
         self.stop_finalize_pending = bool(state.get("stop_finalize_pending", False))
+        finalize_history_status = str(
+            state.get("finalize_history_status") or ""
+        ).lower()
+        self.finalize_history_status = (
+            finalize_history_status
+            if finalize_history_status in {"failed", "closed", "stopped"}
+            else ""
+        )
         self.initialization_in_progress = bool(
             state.get("initialization_in_progress", False)
         )
@@ -338,7 +355,6 @@ class GridEngine:
         )
         if invalid_initial_deployment:
             self.initial_grid_deployment_pending = False
-            self.initial_grid_deployment_ledger.clear()
             self.initialization_in_progress = False
             self.initialization_failed = True
             self.manual_stop_pending = True
@@ -352,11 +368,9 @@ class GridEngine:
             self.initialization_in_progress = True
         elif self.initial_grid_deployment_pending:
             self.initial_grid_deployment_pending = False
-            self.initial_grid_deployment_ledger.clear()
             self.initialization_in_progress = False
         elif self.initialization_in_progress and not self.grid_ready:
             self.initial_grid_deployment_pending = False
-            self.initial_grid_deployment_ledger.clear()
             self.initialization_in_progress = False
             self.initialization_failed = True
             self.manual_stop_pending = True
@@ -364,6 +378,16 @@ class GridEngine:
                 "Grid initialization was interrupted after exchange work began. Managed "
                 "orders will be reconciled and cancelled; the retained position will not "
                 "be market-closed or reused by a new grid without explicit review."
+            )
+        elif self.initial_grid_deployment_ledger:
+            self.initialization_in_progress = False
+            self.initialization_failed = True
+            self.manual_stop_pending = True
+            self.grid_ready = False
+            self.trigger_message = (
+                "Initial grid deployment ledger remained without a resumable deployment. "
+                "Managed orders will be reconciled and cancelled before the state can be "
+                "finalized."
             )
 
         if not self.grid_levels:
@@ -693,12 +717,132 @@ class GridEngine:
             return "done"
         return "pending"
 
+    def _adopt_initial_deployment_orders_for_cleanup(
+        self,
+        open_orders: list[dict],
+    ) -> None:
+        represented_links = {
+            str(link_id)
+            for link_id in self.active_orders
+            if str(link_id)
+        }
+        represented_links.update(
+            str(order.get("link_id") or "")
+            for order in self.active_orders.values()
+            if str(order.get("link_id") or "")
+        )
+        ledger_by_link = {
+            str(entry.get("link_id") or ""): entry
+            for entry in self.initial_grid_deployment_ledger.values()
+            if str(entry.get("link_id") or "") not in represented_links
+        }
+        if not ledger_by_link:
+            return
+
+        snapshots_by_link = {
+            str(snapshot.get("orderLinkId") or ""): snapshot
+            for snapshot in open_orders
+            if str(snapshot.get("orderLinkId") or "") in ledger_by_link
+        }
+        unresolved_links = set(ledger_by_link) - set(snapshots_by_link)
+        if unresolved_links:
+            snapshots_by_link.update(
+                self._submission_history_by_link(unresolved_links)
+            )
+
+        for link_id, entry in ledger_by_link.items():
+            snapshot = snapshots_by_link.get(link_id)
+            if not snapshot:
+                continue
+            order_id = str(snapshot.get("orderId") or "")
+            if not order_id:
+                continue
+            actual_side = str(snapshot.get("side") or entry.get("side") or "")
+            if actual_side.upper() == "BUY":
+                actual_side = "Buy"
+            elif actual_side.upper() == "SELL":
+                actual_side = "Sell"
+            order = {
+                "link_id": link_id,
+                "order_id": order_id,
+                "level_idx": int(entry.get("level_idx", 0) or 0),
+                "side": actual_side,
+                "price": str(snapshot.get("price") or entry.get("price") or "0"),
+                "qty": str(snapshot.get("qty") or entry.get("qty") or "0"),
+                "status": str(snapshot.get("orderStatus") or "open"),
+                "order_type": str(snapshot.get("orderType") or "Limit"),
+                "time_in_force": (
+                    "PostOnly"
+                    if str(snapshot.get("timeInForce") or "") == "PostOnly"
+                    else "GTC"
+                ),
+                "reduce_only": self._truthy(
+                    snapshot.get("reduceOnly", entry.get("reduce_only", False))
+                ),
+                "entry_price": None,
+                "processed_fill_qty": 0.0,
+                "processed_fill_volume": 0.0,
+                "processed_fill_fee": 0.0,
+            }
+            expected = {
+                "side": str(entry.get("side") or ""),
+                "price": str(entry.get("price") or "0"),
+                "qty": str(entry.get("qty") or "0"),
+                "reduce_only": bool(entry.get("reduce_only", False)),
+                "order_type": "Limit",
+            }
+            mismatch = self._accepted_shape_mismatch_reason(expected, snapshot)
+            if mismatch:
+                order["accepted_shape_mismatch"] = mismatch
+            self.active_orders[link_id] = order
+            logger.warning(
+                "Recovered initial deployment order for cleanup symbol=%s "
+                "order_id=%s link_id=%s",
+                self.config.get("symbol"),
+                order_id,
+                link_id,
+            )
+
     def _cancel_managed_orders_once(self) -> bool:
         open_orders = self._fetch_open_orders()
+        self._adopt_initial_deployment_orders_for_cleanup(open_orders)
+        represented_links = {
+            str(link_id)
+            for link_id in self.active_orders
+            if str(link_id)
+        }
+        represented_links.update(
+            str(order.get("link_id") or "")
+            for order in self.active_orders.values()
+            if str(order.get("link_id") or "")
+        )
+        untracked_initial_links = sorted(
+            {
+                str(entry.get("link_id") or "")
+                for entry in self.initial_grid_deployment_ledger.values()
+                if str(entry.get("link_id") or "") not in represented_links
+            }
+        )
+        if untracked_initial_links:
+            self.trigger_message = (
+                "Stop is blocked because the initial deployment ledger contains client "
+                "order IDs that are not represented by the active-order ledger. The state "
+                "is retained for authoritative exchange reconciliation: "
+                + ", ".join(link_id or "<missing>" for link_id in untracked_initial_links[:5])
+            )
         for link_id, order in list(self.active_orders.items()):
             outcome = self._cancel_managed_order_once(order, open_orders)
             if outcome == "done":
                 self.active_orders.pop(link_id, None)
+                order_link_id = str(order.get("link_id") or link_id)
+                for deployment_key, entry in list(
+                    self.initial_grid_deployment_ledger.items()
+                ):
+                    if str(entry.get("link_id") or "") == order_link_id:
+                        self.initial_grid_deployment_ledger.pop(
+                            deployment_key,
+                            None,
+                        )
 
         if self.opening_order:
             outcome = self._cancel_managed_order_once(
@@ -711,14 +855,17 @@ class GridEngine:
                 self.waiting_initial_order = False
 
         self._persist_state()
-        return not self.active_orders and self.opening_order is None
+        return (
+            not self.active_orders
+            and self.opening_order is None
+            and not untracked_initial_links
+        )
 
     async def stop(self):
         self._stopping = True
         self.manual_stop_pending = True
         self.initialization_in_progress = False
         self.initial_grid_deployment_pending = False
-        self.initial_grid_deployment_ledger.clear()
         self.running = True
         self._persist_state()
         await self._stop_user_stream()
@@ -742,10 +889,13 @@ class GridEngine:
                 await asyncio.sleep(MANAGED_CANCEL_RETRY_SECONDS)
 
         if not completed:
-            self.trigger_message = (
-                "Stop is incomplete: one or more managed orders still lack terminal exchange "
-                "confirmation. State was retained for a safe retry."
-            )
+            if not self.trigger_message.startswith(
+                "Stop is blocked because the initial deployment ledger"
+            ):
+                self.trigger_message = (
+                    "Stop is incomplete: one or more managed orders still lack terminal "
+                    "exchange confirmation. State was retained for a safe retry."
+                )
             self._persist_state()
             raise RuntimeError(self.trigger_message)
 
@@ -772,9 +922,14 @@ class GridEngine:
                 pass
         self._persist_state()
 
-    def _mark_fast_poll(self, seconds: float = FAST_POLL_WINDOW_SECONDS):
+    def _mark_fast_poll(
+        self,
+        seconds: float = FAST_POLL_WINDOW_SECONDS,
+        *,
+        wake: bool = True,
+    ):
         self._fast_poll_until = max(self._fast_poll_until, time.time() + seconds)
-        if self._wake_event:
+        if wake and self._wake_event:
             self._wake_event.set()
 
     def _rate_limit_remaining(self) -> float:
@@ -1020,6 +1175,7 @@ class GridEngine:
             "risk_shutdown_pending": self.risk_shutdown_pending,
             "manual_stop_pending": self.manual_stop_pending,
             "stop_finalize_pending": self.stop_finalize_pending,
+            "finalize_history_status": self.finalize_history_status,
             "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
             "initial_grid_deployment_pending": self.initial_grid_deployment_pending,
@@ -1915,6 +2071,7 @@ class GridEngine:
             actual_same_side_qty,
         )
         self._stopping = True
+        self._mark_terminal_finalization("failed")
         all_terminal = False
         try:
             all_terminal = self._cancel_managed_orders_once()
@@ -2219,8 +2376,8 @@ class GridEngine:
         self.grid_ready = False
         self.manual_stop_pending = True
         self.initialization_in_progress = False
+        self.initialization_failed = True
         self.initial_grid_deployment_pending = False
-        self.initial_grid_deployment_ledger.clear()
         self.trigger_message = (
             f"Exchange accepted a grid order with a different shape ({reason}); "
             "new placement is stopped and managed orders will be cancelled without "
@@ -2782,15 +2939,10 @@ class GridEngine:
                 if self._qty_reaches_accounting_step(self.opening_filled_qty):
                     self._fail_opening_completion(rejection)
                     return False
-                self.waiting_initial_order = False
-                self.opening_order = None
-                self.running = False
-                self.trigger_message = (
+                self._fail_unfilled_opening(
                     "Opening order was definitively rejected after submission recovery checks; "
                     "the grid was not deployed."
                 )
-                self._clear_restore_refresh_state()
-                self._persist_state()
                 return False
 
         self.trigger_message = (
@@ -6109,7 +6261,6 @@ class GridEngine:
 
     def _fail_initial_grid_deployment(self, reason: Any) -> None:
         self.initial_grid_deployment_pending = False
-        self.initial_grid_deployment_ledger.clear()
         self.initialization_in_progress = False
         self.initialization_failed = True
         self.manual_stop_pending = True
@@ -6131,6 +6282,11 @@ class GridEngine:
     def _deploy_pending_targets(self, qty_scale: float = 1.0) -> bool:
         plan = self._validated_pending_target_plan(qty_scale)
         if not self.initial_grid_deployment_pending:
+            if self.initial_grid_deployment_ledger:
+                raise RuntimeError(
+                    "Initial grid deployment ledger is not empty; existing exchange work "
+                    "must be reconciled before a new deployment can begin"
+                )
             self.initial_grid_deployment_pending = True
             self.initial_grid_deployment_ledger = {}
             self.initialization_in_progress = True
@@ -6303,6 +6459,7 @@ class GridEngine:
             self.risk_shutdown_pending = False
             self.paused_replacements.clear()
             self._clear_restore_refresh_state()
+            self._mark_terminal_finalization("closed")
             self._persist_state()
             return True
         except Exception as exc:
@@ -6324,15 +6481,29 @@ class GridEngine:
                         self.grid_ready = False
                         self.manual_stop_pending = False
                         self.risk_shutdown_pending = False
+                        self.initialization_in_progress = False
+                        self.initial_grid_deployment_pending = False
+                        self.initial_grid_deployment_ledger.clear()
                         self.paused_replacements.clear()
                         self._clear_restore_refresh_state()
+                        if (
+                            not self.stop_finalize_pending
+                            and self.initialization_failed
+                            and not self._qty_reaches_accounting_step(
+                                self._grid_position_qty()
+                            )
+                        ):
+                            self._mark_terminal_finalization("failed")
                         self._persist_state()
                         break
-                    self.trigger_message = (
-                        "Manual stop recovery is reconciling managed orders; normal grid "
-                        "placement remains disabled."
-                    )
-                    self._mark_fast_poll()
+                    if not self.trigger_message.startswith(
+                        "Stop is blocked because the initial deployment ledger"
+                    ):
+                        self.trigger_message = (
+                            "Manual stop recovery is reconciling managed orders; normal grid "
+                            "placement remains disabled."
+                        )
+                    self._mark_fast_poll(wake=False)
                     self._persist_state()
                     await self._sleep_until_next_poll()
                     continue
@@ -6508,31 +6679,36 @@ class GridEngine:
         self._persist_state()
         return all_terminal
 
+    def _fail_unfilled_opening(self, message: str) -> None:
+        self.waiting_initial_order = False
+        self.opening_order = None
+        self.running = False
+        self.grid_ready = False
+        self.initialization_in_progress = False
+        self.initialization_failed = True
+        self.initial_grid_deployment_pending = False
+        self._clear_restore_refresh_state()
+        self.trigger_message = message
+        self._mark_terminal_finalization("failed")
+        self._persist_state()
+
     def _replace_unfilled_opening_order(self, status: str):
         order = self.opening_order or {}
         side = order.get("side") or self.initial_side
         qty = float(order.get("qty") or self.initial_qty or 0)
         if not side or qty < self.min_qty:
-            self.waiting_initial_order = False
-            self.opening_order = None
-            self.running = False
-            self.trigger_message = "Opening order closed without fills and retry quantity is too small."
-            self._clear_restore_refresh_state()
-            self._persist_state()
+            self._fail_unfilled_opening(
+                "Opening order closed without fills and retry quantity is too small."
+            )
             return
 
         current_price = self._get_current_price()
         self.current_price = current_price
         if not self._in_grid_range(current_price):
-            self.waiting_initial_order = False
-            self.opening_order = None
-            self.running = False
-            self.trigger_message = (
+            self._fail_unfilled_opening(
                 "Opening order closed without fills and price is outside grid range; "
                 "please review before restarting."
             )
-            self._clear_restore_refresh_state()
-            self._persist_state()
             return
 
         self.waiting_initial_order = False
@@ -6554,16 +6730,10 @@ class GridEngine:
                 with contextlib.suppress(Exception):
                     self._persist_state()
                 return
-            self.running = False
-            self.grid_ready = False
-            self.waiting_initial_order = False
-            self.opening_order = None
-            self.trigger_message = (
+            self._fail_unfilled_opening(
                 f"Opening order replacement failed before any confirmed fill: {exc}. "
                 "The grid was stopped without submitting another opening order."
             )
-            self._clear_restore_refresh_state()
-            self._persist_state()
             return
         order_label = "Post-only" if post_only else "Limit"
         self.trigger_message = (
@@ -6577,7 +6747,6 @@ class GridEngine:
         self.opening_order = None
         self.initialization_in_progress = False
         self.initial_grid_deployment_pending = False
-        self.initial_grid_deployment_ledger.clear()
         self.initialization_failed = True
         self.manual_stop_pending = True
         self.grid_ready = False
@@ -6691,15 +6860,10 @@ class GridEngine:
                     self._persist_state()
                     return
                 if self._is_cancelled_status(status):
-                    self.waiting_initial_order = False
-                    self.opening_order = None
-                    self.running = False
-                    self.trigger_message = (
+                    self._fail_unfilled_opening(
                         f"Initial market order ended as {status} without a confirmed fill; "
                         "the grid was not deployed."
                     )
-                    self._clear_restore_refresh_state()
-                    self._persist_state()
                     return
             if self._is_filled_status(status):
                 self.trigger_message = (

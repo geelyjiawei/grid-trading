@@ -933,11 +933,322 @@ class MultiGridServerTests(unittest.TestCase):
         saved = main._load_grid_state_file()["grids"][key]
         self.assertTrue(saved["initial_grid_deployment_ledger"])
 
+        stop_started_at = time.monotonic()
         stop = self.client.post(
             "/api/grid/stop/LEDGERONLYUSDT?exchange=binance"
         )
-        self.assertEqual(stop.status_code, 200, stop.text)
+        stop_elapsed = time.monotonic() - stop_started_at
+        self.assertEqual(stop.status_code, 503, stop.text)
+        self.assertLess(stop_elapsed, 5)
+        self.assertIn("initial deployment ledger", stop.json()["detail"].lower())
+        self.assertIn(key, main._engines)
+        self.assertTrue(retained.initial_grid_deployment_ledger)
+        saved_after_stop = main._load_grid_state_file()["grids"][key]
+        self.assertTrue(saved_after_stop["initial_grid_deployment_ledger"])
+
+    def test_background_initialization_cleanup_archives_after_terminal_cancel(self):
+        class PartiallyAcceptedInitialGridClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.limit_attempts = 0
+
+            def place_order(self, **kwargs):
+                if kwargs.get("order_type") == "Limit":
+                    self.limit_attempts += 1
+                    if self.limit_attempts > 1:
+                        return {
+                            "retCode": -2010,
+                            "retMsg": "definitive deployment rejection",
+                            "result": {},
+                        }
+                return super().place_order(**kwargs)
+
+        client = PartiallyAcceptedInitialGridClient("100")
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("BACKGROUNDCLEANUSDT")
+        payload.update(
+            {
+                "direction": "neutral",
+                "grid_order_post_only": True,
+            }
+        )
+
+        response = self.client.post("/api/grid/start", json=payload)
+
+        self.assertEqual(response.status_code, 409, response.text)
+        key = main._engine_key("binance", "BACKGROUNDCLEANUSDT")
+        deadline = time.time() + 5
+        while key in main._engines and time.time() < deadline:
+            time.sleep(0.05)
+
         self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        self.assertEqual(client.open_limit_order_ids, set())
+        self.assertEqual(len(client.cancelled_orders), 1)
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["symbol"] == "BACKGROUNDCLEANUSDT"
+        )
+        self.assertEqual(record["status"], "failed")
+
+    def test_ledger_only_open_order_is_recovered_and_cancelled_on_stop(self):
+        config = self._payload("RECOVERLEDGERUSDT")
+        config.update(
+            {
+                "exchange": "binance",
+                "run_id": "recover-ledger-run",
+            }
+        )
+        placed = main._client.place_order(
+            symbol="RECOVERLEDGERUSDT",
+            side="Sell",
+            qty="1",
+            price="110",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id="g_0_S_recoverledger",
+        )
+        order_id = str(placed["result"]["orderId"])
+        engine = main.GridEngine(main._client, config, state_callback=main._save_engine_state)
+        engine._fetch_precision()
+        engine.running = False
+        engine.grid_ready = False
+        engine.initialization_failed = True
+        engine.initial_grid_deployment_ledger = {
+            "Sell|0|110.0|1.0|0": {
+                "link_id": "g_0_S_recoverledger",
+                "side": "Sell",
+                "level_idx": 0,
+                "price": "110.0",
+                "qty": "1.0",
+                "reduce_only": False,
+            }
+        }
+        key = main._engine_key("binance", "RECOVERLEDGERUSDT")
+        main._engines[key] = engine
+        main._save_engine_state(engine)
+
+        stop = self.client.post(
+            "/api/grid/stop/RECOVERLEDGERUSDT?exchange=binance"
+        )
+
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertIn(order_id, main._client.cancelled_orders)
+        self.assertNotIn(order_id, main._client.open_limit_order_ids)
+        self.assertEqual(engine.initial_grid_deployment_ledger, {})
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["run_id"] == "recover-ledger-run"
+        )
+        self.assertEqual(record["status"], "stopped")
+
+    def test_unfilled_opening_terminal_failure_is_archived_as_failed(self):
+        payload = self._payload("ASYNCOPENFAILUSDT")
+        payload.update(
+            {
+                "initial_order_type": "limit",
+                "initial_order_price": 99,
+            }
+        )
+        start = self.client.post("/api/grid/start", json=payload)
+        self.assertEqual(start.status_code, 200, start.text)
+        key = main._engine_key("binance", "ASYNCOPENFAILUSDT")
+        engine = main._engines[key]
+        run_id = engine.config["run_id"]
+        opening_order_id = str(engine.opening_order["order_id"])
+        main._client.cancel_order("ASYNCOPENFAILUSDT", opening_order_id)
+        main._client.ticker_price = 120
+
+        asyncio.run(engine._check_initial_order())
+
+        self.assertEqual(main._client.positions, [])
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["run_id"] == run_id
+        )
+        self.assertEqual(record["status"], "failed")
+        self.assertIsNone(record["stopped_at"])
+
+    def test_completed_risk_shutdown_is_archived_as_closed(self):
+        class FilledRiskClient(FakeClient):
+            def get_order(self, symbol, order_id):
+                response = super().get_order(symbol, order_id)
+                order = next(
+                    item
+                    for item in self.orders
+                    if str(item["orderId"]) == str(order_id)
+                )
+                if order.get("order_type") == "Market":
+                    qty = float(order["qty"])
+                    response["result"].update(
+                        {
+                            "orderLinkId": order.get("order_link_id", ""),
+                            "orderStatus": "FILLED",
+                            "executedQty": str(qty),
+                            "cumQuote": str(qty * 100),
+                            "avgPrice": "100",
+                        }
+                    )
+                return response
+
+            def get_order_trades(self, symbol, order_id):
+                order = next(
+                    item
+                    for item in self.orders
+                    if str(item["orderId"]) == str(order_id)
+                )
+                qty = float(order["qty"])
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "qty": str(qty),
+                                "price": "100",
+                                "volume": str(qty * 100),
+                                "feeUsdt": "0.05",
+                                "feeAsset": "USDT",
+                                "isMaker": False,
+                            }
+                        ]
+                    },
+                }
+
+        client = FilledRiskClient("100")
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("RISKCOMPLETEUSDT")
+        payload["take_profit_price"] = 101
+        start = self.client.post("/api/grid/start", json=payload)
+        self.assertEqual(start.status_code, 200, start.text)
+        key = main._engine_key("binance", "RISKCOMPLETEUSDT")
+        engine = main._engines[key]
+        run_id = engine.config["run_id"]
+        self.assertTrue(main._client.positions)
+
+        completed = asyncio.run(engine._shutdown_with_close())
+
+        self.assertTrue(completed)
+        self.assertEqual(main._client.positions, [])
+        self.assertEqual(main._client.open_limit_order_ids, set())
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["run_id"] == run_id
+        )
+        self.assertEqual(record["status"], "closed")
+        self.assertIsNotNone(record["stopped_at"])
+
+    def test_completed_baseline_breach_is_archived_as_failed(self):
+        main._client.positions = [
+            {"side": "Sell", "size": "3", "avgPrice": "100"}
+        ]
+        payload = self._payload("BASELINEFAILUSDT")
+        payload["direction"] = "short"
+        start = self.client.post("/api/grid/start", json=payload)
+        self.assertEqual(start.status_code, 200, start.text)
+        key = main._engine_key("binance", "BASELINEFAILUSDT")
+        engine = main._engines[key]
+        run_id = engine.config["run_id"]
+        self.assertEqual(engine.baseline_position_qty, 3.0)
+        main._client.positions = [
+            {"side": "Sell", "size": "2.9", "avgPrice": "100"}
+        ]
+
+        halted = engine._halt_if_baseline_breached()
+
+        self.assertTrue(halted)
+        self.assertEqual(main._client.open_limit_order_ids, set())
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["run_id"] == run_id
+        )
+        self.assertEqual(record["status"], "failed")
+        self.assertIsNone(record["stopped_at"])
+
+    def test_restore_preserves_closed_terminal_history_status(self):
+        config = self._payload("RESTORECLOSEDUSDT")
+        config.update(
+            {
+                "exchange": "binance",
+                "run_id": "restore-closed-run",
+            }
+        )
+        engine = main.GridEngine(main._client, config)
+        engine.running = False
+        engine.grid_ready = False
+        engine.stop_finalize_pending = True
+        engine.finalize_history_status = "closed"
+        key = main._engine_key("binance", "RESTORECLOSEDUSDT")
+        main._write_grid_state_file(
+            {"version": 1, "grids": {key: engine.to_state()}}
+        )
+        self.assertTrue(main._upsert_grid_history(engine, "saved"))
+
+        main._restore_saved_engines()
+
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["run_id"] == "restore-closed-run"
+        )
+        self.assertEqual(record["status"], "closed")
+        self.assertIsNotNone(record["stopped_at"])
+
+    def test_restore_never_finalizes_nonempty_initial_deployment_ledger(self):
+        config = self._payload("RESTORELEDGERUSDT")
+        config.update(
+            {
+                "exchange": "binance",
+                "run_id": "restore-ledger-run",
+            }
+        )
+        engine = main.GridEngine(main._client, config)
+        engine.running = False
+        engine.grid_ready = False
+        engine.stop_finalize_pending = True
+        engine.finalize_history_status = "stopped"
+        engine.initialization_in_progress = True
+        engine.initial_grid_deployment_pending = True
+        engine.initial_grid_deployment_ledger = {
+            "Sell|0|110.0|1.0|0": {
+                "link_id": "g_0_S_restoreledger",
+                "side": "Sell",
+                "level_idx": 0,
+                "price": "110.0",
+                "qty": "1.0",
+                "reduce_only": False,
+            }
+        }
+        key = main._engine_key("binance", "RESTORELEDGERUSDT")
+        main._write_grid_state_file(
+            {"version": 1, "grids": {key: engine.to_state()}}
+        )
+
+        main._restore_saved_engines()
+
+        self.assertIn(key, main._engines)
+        retained = main._engines[key]
+        self.assertFalse(retained.running)
+        self.assertTrue(retained.manual_stop_pending)
+        self.assertTrue(retained.stop_finalize_pending)
+        self.assertTrue(retained.initial_grid_deployment_ledger)
+        self.assertIn(key, main._load_grid_state_file()["grids"])
 
     def test_rate_limited_initial_opening_starts_in_recoverable_wait_state(self):
         class RateLimitedStartClient(FakeClient):
