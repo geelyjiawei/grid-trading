@@ -24,6 +24,7 @@ export interface GridConfigRequest {
   take_profit_price?: number | null;
   maker_fee_rate?: number;
   taker_fee_rate?: number;
+  fee_rate?: number;
 }
 
 export interface AuthStatus {

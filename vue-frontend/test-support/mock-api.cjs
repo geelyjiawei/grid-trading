@@ -104,6 +104,27 @@ http
         unmanaged_delta_qty: 0,
       });
     }
+    if (url.pathname === "/api/grid/preview") {
+      return send(response, {
+        grid_step: 1,
+        grid_profit_pct: 0.099,
+        per_grid_gross_profit: 0.247,
+        per_grid_fee: 0.0998,
+        per_grid_open_fee: 0.0499,
+        per_grid_close_fee: 0.0499,
+        per_grid_net_profit: 0.1472,
+        active_grid_count: 10,
+        grid_count: 20,
+        qty_per_grid_min: 0.2,
+        qty_per_grid_max: 0.2,
+        qty_per_grid_avg: 0.2,
+        min_notional: 5,
+        total_qty: 2,
+        maker_fee_rate: 0.0002,
+        taker_fee_rate: 0.0005,
+        fee_rate_source: "exchange",
+      });
+    }
     return send(response, { detail: "mock endpoint not found" }, 404);
   })
   .listen(8000, "127.0.0.1", () => {

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { ApiConfigResponse, GridStatus } from "../api/types";
 import AuthDialog from "./AuthDialog.vue";
 import ExchangeSettingsDialog from "./ExchangeSettingsDialog.vue";
+import GridConfigurationPanel from "./GridConfigurationPanel.vue";
 import StrategyList from "./StrategyList.vue";
 
 describe("Vue migration components", () => {
@@ -84,5 +85,64 @@ describe("Vue migration components", () => {
     await wrapper.find("button.strategy-row").trigger("click");
 
     expect(wrapper.emitted("select")?.[0]?.[0]).toEqual(grid);
+  });
+
+  it("keeps fixed per-grid quantity separate from investment sizing", async () => {
+    const wrapper = mount(GridConfigurationPanel, {
+      props: {
+        exchange: "binance",
+        symbol: "MUUSDT",
+        configured: true,
+        fees: { maker_fee_rate: 0.0002, taker_fee_rate: 0.0005 },
+        preview: null,
+        busy: false,
+        error: "",
+      },
+    });
+
+    expect(wrapper.find('[data-testid="grid-order-qty"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="total-investment"]').exists()).toBe(false);
+    await wrapper.find('[data-testid="lower-price"]').setValue("1000");
+    await wrapper.find('[data-testid="upper-price"]').setValue("1020");
+    await wrapper.find('[data-testid="grid-order-qty"]').setValue("0.2");
+    await wrapper.find("form").trigger("submit");
+
+    expect(wrapper.emitted("preview")?.[0]?.[0]).toMatchObject({
+      exchange: "binance",
+      symbol: "MUUSDT",
+      grid_count: 20,
+      total_investment: 0,
+      position_sizing_mode: "fixed_grid_qty",
+      grid_order_qty: 0.2,
+      initial_order_type: "market",
+      maker_fee_rate: 0.0002,
+      taker_fee_rate: 0.0005,
+    });
+
+    await wrapper.find('[data-testid="sizing-mode"]').setValue("investment");
+    expect(wrapper.find('[data-testid="grid-order-qty"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="total-investment"]').exists()).toBe(true);
+  });
+
+  it("exposes three distinct opening order semantics", () => {
+    const wrapper = mount(GridConfigurationPanel, {
+      props: {
+        exchange: "aster",
+        symbol: "ANSEMUSDT",
+        configured: true,
+        fees: { maker_fee_rate: 0.0002, taker_fee_rate: 0.0005 },
+        preview: null,
+        busy: false,
+        error: "",
+      },
+    });
+    const select = wrapper.find('[data-testid="initial-order-type"]')
+      .element as HTMLSelectElement;
+
+    expect(Array.from(select.options).map((option) => option.value)).toEqual([
+      "market",
+      "limit",
+      "post_only",
+    ]);
   });
 });

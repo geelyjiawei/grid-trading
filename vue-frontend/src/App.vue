@@ -7,6 +7,8 @@ import type {
   BalanceSnapshot,
   Exchange,
   FeeRates,
+  GridConfigRequest,
+  GridPreview,
   GridStatus,
   LoginRequest,
   PriceSnapshot,
@@ -15,6 +17,7 @@ import type {
 } from "./api/types";
 import AuthDialog from "./components/AuthDialog.vue";
 import ExchangeSettingsDialog from "./components/ExchangeSettingsDialog.vue";
+import GridConfigurationPanel from "./components/GridConfigurationPanel.vue";
 import MarketOverview from "./components/MarketOverview.vue";
 import StrategyList from "./components/StrategyList.vue";
 import StrategyOverview from "./components/StrategyOverview.vue";
@@ -34,6 +37,10 @@ const fees = ref<FeeRates | null>(null);
 const grids = ref<GridStatus[]>([]);
 const selectedStatus = ref<GridStatus | null>(null);
 const risk = ref<RiskSnapshot | null>(null);
+const preview = ref<GridPreview | null>(null);
+const previewContext = ref("");
+const previewBusy = ref(false);
+const previewError = ref("");
 const loading = ref(true);
 const strategyError = ref("");
 const marketError = ref("");
@@ -44,12 +51,19 @@ let statusTimer: number | undefined;
 let marketTimer: number | undefined;
 let statusRefreshRunning = false;
 let marketRefreshRunning = false;
+let previewRequestSequence = 0;
 
 const configured = computed(
   () => Boolean(config.value?.configs[activeExchange.value]?.configured),
 );
 const workspaceError = computed(() =>
   [...new Set([strategyError.value, marketError.value].filter(Boolean))].join("；"),
+);
+const currentPreviewContext = computed(
+  () => `${activeExchange.value}:${symbol.value}:${fees.value?.maker_fee_rate ?? ""}:${fees.value?.taker_fee_rate ?? ""}`,
+);
+const visiblePreview = computed(() =>
+  previewContext.value === currentPreviewContext.value ? preview.value : null,
 );
 
 function messageFrom(reason: unknown, fallback: string): string {
@@ -142,6 +156,29 @@ async function refreshWorkspace(): Promise<void> {
     await Promise.all([refreshStrategies(), refreshMarket()]);
   } finally {
     loading.value = false;
+  }
+}
+
+async function requestPreview(configRequest: GridConfigRequest): Promise<void> {
+  const requestSequence = ++previewRequestSequence;
+  const context = currentPreviewContext.value;
+  previewBusy.value = true;
+  previewError.value = "";
+  try {
+    const result = await api.preview(configRequest);
+    if (requestSequence !== previewRequestSequence || context !== currentPreviewContext.value) {
+      return;
+    }
+    preview.value = result;
+    previewContext.value = context;
+  } catch (reason) {
+    if (requestSequence === previewRequestSequence && context === currentPreviewContext.value) {
+      preview.value = null;
+      previewContext.value = context;
+      previewError.value = messageFrom(reason, "网格预览失败");
+    }
+  } finally {
+    if (requestSequence === previewRequestSequence) previewBusy.value = false;
   }
 }
 
@@ -287,6 +324,16 @@ onUnmounted(() => {
         :active-symbol="symbol"
         :loading="loading"
         @select="selectStrategy"
+      />
+      <GridConfigurationPanel
+        :exchange="activeExchange"
+        :symbol="symbol"
+        :configured="configured"
+        :fees="fees"
+        :preview="visiblePreview"
+        :busy="previewBusy"
+        :error="previewError"
+        @preview="requestPreview"
       />
       <StrategyOverview class="dashboard-span" :status="selectedStatus" :risk="risk" />
     </section>
