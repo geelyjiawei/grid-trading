@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import threading
 import time
 from decimal import Decimal, ROUND_DOWN
@@ -17,12 +18,17 @@ from exchange_errors import (
 from fee_rates import fee_rate_response
 
 
+logger = logging.getLogger(__name__)
+
+
 class BinanceFuturesClient:
     exchange = "binance"
     ASSET_PRICE_TTL_SECONDS = 60
     HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS = 2048
     FEE_RATE_TTL_SECONDS = 300
     RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
+    TIME_SYNC_DEDUP_SECONDS = 1.0
+    MAX_TIME_OFFSET_MS = 24 * 60 * 60 * 1000
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -37,6 +43,9 @@ class BinanceFuturesClient:
         self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
         self._rate_limit_lock = threading.Lock()
         self._rate_limit_until = 0.0
+        self._time_sync_lock = threading.Lock()
+        self._time_offset_ms = 0
+        self._time_sync_monotonic = 0.0
 
     def _rate_limit_remaining(self) -> float:
         with self._rate_limit_lock:
@@ -69,6 +78,87 @@ class BinanceFuturesClient:
             hashlib.sha256,
         ).hexdigest()
 
+    def _timestamp_ms(self) -> int:
+        return int(time.time() * 1000) + self._time_offset_ms
+
+    @staticmethod
+    def _is_timestamp_rejection(data: Any, message: object) -> bool:
+        code = data.get("code") if isinstance(data, dict) else None
+        if str(code) == "-1021":
+            return True
+        normalized = str(message or "").lower()
+        return "timestamp" in normalized and (
+            "recvwindow" in normalized
+            or "ahead of the server" in normalized
+            or "outside of the" in normalized
+        )
+
+    def _sync_server_time(self) -> bool:
+        with self._time_sync_lock:
+            now = time.monotonic()
+            if (
+                self._time_sync_monotonic > 0
+                and now - self._time_sync_monotonic < self.TIME_SYNC_DEDUP_SECONDS
+            ):
+                return True
+
+            before_ms = int(time.time() * 1000)
+            try:
+                response = self.session.request(
+                    "GET",
+                    f"{self.base_url}/fapi/v1/time",
+                    timeout=10,
+                )
+            except requests.RequestException:
+                return False
+            after_ms = int(time.time() * 1000)
+
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            message = data.get("msg") if isinstance(data, dict) else response.text
+            if response.status_code in {418, 429} or is_exchange_rate_limit_message(
+                message
+            ):
+                retry_after = self._activate_rate_limit(
+                    str(message or "Binance rate limit reached while synchronizing time"),
+                    response,
+                )
+                raise ExchangeRateLimitError(
+                    str(message or "Binance rate limit reached while synchronizing time"),
+                    retry_after=retry_after,
+                )
+            if response.status_code >= 400 or not isinstance(data, dict):
+                logger.warning(
+                    "Binance server-time synchronization failed status=%s",
+                    response.status_code,
+                )
+                return False
+            try:
+                server_time = int(data.get("serverTime"))
+            except (TypeError, ValueError):
+                return False
+            if server_time <= 0:
+                return False
+
+            midpoint_ms = (before_ms + after_ms) // 2
+            offset_ms = server_time - midpoint_ms
+            if abs(offset_ms) > self.MAX_TIME_OFFSET_MS:
+                logger.warning(
+                    "Binance server-time synchronization returned implausible offset_ms=%s",
+                    offset_ms,
+                )
+                return False
+            self._time_offset_ms = offset_ms
+            self._time_sync_monotonic = time.monotonic()
+            logger.warning(
+                "Synchronized Binance server time after timestamp rejection offset_ms=%s rtt_ms=%s",
+                offset_ms,
+                after_ms - before_ms,
+            )
+            return True
+
     def _request(
         self,
         method: str,
@@ -78,37 +168,57 @@ class BinanceFuturesClient:
         auth: bool = False,
         api_key: bool = False,
     ) -> Any:
-        self._raise_if_rate_limited()
-        request_params = dict(params or {})
+        base_params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key} if auth or api_key else None
-
-        if auth:
-            request_params["timestamp"] = int(time.time() * 1000)
-            request_params["recvWindow"] = self.recv_window
-            request_params["signature"] = self._sign(request_params)
-
         url = f"{self.base_url}{path}"
-        response = self.session.request(method, url, params=request_params, headers=headers, timeout=10)
-        try:
-            data = response.json()
-        except ValueError:
-            data = {"code": response.status_code, "msg": response.text}
-        if response.status_code >= 400:
-            message = data.get("msg") if isinstance(data, dict) else response.text
-            if response.status_code in {418, 429} or is_exchange_rate_limit_message(message):
-                retry_after = self._activate_rate_limit(
-                    str(message or "Binance rate limit reached"), response
+        for attempt in range(2):
+            self._raise_if_rate_limited()
+            request_params = dict(base_params)
+            if auth:
+                request_params["timestamp"] = self._timestamp_ms()
+                request_params["recvWindow"] = self.recv_window
+                request_params["signature"] = self._sign(request_params)
+
+            response = self.session.request(
+                method,
+                url,
+                params=request_params,
+                headers=headers,
+                timeout=10,
+            )
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"code": response.status_code, "msg": response.text}
+            if response.status_code >= 400:
+                message = data.get("msg") if isinstance(data, dict) else response.text
+                if response.status_code in {418, 429} or is_exchange_rate_limit_message(
+                    message
+                ):
+                    retry_after = self._activate_rate_limit(
+                        str(message or "Binance rate limit reached"), response
+                    )
+                    raise ExchangeRateLimitError(
+                        str(message or "Binance rate limit reached"),
+                        retry_after=retry_after,
+                    )
+                if response.status_code == 408 or response.status_code >= 500:
+                    raise ExchangeRequestUncertainError(
+                        message
+                        or f"Binance request status unknown after HTTP {response.status_code}"
+                    )
+                if (
+                    auth
+                    and attempt == 0
+                    and self._is_timestamp_rejection(data, message)
+                    and self._sync_server_time()
+                ):
+                    continue
+                raise RuntimeError(
+                    message or f"Binance request failed with {response.status_code}"
                 )
-                raise ExchangeRateLimitError(
-                    str(message or "Binance rate limit reached"),
-                    retry_after=retry_after,
-                )
-            if response.status_code == 408 or response.status_code >= 500:
-                raise ExchangeRequestUncertainError(
-                    message or f"Binance request status unknown after HTTP {response.status_code}"
-                )
-            raise RuntimeError(message or f"Binance request failed with {response.status_code}")
-        return data
+            return data
+        raise RuntimeError("Binance request failed after timestamp synchronization")
 
     def get_ticker(self, symbol: str) -> dict:
         symbol = symbol.upper()

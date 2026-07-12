@@ -2649,6 +2649,295 @@ class MultiGridServerTests(unittest.TestCase):
                 order_link_id="init_B_unknown",
             )
 
+    def test_binance_http_503_with_timestamp_code_is_never_retried(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 503
+        response.json.return_value = {
+            "code": -1021,
+            "msg": "Timestamp for this request is outside of the recvWindow.",
+        }
+        response.text = "timestamp rejected after gateway failure"
+        response.headers = {}
+        client.session.request = Mock(return_value=response)
+
+        with self.assertRaises(ExchangeRequestUncertainError):
+            client.place_order(
+                symbol="TESTUSDT",
+                side="Buy",
+                qty="1",
+                order_type="Market",
+                order_link_id="init_B_503_timestamp",
+            )
+
+        self.assertEqual(client.session.request.call_count, 1)
+
+    def test_binance_timestamp_rejection_resigns_once_with_same_client_order_id(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        calls = []
+        signed_attempts = 0
+
+        def response(status_code, data):
+            item = Mock()
+            item.status_code = status_code
+            item.json.return_value = data
+            item.text = str(data)
+            item.headers = {}
+            return item
+
+        def request(method, url, **kwargs):
+            nonlocal signed_attempts
+            calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "params": dict(kwargs.get("params") or {}),
+                    "headers": kwargs.get("headers"),
+                }
+            )
+            if url.endswith("/fapi/v1/time"):
+                return response(
+                    200,
+                    {"serverTime": int(time.time() * 1000) + 7000},
+                )
+            signed_attempts += 1
+            if signed_attempts == 1:
+                return response(
+                    400,
+                    {
+                        "code": -1021,
+                        "msg": "Timestamp for this request is outside of the recvWindow.",
+                    },
+                )
+            return response(
+                200,
+                {
+                    "orderId": 987,
+                    "clientOrderId": "g_0_B_time_sync",
+                    "side": "BUY",
+                    "origQty": "1",
+                    "price": "90",
+                    "status": "NEW",
+                    "reduceOnly": False,
+                },
+            )
+
+        client.session.request = request
+
+        result = client.place_order(
+            symbol="TESTUSDT",
+            side="Buy",
+            qty="1",
+            price="90",
+            order_type="Limit",
+            order_link_id="g_0_B_time_sync",
+        )
+
+        order_calls = [item for item in calls if item["url"].endswith("/fapi/v1/order")]
+        time_calls = [item for item in calls if item["url"].endswith("/fapi/v1/time")]
+        self.assertEqual(result["result"]["orderId"], "987")
+        self.assertEqual(len(order_calls), 2)
+        self.assertEqual(len(time_calls), 1)
+        self.assertIsNone(time_calls[0]["headers"])
+        self.assertEqual(
+            order_calls[0]["params"]["newClientOrderId"],
+            order_calls[1]["params"]["newClientOrderId"],
+        )
+        immutable_first = {
+            key: value
+            for key, value in order_calls[0]["params"].items()
+            if key not in {"timestamp", "signature"}
+        }
+        immutable_retry = {
+            key: value
+            for key, value in order_calls[1]["params"].items()
+            if key not in {"timestamp", "signature"}
+        }
+        self.assertEqual(immutable_first, immutable_retry)
+        self.assertGreaterEqual(
+            order_calls[1]["params"]["timestamp"]
+            - order_calls[0]["params"]["timestamp"],
+            6000,
+        )
+        self.assertNotEqual(
+            order_calls[0]["params"]["signature"],
+            order_calls[1]["params"]["signature"],
+        )
+        for item in order_calls:
+            signed_params = dict(item["params"])
+            signature = signed_params.pop("signature")
+            self.assertEqual(signature, client._sign(signed_params))
+
+    def test_binance_repeated_timestamp_rejection_does_not_loop(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        calls = []
+
+        def response(status_code, data):
+            item = Mock()
+            item.status_code = status_code
+            item.json.return_value = data
+            item.text = str(data)
+            item.headers = {}
+            return item
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, dict(kwargs.get("params") or {})))
+            if url.endswith("/fapi/v1/time"):
+                return response(200, {"serverTime": int(time.time() * 1000) + 7000})
+            return response(
+                400,
+                {
+                    "code": -1021,
+                    "msg": "Timestamp for this request is outside of the recvWindow.",
+                },
+            )
+
+        client.session.request = request
+
+        with self.assertRaisesRegex(RuntimeError, "outside of the recvWindow"):
+            client.get_open_orders("TESTUSDT")
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            len([item for item in calls if item[1].endswith("/fapi/v1/time")]),
+            1,
+        )
+
+    def test_binance_timestamp_sync_failure_does_not_retry_mutation(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        calls = []
+
+        def response(status_code, data):
+            item = Mock()
+            item.status_code = status_code
+            item.json.return_value = data
+            item.text = str(data)
+            item.headers = {}
+            return item
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, dict(kwargs.get("params") or {})))
+            if url.endswith("/fapi/v1/time"):
+                return response(500, {"code": -1000, "msg": "time service unavailable"})
+            return response(
+                400,
+                {
+                    "code": -1021,
+                    "msg": "Timestamp for this request is outside of the recvWindow.",
+                },
+            )
+
+        client.session.request = request
+
+        with self.assertRaisesRegex(RuntimeError, "outside of the recvWindow"):
+            client.place_order(
+                symbol="TESTUSDT",
+                side="Buy",
+                qty="1",
+                order_type="Market",
+                order_link_id="init_B_no_time_retry",
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            len([item for item in calls if item[1].endswith("/fapi/v1/order")]),
+            1,
+        )
+
+    def test_binance_concurrent_timestamp_rejections_share_one_time_sync(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        first_attempt_barrier = threading.Barrier(2)
+        local = threading.local()
+        calls = []
+        calls_lock = threading.Lock()
+
+        def response(status_code, data):
+            item = Mock()
+            item.status_code = status_code
+            item.json.return_value = data
+            item.text = str(data)
+            item.headers = {}
+            return item
+
+        def request(method, url, **kwargs):
+            with calls_lock:
+                calls.append((method, url, dict(kwargs.get("params") or {})))
+            if url.endswith("/fapi/v1/time"):
+                return response(200, {"serverTime": int(time.time() * 1000) + 7000})
+
+            attempt = int(getattr(local, "signed_attempt", 0)) + 1
+            local.signed_attempt = attempt
+            if attempt == 1:
+                first_attempt_barrier.wait(timeout=5)
+                return response(
+                    400,
+                    {
+                        "code": -1021,
+                        "msg": "Timestamp for this request is outside of the recvWindow.",
+                    },
+                )
+            return response(200, [])
+
+        client.session.request = request
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda symbol: client.get_open_orders(symbol),
+                    ("BTCUSDT", "ETHUSDT"),
+                )
+            )
+
+        self.assertEqual(
+            [result["result"]["list"] for result in results],
+            [[], []],
+        )
+        self.assertEqual(
+            len([item for item in calls if item[1].endswith("/fapi/v1/time")]),
+            1,
+        )
+        self.assertEqual(
+            len([item for item in calls if item[1].endswith("/fapi/v1/openOrders")]),
+            4,
+        )
+
+    def test_binance_time_sync_rate_limit_stops_timestamp_retry(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        calls = []
+
+        def response(status_code, data, headers=None):
+            item = Mock()
+            item.status_code = status_code
+            item.json.return_value = data
+            item.text = str(data)
+            item.headers = dict(headers or {})
+            return item
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, dict(kwargs.get("params") or {})))
+            if url.endswith("/fapi/v1/time"):
+                return response(
+                    429,
+                    {"code": -1003, "msg": "Too many requests"},
+                    {"Retry-After": "7"},
+                )
+            return response(
+                400,
+                {
+                    "code": -1021,
+                    "msg": "Timestamp for this request is outside of the recvWindow.",
+                },
+            )
+
+        client.session.request = request
+
+        with self.assertRaises(ExchangeRateLimitError):
+            client.get_open_orders("TESTUSDT")
+        with self.assertRaises(ExchangeRateLimitError):
+            client.get_open_orders("TESTUSDT")
+
+        self.assertEqual(len(calls), 2)
+
     def test_bybit_get_order_by_link_falls_back_to_history(self):
         client = BybitClient("", "", True)
         calls = []
