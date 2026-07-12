@@ -3328,6 +3328,90 @@ class MultiGridServerTests(unittest.TestCase):
                     order_link_id="init_B_unknown",
                 )
 
+    def test_bybit_non_json_http_503_is_an_unknown_request_outcome(self):
+        client = BybitClient("key", "secret")
+        response = Mock()
+        response.status_code = 503
+        response.json.side_effect = ValueError("invalid upstream body")
+        response.text = "upstream unavailable"
+
+        with patch("bybit_client.requests.post", return_value=response):
+            with self.assertRaises(ExchangeRequestUncertainError):
+                client.place_order(
+                    symbol="TESTUSDT",
+                    side="Buy",
+                    qty="1",
+                    order_type="Market",
+                    order_link_id="init_B_non_json_503",
+                )
+
+    def test_bybit_timeout_ret_codes_are_unknown_request_outcomes(self):
+        for ret_code in (10000, 10016):
+            with self.subTest(ret_code=ret_code):
+                client = BybitClient("key", "secret")
+                response = Mock()
+                response.status_code = 200
+                response.json.return_value = {
+                    "retCode": ret_code,
+                    "retMsg": "Server timeout",
+                }
+                response.text = "Server timeout"
+
+                with patch("bybit_client.requests.post", return_value=response):
+                    with self.assertRaises(ExchangeRequestUncertainError):
+                        client.place_order(
+                            symbol="TESTUSDT",
+                            side="Buy",
+                            qty="1",
+                            order_type="Market",
+                            order_link_id=f"init_B_{ret_code}",
+                        )
+
+    def test_bybit_http_200_invalid_order_response_is_unknown(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                client = BybitClient("key", "secret")
+                response = Mock()
+                response.status_code = 200
+                response.text = "truncated acknowledgement"
+                response.headers = {}
+                if response_kind == "invalid_json":
+                    response.json.side_effect = ValueError("invalid json")
+                else:
+                    response.json.return_value = []
+
+                with patch("bybit_client.requests.post", return_value=response):
+                    with self.assertRaises(ExchangeRequestUncertainError):
+                        client.place_order(
+                            symbol="TESTUSDT",
+                            side="Buy",
+                            qty="1",
+                            order_type="Market",
+                            order_link_id=f"init_B_{response_kind}",
+                        )
+
+    def test_bybit_http_200_invalid_query_response_is_read_error(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                client = BybitClient("key", "secret")
+                response = Mock()
+                response.status_code = 200
+                response.text = "truncated query response"
+                response.headers = {}
+                if response_kind == "invalid_json":
+                    response.json.side_effect = ValueError("invalid json")
+                else:
+                    response.json.return_value = []
+
+                with patch("bybit_client.requests.get", return_value=response):
+                    with self.assertRaises(RuntimeError) as error:
+                        client.get_ticker("TESTUSDT")
+
+                self.assertNotIsInstance(
+                    error.exception,
+                    ExchangeRequestUncertainError,
+                )
+
     def test_bybit_order_trades_follows_cursor_and_normalizes_all_executions(self):
         client = BybitClient("key", "secret")
         calls = []
@@ -3892,6 +3976,59 @@ class MultiGridServerTests(unittest.TestCase):
             with self.assertRaises(ExchangeRateLimitError):
                 client.get_ticker("BTCUSDT")
 
+        self.assertEqual(request.call_count, 1)
+
+    def test_bybit_non_json_http_429_uses_local_cooldown(self):
+        client = BybitClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 429
+        response.json.side_effect = ValueError("invalid rate-limit body")
+        response.text = "rate limited"
+        response.headers = {}
+
+        with patch("bybit_client.requests.get", return_value=response) as request:
+            with self.assertRaises(ExchangeRateLimitError):
+                client.get_ticker("BTCUSDT")
+            with self.assertRaises(ExchangeRateLimitError):
+                client.get_ticker("BTCUSDT")
+
+        self.assertEqual(request.call_count, 1)
+
+    def test_bybit_ret_code_429_uses_local_cooldown(self):
+        client = BybitClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "retCode": 429,
+            "retMsg": "The trading service is experiencing a high server load. Please retry",
+        }
+        response.text = "high server load"
+        response.headers = {}
+
+        with patch("bybit_client.requests.get", return_value=response) as request:
+            with self.assertRaises(ExchangeRateLimitError):
+                client.get_ticker("BTCUSDT")
+            with self.assertRaises(ExchangeRateLimitError):
+                client.get_ticker("BTCUSDT")
+
+        self.assertEqual(request.call_count, 1)
+
+    def test_bybit_http_403_access_too_frequent_uses_ten_minute_ip_cooldown(self):
+        client = BybitClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 403
+        response.text = "access too frequent"
+        response.headers = {}
+        response.json.side_effect = ValueError("non-json ban response")
+
+        with patch("bybit_client.requests.get", return_value=response) as request:
+            with self.assertRaises(ExchangeRateLimitError) as first:
+                client.get_open_orders("MUUSDT")
+            with self.assertRaises(ExchangeRateLimitError) as second:
+                client.get_open_orders("MUUSDT")
+
+        self.assertGreaterEqual(first.exception.retry_after, 600)
+        self.assertGreater(second.exception.retry_after, 0)
         self.assertEqual(request.call_count, 1)
 
 

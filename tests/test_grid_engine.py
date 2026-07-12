@@ -11919,6 +11919,56 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.active_orders[link_id]["submission_pending"])
         self.assertEqual(engine.active_orders[link_id]["status"], "SUBMIT_UNKNOWN")
 
+    async def test_bybit_duplicate_client_id_results_preserve_write_ahead_record(self):
+        for ret_code, ret_msg in (
+            (10014, "Invalid duplicate request."),
+            (110072, "OrderLinkedID is duplicate"),
+            (170141, "Duplicate clientOrderId"),
+        ):
+            with self.subTest(ret_code=ret_code):
+                class DuplicateResultClient(FakeClient):
+                    def place_order(self, **kwargs):
+                        return {
+                            "retCode": ret_code,
+                            "retMsg": ret_msg,
+                            "result": {},
+                        }
+
+                client = DuplicateResultClient("100")
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "short",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 1,
+                        "leverage": 2,
+                    },
+                )
+                engine._fetch_precision()
+                engine.grid_levels = [90, 110]
+
+                link_id = engine._place(
+                    "Sell",
+                    110,
+                    0,
+                    reduce_only=False,
+                    qty_override=1,
+                )
+
+                self.assertIsNotNone(link_id)
+                self.assertIn(link_id, engine.active_orders)
+                self.assertTrue(engine.active_orders[link_id]["submission_pending"])
+                self.assertEqual(
+                    engine.active_orders[link_id]["status"],
+                    "SUBMIT_UNKNOWN",
+                )
+
     async def test_exchange_unknown_batch_items_do_not_fall_back_to_new_client_ids(self):
         class UnknownBatchClient(FakeClient):
             def __init__(self, *args, **kwargs):

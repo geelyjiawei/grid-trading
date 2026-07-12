@@ -23,6 +23,7 @@ class BybitClient:
     FEE_RATE_TTL_SECONDS = 300
     MAX_PAGINATION_PAGES = 100
     RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
+    IP_RATE_LIMIT_RETRY_SECONDS = 600.0
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -39,8 +40,17 @@ class BybitClient:
         with self._rate_limit_lock:
             return max(0.0, self._rate_limit_until - time.time())
 
-    def _activate_rate_limit(self, message: str, response: Any | None = None) -> float:
-        retry_after = self.RATE_LIMIT_DEFAULT_RETRY_SECONDS
+    def _activate_rate_limit(
+        self,
+        message: str,
+        response: Any | None = None,
+        *,
+        minimum_retry_seconds: float | None = None,
+    ) -> float:
+        retry_after = max(
+            self.RATE_LIMIT_DEFAULT_RETRY_SECONDS,
+            float(minimum_retry_seconds or 0),
+        )
         headers = getattr(response, "headers", {}) or {}
         try:
             retry_after = max(retry_after, float(headers.get("Retry-After", 0) or 0))
@@ -98,6 +108,19 @@ class BybitClient:
         else:
             response = requests.post(url, headers=headers, data=body, timeout=10)
 
+        if (
+            response.status_code == 403
+            and "access too frequent" in str(response.text or "").lower()
+        ):
+            retry_after = self._activate_rate_limit(
+                "Bybit IP rate limit reached: access too frequent",
+                response,
+                minimum_retry_seconds=self.IP_RATE_LIMIT_RETRY_SECONDS,
+            )
+            raise ExchangeRateLimitError(
+                "Bybit IP rate limit reached: access too frequent",
+                retry_after=retry_after,
+            )
         if response.status_code == 429:
             try:
                 data = response.json()
@@ -121,8 +144,23 @@ class BybitClient:
                 message or f"Bybit request status unknown after HTTP {response.status_code}"
             )
         response.raise_for_status()
-        data = response.json()
-        if data.get("retCode") in {10006, 10018} or is_exchange_rate_limit_message(
+        try:
+            data = response.json()
+        except ValueError as exc:
+            message = f"Bybit returned invalid JSON for {path}"
+            if method.upper() != "GET":
+                raise ExchangeRequestUncertainError(
+                    f"{message}; request status unknown"
+                ) from exc
+            raise RuntimeError(message) from exc
+        if not isinstance(data, dict):
+            message = f"Bybit returned an invalid response structure for {path}"
+            if method.upper() != "GET":
+                raise ExchangeRequestUncertainError(
+                    f"{message}; request status unknown"
+                )
+            raise RuntimeError(message)
+        if data.get("retCode") in {429, 10006, 10018} or is_exchange_rate_limit_message(
             data.get("retMsg")
         ):
             retry_after = self._activate_rate_limit(

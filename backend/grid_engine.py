@@ -2179,9 +2179,20 @@ class GridEngine:
             code = int(result.get("retCode"))
         except (TypeError, ValueError):
             code = None
-        if code in {-1006, -1007, 10000, 10016}:
+        if code in {
+            -1006,
+            -1007,
+            10000,
+            10014,
+            10016,
+            110072,
+            170141,
+        }:
             return True
-        return GridEngine._is_uncertain_submission_message(str(result.get("retMsg") or ""))
+        message = str(result.get("retMsg") or "")
+        return GridEngine._is_uncertain_submission_message(
+            message
+        ) or GridEngine._is_duplicate_client_order_rejection(message)
 
     @staticmethod
     def _is_duplicate_client_order_rejection(message: str) -> bool:
@@ -2194,6 +2205,10 @@ class GridEngine:
                 "duplicate client order",
                 "duplicate orderlinkid",
                 "duplicated orderlinkid",
+                "invalid duplicate request",
+                "orderlinkedid is duplicate",
+                "order link id is duplicate",
+                "duplicate clientorderid",
             )
         )
 
