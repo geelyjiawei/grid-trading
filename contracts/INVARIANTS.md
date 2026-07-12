@@ -38,6 +38,14 @@ the OpenAPI schema.
 ## Grid behavior
 
 - Fixed quantity mode preserves the configured quantity for every grid level.
+- A fixed quantity that is not an exact exchange quantity step is rejected before
+  submission; it is never silently reduced or redistributed.
+- Directional opening quantity equals the exact sum of the profit-side grid legs at
+  the exchange-normalized opening reference price.
+- A limit opening reference is the actual exchange-quantized order price, not the
+  unrounded user input or a later ticker value.
+- Grid levels that collapse after exchange tick-size quantization are rejected before
+  any opening exposure is created.
 - Partial fills preserve exact remainders, including valid sub-minimum fragments.
 - Completed legs restore the exact opposite order, including outside the configured
   range when that is the defined grid transition.
