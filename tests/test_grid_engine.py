@@ -7377,6 +7377,99 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.active_orders, {})
         self.assertEqual(client.open_limit_order_ids, set())
 
+    async def test_ambiguous_batch_identity_never_falls_back_with_new_client_ids(self):
+        for response_variant in ("reordered", "missing", "duplicate"):
+            with self.subTest(response_variant=response_variant):
+                class AmbiguousBatchClient(BatchFakeClient):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.single_fallback_calls = 0
+
+                    def place_order(self, **kwargs):
+                        self.single_fallback_calls += 1
+                        return FakeClient.place_order(self, **kwargs)
+
+                    def place_orders(self, orders):
+                        self.batch_calls.append([dict(order) for order in orders])
+                        accepted = [
+                            FakeClient.place_order(self, **order)
+                            for order in orders
+                        ]
+
+                        def success(index):
+                            request = orders[index]
+                            return {
+                                "retCode": 0,
+                                "result": {
+                                    "orderId": accepted[index]["result"]["orderId"],
+                                    "orderLinkId": request["order_link_id"],
+                                    "side": request["side"],
+                                    "price": request["price"],
+                                    "qty": request["qty"],
+                                    "reduceOnly": request["reduce_only"],
+                                    "orderStatus": "NEW",
+                                },
+                            }
+
+                        rejection = {
+                            "retCode": -2010,
+                            "retMsg": "definitive rejection without client identity",
+                            "result": {},
+                        }
+                        if response_variant == "reordered":
+                            result_items = [rejection, success(0), success(2)]
+                        elif response_variant == "missing":
+                            result_items = [rejection, success(1)]
+                        else:
+                            result_items = [rejection, success(0), success(0)]
+                        return {"retCode": 0, "result": {"list": result_items}}
+
+                client = AmbiguousBatchClient(
+                    "100",
+                    tick_size="1",
+                    qty_step="1",
+                    min_qty="1",
+                )
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "short",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 3,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 1,
+                        "qty_per_grid": 1,
+                        "leverage": 2,
+                        "grid_order_post_only": False,
+                    },
+                )
+                engine._fetch_precision()
+                engine.grid_levels = [80, 90, 100, 110]
+                plan = [
+                    {
+                        "side": "Sell",
+                        "price": price,
+                        "level_idx": index,
+                        "reduce_only": False,
+                        "qty_override": 1,
+                    }
+                    for index, price in enumerate((90, 100, 110))
+                ]
+
+                links = engine._place_batch_limit_orders(plan)
+
+                self.assertEqual(client.single_fallback_calls, 0)
+                self.assertEqual(len(client.orders), 3)
+                self.assertEqual(len(links), 3)
+                self.assertEqual(set(links), set(engine.active_orders))
+                self.assertTrue(
+                    all(order.get("order_id") for order in engine.active_orders.values())
+                )
+
     async def test_pending_plan_submits_every_target_across_directions_and_prices(self):
         references = (91.0, 95.5, 100.0, 104.5, 109.0)
         for direction in ("long", "short", "neutral"):

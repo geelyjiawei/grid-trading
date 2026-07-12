@@ -5194,6 +5194,55 @@ class GridEngine:
             result_items = result.get("result", {}).get("list", []) or []
             if not isinstance(result_items, list):
                 result_items = []
+            identity_ambiguous = len(result_items) != len(chunk)
+            seen_response_links: set[str] = set()
+            if not identity_ambiguous:
+                for index, order_result in enumerate(result_items):
+                    if not isinstance(order_result, dict):
+                        identity_ambiguous = True
+                        break
+                    snapshot = order_result.get("result", {}) or {}
+                    if not isinstance(snapshot, dict):
+                        identity_ambiguous = True
+                        break
+                    response_link = str(snapshot.get("orderLinkId", "") or "")
+                    expected_link = str(chunk[index]["state"]["link_id"])
+                    if response_link and (
+                        response_link != expected_link
+                        or response_link in seen_response_links
+                    ):
+                        identity_ambiguous = True
+                        break
+                    if response_link:
+                        seen_response_links.add(response_link)
+
+            if identity_ambiguous:
+                message = "batch response client-order identities were incomplete or misaligned"
+                for order_result in result_items:
+                    if not isinstance(order_result, dict):
+                        continue
+                    item_message = str(order_result.get("retMsg") or "")
+                    if self._is_rate_limit_result(
+                        order_result
+                    ) or is_exchange_rate_limit_message(item_message):
+                        self._record_order_rejection(
+                            "",
+                            item_message or message,
+                            rate_limit_retry_after=ORDER_REJECTION_BACKOFF_MAX_SECONDS,
+                            track_shape=False,
+                        )
+                        break
+                logger.warning(
+                    "Batch order response identities are ambiguous; preserving every original "
+                    "client order ID symbol=%s orders=%s",
+                    self.config.get("symbol"),
+                    len(chunk),
+                )
+                mark_unknown(chunk, message)
+                with contextlib.suppress(Exception):
+                    self._reconcile_exchange_open_orders()
+                continue
+
             rejected: list[tuple[dict[str, Any], str]] = []
             unconfirmed: list[dict[str, Any]] = []
             for index, item in enumerate(chunk):
