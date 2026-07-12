@@ -1,5 +1,8 @@
 pub mod api;
 pub mod domain;
+pub mod engine;
+pub mod exchange;
+pub mod persistence;
 
 use axum::Router;
 use tower_http::trace::TraceLayer;
