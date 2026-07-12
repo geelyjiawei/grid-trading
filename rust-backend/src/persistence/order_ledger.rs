@@ -217,10 +217,16 @@ fn validate_transition(current: &IntentState, next: &IntentState) -> Result<(), 
             IntentState::SubmitUnknown { .. }
                 | IntentState::Accepted { .. }
                 | IntentState::Rejected { .. }
+                | IntentState::OwnershipConflict { .. }
         ) | (
             IntentState::SubmitUnknown { .. },
-            IntentState::Accepted { .. } | IntentState::Rejected { .. }
-        ) | (IntentState::Accepted { .. }, IntentState::Terminal { .. })
+            IntentState::Accepted { .. }
+                | IntentState::Rejected { .. }
+                | IntentState::OwnershipConflict { .. }
+        ) | (
+            IntentState::Accepted { .. },
+            IntentState::Terminal { .. } | IntentState::OwnershipConflict { .. }
+        )
     );
     if allowed {
         Ok(())

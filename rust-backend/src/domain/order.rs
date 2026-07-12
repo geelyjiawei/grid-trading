@@ -45,6 +45,14 @@ pub enum TimeInForce {
     PostOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalOrderStatus {
+    Filled,
+    Cancelled,
+    Rejected,
+    Expired,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderShape {
     pub symbol: String,
@@ -96,8 +104,11 @@ pub enum IntentState {
         code: Option<String>,
         message: String,
     },
+    OwnershipConflict {
+        message: String,
+    },
     Terminal {
-        status: String,
+        status: TerminalOrderStatus,
     },
 }
 

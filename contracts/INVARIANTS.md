@@ -15,6 +15,13 @@ the OpenAPI schema.
   shape.
 - A write intent is durable before the exchange request.
 - Timeout or malformed acknowledgement is `SUBMIT_UNKNOWN`, never a safe retry.
+- A missing client order ID lookup is inconclusive and never authorizes a replacement
+  order.
+- Reconciliation accepts an exchange order only when its exchange, client ID, order
+  ID, side, price, quantity, reduce-only flag, type, and time-in-force are consistent
+  with the immutable intent.
+- Any reconciliation identity or shape mismatch is a durable ownership conflict that
+  stops automatic handling for that intent.
 - An order is removed only after authoritative terminal status and complete execution
   accounting.
 - A cancelled order is not equivalent to a filled order.

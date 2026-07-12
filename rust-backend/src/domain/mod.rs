@@ -7,5 +7,5 @@ pub use grid_config::{
 };
 pub use order::{
     ClientOrderId, IntentState, OrderIntent, OrderIntentError, OrderKind, OrderShape, OrderSide,
-    TimeInForce,
+    TerminalOrderStatus, TimeInForce,
 };

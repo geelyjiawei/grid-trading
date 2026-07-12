@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     domain::{IntentState, OrderIntent},
-    exchange::{ExchangeGateway, PlacementError},
+    exchange::{OrderPlacementGateway, PlacementError},
     persistence::{IntentStore, LedgerError},
 };
 
@@ -20,7 +20,7 @@ pub struct SubmissionService<G, S> {
 
 impl<G, S> SubmissionService<G, S>
 where
-    G: ExchangeGateway,
+    G: OrderPlacementGateway,
     S: IntentStore,
 {
     pub fn new(gateway: G, store: S) -> Self {
@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl ExchangeGateway for FakeGateway {
+    impl OrderPlacementGateway for FakeGateway {
         async fn place_order(
             &self,
             intent: &OrderIntent,
