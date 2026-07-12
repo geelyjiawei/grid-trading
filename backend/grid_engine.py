@@ -2271,6 +2271,12 @@ class GridEngine:
         )
 
     def _submission_snapshot_by_link(self, link_id: str) -> tuple[dict | None, bool]:
+        if not link_id:
+            logger.error(
+                "Pending submission lookup has no client order ID symbol=%s",
+                self.config.get("symbol"),
+            )
+            return None, False
         getter = getattr(self.client, "get_order_by_link", None)
         if not callable(getter):
             return None, False
@@ -2284,15 +2290,71 @@ class GridEngine:
                 exc,
             )
             return None, False
+        if not isinstance(response, dict):
+            logger.error(
+                "Pending submission lookup returned an invalid response object "
+                "symbol=%s link_id=%s",
+                self.config.get("symbol"),
+                link_id,
+            )
+            return None, False
         if response.get("retCode") != 0:
             return None, False
-        snapshot = response.get("result") or {}
-        if isinstance(snapshot, dict) and snapshot.get("list") is not None:
-            items = snapshot.get("list") or []
-            snapshot = items[0] if items else {}
-        if isinstance(snapshot, dict) and snapshot.get("orderId"):
-            return snapshot, True
-        return None, True
+        result = response.get("result")
+        if result == {}:
+            return None, True
+        if not isinstance(result, dict):
+            logger.error(
+                "Pending submission lookup returned no authoritative result object "
+                "symbol=%s link_id=%s",
+                self.config.get("symbol"),
+                link_id,
+            )
+            return None, False
+
+        snapshot = result
+        if "list" in result:
+            items = result.get("list")
+            if not isinstance(items, list):
+                logger.error(
+                    "Pending submission lookup returned an invalid result list "
+                    "symbol=%s link_id=%s",
+                    self.config.get("symbol"),
+                    link_id,
+                )
+                return None, False
+            if not items:
+                return None, True
+            if len(items) != 1 or not isinstance(items[0], dict):
+                logger.error(
+                    "Pending submission lookup returned an ambiguous result list "
+                    "symbol=%s link_id=%s count=%s",
+                    self.config.get("symbol"),
+                    link_id,
+                    len(items),
+                )
+                return None, False
+            snapshot = items[0]
+
+        if not snapshot.get("orderId"):
+            logger.error(
+                "Pending submission lookup returned a non-empty result without an order ID "
+                "symbol=%s link_id=%s",
+                self.config.get("symbol"),
+                link_id,
+            )
+            return None, False
+        snapshot_link_id = str(snapshot.get("orderLinkId", "") or "")
+        if snapshot_link_id != link_id:
+            logger.error(
+                "Pending submission lookup did not prove the requested client order ID "
+                "symbol=%s expected=%s actual=%s",
+                self.config.get("symbol"),
+                link_id,
+                snapshot_link_id or "missing",
+            )
+            return None, False
+        return snapshot, True
 
     def _submission_history_by_link(self, links: set[str]) -> dict[str, dict]:
         if not links or not hasattr(self.client, "get_order_history"):

@@ -12220,6 +12220,155 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(engine.opening_order["order_id"], "1")
                 self.assertEqual(len(client.orders), 1)
 
+    async def test_untrusted_client_id_lookup_never_counts_absence_or_retries(self):
+        for response_variant in (
+            "wrong_identity",
+            "missing_identity",
+            "missing_order_id",
+            "multiple_results",
+            "missing_result",
+            "invalid_list",
+            "invalid_response",
+        ):
+            for submission_path in ("grid", "opening"):
+                with self.subTest(
+                    response_variant=response_variant,
+                    submission_path=submission_path,
+                ):
+                    class MisleadingLookupClient(FakeClient):
+                        def __init__(self, *args, **kwargs):
+                            super().__init__(*args, **kwargs)
+                            self.place_calls = 0
+
+                        def place_order(self, **kwargs):
+                            self.place_calls += 1
+                            response = super().place_order(**kwargs)
+                            if self.place_calls == 1:
+                                raise ConnectionError("response lost after exchange acceptance")
+                            return response
+
+                        def get_order_by_link(self, symbol, order_link_id):
+                            if response_variant == "missing_result":
+                                return {"retCode": 0}
+                            if response_variant == "invalid_list":
+                                return {
+                                    "retCode": 0,
+                                    "result": {"list": "not-a-list"},
+                                }
+                            if response_variant == "invalid_response":
+                                return []
+                            snapshot = {
+                                "orderId": "unrelated-order",
+                                "side": "Sell",
+                                "price": "110",
+                                "qty": "1",
+                                "reduceOnly": False,
+                                "orderStatus": "NEW",
+                            }
+                            if response_variant == "wrong_identity":
+                                snapshot["orderLinkId"] = "another-client-order-id"
+                            elif response_variant == "missing_order_id":
+                                snapshot["orderLinkId"] = order_link_id
+                                snapshot.pop("orderId")
+                            elif response_variant == "multiple_results":
+                                snapshot["orderLinkId"] = order_link_id
+                                other = dict(snapshot)
+                                other["orderId"] = "second-unrelated-order"
+                                return {
+                                    "retCode": 0,
+                                    "result": {"list": [snapshot, other]},
+                                }
+                            return {"retCode": 0, "result": snapshot}
+
+                        def get_order_history(self, symbol, limit=100):
+                            return {"retCode": 0, "result": {"list": []}}
+
+                    client = MisleadingLookupClient(
+                        "100",
+                        tick_size="1",
+                        qty_step="1",
+                        min_qty="1",
+                    )
+                    engine = GridEngine(
+                        client,
+                        {
+                            "symbol": "TESTUSDT",
+                            "direction": "short",
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 1,
+                            "total_investment": 0,
+                            "position_sizing_mode": "fixed_grid_qty",
+                            "grid_order_qty": 1,
+                            "leverage": 2,
+                        },
+                    )
+                    engine._fetch_precision()
+                    engine.grid_levels = [90, 110]
+
+                    if submission_path == "grid":
+                        link_id = engine._place(
+                            "Sell",
+                            110,
+                            0,
+                            reduce_only=False,
+                            qty_override=1,
+                        )
+                        pending = engine.active_orders[link_id]
+                    else:
+                        engine._place_limit_open(
+                            "Sell",
+                            1,
+                            110,
+                            post_only=False,
+                        )
+                        pending = engine.opening_order
+
+                    pending["submission_updated_at"] = 0.0
+                    pending["submission_last_not_found_at"] = 0.0
+                    for checked_at in range(20, 28):
+                        with patch("grid_engine.time.time", return_value=float(checked_at)):
+                            if submission_path == "grid":
+                                engine._resolve_pending_submissions([])
+                            else:
+                                engine._resolve_opening_submission([])
+
+                    self.assertEqual(client.place_calls, 1)
+                    self.assertEqual(len(client.orders), 1)
+                    self.assertEqual(pending["submission_not_found_count"], 0)
+                    self.assertTrue(pending["submission_pending"])
+                    self.assertEqual(pending["order_id"], "")
+
+    async def test_explicit_empty_client_id_lookup_is_authoritative_absence(self):
+        for empty_result in ({}, {"list": []}):
+            with self.subTest(empty_result=empty_result):
+                class EmptyLookupClient(FakeClient):
+                    def get_order_by_link(self, symbol, order_link_id):
+                        return {"retCode": 0, "result": empty_result}
+
+                engine = GridEngine(
+                    EmptyLookupClient("100"),
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "neutral",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 100,
+                        "qty_per_grid": 1,
+                        "leverage": 2,
+                    },
+                )
+
+                snapshot, authoritative = engine._submission_snapshot_by_link(
+                    "g_0_B_missing"
+                )
+
+                self.assertIsNone(snapshot)
+                self.assertTrue(authoritative)
+
     async def test_exchange_unknown_batch_items_do_not_fall_back_to_new_client_ids(self):
         class UnknownBatchClient(FakeClient):
             def __init__(self, *args, **kwargs):
