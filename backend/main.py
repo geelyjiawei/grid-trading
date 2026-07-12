@@ -1996,8 +1996,40 @@ async def stop_all_grids():
     if not pending:
         raise HTTPException(status_code=400, detail="No active grid")
 
+    stopped: list[str] = []
+    failures: list[str] = []
     for engine in pending:
-        await _stop_engine_once(engine)
+        symbol = _engine_symbol(engine)
+        exchange = _engine_exchange(engine)
+        label = f"{exchange.title()} {symbol}"
+        try:
+            await _stop_engine_once(engine)
+            stopped.append(label)
+        except HTTPException as exc:
+            reason = (
+                exc.detail
+                if isinstance(exc.detail, str)
+                else "stop request failed; state was retained"
+            )
+            failures.append(f"{label}: {reason[:300]}")
+        except Exception as exc:
+            logger.exception(
+                "Unexpected stop-all failure exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+            failures.append(f"{label}: unexpected stop failure; state was retained")
+
+    if failures:
+        stopped_text = ", ".join(stopped) if stopped else "none"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Stop-all incomplete. Stopped: {stopped_text}. "
+                f"Still pending: {'; '.join(failures)}"
+            ),
+        )
 
     return {"ok": True, "message": "All grids stopped and open orders cancelled"}
 
@@ -2095,12 +2127,39 @@ async def _stop_and_finalize_engine(engine: GridEngine):
 
 
 async def _stop_engine_once(engine: GridEngine):
-    engine_key = _engine_key(_engine_exchange(engine), _engine_symbol(engine))
+    symbol = _engine_symbol(engine)
+    exchange = _engine_exchange(engine)
+    engine_key = _engine_key(exchange, symbol)
     with _engines_lock:
+        current_engine = _engines.get(engine_key)
+        stale_stop_completed = bool(
+            current_engine is None
+            and getattr(engine, "_stopping", False) is True
+            and not engine.running
+            and not engine.active_orders
+            and not engine.opening_order
+            and not engine.pending_reduce_action
+            and not engine.paused_replacements
+            and not engine.manual_stop_pending
+            and not engine.risk_shutdown_pending
+            and getattr(engine, "stop_finalize_pending", False) is False
+            and not engine.initialization_in_progress
+            and not engine.initial_grid_deployment_pending
+        )
+        if stale_stop_completed:
+            return symbol, exchange
+        if current_engine is not engine:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{symbol} grid instance changed before stop; the stale stop request "
+                    "was not executed"
+                ),
+            )
         if engine_key in _stopping_engine_keys:
             raise HTTPException(
                 status_code=409,
-                detail=f"{_engine_symbol(engine)} grid is already stopping",
+                detail=f"{symbol} grid is already stopping",
             )
         _stopping_engine_keys.add(engine_key)
     try:

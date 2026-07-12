@@ -360,6 +360,142 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertIn("already stopping", second_response.json()["detail"].lower())
         self.assertEqual(blocking_client.cancel_calls, expected_cancel_calls)
 
+    def test_stop_all_continues_after_one_grid_fails(self):
+        first_start = self.client.post(
+            "/api/grid/start", json=self._payload("STOPALLAUSDT")
+        )
+        second_start = self.client.post(
+            "/api/grid/start", json=self._payload("STOPALLBUSDT")
+        )
+        self.assertEqual(first_start.status_code, 200, first_start.text)
+        self.assertEqual(second_start.status_code, 200, second_start.text)
+        first_key = main._engine_key("binance", "STOPALLAUSDT")
+        second_key = main._engine_key("binance", "STOPALLBUSDT")
+        first_engine = main._engines[first_key]
+        second_order_ids = {
+            str(order["order_id"])
+            for order in main._engines[second_key].active_orders.values()
+        }
+
+        async def fail_first_stop():
+            raise RuntimeError("injected first-grid stop failure")
+
+        with patch.object(first_engine, "stop", new=fail_first_stop):
+            response = self.client.post("/api/grid/stop-all")
+
+        self.assertEqual(response.status_code, 503, response.text)
+        detail = response.json()["detail"]
+        self.assertIn("STOPALLAUSDT", detail)
+        self.assertIn("STOPALLBUSDT", detail)
+        self.assertIn(first_key, main._engines)
+        self.assertNotIn(second_key, main._engines)
+        self.assertTrue(
+            second_order_ids.isdisjoint(main._client.open_limit_order_ids)
+        )
+
+        retry = self.client.post(
+            "/api/grid/stop/STOPALLAUSDT?exchange=binance"
+        )
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertNotIn(first_key, main._engines)
+
+    def test_stop_all_stops_and_archives_every_grid(self):
+        symbols = ("STOPALLCUSDT", "STOPALLDUSDT")
+        run_ids = {}
+        for symbol in symbols:
+            start = self.client.post(
+                "/api/grid/start", json=self._payload(symbol)
+            )
+            self.assertEqual(start.status_code, 200, start.text)
+            key = main._engine_key("binance", symbol)
+            run_ids[symbol] = main._engines[key].config["run_id"]
+
+        response = self.client.post("/api/grid/stop-all")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(main._engines, {})
+        self.assertEqual(main._load_grid_state_file()["grids"], {})
+        self.assertEqual(main._client.open_limit_order_ids, set())
+        history_by_run = {
+            item["run_id"]: item
+            for item in main._load_grid_history_file()["runs"]
+        }
+        for symbol in symbols:
+            record = history_by_run[run_ids[symbol]]
+            self.assertEqual(record["symbol"], symbol)
+            self.assertEqual(record["status"], "stopped")
+            self.assertIsNotNone(record["stopped_at"])
+
+    def test_stale_stop_snapshot_cannot_overwrite_new_grid_instance(self):
+        first_start = self.client.post(
+            "/api/grid/start", json=self._payload("STALESTOPUSDT")
+        )
+        self.assertEqual(first_start.status_code, 200, first_start.text)
+        key = main._engine_key("binance", "STALESTOPUSDT")
+        stale_engine = main._engines[key]
+
+        first_stop = self.client.post(
+            "/api/grid/stop/STALESTOPUSDT?exchange=binance"
+        )
+        self.assertEqual(first_stop.status_code, 200, first_stop.text)
+        second_start = self.client.post(
+            "/api/grid/start", json=self._payload("STALESTOPUSDT")
+        )
+        self.assertEqual(second_start.status_code, 200, second_start.text)
+        current_engine = main._engines[key]
+        current_run_id = current_engine.config["run_id"]
+        open_before = set(main._client.open_limit_order_ids)
+
+        with self.assertRaises(main.HTTPException) as error:
+            asyncio.run(main._stop_engine_once(stale_engine))
+
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertIs(main._engines[key], current_engine)
+        self.assertTrue(current_engine.running)
+        self.assertEqual(main._client.open_limit_order_ids, open_before)
+        saved = main._load_grid_state_file()["grids"][key]
+        self.assertEqual(saved["config"]["run_id"], current_run_id)
+
+    def test_completed_stale_stop_is_idempotent_with_retained_position(self):
+        start = self.client.post(
+            "/api/grid/start", json=self._payload("STALEDONEUSDT")
+        )
+        self.assertEqual(start.status_code, 200, start.text)
+        key = main._engine_key("binance", "STALEDONEUSDT")
+        stale_engine = main._engines[key]
+        self.assertGreater(abs(stale_engine._grid_position_qty()), 0)
+
+        stop = self.client.post(
+            "/api/grid/stop/STALEDONEUSDT?exchange=binance"
+        )
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+
+        result = asyncio.run(main._stop_engine_once(stale_engine))
+
+        self.assertEqual(result, ("STALEDONEUSDT", "binance"))
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+
+    def test_unregistered_incomplete_stop_snapshot_is_rejected_without_writes(self):
+        start = self.client.post(
+            "/api/grid/start", json=self._payload("ORPHANSTOPUSDT")
+        )
+        self.assertEqual(start.status_code, 200, start.text)
+        key = main._engine_key("binance", "ORPHANSTOPUSDT")
+        engine = main._engines.pop(key)
+        open_before = set(main._client.open_limit_order_ids)
+        saved_before = main._load_grid_state_file()["grids"][key]
+
+        with self.assertRaises(main.HTTPException) as error:
+            asyncio.run(main._stop_engine_once(engine))
+
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(main._client.open_limit_order_ids, open_before)
+        saved_after = main._load_grid_state_file()["grids"][key]
+        self.assertEqual(saved_after, saved_before)
+
     def test_concurrent_engine_state_saves_preserve_both_grids(self):
         original_load = main._load_grid_state_file
 
