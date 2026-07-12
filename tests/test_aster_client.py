@@ -1,6 +1,8 @@
 import json
 import sys
+import time
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -10,7 +12,6 @@ if str(BACKEND_DIR) not in sys.path:
 
 from aster_client import AsterFuturesClient  # noqa: E402
 from exchange_errors import ExchangeRateLimitError, ExchangeRequestUncertainError  # noqa: E402
-from grid_engine import validate_instrument_response  # noqa: E402
 
 
 PRIVATE_KEY = "0x" + "1" * 64
@@ -143,11 +144,65 @@ class AsterClientTests(unittest.TestCase):
         client.session = FakeSession(
             FakeResponse({"symbols": [{"symbol": "ASTERUSDT", "filters": []}]})
         )
-
-        response = client.get_instrument_info("ASTERUSDT")
+        client._instrument_info_cache["ASTERUSDT"] = (
+            {
+                "retCode": 0,
+                "result": {"list": [{"symbol": "ASTERUSDT"}]},
+            },
+            time.time(),
+        )
 
         with self.assertRaisesRegex(RuntimeError, "instrument snapshot"):
-            validate_instrument_response(response, symbol="ASTERUSDT")
+            client.get_instrument_info("ASTERUSDT")
+
+        self.assertEqual(client._instrument_info_cache, {})
+
+    def test_balance_rejects_invalid_usdt_rows_without_fabricating_zero(self):
+        valid = {
+            "asset": "USDT",
+            "availableBalance": "10",
+            "balance": "12",
+            "crossUnPnl": "-2",
+        }
+        cases = {
+            "missing available": [
+                {key: value for key, value in valid.items() if key != "availableBalance"}
+            ],
+            "missing wallet balance": [
+                {key: value for key, value in valid.items() if key != "balance"}
+            ],
+            "missing pnl": [
+                {key: value for key, value in valid.items() if key != "crossUnPnl"}
+            ],
+            "non-finite available": [{**valid, "availableBalance": "Infinity"}],
+            "duplicate usdt": [valid, valid],
+            "invalid row": [None],
+        }
+
+        for label, response in cases.items():
+            with self.subTest(label=label):
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                client._request = lambda *args, response=response, **kwargs: response
+
+                with self.assertRaisesRegex(RuntimeError, "balance snapshot"):
+                    client.get_balance()
+
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client._request = lambda *args, **kwargs: [{"asset": "BNB"}]
+
+        response = client.get_balance()
+
+        self.assertEqual(response["result"]["list"][0]["coin"], [])
 
     def test_http_503_is_reported_as_unknown_submission_outcome(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
@@ -996,6 +1051,60 @@ class AsterClientTests(unittest.TestCase):
         self.assertEqual(trade["feeUsdt"], "0.600")
         self.assertEqual(trade["feeUsdtSource"], "historical_minute_open")
         self.assertEqual(calls[0][1], "/fapi/v3/klines")
+
+    def test_fee_asset_prices_require_identity_and_finite_values(self):
+        current_cases = {
+            "missing symbol": {"price": "700"},
+            "wrong symbol": {"symbol": "OTHERUSDT", "price": "700"},
+            "infinite price": {"symbol": "BNBUSDT", "price": "Infinity"},
+            "overflowing price": {"symbol": "BNBUSDT", "price": "1e1000000"},
+        }
+        for label, ticker in current_cases.items():
+            with self.subTest(kind="current", label=label):
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                client._asset_price_cache["BNBUSDT"] = (
+                    Decimal("Infinity"),
+                    time.time(),
+                )
+                client._request = lambda *args, ticker=ticker, **kwargs: ticker
+
+                fee, source = client._fee_to_usdt_with_source(
+                    Decimal("0.001"),
+                    "BNB",
+                )
+
+                self.assertIsNone(fee)
+                self.assertEqual(source, "current_price_unavailable")
+                self.assertEqual(client._asset_price_cache, {})
+
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        minute_start = 1714012800000
+        client._request = lambda *args, **kwargs: [
+            [minute_start, "Infinity", "1", "1", "1"]
+        ]
+        client._historical_asset_price_cache[("BNBUSDT", minute_start)] = Decimal(
+            "Infinity"
+        )
+
+        fee, source = client._fee_to_usdt_with_source(
+            Decimal("0.001"),
+            "BNB",
+            trade_time_ms=minute_start,
+        )
+
+        self.assertIsNone(fee)
+        self.assertEqual(source, "historical_price_unavailable")
+        self.assertEqual(client._historical_asset_price_cache, {})
 
     def test_rate_limit_activates_local_cooldown_without_second_http_request(self):
         client = AsterFuturesClient(

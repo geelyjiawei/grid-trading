@@ -28,13 +28,14 @@ from auth import (
 from aster_client import AsterFuturesClient
 from binance_client import BinanceFuturesClient
 from bybit_client import BybitClient
-from fee_rates import normalize_fee_rate
-from grid_engine import (
-    GridEngine,
+from exchange_snapshots import (
+    validate_balance_response,
     validate_instrument_response,
     validate_position_response,
     validate_ticker_response,
 )
+from fee_rates import normalize_fee_rate
+from grid_engine import GridEngine
 from secret_store import decrypt_text, encrypt_text, storage_backend
 
 
@@ -900,6 +901,25 @@ def _instrument_snapshot_or_http(client, symbol: str) -> dict:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+def _balance_snapshot_or_http(client) -> dict:
+    try:
+        response = client.get_balance()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Balance snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch balance"),
+        )
+    try:
+        return validate_balance_response(response)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 def _with_exchange_fee_rates(client, cfg: "GridConfig", symbol: str) -> tuple["GridConfig", dict]:
     rates = _exchange_fee_rates(client, symbol)
     updated = cfg.model_copy(
@@ -1572,11 +1592,13 @@ def set_config(cfg: ApiConfig):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to connect to {exchange.title()}: {exc}") from exc
 
-    if balance.get("retCode") != 0:
+    try:
+        validate_balance_response(balance)
+    except RuntimeError as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"API verification failed: {balance.get('retMsg', 'unknown error')}",
-        )
+            detail=f"API verification failed: {exc}",
+        ) from exc
 
     saved_config = cfg.model_dump()
     saved_config["exchange"] = exchange
@@ -1614,19 +1636,11 @@ def get_price(symbol: str, exchange: str | None = None):
 @app.get("/api/balance")
 def get_balance(exchange: str | None = None):
     client = _get_client(exchange)
-    resp = client.get_balance()
-    if resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch balance"))
-
-    wallets = resp["result"]["list"][0].get("coin", [])
-    usdt = next((item for item in wallets if item.get("coin") == "USDT"), None)
-    if not usdt:
-        return {"available": "0", "equity": "0", "unrealised_pnl": "0"}
-
+    balance = _balance_snapshot_or_http(client)
     return {
-        "available": usdt.get("availableToWithdraw") or usdt.get("walletBalance", "0"),
-        "equity": usdt.get("equity", "0"),
-        "unrealised_pnl": usdt.get("unrealisedPnl", "0"),
+        "available": str(balance["available"]),
+        "equity": str(balance["equity"]),
+        "unrealised_pnl": str(balance["unrealised_pnl"]),
     }
 
 

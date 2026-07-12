@@ -13,6 +13,12 @@ from exchange_errors import (
     ExchangeRequestUncertainError,
     is_exchange_rate_limit_message,
 )
+from exchange_snapshots import (
+    validate_balance_response,
+    validate_positive_decimal,
+    validate_price_cache_entry,
+    validate_ticker_response,
+)
 from fee_rates import fee_rate_response
 
 
@@ -30,7 +36,7 @@ class BybitClient:
         self.api_secret = api_secret
         self.base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.recv_window = "5000"
-        self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
+        self._asset_price_cache: dict[str, tuple[Decimal, float]] = {}
         self._historical_asset_price_cache: dict[tuple[str, int], Decimal] = {}
         self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
         self._rate_limit_lock = threading.Lock()
@@ -191,12 +197,14 @@ class BybitClient:
         )
 
     def get_balance(self) -> dict:
-        return self._request(
+        response = self._request(
             "GET",
             "/v5/account/wallet-balance",
             params="accountType=UNIFIED",
             auth=True,
         )
+        validate_balance_response(response)
+        return response
 
     def set_leverage(self, symbol: str, leverage: str) -> dict:
         return self._request(
@@ -490,7 +498,14 @@ class BybitClient:
         key = (symbol, minute_start)
         cached = self._historical_asset_price_cache.get(key)
         if cached is not None:
-            return cached
+            try:
+                return validate_positive_decimal(
+                    cached,
+                    context=f"{symbol} historical fee price cache",
+                    field="open price",
+                )
+            except RuntimeError:
+                self._historical_asset_price_cache.pop(key, None)
 
         try:
             response = self._request(
@@ -503,12 +518,22 @@ class BybitClient:
             )
             if response.get("retCode") != 0:
                 return None
-            row = response.get("result", {}).get("list", [])[0]
+            result = response.get("result")
+            if not isinstance(result, dict):
+                return None
+            rows = result.get("list")
+            if not isinstance(rows, list) or len(rows) != 1:
+                return None
+            row = rows[0]
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                return None
             if int(row[0]) != minute_start:
                 return None
-            price = Decimal(str(row[1]))
-            if price <= 0:
-                return None
+            price = validate_positive_decimal(
+                row[1],
+                context=f"{symbol} historical fee price snapshot",
+                field="open price",
+            )
         except Exception:
             return None
 
@@ -542,25 +567,29 @@ class BybitClient:
 
         now = time.time()
         cached = self._asset_price_cache.get(symbol)
-        if isinstance(cached, tuple):
-            cached_price, cached_at = cached
-            if now - cached_at < self.ASSET_PRICE_TTL_SECONDS:
-                return amount * cached_price, "current_ticker_cache"
-        elif cached is not None:
-            return amount * cached, "current_ticker_cache"
+        cached_price = None
+        cached_fresh = False
+        if cached is not None:
+            try:
+                cached_price, cached_fresh = validate_price_cache_entry(
+                    cached,
+                    symbol=symbol,
+                    now=now,
+                    ttl_seconds=self.ASSET_PRICE_TTL_SECONDS,
+                )
+            except RuntimeError:
+                self._asset_price_cache.pop(symbol, None)
+        if cached_fresh:
+            return amount * cached_price, "current_ticker_cache"
 
         try:
             ticker = self.get_ticker(symbol)
-            price = Decimal(str(ticker["result"]["list"][0]["lastPrice"]))
-            if price <= 0:
-                raise ValueError("invalid fee asset price")
+            price = validate_ticker_response(ticker, symbol=symbol)["last_price"]
             self._asset_price_cache[symbol] = (price, now)
             return amount * price, "current_ticker"
         except Exception:
-            if isinstance(cached, tuple):
-                return amount * cached[0], "stale_current_ticker_cache"
-            if cached is not None:
-                return amount * cached, "stale_current_ticker_cache"
+            if cached_price is not None:
+                return amount * cached_price, "stale_current_ticker_cache"
             return None, "current_price_unavailable"
 
     def _fee_to_usdt(

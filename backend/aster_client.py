@@ -16,6 +16,13 @@ from exchange_errors import (
     ExchangeRequestUncertainError,
     is_exchange_rate_limit_message,
 )
+from exchange_snapshots import (
+    normalize_futures_balance_rows,
+    validate_instrument_response,
+    validate_positive_decimal,
+    validate_price_cache_entry,
+    validate_symbol_price_row,
+)
 from fee_rates import fee_rate_response
 
 
@@ -252,8 +259,14 @@ class AsterFuturesClient:
         symbol = symbol.upper()
         cached = self._instrument_info_cache.get(symbol)
         now = time.time()
-        if cached and now - cached[1] < 300:
-            return cached[0]
+        if cached:
+            try:
+                cached_response, cached_at = cached
+                if now - float(cached_at) < 300:
+                    validate_instrument_response(cached_response, symbol=symbol)
+                    return cached_response
+            except (RuntimeError, TypeError, ValueError):
+                self._instrument_info_cache.pop(symbol, None)
 
         data = self._request("GET", "/fapi/v3/exchangeInfo", params={"symbol": symbol})
         instrument = next((item for item in data.get("symbols", []) if item.get("symbol") == symbol), None)
@@ -296,30 +309,13 @@ class AsterFuturesClient:
                 ]
             },
         }
+        validate_instrument_response(result, symbol=symbol)
         self._instrument_info_cache[symbol] = (result, now)
         return result
 
     def get_balance(self) -> dict:
         balances = self._request("GET", "/fapi/v3/balance", auth=True)
-        usdt = next((item for item in balances if item.get("asset") == "USDT"), {})
-        return {
-            "retCode": 0,
-            "result": {
-                "list": [
-                    {
-                        "coin": [
-                            {
-                                "coin": "USDT",
-                                "availableToWithdraw": usdt.get("availableBalance", "0"),
-                                "walletBalance": usdt.get("balance", "0"),
-                                "equity": usdt.get("balance", "0"),
-                                "unrealisedPnl": usdt.get("crossUnPnl", "0"),
-                            }
-                        ]
-                    }
-                ]
-            },
-        }
+        return normalize_futures_balance_rows(balances)
 
     def set_leverage(self, symbol: str, leverage: str) -> dict:
         self._request(
@@ -840,7 +836,14 @@ class AsterFuturesClient:
         key = (symbol, minute_start)
         cached = self._historical_asset_price_cache.get(key)
         if cached is not None:
-            return cached
+            try:
+                return validate_positive_decimal(
+                    cached,
+                    context=f"{symbol} historical fee price cache",
+                    field="open price",
+                )
+            except RuntimeError:
+                self._historical_asset_price_cache.pop(key, None)
 
         try:
             rows = self._request(
@@ -853,12 +856,18 @@ class AsterFuturesClient:
                     "limit": 1,
                 },
             )
+            if not isinstance(rows, list) or len(rows) != 1:
+                return None
             row = rows[0]
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                return None
             if int(row[0]) != minute_start:
                 return None
-            price = Decimal(str(row[1]))
-            if price <= 0:
-                return None
+            price = validate_positive_decimal(
+                row[1],
+                context=f"{symbol} historical fee price snapshot",
+                field="open price",
+            )
         except Exception:
             return None
 
@@ -892,18 +901,28 @@ class AsterFuturesClient:
 
         now = time.time()
         cached = self._asset_price_cache.get(symbol)
-        if cached and now - cached[1] < self.ASSET_PRICE_TTL_SECONDS:
-            return amount * cached[0], "current_ticker_cache"
+        cached_price = None
+        cached_fresh = False
+        if cached is not None:
+            try:
+                cached_price, cached_fresh = validate_price_cache_entry(
+                    cached,
+                    symbol=symbol,
+                    now=now,
+                    ttl_seconds=self.ASSET_PRICE_TTL_SECONDS,
+                )
+            except RuntimeError:
+                self._asset_price_cache.pop(symbol, None)
+        if cached_fresh:
+            return amount * cached_price, "current_ticker_cache"
         try:
             ticker = self._request("GET", "/fapi/v3/ticker/price", params={"symbol": symbol})
-            price = Decimal(str(ticker.get("price", "0")))
-            if price <= 0:
-                raise ValueError("invalid fee asset price")
+            price = validate_symbol_price_row(ticker, symbol=symbol)
             self._asset_price_cache[symbol] = (price, now)
             return amount * price, "current_ticker"
         except Exception:
-            if cached:
-                return amount * cached[0], "stale_current_ticker_cache"
+            if cached_price is not None:
+                return amount * cached_price, "stale_current_ticker_cache"
             return None, "current_price_unavailable"
 
     def _fee_to_usdt(

@@ -27,7 +27,6 @@ from aster_client import AsterFuturesClient  # noqa: E402
 from binance_client import BinanceFuturesClient  # noqa: E402
 from bybit_client import BybitClient  # noqa: E402
 from exchange_errors import ExchangeRateLimitError, ExchangeRequestUncertainError  # noqa: E402
-from grid_engine import validate_instrument_response  # noqa: E402
 from auth import hash_password  # noqa: E402
 from test_grid_engine import FakeClient  # noqa: E402
 
@@ -984,6 +983,106 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertIn("fee rate", response.json()["detail"])
         self.assertIn("symbol", response.json()["detail"])
+
+    def test_balance_endpoint_rejects_malformed_snapshots(self):
+        valid_coin = {
+            "coin": "USDT",
+            "availableToWithdraw": "10",
+            "walletBalance": "12",
+            "equity": "11",
+            "unrealisedPnl": "-1",
+        }
+
+        def response_with_coin(coin):
+            return {
+                "retCode": 0,
+                "result": {"list": [{"coin": [coin]}]},
+            }
+
+        cases = {
+            "top-level list": [],
+            "missing result": {"retCode": 0},
+            "invalid result": {"retCode": 0, "result": []},
+            "missing account list": {"retCode": 0, "result": {}},
+            "invalid account list": {"retCode": 0, "result": {"list": {}}},
+            "empty account list": {"retCode": 0, "result": {"list": []}},
+            "multiple account rows": {
+                "retCode": 0,
+                "result": {"list": [{"coin": []}, {"coin": []}]},
+            },
+            "invalid account row": {
+                "retCode": 0,
+                "result": {"list": [None]},
+            },
+            "invalid coin list": {
+                "retCode": 0,
+                "result": {"list": [{"coin": {}}]},
+            },
+            "invalid coin row": {
+                "retCode": 0,
+                "result": {"list": [{"coin": [None]}]},
+            },
+            "duplicate usdt": {
+                "retCode": 0,
+                "result": {"list": [{"coin": [valid_coin, valid_coin]}]},
+            },
+            "missing available balance": response_with_coin(
+                {key: value for key, value in valid_coin.items() if key != "availableToWithdraw"}
+                | {"walletBalance": ""}
+            ),
+            "nan available balance": response_with_coin(
+                {**valid_coin, "availableToWithdraw": "NaN"}
+            ),
+            "infinite equity": response_with_coin(
+                {**valid_coin, "equity": "Infinity"}
+            ),
+            "boolean pnl": response_with_coin(
+                {**valid_coin, "unrealisedPnl": True}
+            ),
+        }
+
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                client = FakeClient("100")
+                client.get_balance = lambda snapshot=snapshot: snapshot
+                main._client = client
+                main._clients["binance"] = client
+
+                response = self.client.get("/api/balance?exchange=binance")
+
+                self.assertEqual(response.status_code, 502)
+                self.assertIn("balance snapshot", response.json()["detail"])
+
+    def test_balance_endpoint_allows_valid_account_without_usdt(self):
+        client = FakeClient("100")
+        client.get_balance = lambda: {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {
+                                "coin": "BTC",
+                                "availableToWithdraw": "1",
+                                "walletBalance": "1",
+                                "equity": "1",
+                                "unrealisedPnl": "0",
+                            }
+                        ]
+                    }
+                ]
+            },
+        }
+        main._client = client
+        main._clients["binance"] = client
+
+        response = self.client.get("/api/balance?exchange=binance")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"available": "0", "equity": "0", "unrealised_pnl": "0"},
+        )
 
     def test_price_and_preview_reject_wrong_symbol_ticker(self):
         client = FakeClient("100")
@@ -2725,6 +2824,32 @@ class MultiGridServerTests(unittest.TestCase):
                 main.BinanceFuturesClient = original_binance
                 main.BybitClient = original_bybit
 
+    def test_api_config_rejects_malformed_balance_snapshot_without_saving(self):
+        class MalformedBalanceClient(FakeBinanceConfigClient):
+            def get_balance(self):
+                return {"retCode": 0, "result": {"list": []}}
+
+        original_binance = main.BinanceFuturesClient
+        original_client = main._clients["binance"]
+        main.BinanceFuturesClient = MalformedBalanceClient
+        try:
+            response = self.client.post(
+                "/api/config",
+                json={
+                    "exchange": "binance",
+                    "api_key": "replacement-key",
+                    "api_secret": "replacement-secret",
+                    "testnet": True,
+                },
+            )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("balance snapshot", response.json()["detail"])
+            self.assertIs(main._clients["binance"], original_client)
+            self.assertFalse(Path(main.API_CONFIG_FILE).exists())
+        finally:
+            main.BinanceFuturesClient = original_binance
+
     def test_api_config_endpoint_saves_bybit_and_uses_bybit_client(self):
         original_path = main.API_CONFIG_FILE
         original_binance = main.BinanceFuturesClient
@@ -2813,7 +2938,7 @@ class MultiGridServerTests(unittest.TestCase):
                 "liquidationPrice": "140",
             }
         )
-        client._asset_price_cache["BNBUSDT"] = Decimal("600")
+        client._asset_price_cache["BNBUSDT"] = (Decimal("600"), time.time())
         trade = client._normalize_trade(
             {
                 "orderId": 123,
@@ -2884,14 +3009,89 @@ class MultiGridServerTests(unittest.TestCase):
 
     def test_binance_missing_required_filters_never_become_default_rules(self):
         client = BinanceFuturesClient("", "", True)
+        client._instrument_info_cache["TESTUSDT"] = (
+            {
+                "retCode": 0,
+                "result": {"list": [{"symbol": "TESTUSDT"}]},
+            },
+            time.time(),
+        )
         client._request = Mock(
             return_value={"symbols": [{"symbol": "TESTUSDT", "filters": []}]}
         )
 
-        response = client.get_instrument_info("TESTUSDT")
-
         with self.assertRaisesRegex(RuntimeError, "instrument snapshot"):
-            validate_instrument_response(response, symbol="TESTUSDT")
+            client.get_instrument_info("TESTUSDT")
+
+        self.assertEqual(client._instrument_info_cache, {})
+
+    def test_binance_balance_rejects_invalid_usdt_rows_without_fabricating_zero(self):
+        valid = {
+            "asset": "USDT",
+            "availableBalance": "10",
+            "balance": "12",
+            "crossUnPnl": "-2",
+        }
+        cases = {
+            "missing available": [
+                {key: value for key, value in valid.items() if key != "availableBalance"}
+            ],
+            "missing wallet balance": [
+                {key: value for key, value in valid.items() if key != "balance"}
+            ],
+            "missing pnl": [
+                {key: value for key, value in valid.items() if key != "crossUnPnl"}
+            ],
+            "non-finite available": [{**valid, "availableBalance": "Infinity"}],
+            "duplicate usdt": [valid, valid],
+            "invalid row": [None],
+        }
+
+        for label, response in cases.items():
+            with self.subTest(label=label):
+                client = BinanceFuturesClient("", "", True)
+                client._request = Mock(return_value=response)
+
+                with self.assertRaisesRegex(RuntimeError, "balance snapshot"):
+                    client.get_balance()
+
+        client = BinanceFuturesClient("", "", True)
+        client._request = Mock(return_value=[{"asset": "BNB"}])
+
+        response = client.get_balance()
+
+        self.assertEqual(response["result"]["list"][0]["coin"], [])
+
+    def test_bybit_balance_validates_wallet_snapshot_before_returning(self):
+        client = BybitClient("", "", True)
+        client._request = Mock(
+            return_value={"retCode": 0, "result": {"list": []}}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "balance snapshot"):
+            client.get_balance()
+
+        valid = {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "availableToWithdraw": "",
+                                "walletBalance": "12",
+                                "equity": "11",
+                                "unrealisedPnl": "-1",
+                            }
+                        ]
+                    }
+                ]
+            },
+        }
+        client._request = Mock(return_value=valid)
+
+        self.assertIs(client.get_balance(), valid)
 
     def test_binance_fee_rates_use_signed_endpoint_and_short_cache(self):
         client = BinanceFuturesClient("key", "secret", True)
@@ -3844,7 +4044,7 @@ class MultiGridServerTests(unittest.TestCase):
 
         def fake_request(method, path, *, params=None, auth=False):
             calls.append((method, path, params, auth))
-            return {"price": "700"}
+            return {"symbol": "BNBUSDT", "price": "700"}
 
         client._request = fake_request
         client._asset_price_cache["BNBUSDT"] = (Decimal("600"), time.time() - 61)
@@ -3853,6 +4053,50 @@ class MultiGridServerTests(unittest.TestCase):
 
         self.assertEqual(fee_usdt, Decimal("0.700"))
         self.assertEqual(len(calls), 1)
+
+    def test_binance_fee_asset_prices_require_identity_and_finite_values(self):
+        current_cases = {
+            "missing symbol": {"price": "700"},
+            "wrong symbol": {"symbol": "OTHERUSDT", "price": "700"},
+            "infinite price": {"symbol": "BNBUSDT", "price": "Infinity"},
+            "overflowing price": {"symbol": "BNBUSDT", "price": "1e1000000"},
+        }
+        for label, ticker in current_cases.items():
+            with self.subTest(kind="current", label=label):
+                client = BinanceFuturesClient("", "", True)
+                client._asset_price_cache["BNBUSDT"] = (
+                    Decimal("Infinity"),
+                    time.time(),
+                )
+                client._request = Mock(return_value=ticker)
+
+                fee, source = client._fee_to_usdt_with_source(
+                    Decimal("0.001"),
+                    "BNB",
+                )
+
+                self.assertIsNone(fee)
+                self.assertEqual(source, "current_price_unavailable")
+                self.assertEqual(client._asset_price_cache, {})
+
+        client = BinanceFuturesClient("", "", True)
+        minute_start = 1714012800000
+        client._request = Mock(
+            return_value=[[minute_start, "Infinity", "1", "1", "1"]]
+        )
+        client._historical_asset_price_cache[("BNBUSDT", minute_start)] = Decimal(
+            "Infinity"
+        )
+
+        fee, source = client._fee_to_usdt_with_source(
+            Decimal("0.001"),
+            "BNB",
+            trade_time_ms=minute_start,
+        )
+
+        self.assertIsNone(fee)
+        self.assertEqual(source, "historical_price_unavailable")
+        self.assertEqual(client._historical_asset_price_cache, {})
 
     def test_binance_fee_conversion_uses_execution_minute_open_and_cache(self):
         client = BinanceFuturesClient("", "", True)
@@ -3971,6 +4215,80 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(trade["feeUsdt"], "0.600")
         self.assertEqual(trade["feeUsdtSource"], "historical_minute_open")
         self.assertEqual(calls[0][1], "/v5/market/kline")
+
+    def test_bybit_fee_asset_prices_require_identity_and_finite_values(self):
+        current_cases = {
+            "wrong symbol": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "OTHERUSDT", "lastPrice": "700", "markPrice": "700"}
+                    ]
+                },
+            },
+            "multiple rows": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "BNBUSDT", "lastPrice": "700", "markPrice": "700"},
+                        {"symbol": "BNBUSDT", "lastPrice": "700", "markPrice": "700"},
+                    ]
+                },
+            },
+            "infinite price": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BNBUSDT",
+                            "lastPrice": "Infinity",
+                            "markPrice": "700",
+                        }
+                    ]
+                },
+            },
+        }
+        for label, ticker in current_cases.items():
+            with self.subTest(kind="current", label=label):
+                client = BybitClient("", "", True)
+                client._asset_price_cache["BNBUSDT"] = (
+                    Decimal("Infinity"),
+                    time.time(),
+                )
+                client.get_ticker = Mock(return_value=ticker)
+
+                fee, source = client._fee_to_usdt_with_source(
+                    Decimal("0.001"),
+                    "BNB",
+                )
+
+                self.assertIsNone(fee)
+                self.assertEqual(source, "current_price_unavailable")
+                self.assertEqual(client._asset_price_cache, {})
+
+        client = BybitClient("", "", True)
+        minute_start = 1714012800000
+        client._request = Mock(
+            return_value={
+                "retCode": 0,
+                "result": {
+                    "list": [[str(minute_start), "Infinity", "1", "1", "1"]]
+                },
+            }
+        )
+        client._historical_asset_price_cache[("BNBUSDT", minute_start)] = Decimal(
+            "Infinity"
+        )
+
+        fee, source = client._fee_to_usdt_with_source(
+            Decimal("0.001"),
+            "BNB",
+            trade_time_ms=minute_start,
+        )
+
+        self.assertIsNone(fee)
+        self.assertEqual(source, "historical_price_unavailable")
+        self.assertEqual(client._historical_asset_price_cache, {})
 
     def test_history_records_realized_and_unrealized_profit_separately(self):
         client = FakeClient("99", tick_size="1", qty_step="0.1", min_qty="0.1")
