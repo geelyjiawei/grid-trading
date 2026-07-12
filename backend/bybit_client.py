@@ -1,13 +1,18 @@
 import hashlib
 import hmac
 import json
+import threading
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 import requests
 
-from exchange_errors import ExchangeRequestUncertainError
+from exchange_errors import (
+    ExchangeRateLimitError,
+    ExchangeRequestUncertainError,
+    is_exchange_rate_limit_message,
+)
 from fee_rates import fee_rate_response
 
 
@@ -17,6 +22,7 @@ class BybitClient:
     HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS = 2048
     FEE_RATE_TTL_SECONDS = 300
     MAX_PAGINATION_PAGES = 100
+    RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -26,6 +32,31 @@ class BybitClient:
         self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
         self._historical_asset_price_cache: dict[tuple[str, int], Decimal] = {}
         self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0.0
+
+    def _rate_limit_remaining(self) -> float:
+        with self._rate_limit_lock:
+            return max(0.0, self._rate_limit_until - time.time())
+
+    def _activate_rate_limit(self, message: str, response: Any | None = None) -> float:
+        retry_after = self.RATE_LIMIT_DEFAULT_RETRY_SECONDS
+        headers = getattr(response, "headers", {}) or {}
+        try:
+            retry_after = max(retry_after, float(headers.get("Retry-After", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        with self._rate_limit_lock:
+            self._rate_limit_until = max(self._rate_limit_until, time.time() + retry_after)
+        return retry_after
+
+    def _raise_if_rate_limited(self):
+        remaining = self._rate_limit_remaining()
+        if remaining > 0:
+            raise ExchangeRateLimitError(
+                "Bybit request paused after an exchange rate-limit rejection",
+                retry_after=remaining,
+            )
 
     def _sign(self, payload: str, timestamp: str) -> str:
         raw = f"{timestamp}{self.api_key}{self.recv_window}{payload}"
@@ -55,6 +86,7 @@ class BybitClient:
         payload: dict[str, Any] | None = None,
         auth: bool = False,
     ) -> dict:
+        self._raise_if_rate_limited()
         url = f"{self.base_url}{path}"
         body = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
         headers = self._headers(body if method == "POST" else params) if auth else None
@@ -66,6 +98,19 @@ class BybitClient:
         else:
             response = requests.post(url, headers=headers, data=body, timeout=10)
 
+        if response.status_code == 429:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            message = data.get("retMsg") if isinstance(data, dict) else ""
+            retry_after = self._activate_rate_limit(
+                str(message or "Bybit rate limit reached"), response
+            )
+            raise ExchangeRateLimitError(
+                str(message or "Bybit rate limit reached"),
+                retry_after=retry_after,
+            )
         if response.status_code == 408 or response.status_code >= 500:
             try:
                 data = response.json()
@@ -77,6 +122,16 @@ class BybitClient:
             )
         response.raise_for_status()
         data = response.json()
+        if data.get("retCode") in {10006, 10018} or is_exchange_rate_limit_message(
+            data.get("retMsg")
+        ):
+            retry_after = self._activate_rate_limit(
+                str(data.get("retMsg") or "Bybit rate limit reached")
+            )
+            raise ExchangeRateLimitError(
+                str(data.get("retMsg") or "Bybit rate limit reached"),
+                retry_after=retry_after,
+            )
         if data.get("retCode") in {10000, 10016}:
             raise ExchangeRequestUncertainError(
                 str(data.get("retMsg") or "Bybit server timeout; request status unknown")

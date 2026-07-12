@@ -26,7 +26,7 @@ import pyotp  # noqa: E402
 from aster_client import AsterFuturesClient  # noqa: E402
 from binance_client import BinanceFuturesClient  # noqa: E402
 from bybit_client import BybitClient  # noqa: E402
-from exchange_errors import ExchangeRequestUncertainError  # noqa: E402
+from exchange_errors import ExchangeRateLimitError, ExchangeRequestUncertainError  # noqa: E402
 from auth import hash_password  # noqa: E402
 from test_grid_engine import FakeClient  # noqa: E402
 
@@ -2440,6 +2440,7 @@ class MultiGridServerTests(unittest.TestCase):
                                 "minQty": "0.1",
                                 "maxQty": "120",
                             },
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
                         ],
                     }
                 ]
@@ -2451,6 +2452,7 @@ class MultiGridServerTests(unittest.TestCase):
         info = response["result"]["list"][0]
 
         self.assertEqual(info["lotSizeFilter"]["maxOrderQty"], "1000")
+        self.assertEqual(info["lotSizeFilter"]["minNotionalValue"], "5")
         self.assertEqual(info["marketLotSizeFilter"]["qtyStep"], "0.1")
         self.assertEqual(info["marketLotSizeFilter"]["minOrderQty"], "0.1")
         self.assertEqual(info["marketLotSizeFilter"]["maxOrderQty"], "120")
@@ -3074,6 +3076,273 @@ class MultiGridServerTests(unittest.TestCase):
 
         authenticated = self.client.get("/api/grid/status")
         self.assertEqual(authenticated.status_code, 200)
+
+    def test_grid_preview_rejects_round_trip_below_exchange_min_notional(self):
+        client = FakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("ANSEMUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 0.26,
+                "upper_price": 0.30,
+                "grid_count": 20,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 10,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("minimum", response.json()["detail"])
+        self.assertIn("notional", response.json()["detail"])
+        self.assertEqual(client.orders, [])
+
+    def test_grid_start_rejects_min_notional_before_opening_position(self):
+        client = FakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("ANSEMUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 0.26,
+                "upper_price": 0.30,
+                "grid_count": 20,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 10,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/start", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("minimum notional", response.json()["detail"])
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.positions, [])
+        self.assertIsNone(main._get_engine("binance", "ANSEMUSDT"))
+
+    def test_grid_preview_reports_exchange_min_notional_for_valid_quantity(self):
+        client = FakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("ANSEMUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 0.26,
+                "upper_price": 0.30,
+                "grid_count": 20,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 20,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["min_notional"], 5)
+
+    def test_short_min_notional_uses_actual_upper_open_price(self):
+        client = FakeClient(
+            "0.25",
+            tick_size="0.01",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("EDGEUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 0.24,
+                "upper_price": 0.28,
+                "grid_count": 2,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 20,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["qty_per_grid_min"], 20)
+
+    def test_preview_rejects_initial_market_notional_before_order_submission(self):
+        client = FakeClient(
+            "0.241",
+            tick_size="0.001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("EDGEUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 0.24,
+                "upper_price": 0.28,
+                "grid_count": 2,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 20,
+                "total_investment": 0,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Initial opening notional", response.json()["detail"])
+        self.assertEqual(client.orders, [])
+
+    def test_preview_rechecks_initial_notional_after_market_step_rounding(self):
+        client = FakeClient(
+            "0.29",
+            tick_size="0.001",
+            qty_step="0.1",
+            min_qty="0.1",
+            min_notional="5",
+            market_qty_step="1",
+            market_min_qty="1",
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("ROUNDUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 0.28,
+                "upper_price": 0.34,
+                "grid_count": 2,
+                "position_sizing_mode": "investment",
+                "total_investment": 2.51,
+                "leverage": 2,
+                "initial_order_type": "market",
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Initial opening notional 4.93", response.json()["detail"])
+        self.assertEqual(client.orders, [])
+
+    def test_preview_rechecks_initial_notional_after_limit_tick_rounding(self):
+        client = FakeClient(
+            "0.30",
+            tick_size="0.01",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("TICKUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "lower_price": 0.28,
+                "upper_price": 0.34,
+                "grid_count": 2,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 17,
+                "total_investment": 0,
+                "initial_order_type": "limit",
+                "initial_order_price": 0.2999,
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Initial opening notional 4.93", response.json()["detail"])
+        self.assertEqual(client.orders, [])
+
+    def test_binance_rate_limit_uses_local_cooldown(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 429
+        response.json.return_value = {"code": -1015, "msg": "Too many new orders"}
+        response.text = "Too many new orders"
+        response.headers = {"Retry-After": "10"}
+        client.session = Mock()
+        client.session.request.return_value = response
+
+        with self.assertRaises(ExchangeRateLimitError):
+            client.get_ticker("BTCUSDT")
+        with self.assertRaises(ExchangeRateLimitError):
+            client.get_ticker("BTCUSDT")
+
+        self.assertEqual(client.session.request.call_count, 1)
+
+    def test_binance_http_418_ip_ban_uses_local_cooldown(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 418
+        response.json.return_value = {
+            "code": -1003,
+            "msg": "Way too much request weight used; IP banned until 1783839999000.",
+        }
+        response.text = "IP banned"
+        response.headers = {"Retry-After": "90"}
+        client.session = Mock()
+        client.session.request.return_value = response
+
+        with self.assertRaises(ExchangeRateLimitError) as first:
+            client.get_ticker("BTCUSDT")
+        with self.assertRaises(ExchangeRateLimitError):
+            client.get_ticker("BTCUSDT")
+
+        self.assertGreaterEqual(first.exception.retry_after, 90)
+        self.assertEqual(client.session.request.call_count, 1)
+
+    def test_bybit_rate_limit_uses_local_cooldown(self):
+        client = BybitClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 429
+        response.json.return_value = {"retCode": 10006, "retMsg": "Too many requests"}
+        response.headers = {"Retry-After": "10"}
+
+        with patch("bybit_client.requests.get", return_value=response) as request:
+            with self.assertRaises(ExchangeRateLimitError):
+                client.get_ticker("BTCUSDT")
+            with self.assertRaises(ExchangeRateLimitError):
+                client.get_ticker("BTCUSDT")
+
+        self.assertEqual(request.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from exchange_errors import ExchangeRateLimitError  # noqa: E402
 from grid_engine import GridEngine  # noqa: E402
 
 
@@ -23,6 +24,7 @@ class FakeClient:
         tick_size="0.1",
         qty_step="0.1",
         min_qty="0.1",
+        min_notional="0",
         market_qty_step=None,
         market_min_qty=None,
         max_market_qty="0",
@@ -33,6 +35,7 @@ class FakeClient:
         self.tick_size = str(tick_size)
         self.qty_step = str(qty_step)
         self.min_qty = str(min_qty)
+        self.min_notional = str(min_notional)
         self.market_qty_step = str(market_qty_step or qty_step)
         self.market_min_qty = str(market_min_qty or min_qty)
         self.max_market_qty = str(max_market_qty)
@@ -53,7 +56,11 @@ class FakeClient:
                 "list": [
                     {
                         "priceFilter": {"tickSize": self.tick_size},
-                        "lotSizeFilter": {"qtyStep": self.qty_step, "minOrderQty": self.min_qty},
+                        "lotSizeFilter": {
+                            "qtyStep": self.qty_step,
+                            "minOrderQty": self.min_qty,
+                            "minNotionalValue": self.min_notional,
+                        },
                         "marketLotSizeFilter": {
                             "qtyStep": self.market_qty_step,
                             "minOrderQty": self.market_min_qty,
@@ -9976,6 +9983,825 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                     msg=f"direction={direction} step={index}",
                 )
                 self.assertTrue(engine.reduce_lots_complete)
+
+    async def test_partial_counter_waits_for_source_terminal_and_places_one_full_order(self):
+        client = FakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "ANSEMUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.30,
+                "lower_price": 0.26,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 20,
+                "qty_per_grid": 20,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.26, 0.30]
+        source = {
+            "link_id": "g_0_B_source",
+            "order_id": "source-1",
+            "level_idx": 0,
+            "side": "Buy",
+            "price": "0.26",
+            "qty": "20",
+            "status": "PARTIALLY_FILLED",
+            "order_type": "Limit",
+            "time_in_force": "GTC",
+            "reduce_only": False,
+            "processed_fill_qty": 0,
+            "processed_fill_volume": 0,
+            "processed_fill_fee": 0,
+        }
+        engine.active_orders[source["link_id"]] = source
+
+        first = engine._record_execution_delta(
+            source,
+            {
+                "price": 0.26,
+                "qty": 8,
+                "volume": 2.08,
+                "fee": 0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+
+        self.assertTrue(first)
+        self.assertEqual(client.orders, [])
+        self.assertEqual(len(engine.paused_replacements), 1)
+
+        second = engine._record_execution_delta(
+            source,
+            {
+                "price": 0.26,
+                "qty": 20,
+                "volume": 5.2,
+                "fee": 0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+
+        self.assertTrue(second)
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.orders[0]["side"], "Sell")
+        self.assertEqual(client.orders[0]["price"], "0.30000")
+        self.assertEqual(client.orders[0]["qty"], "20")
+        self.assertEqual(engine.paused_replacements, [])
+
+    async def test_sub_minimum_counter_tasks_coalesce_before_exchange_submission(self):
+        client = FakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "ANSEMUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.30,
+                "lower_price": 0.26,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 20,
+                "qty_per_grid": 20,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.26, 0.30]
+
+        for index, qty in enumerate((8, 9), start=1):
+            source = {
+                "link_id": f"g_0_B_source_{index}",
+                "order_id": f"source-{index}",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "0.26",
+                "qty": str(qty),
+                "status": "FILLED",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": False,
+                "processed_fill_qty": 0,
+                "processed_fill_volume": 0,
+                "processed_fill_fee": 0,
+            }
+            engine._record_execution_delta(
+                source,
+                {
+                    "price": 0.26,
+                    "qty": qty,
+                    "volume": 0.26 * qty,
+                    "fee": 0,
+                    "fee_asset": "USDT",
+                    "fee_source": "exchange",
+                    "maker_count": 1,
+                    "taker_count": 0,
+                },
+            )
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.orders[0]["side"], "Sell")
+        self.assertEqual(client.orders[0]["qty"], "17")
+        self.assertEqual(engine.paused_replacements, [])
+
+    async def test_coalesced_counter_survives_restart_and_places_once(self):
+        client = FakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        config = {
+            "symbol": "ANSEMUSDT",
+            "direction": "neutral",
+            "grid_mode": "arithmetic",
+            "upper_price": 0.30,
+            "lower_price": 0.26,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 20,
+            "qty_per_grid": 20,
+            "leverage": 2,
+        }
+        engine = GridEngine(client, config)
+        engine._fetch_precision()
+        engine.grid_levels = [0.26, 0.30]
+        engine._exchange_rate_limit_until = 10**12
+
+        for index, qty in enumerate((8, 9), start=1):
+            source = {
+                "link_id": f"g_0_B_restart_source_{index}",
+                "order_id": f"restart-source-{index}",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "0.26",
+                "qty": str(qty),
+                "status": "FILLED",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": False,
+                "processed_fill_qty": 0,
+                "processed_fill_volume": 0,
+                "processed_fill_fee": 0,
+            }
+            engine._record_execution_delta(
+                source,
+                {
+                    "price": 0.26,
+                    "qty": qty,
+                    "volume": 0.26 * qty,
+                    "fee": 0,
+                    "fee_asset": "USDT",
+                    "fee_source": "exchange",
+                    "maker_count": 1,
+                    "taker_count": 0,
+                },
+            )
+
+        self.assertEqual(client.orders, [])
+        self.assertEqual(len(engine.paused_replacements), 1)
+        self.assertEqual(engine.paused_replacements[0]["qty"], "17")
+        self.assertEqual(
+            set(engine.paused_replacements[0]["replacement_source_links"]),
+            {"g_0_B_restart_source_1", "g_0_B_restart_source_2"},
+        )
+        durable_state = engine.to_state()
+
+        restored = GridEngine(client, config)
+        restored.restore_state({**durable_state, "running": False})
+        restored._exchange_rate_limit_until = 0
+        restored._resume_paused_replacements()
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.orders[0]["side"], "Sell")
+        self.assertEqual(client.orders[0]["price"], "0.30000")
+        self.assertEqual(client.orders[0]["qty"], "17")
+        self.assertEqual(restored.paused_replacements, [])
+
+    async def test_accepted_coalesced_counter_is_adopted_after_persist_failure(self):
+        client = FakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        config = {
+            "symbol": "ANSEMUSDT",
+            "direction": "neutral",
+            "grid_mode": "arithmetic",
+            "upper_price": 0.30,
+            "lower_price": 0.26,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 20,
+            "qty_per_grid": 20,
+            "leverage": 2,
+        }
+        durable_state = {}
+
+        def persist_until_exchange_accepts(current):
+            if client.orders and any(
+                order.get("order_id") for order in current.active_orders.values()
+            ):
+                raise OSError("simulated state write failure after exchange acceptance")
+            durable_state.clear()
+            durable_state.update(copy.deepcopy(current.to_state()))
+
+        engine = GridEngine(client, config, state_callback=persist_until_exchange_accepts)
+        engine._fetch_precision()
+        engine.grid_levels = [0.26, 0.30]
+        engine.paused_replacements = [
+            {
+                "link_id": "g_0_B_aggregate_source",
+                "order_id": "aggregate-source",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "0.26",
+                "qty": "17",
+                "fill_price": 0.26,
+                "status": "FILLED",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": False,
+                "replacement_mode": "counter_order",
+                "replacement_source_links": ["source-a", "source-b"],
+            }
+        ]
+
+        with self.assertRaisesRegex(OSError, "after exchange acceptance"):
+            engine._resume_paused_replacements()
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(len(durable_state["paused_replacements"]), 1)
+        pending = next(iter(durable_state["active_orders"].values()))
+        self.assertTrue(pending["submission_pending"])
+        self.assertEqual(pending["order_id"], "")
+
+        restored = GridEngine(client, config)
+        restored.restore_state({**durable_state, "running": False})
+        restored._reconcile_exchange_open_orders()
+        restored._resume_paused_replacements()
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(restored.paused_replacements, [])
+        adopted = next(iter(restored.active_orders.values()))
+        self.assertFalse(adopted.get("submission_pending", False))
+        self.assertEqual(adopted["order_id"], client.orders[0]["orderId"])
+
+    async def test_batch_rejects_sub_minimum_nonreduce_order_before_exchange(self):
+        client = BatchFakeClient(
+            "0.28",
+            tick_size="0.00001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "ANSEMUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.30,
+                "lower_price": 0.26,
+                "grid_count": 1,
+                "total_investment": 0,
+                "qty_per_grid": 10,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [0.26, 0.30]
+
+        placed = engine._place_batch_limit_orders(
+            [
+                {
+                    "side": "Sell",
+                    "price": 0.30,
+                    "level_idx": 0,
+                    "reduce_only": False,
+                    "qty_override": 10,
+                }
+            ]
+        )
+
+        self.assertEqual(placed, [])
+        self.assertEqual(client.batch_calls, [])
+        self.assertEqual(client.orders, [])
+        self.assertEqual(engine.active_orders, {})
+        self.assertIn("minimum notional", engine.trigger_message)
+
+    async def test_run_loop_persists_read_rate_limit_without_fast_retry(self):
+        client = FakeClient("100")
+        persisted = []
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 100,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+            state_callback=lambda current: persisted.append(current.to_state()),
+        )
+        calls = 0
+
+        def rate_limited_price():
+            nonlocal calls
+            calls += 1
+            raise ExchangeRateLimitError("Too many requests", retry_after=17)
+
+        async def stop_after_backoff():
+            engine.running = False
+
+        engine._get_current_price = rate_limited_price
+        engine._sleep_until_next_poll = stop_after_backoff
+        engine.running = True
+
+        await engine._run_loop()
+
+        self.assertEqual(calls, 1)
+        self.assertGreater(engine._rate_limit_remaining(), 16)
+        self.assertIn("Exchange rate limit reached", engine.trigger_message)
+        self.assertTrue(persisted)
+        self.assertGreater(persisted[-1]["exchange_rate_limit_until"], 0)
+
+    async def test_definitive_order_rejection_uses_persistent_shape_backoff(self):
+        class RejectingClient(FakeClient):
+            def __init__(self):
+                super().__init__("100")
+                self.place_calls = 0
+
+            def place_order(self, **kwargs):
+                self.place_calls += 1
+                return {"retCode": 400, "retMsg": "ReduceOnly Order is rejected."}
+
+        client = RejectingClient()
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+
+        with patch("grid_engine.time.time", return_value=1000.0):
+            self.assertIsNone(
+                engine._place("Buy", 90, 0, reduce_only=True, qty_override=1)
+            )
+            self.assertIsNone(
+                engine._place("Buy", 90, 0, reduce_only=True, qty_override=1)
+            )
+        self.assertEqual(client.place_calls, 1)
+
+        durable = engine.to_state()
+        restored = GridEngine(client, engine.config)
+        with patch("grid_engine.time.time", return_value=1001.0):
+            restored.restore_state({**durable, "running": False})
+            self.assertIsNone(
+                restored._place("Buy", 90, 0, reduce_only=True, qty_override=1)
+            )
+        self.assertEqual(client.place_calls, 1)
+
+        with patch("grid_engine.time.time", return_value=1004.0):
+            self.assertIsNone(
+                restored._place("Buy", 90, 0, reduce_only=True, qty_override=1)
+            )
+        self.assertEqual(client.place_calls, 2)
+
+    async def test_batch_rate_limit_never_falls_back_to_single_orders(self):
+        class RateLimitedBatchClient(BatchFakeClient):
+            def __init__(self):
+                super().__init__("100")
+                self.single_calls = 0
+
+            def place_orders(self, orders):
+                self.batch_calls.append([dict(order) for order in orders])
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "retCode": -1015,
+                                "retMsg": "Too many new orders; current limit is 1200 orders per MINUTE.",
+                                "result": {},
+                            }
+                            for _ in orders
+                        ]
+                    },
+                }
+
+            def place_order(self, **kwargs):
+                self.single_calls += 1
+                return super().place_order(**kwargs)
+
+        client = RateLimitedBatchClient()
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+
+        placed = engine._place_batch_limit_orders(
+            [
+                {
+                    "side": "Buy",
+                    "price": 90,
+                    "level_idx": 0,
+                    "reduce_only": False,
+                    "qty_override": 1,
+                }
+            ]
+        )
+
+        self.assertEqual(placed, [])
+        self.assertEqual(len(client.batch_calls), 1)
+        self.assertEqual(client.single_calls, 0)
+        self.assertGreater(engine._rate_limit_remaining(), 0)
+        self.assertEqual(engine.active_orders, {})
+
+    async def test_manual_stop_discovers_and_cancels_pending_submission_by_client_id(self):
+        client = FakeClient("100", tick_size="1", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 100,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        link_id = "g_0_B_pending_stop"
+        accepted = client.place_order(
+            symbol="TESTUSDT",
+            side="Buy",
+            qty="1",
+            price="90",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id=link_id,
+        )
+        order_id = str(accepted["result"]["orderId"])
+        engine.active_orders[link_id] = engine._pending_limit_order_state(
+            link_id=link_id,
+            level_idx=0,
+            side="Buy",
+            price="90",
+            qty="1",
+            reduce_only=False,
+            entry_price=None,
+            time_in_force="GTC",
+        )
+        engine.running = True
+        engine.grid_ready = True
+
+        await engine.stop()
+
+        self.assertEqual(client.cancelled_orders, [order_id])
+        self.assertEqual(engine.active_orders, {})
+        self.assertFalse(engine.running)
+        self.assertFalse(engine.manual_stop_pending)
+
+    async def test_manual_stop_accounts_pending_fill_without_counter_order(self):
+        class FilledPendingClient(FakeClient):
+            def get_order(self, symbol, order_id):
+                response = super().get_order(symbol, order_id)
+                order = next(
+                    item for item in self.orders if str(item["orderId"]) == str(order_id)
+                )
+                response["result"].update(
+                    {
+                        "orderLinkId": order.get("order_link_id", ""),
+                        "orderStatus": "FILLED",
+                        "executedQty": order["qty"],
+                        "cumQuote": str(float(order["qty"]) * float(order["price"])),
+                        "avgPrice": order["price"],
+                    }
+                )
+                return response
+
+            def get_order_trades(self, symbol, order_id):
+                order = next(
+                    item for item in self.orders if str(item["orderId"]) == str(order_id)
+                )
+                qty = float(order["qty"])
+                price = float(order["price"])
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "qty": str(qty),
+                                "price": str(price),
+                                "volume": str(qty * price),
+                                "feeUsdt": "0",
+                                "feeAsset": "USDT",
+                                "isMaker": True,
+                            }
+                        ]
+                    },
+                }
+
+        client = FilledPendingClient("100", tick_size="1", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 100,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        link_id = "g_0_B_pending_fill"
+        accepted = client.place_order(
+            symbol="TESTUSDT",
+            side="Buy",
+            qty="1",
+            price="90",
+            order_type="Limit",
+            reduce_only=False,
+            order_link_id=link_id,
+        )
+        order_id = str(accepted["result"]["orderId"])
+        client.open_limit_order_ids.discard(order_id)
+        next(item for item in client.orders if item["orderId"] == order_id)[
+            "orderStatus"
+        ] = "FILLED"
+        engine.active_orders[link_id] = engine._pending_limit_order_state(
+            link_id=link_id,
+            level_idx=0,
+            side="Buy",
+            price="90",
+            qty="1",
+            reduce_only=False,
+            entry_price=None,
+            time_in_force="GTC",
+        )
+        engine.running = True
+        engine.grid_ready = True
+
+        await engine.stop()
+
+        self.assertEqual(client.cancelled_orders, [])
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(engine.filled_count, 1)
+        self.assertEqual(engine.grid_position_net_qty, 1.0)
+        self.assertEqual(engine.active_orders, {})
+        self.assertFalse(engine.running)
+
+    async def test_manual_stop_retains_pending_submission_when_lookup_fails(self):
+        class LookupFailureClient(FakeClient):
+            def get_order_by_link(self, symbol, order_link_id):
+                raise ConnectionError("exchange lookup unavailable")
+
+        client = LookupFailureClient("100", tick_size="1", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 100,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        link_id = "g_0_B_lookup_failure"
+        engine.active_orders[link_id] = engine._pending_limit_order_state(
+            link_id=link_id,
+            level_idx=0,
+            side="Buy",
+            price="90",
+            qty="1",
+            reduce_only=False,
+            entry_price=None,
+            time_in_force="GTC",
+        )
+        engine.running = True
+        engine.grid_ready = True
+
+        with patch("grid_engine.asyncio.sleep", new=unittest.mock.AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                await engine.stop()
+
+        self.assertIn(link_id, engine.active_orders)
+        self.assertTrue(engine.active_orders[link_id]["submission_pending"])
+        self.assertTrue(engine.running)
+        self.assertTrue(engine.manual_stop_pending)
+        self.assertEqual(client.orders, [])
+
+    async def test_pending_cancel_requires_repeated_authoritative_absence(self):
+        client = FakeClient("100", tick_size="1", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 100,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        order = engine._pending_limit_order_state(
+            link_id="g_0_B_absent",
+            level_idx=0,
+            side="Buy",
+            price="90",
+            qty="1",
+            reduce_only=False,
+            entry_price=None,
+            time_in_force="GTC",
+        )
+
+        outcomes = []
+        for checked_at in (1.0, 1.5, 2.0, 2.5, 3.0):
+            with patch("grid_engine.time.time", return_value=checked_at):
+                outcomes.append(engine._resolve_pending_for_cancel(order, []))
+
+        self.assertEqual(outcomes, ["pending", "pending", "pending", "pending", "absent"])
+        self.assertEqual(order["submission_not_found_count"], 5)
+
+    async def test_pending_cancel_can_confirm_from_history_only(self):
+        class HistoryOnlyClient(FakeClient):
+            def get_order_by_link(self, symbol, order_link_id):
+                raise ConnectionError("direct lookup unavailable")
+
+            def get_order_history(self, symbol, limit=100):
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "orderId": "77",
+                                "orderLinkId": "g_0_B_history",
+                                "side": "Buy",
+                                "price": "90",
+                                "qty": "1",
+                                "orderStatus": "NEW",
+                                "reduceOnly": False,
+                            }
+                        ]
+                    },
+                }
+
+        client = HistoryOnlyClient("100", tick_size="1", qty_step="1", min_qty="1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 100,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        order = engine._pending_limit_order_state(
+            link_id="g_0_B_history",
+            level_idx=0,
+            side="Buy",
+            price="90",
+            qty="1",
+            reduce_only=False,
+            entry_price=None,
+            time_in_force="GTC",
+        )
+
+        outcome = engine._resolve_pending_for_cancel(order, [])
+
+        self.assertEqual(outcome, "confirmed")
+        self.assertEqual(order["order_id"], "77")
+        self.assertFalse(order.get("submission_pending", False))
+
+    async def test_initial_market_min_notional_uses_exchange_mark_price(self):
+        class MarkPriceClient(FakeClient):
+            def get_ticker(self, symbol):
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "lastPrice": "0.241",
+                                "markPrice": "0.26",
+                            }
+                        ]
+                    },
+                }
+
+        client = MarkPriceClient(
+            "0.241",
+            tick_size="0.001",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "EDGEUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 0.28,
+                "lower_price": 0.24,
+                "grid_count": 2,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 20,
+                "leverage": 2,
+                "initial_order_type": "market",
+            },
+        )
+
+        await engine.initialize()
+
+        market_orders = [
+            order for order in client.orders if order.get("order_type") == "Market"
+        ]
+        self.assertEqual(engine.current_price, 0.241)
+        self.assertEqual(engine.current_mark_price, 0.26)
+        self.assertEqual(len(market_orders), 1)
+        self.assertEqual(market_orders[0]["qty"], "20")
 
 
 if __name__ == "__main__":

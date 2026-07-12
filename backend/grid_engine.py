@@ -11,7 +11,11 @@ from typing import Any, Callable, Optional
 
 import requests
 
-from exchange_errors import ExchangeRequestUncertainError
+from exchange_errors import (
+    ExchangeRateLimitError,
+    ExchangeRequestUncertainError,
+    is_exchange_rate_limit_message,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +33,8 @@ SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS = 0.5
 MANAGED_CANCEL_MAX_ROUNDS = 5
 MANAGED_CANCEL_RETRY_SECONDS = 0.25
 ORDER_LINK_RANDOM_HEX_LENGTH = 16
+ORDER_REJECTION_BACKOFF_BASE_SECONDS = 3.0
+ORDER_REJECTION_BACKOFF_MAX_SECONDS = 60.0
 COMPLETED_REPAIR_MESSAGE_PREFIXES = (
     "Repaired ",
     "Restored ",
@@ -58,10 +64,12 @@ class GridEngine:
         self.tick_size = "0.1"
         self.qty_step = "0.001"
         self.min_qty = 0.001
+        self.min_notional = 0.0
         self.market_qty_step = "0.001"
         self.market_min_qty = 0.001
         self.max_market_qty = 0.0
         self.current_price = 0.0
+        self.current_mark_price = 0.0
         self.initial_side = ""
         self.initial_qty = 0.0
         self.initial_entry_price = 0.0
@@ -96,6 +104,8 @@ class GridEngine:
         self._position_mismatch_signature: tuple[float, float, float] | None = None
         self._last_actual_grid_position_net_qty = 0.0
         self._reduce_warning_at_by_signature: dict[tuple, float] = {}
+        self._exchange_rate_limit_until = 0.0
+        self._order_rejection_backoff: dict[str, dict[str, float | int | str]] = {}
 
     def _persist_state(self):
         if self.state_callback:
@@ -122,10 +132,12 @@ class GridEngine:
             "tick_size": self.tick_size,
             "qty_step": self.qty_step,
             "min_qty": self.min_qty,
+            "min_notional": self.min_notional,
             "market_qty_step": self.market_qty_step,
             "market_min_qty": self.market_min_qty,
             "max_market_qty": self.max_market_qty,
             "current_price": self.current_price,
+            "current_mark_price": self.current_mark_price,
             "initial_side": self.initial_side,
             "initial_qty": self.initial_qty,
             "initial_entry_price": self.initial_entry_price,
@@ -149,6 +161,8 @@ class GridEngine:
             # This is live recovery work, not display history. Truncating it
             # would permanently discard older missing grid legs after restart.
             "paused_replacements": list(self.paused_replacements),
+            "exchange_rate_limit_until": self._exchange_rate_limit_until,
+            "order_rejection_backoff": self._order_rejection_backoff,
             "saved_at": time.time(),
         }
 
@@ -177,10 +191,12 @@ class GridEngine:
         self.tick_size = str(state.get("tick_size") or self.tick_size)
         self.qty_step = str(state.get("qty_step") or self.qty_step)
         self.min_qty = float(state.get("min_qty") or self.min_qty)
+        self.min_notional = float(state.get("min_notional") or 0)
         self.market_qty_step = str(state.get("market_qty_step") or self.qty_step)
         self.market_min_qty = float(state.get("market_min_qty") or self.min_qty)
         self.max_market_qty = float(state.get("max_market_qty") or 0)
         self.current_price = float(state.get("current_price") or 0)
+        self.current_mark_price = float(state.get("current_mark_price") or 0)
         self.initial_side = str(state.get("initial_side") or "")
         self.initial_qty = float(state.get("initial_qty") or 0)
         self.initial_entry_price = float(state.get("initial_entry_price") or 0)
@@ -208,6 +224,15 @@ class GridEngine:
         self.ownership_conflicts = list(state.get("ownership_conflicts") or [])
         self._pending_targets = state.get("pending_targets")
         self.paused_replacements = list(state.get("paused_replacements") or [])
+        self._exchange_rate_limit_until = float(
+            state.get("exchange_rate_limit_until") or 0
+        )
+        raw_backoff = state.get("order_rejection_backoff") or {}
+        self._order_rejection_backoff = {
+            str(key): dict(value)
+            for key, value in raw_backoff.items()
+            if isinstance(value, dict)
+        }
 
         if self.initialization_in_progress and not self.grid_ready:
             self.initialization_in_progress = False
@@ -496,7 +521,68 @@ class GridEngine:
         if self._wake_event:
             self._wake_event.set()
 
+    def _rate_limit_remaining(self) -> float:
+        return max(0.0, self._exchange_rate_limit_until - time.time())
+
+    @staticmethod
+    def _order_shape_key(
+        side: str,
+        price_text: str,
+        qty_text: str,
+        reduce_only: bool,
+    ) -> str:
+        return "|".join((side, price_text, qty_text, "1" if reduce_only else "0"))
+
+    def _order_shape_retry_remaining(self, shape_key: str) -> float:
+        retry = self._order_rejection_backoff.get(shape_key) or {}
+        try:
+            return max(0.0, float(retry.get("retry_after", 0) or 0) - time.time())
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _record_order_rejection(
+        self,
+        shape_key: str,
+        message: str,
+        *,
+        rate_limit_retry_after: float | None = None,
+        track_shape: bool = True,
+    ):
+        now = time.time()
+        changed = False
+        if rate_limit_retry_after is not None or is_exchange_rate_limit_message(message):
+            delay = max(1.0, float(rate_limit_retry_after or ORDER_REJECTION_BACKOFF_MAX_SECONDS))
+            self._exchange_rate_limit_until = max(
+                self._exchange_rate_limit_until,
+                now + delay,
+            )
+            self._fast_poll_until = min(self._fast_poll_until, now)
+            changed = True
+
+        if track_shape:
+            previous = self._order_rejection_backoff.get(shape_key) or {}
+            attempts = int(previous.get("attempts", 0) or 0) + 1
+            delay = min(
+                ORDER_REJECTION_BACKOFF_MAX_SECONDS,
+                ORDER_REJECTION_BACKOFF_BASE_SECONDS * (2 ** min(attempts - 1, 8)),
+            )
+            self._order_rejection_backoff[shape_key] = {
+                "attempts": attempts,
+                "retry_after": now + delay,
+                "message": str(message),
+            }
+            changed = True
+        if changed:
+            self._persist_state()
+
+    def _clear_order_rejection(self, shape_key: str):
+        if self._order_rejection_backoff.pop(shape_key, None) is not None:
+            self._persist_state()
+
     def _poll_interval(self) -> float:
+        rate_limit_remaining = self._rate_limit_remaining()
+        if rate_limit_remaining > 0:
+            return max(NORMAL_POLL_SECONDS, min(rate_limit_remaining, 60.0))
         if self.waiting_initial_order or time.time() < self._fast_poll_until:
             return FAST_POLL_SECONDS
         return NORMAL_POLL_SECONDS
@@ -655,9 +741,12 @@ class GridEngine:
             "fee_rate_fetched_at": self.config.get("fee_rate_fetched_at"),
             "start_time": self.start_time,
             "current_price": self.current_price,
+            "current_mark_price": self.current_mark_price,
             "market_qty_step": self.market_qty_step,
             "market_min_qty": self.market_min_qty,
             "max_market_qty": self.max_market_qty,
+            "min_notional": self.min_notional,
+            "exchange_rate_limit_retry_after": round(self._rate_limit_remaining(), 3),
             "initial_side": self.initial_side,
             "initial_qty": round(self.initial_qty, 8),
             "initial_entry_price": round(self.initial_entry_price, 10),
@@ -689,6 +778,11 @@ class GridEngine:
         market_filter = explicit_market_filter or lot_filter
         self.qty_step = lot_filter["qtyStep"]
         self.min_qty = float(lot_filter["minOrderQty"])
+        self.min_notional = float(
+            lot_filter.get("minNotionalValue")
+            or info.get("minNotionalValue")
+            or 0
+        )
         self.market_qty_step = str(market_filter.get("qtyStep") or self.qty_step)
         self.market_min_qty = float(
             market_filter.get("minOrderQty") or self.min_qty
@@ -709,7 +803,13 @@ class GridEngine:
         ticker = self.client.get_ticker(self.config["symbol"])
         if ticker.get("retCode") != 0:
             raise RuntimeError(ticker.get("retMsg", "Failed to fetch current price"))
-        return float(ticker["result"]["list"][0]["lastPrice"])
+        item = ticker["result"]["list"][0]
+        last_price = float(item["lastPrice"])
+        try:
+            self.current_mark_price = float(item.get("markPrice") or last_price)
+        except (TypeError, ValueError):
+            self.current_mark_price = last_price
+        return last_price
 
     def _calculate_levels(self) -> list[float]:
         lower = float(self.config["lower_price"])
@@ -1123,6 +1223,25 @@ class GridEngine:
         if not reduce_only and qty + self._qty_tolerance_decimal() < Decimal(str(self.min_qty)):
             return ""
         return qty_text
+
+    def _limit_notional(self, price_text: str, qty_text: str) -> Decimal:
+        try:
+            return Decimal(str(price_text)) * Decimal(str(qty_text))
+        except Exception:
+            return Decimal("0")
+
+    def _meets_min_notional(self, price_text: str, qty_text: str) -> bool:
+        minimum = Decimal(str(self.min_notional or 0))
+        if minimum <= 0:
+            return True
+        tolerance = max(minimum * Decimal("1e-12"), Decimal("1e-18"))
+        return self._limit_notional(price_text, qty_text) + tolerance >= minimum
+
+    def _round_trip_open_price_text(self, level_idx: int) -> str:
+        if level_idx < 0 or level_idx + 1 >= len(self.grid_levels):
+            return "0"
+        price_index = level_idx + 1 if self.config.get("direction") == "short" else level_idx
+        return self._fp(self.grid_levels[price_index])
 
     def _market_order_qty_text(self, value: float, *, reduce_only: bool) -> str:
         step = Decimal(str(self.market_qty_step or self.qty_step))
@@ -4013,6 +4132,12 @@ class GridEngine:
         qty_text = self._market_order_qty_text(qty, reduce_only=False)
         if not qty_text:
             raise RuntimeError(f"Initial market order quantity {qty} is below the exchange minimum")
+        notional_price = self.current_mark_price or self.current_price
+        if not self._meets_min_notional(str(notional_price), qty_text):
+            raise RuntimeError(
+                f"Initial market order notional {self._limit_notional(str(notional_price), qty_text)} "
+                f"is below the exchange minimum {self.min_notional}"
+            )
         formatted_qty = Decimal(str(qty_text))
         requested_qty = self._normalized_qty_decimal(qty, self.qty_step)
         market_tolerance = max(
@@ -4153,7 +4278,6 @@ class GridEngine:
             qty,
             reason,
         )
-        self._mark_fast_poll()
         self._persist_state()
 
     def _place_limit_open(self, side: str, qty: float, price: float, *, post_only: bool = True):
@@ -4161,6 +4285,11 @@ class GridEngine:
         if not qty_text:
             raise RuntimeError(f"Initial limit order quantity {qty} is below the exchange minimum")
         price_text = self._fp(price)
+        if not self._meets_min_notional(price_text, qty_text):
+            raise RuntimeError(
+                f"Initial limit order notional {self._limit_notional(price_text, qty_text)} "
+                f"is below the exchange minimum {self.min_notional}"
+            )
         link_id = f"open_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
         self.initial_side = side
         self.initial_qty = float(qty_text)
@@ -4289,6 +4418,22 @@ class GridEngine:
             )
             return None
         price_text = self._fp(price)
+        shape_key = self._order_shape_key(side, price_text, qty, reduce_only)
+        if self._rate_limit_remaining() > 0 or self._order_shape_retry_remaining(shape_key) > 0:
+            return None
+        if not reduce_only and not self._meets_min_notional(price_text, qty):
+            message = (
+                f"Grid order is below exchange minimum notional: {side} {qty} at {price_text} "
+                f"is {self._limit_notional(price_text, qty)}, minimum {self.min_notional}; "
+                "the exact counter task remains queued for aggregation instead of submitting "
+                "an invalid or oversized order."
+            )
+            self.trigger_message = message
+            signature = ("minimum-notional", shape_key)
+            if self._should_log_reduce_warning(signature):
+                logger.warning("%s symbol=%s", message, self.config.get("symbol"))
+            self._persist_state()
+            return None
         link_id = str(
             link_id_override
             or f"g_{level_idx}_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
@@ -4369,6 +4514,13 @@ class GridEngine:
 
             self.active_orders.pop(link_id, None)
             self._persist_state()
+            retry_after = exc.retry_after if isinstance(exc, ExchangeRateLimitError) else None
+            self._record_order_rejection(
+                shape_key,
+                str(exc),
+                rate_limit_retry_after=retry_after,
+                track_shape=not bool(link_id_override),
+            )
             if reduce_only:
                 self._warn_reduce_limit_unplaced(side, price_text, qty, str(exc))
             else:
@@ -4388,6 +4540,11 @@ class GridEngine:
                 return link_id
             self.active_orders.pop(link_id, None)
             self._persist_state()
+            self._record_order_rejection(
+                shape_key,
+                message,
+                track_shape=not bool(link_id_override),
+            )
             if reduce_only:
                 self._warn_reduce_limit_unplaced(side, price_text, qty, message)
             else:
@@ -4412,6 +4569,7 @@ class GridEngine:
             )
             return link_id
 
+        self._clear_order_rejection(shape_key)
         self._mark_fast_poll()
         self._persist_state()
         return link_id
@@ -4421,7 +4579,7 @@ class GridEngine:
         return hasattr(self.client, "place_orders") and not bool(self.config.get("grid_order_post_only", False))
 
     def _place_batch_limit_orders(self, order_specs: list[dict[str, Any]]) -> list[str]:
-        if self.ownership_conflicts:
+        if self.ownership_conflicts or self._rate_limit_remaining() > 0:
             return []
         planned = []
         planned_keys: set[tuple[str, int, bool]] = set()
@@ -4458,6 +4616,21 @@ class GridEngine:
                 )
                 continue
             price_text = self._fp(float(spec["price"]))
+            if not reduce_only and not self._meets_min_notional(price_text, qty):
+                message = (
+                    f"Grid order is below exchange minimum notional: {side} {qty} at "
+                    f"{price_text} is {self._limit_notional(price_text, qty)}, minimum "
+                    f"{self.min_notional}; no invalid batch request was submitted."
+                )
+                self.trigger_message = message
+                signature = (
+                    "minimum-notional",
+                    self._order_shape_key(side, price_text, qty, reduce_only),
+                )
+                if self._should_log_reduce_warning(signature):
+                    logger.warning("%s symbol=%s", message, self.config.get("symbol"))
+                self._persist_state()
+                continue
             link_id = (
                 f"g_{level_idx}_{side[0]}_"
                 f"{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
@@ -4485,6 +4658,12 @@ class GridEngine:
                         time_in_force="GTC",
                         tag=spec.get("tag"),
                     ),
+                    "shape_key": self._order_shape_key(
+                        side,
+                        price_text,
+                        qty,
+                        reduce_only,
+                    ),
                     "fallback": spec,
                 }
             )
@@ -4499,6 +4678,13 @@ class GridEngine:
             state = item["state"]
             self.active_orders.pop(str(state["link_id"]), None)
             self._persist_state()
+            if is_exchange_rate_limit_message(message):
+                self._record_order_rejection(
+                    str(item["shape_key"]),
+                    message,
+                    rate_limit_retry_after=ORDER_REJECTION_BACKOFF_MAX_SECONDS,
+                )
+                return
             fallback = item["fallback"]
             logger.warning(
                 "Batch order item definitively failed; falling back to single order "
@@ -4535,7 +4721,12 @@ class GridEngine:
 
         for start in range(0, len(planned), BATCH_ORDER_CHUNK_SIZE):
             chunk = planned[start : start + BATCH_ORDER_CHUNK_SIZE]
-            if self._stopping or self.manual_stop_pending or self.risk_shutdown_pending:
+            if (
+                self._stopping
+                or self.manual_stop_pending
+                or self.risk_shutdown_pending
+                or self._rate_limit_remaining() > 0
+            ):
                 break
 
             for item in chunk:
@@ -4568,6 +4759,24 @@ class GridEngine:
                         self._reconcile_exchange_open_orders()
                     continue
 
+                if isinstance(exc, ExchangeRateLimitError) or is_exchange_rate_limit_message(
+                    message
+                ):
+                    retry_after = (
+                        exc.retry_after
+                        if isinstance(exc, ExchangeRateLimitError)
+                        else ORDER_REJECTION_BACKOFF_MAX_SECONDS
+                    )
+                    for item in chunk:
+                        state = item["state"]
+                        self.active_orders.pop(str(state["link_id"]), None)
+                        self._record_order_rejection(
+                            str(item["shape_key"]),
+                            message,
+                            rate_limit_retry_after=retry_after,
+                        )
+                    break
+
                 logger.warning(
                     "Batch order request was definitively rejected; using single-order fallback "
                     "symbol=%s msg=%s",
@@ -4587,6 +4796,10 @@ class GridEngine:
                     with contextlib.suppress(Exception):
                         self._reconcile_exchange_open_orders()
                     continue
+                if is_exchange_rate_limit_message(message):
+                    for item in chunk:
+                        fallback_single(item, message)
+                    break
                 for item in chunk:
                     fallback_single(item, message)
                 continue
@@ -4608,6 +4821,7 @@ class GridEngine:
                     continue
                 if order_result.get("retCode") == 0:
                     if self._confirm_pending_submission(state, order_result.get("result", {})):
+                        self._clear_order_rejection(str(item["shape_key"]))
                         remember_link(str(state["link_id"]))
                     elif state.get("accepted_shape_mismatch"):
                         remember_link(str(state["link_id"]))
@@ -4967,6 +5181,14 @@ class GridEngine:
                     "A pending grid order is below exchange quantity precision or minimum: "
                     f"{target['side']} level {target['level_idx']} requested={raw_qty}"
                 )
+            open_price_text = self._round_trip_open_price_text(int(target["level_idx"]))
+            if not self._meets_min_notional(open_price_text, qty_text):
+                raise RuntimeError(
+                    "A pending grid round trip is below the exchange minimum notional: "
+                    f"{target['side']} level {target['level_idx']} "
+                    f"notional={self._limit_notional(open_price_text, qty_text)} "
+                    f"minimum={self.min_notional}; increase the per-grid quantity or investment"
+                )
             plan_key = (str(target["side"]), int(target["level_idx"]), reduce_only)
             if plan_key in plan_keys:
                 raise RuntimeError(
@@ -5186,6 +5408,19 @@ class GridEngine:
                     await self._sleep_until_next_poll()
                     continue
 
+                rate_limit_remaining = self._rate_limit_remaining()
+                if rate_limit_remaining > 0:
+                    self.trigger_message = (
+                        "Exchange rate limit reached; normal grid requests are paused for "
+                        f"{int(rate_limit_remaining + 0.999)} second(s) without dropping any ledger work."
+                    )
+                    self._persist_state()
+                    await self._sleep_until_next_poll()
+                    continue
+                if self.trigger_message.startswith("Exchange rate limit reached;"):
+                    self.trigger_message = ""
+                    self._persist_state()
+
                 self.current_price = self._get_current_price()
 
                 if self.waiting_trigger and self._is_trigger_hit(self.current_price):
@@ -5209,6 +5444,34 @@ class GridEngine:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                if isinstance(exc, ExchangeRateLimitError) or is_exchange_rate_limit_message(
+                    exc
+                ):
+                    retry_after = (
+                        exc.retry_after
+                        if isinstance(exc, ExchangeRateLimitError)
+                        else ORDER_REJECTION_BACKOFF_MAX_SECONDS
+                    )
+                    self._record_order_rejection(
+                        "",
+                        str(exc),
+                        rate_limit_retry_after=retry_after,
+                        track_shape=False,
+                    )
+                    remaining = self._rate_limit_remaining()
+                    self.trigger_message = (
+                        "Exchange rate limit reached; normal grid requests are paused for "
+                        f"{int(remaining + 0.999)} second(s) without dropping any ledger work."
+                    )
+                    logger.warning(
+                        "Exchange rate limit paused grid polling symbol=%s retry_after=%.3f msg=%s",
+                        self.config.get("symbol"),
+                        remaining,
+                        exc,
+                    )
+                    self._persist_state()
+                    await self._sleep_until_next_poll()
+                    continue
                 logger.exception("Grid polling failed: %s", exc)
                 await asyncio.sleep(1 if self.waiting_initial_order else 5)
 
@@ -5497,10 +5760,65 @@ class GridEngine:
         self._record_execution_delta(order, stats)
         return True
 
+    def _coalesce_nonreduce_counter_replacements(self) -> bool:
+        changed = False
+        retained: list[dict] = []
+        groups: dict[tuple[str, str, int, bool], dict] = {}
+
+        for order in self.paused_replacements:
+            if order.get("replacement_mode") != "counter_order":
+                retained.append(order)
+                continue
+            replacement_link_id = str(order.get("replacement_link_id") or "")
+            if replacement_link_id and replacement_link_id in self.active_orders:
+                changed = True
+                continue
+            plan = self._counter_order_plan(order)
+            if not plan or bool(plan.get("reduce_only")):
+                retained.append(order)
+                continue
+
+            key = (
+                str(plan["side"]),
+                self._fp(float(plan["price"])),
+                int(plan["level_idx"]),
+                False,
+            )
+            source_links = list(order.get("replacement_source_links") or [])
+            source_link = str(order.get("link_id") or "")
+            if source_link and source_link not in source_links:
+                source_links.append(source_link)
+            order["replacement_source_links"] = source_links
+
+            existing = groups.get(key)
+            if existing is None:
+                groups[key] = order
+                retained.append(order)
+                continue
+
+            total_qty = Decimal(str(existing.get("qty", 0) or 0)) + Decimal(
+                str(order.get("qty", 0) or 0)
+            )
+            existing["qty"] = self._fq(float(total_qty))
+            existing["replacement_retry_after"] = 0.0
+            existing["replacement_retry_attempts"] = 0
+            existing_sources = list(existing.get("replacement_source_links") or [])
+            for link_id in source_links:
+                if link_id and link_id not in existing_sources:
+                    existing_sources.append(link_id)
+            existing["replacement_source_links"] = existing_sources
+            changed = True
+
+        if changed:
+            self.paused_replacements = retained
+            self._persist_state()
+        return changed
+
     def _resume_paused_replacements(self):
         if not self.paused_replacements or self._stopping:
             return
 
+        self._coalesce_nonreduce_counter_replacements()
         pending = list(self.paused_replacements)
 
         def dequeue(order: dict) -> None:
@@ -6031,6 +6349,27 @@ class GridEngine:
         # permanent gap; if the limit is marketable, the taker fill is still
         # part of maintaining the grid state. Risky ledger cases are blocked
         # before this method by reduce-protection checks.
+        plan = self._counter_order_plan(order)
+        if not plan or bool(plan.get("reduce_only")):
+            return True
+
+        qty_text = self._order_qty_text(float(plan.get("qty", 0) or 0), reduce_only=False)
+        price_text = self._fp(float(plan.get("price", 0) or 0))
+        if qty_text and self._meets_min_notional(price_text, qty_text):
+            return True
+
+        source_links = list(order.get("replacement_source_links") or [])
+        source_link = str(order.get("link_id") or "")
+        if source_link and source_link not in source_links:
+            source_links.append(source_link)
+        for link_id in source_links:
+            source = self.active_orders.get(str(link_id))
+            if not source:
+                continue
+            planned = Decimal(str(source.get("qty", 0) or 0))
+            processed = Decimal(str(source.get("processed_fill_qty", 0) or 0))
+            if planned - processed > self._qty_tolerance_decimal():
+                return False
         return True
 
     def _place_counter_order(self, order: dict) -> bool:

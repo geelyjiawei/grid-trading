@@ -11,7 +11,11 @@ import requests
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from exchange_errors import ExchangeRequestUncertainError
+from exchange_errors import (
+    ExchangeRateLimitError,
+    ExchangeRequestUncertainError,
+    is_exchange_rate_limit_message,
+)
 from fee_rates import fee_rate_response
 
 
@@ -25,6 +29,7 @@ class AsterFuturesClient:
     TRADE_WINDOW_LIMIT_MS = (7 * 24 * 60 * 60 * 1000) - 1
     MAX_TRADE_HISTORY_QUERIES = 64
     FEE_RATE_TTL_SECONDS = 300
+    RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
 
     def __init__(
         self,
@@ -64,6 +69,31 @@ class AsterFuturesClient:
         self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
         self._nonce_lock = threading.Lock()
         self._last_nonce = 0
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0.0
+
+    def _rate_limit_remaining(self) -> float:
+        with self._rate_limit_lock:
+            return max(0.0, self._rate_limit_until - time.time())
+
+    def _activate_rate_limit(self, message: str, response: Any | None = None) -> float:
+        retry_after = self.RATE_LIMIT_DEFAULT_RETRY_SECONDS
+        headers = getattr(response, "headers", {}) or {}
+        try:
+            retry_after = max(retry_after, float(headers.get("Retry-After", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        with self._rate_limit_lock:
+            self._rate_limit_until = max(self._rate_limit_until, time.time() + retry_after)
+        return retry_after
+
+    def _raise_if_rate_limited(self):
+        remaining = self._rate_limit_remaining()
+        if remaining > 0:
+            raise ExchangeRateLimitError(
+                "Aster request paused after an exchange rate-limit rejection",
+                retry_after=remaining,
+            )
 
     def _nonce(self) -> int:
         with self._nonce_lock:
@@ -120,6 +150,7 @@ class AsterFuturesClient:
         params: dict[str, Any] | None = None,
         auth: bool = False,
     ) -> Any:
+        self._raise_if_rate_limited()
         request_params = self._auth_params(params or {}) if auth else dict(params or {})
         url = f"{self.base_url}{path}"
         headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "grid-trading/1.0"}
@@ -139,6 +170,12 @@ class AsterFuturesClient:
             normalized_error_code = int(error_code) if error_code is not None else None
         except (TypeError, ValueError):
             normalized_error_code = None
+        if response.status_code in {418, 429} or is_exchange_rate_limit_message(message):
+            retry_after = self._activate_rate_limit(str(message or "Aster rate limit reached"), response)
+            raise ExchangeRateLimitError(
+                str(message or "Aster rate limit reached"),
+                retry_after=retry_after,
+            )
         if normalized_error_code in self.UNCERTAIN_EXECUTION_CODES:
             raise ExchangeRequestUncertainError(
                 str(message or f"Aster request execution status unknown ({normalized_error_code})")
@@ -193,6 +230,12 @@ class AsterFuturesClient:
         price_filter = filters.get("PRICE_FILTER", {})
         lot_filter = filters.get("LOT_SIZE", {})
         market_lot_filter = filters.get("MARKET_LOT_SIZE", lot_filter)
+        notional_filter = filters.get("MIN_NOTIONAL", {}) or filters.get("NOTIONAL", {})
+        min_notional = (
+            notional_filter.get("notional")
+            or notional_filter.get("minNotional")
+            or "0"
+        )
         result = {
             "retCode": 0,
             "result": {
@@ -203,6 +246,7 @@ class AsterFuturesClient:
                             "qtyStep": lot_filter.get("stepSize", "0.001"),
                             "minOrderQty": lot_filter.get("minQty", "0.001"),
                             "maxOrderQty": lot_filter.get("maxQty", "0"),
+                            "minNotionalValue": min_notional,
                         },
                         "marketLotSizeFilter": {
                             "qtyStep": market_lot_filter.get(
@@ -333,10 +377,13 @@ class AsterFuturesClient:
                 normalized_item["orderId"] = str(item.get("orderId", normalized_item.get("orderId", "")))
                 normalized.append({"retCode": 0, "result": normalized_item})
             else:
+                message = item.get("msg", "Batch order failed") if isinstance(item, dict) else "Batch order failed"
+                if is_exchange_rate_limit_message(message):
+                    self._activate_rate_limit(str(message))
                 normalized.append(
                     {
                         "retCode": int(item.get("code", -1) or -1) if isinstance(item, dict) else -1,
-                        "retMsg": item.get("msg", "Batch order failed") if isinstance(item, dict) else "Batch order failed",
+                        "retMsg": message,
                         "result": {},
                     }
                 )

@@ -390,6 +390,7 @@ async function updatePreview() {
     document.getElementById("prev-profit").textContent = Number(preview.per_grid_net_profit).toFixed(4);
     document.getElementById("prev-active-count").textContent = `${preview.active_grid_count} / ${preview.grid_count}`;
     document.getElementById("prev-qty").textContent = qtyText;
+    document.getElementById("prev-min-notional").textContent = Number(preview.min_notional || 0).toFixed(4);
     document.getElementById("prev-total-qty").textContent = formatOrderQty(preview.total_qty);
     box.classList.remove("hidden");
   } catch (_) {

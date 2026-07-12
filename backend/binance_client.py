@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import threading
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
@@ -8,7 +9,11 @@ from urllib.parse import urlencode
 
 import requests
 
-from exchange_errors import ExchangeRequestUncertainError
+from exchange_errors import (
+    ExchangeRateLimitError,
+    ExchangeRequestUncertainError,
+    is_exchange_rate_limit_message,
+)
 from fee_rates import fee_rate_response
 
 
@@ -17,6 +22,7 @@ class BinanceFuturesClient:
     ASSET_PRICE_TTL_SECONDS = 60
     HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS = 2048
     FEE_RATE_TTL_SECONDS = 300
+    RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -29,6 +35,31 @@ class BinanceFuturesClient:
         self._historical_asset_price_cache: dict[tuple[str, int], Decimal] = {}
         self._instrument_info_cache: dict[str, tuple[dict, float]] = {}
         self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0.0
+
+    def _rate_limit_remaining(self) -> float:
+        with self._rate_limit_lock:
+            return max(0.0, self._rate_limit_until - time.time())
+
+    def _activate_rate_limit(self, message: str, response: Any | None = None) -> float:
+        retry_after = self.RATE_LIMIT_DEFAULT_RETRY_SECONDS
+        headers = getattr(response, "headers", {}) or {}
+        try:
+            retry_after = max(retry_after, float(headers.get("Retry-After", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        with self._rate_limit_lock:
+            self._rate_limit_until = max(self._rate_limit_until, time.time() + retry_after)
+        return retry_after
+
+    def _raise_if_rate_limited(self):
+        remaining = self._rate_limit_remaining()
+        if remaining > 0:
+            raise ExchangeRateLimitError(
+                "Binance request paused after an exchange rate-limit rejection",
+                retry_after=remaining,
+            )
 
     def _sign(self, params: dict[str, Any]) -> str:
         query = urlencode(params, doseq=True)
@@ -47,6 +78,7 @@ class BinanceFuturesClient:
         auth: bool = False,
         api_key: bool = False,
     ) -> Any:
+        self._raise_if_rate_limited()
         request_params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key} if auth or api_key else None
 
@@ -63,6 +95,14 @@ class BinanceFuturesClient:
             data = {"code": response.status_code, "msg": response.text}
         if response.status_code >= 400:
             message = data.get("msg") if isinstance(data, dict) else response.text
+            if response.status_code in {418, 429} or is_exchange_rate_limit_message(message):
+                retry_after = self._activate_rate_limit(
+                    str(message or "Binance rate limit reached"), response
+                )
+                raise ExchangeRateLimitError(
+                    str(message or "Binance rate limit reached"),
+                    retry_after=retry_after,
+                )
             if response.status_code == 408 or response.status_code >= 500:
                 raise ExchangeRequestUncertainError(
                     message or f"Binance request status unknown after HTTP {response.status_code}"
@@ -107,6 +147,12 @@ class BinanceFuturesClient:
         price_filter = filters.get("PRICE_FILTER", {})
         lot_filter = filters.get("LOT_SIZE", {})
         market_lot_filter = filters.get("MARKET_LOT_SIZE", lot_filter)
+        notional_filter = filters.get("MIN_NOTIONAL", {}) or filters.get("NOTIONAL", {})
+        min_notional = (
+            notional_filter.get("notional")
+            or notional_filter.get("minNotional")
+            or "0"
+        )
         result = {
             "retCode": 0,
             "result": {
@@ -117,6 +163,7 @@ class BinanceFuturesClient:
                             "qtyStep": lot_filter.get("stepSize", "0.001"),
                             "minOrderQty": lot_filter.get("minQty", "0.001"),
                             "maxOrderQty": lot_filter.get("maxQty", "0"),
+                            "minNotionalValue": min_notional,
                         },
                         "marketLotSizeFilter": {
                             "qtyStep": market_lot_filter.get(

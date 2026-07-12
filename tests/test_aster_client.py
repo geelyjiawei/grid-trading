@@ -9,7 +9,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from aster_client import AsterFuturesClient  # noqa: E402
-from exchange_errors import ExchangeRequestUncertainError  # noqa: E402
+from exchange_errors import ExchangeRateLimitError, ExchangeRequestUncertainError  # noqa: E402
 
 
 PRIVATE_KEY = "0x" + "1" * 64
@@ -18,10 +18,11 @@ USER = "0x0000000000000000000000000000000000000abc"
 
 
 class FakeResponse:
-    def __init__(self, data, status_code=200):
+    def __init__(self, data, status_code=200, headers=None):
         self._data = data
         self.status_code = status_code
         self.text = str(data)
+        self.headers = dict(headers or {})
 
     def json(self):
         return self._data
@@ -114,6 +115,7 @@ class AsterClientTests(unittest.TestCase):
                                     "minQty": "1",
                                     "maxQty": "5000",
                                 },
+                                {"filterType": "MIN_NOTIONAL", "notional": "5"},
                             ],
                         }
                     ]
@@ -125,6 +127,7 @@ class AsterClientTests(unittest.TestCase):
         info = response["result"]["list"][0]
 
         self.assertEqual(info["lotSizeFilter"]["maxOrderQty"], "100000")
+        self.assertEqual(info["lotSizeFilter"]["minNotionalValue"], "5")
         self.assertEqual(info["marketLotSizeFilter"]["qtyStep"], "1")
         self.assertEqual(info["marketLotSizeFilter"]["minOrderQty"], "1")
         self.assertEqual(info["marketLotSizeFilter"]["maxOrderQty"], "5000")
@@ -815,6 +818,93 @@ class AsterClientTests(unittest.TestCase):
         self.assertEqual(trade["feeUsdt"], "0.600")
         self.assertEqual(trade["feeUsdtSource"], "historical_minute_open")
         self.assertEqual(calls[0][1], "/fapi/v3/klines")
+
+    def test_rate_limit_activates_local_cooldown_without_second_http_request(self):
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client.session = FakeSession(
+            FakeResponse(
+                {
+                    "code": -1015,
+                    "msg": "Too many new orders; current limit is 1200 orders per MINUTE.",
+                },
+                status_code=429,
+                headers={"Retry-After": "7"},
+            )
+        )
+
+        with self.assertRaises(ExchangeRateLimitError) as first:
+            client.get_open_orders("ANSEMUSDT")
+        with self.assertRaises(ExchangeRateLimitError) as second:
+            client.get_open_orders("ANSEMUSDT")
+
+        self.assertGreaterEqual(first.exception.retry_after, 60)
+        self.assertGreater(second.exception.retry_after, 0)
+        self.assertEqual(len(client.session.calls), 1)
+
+    def test_batch_item_rate_limit_activates_cooldown_before_next_request(self):
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client.session = FakeSession(
+            FakeResponse(
+                [
+                    {
+                        "code": -1015,
+                        "msg": "Too many new orders; current limit is 1200 orders per MINUTE.",
+                    }
+                ]
+            )
+        )
+
+        with self.assertRaises(ExchangeRateLimitError):
+            client.place_orders(
+                [
+                    {
+                        "symbol": "ANSEMUSDT",
+                        "side": "Buy",
+                        "qty": "20",
+                        "price": "0.30",
+                        "order_type": "Limit",
+                        "reduce_only": False,
+                        "order_link_id": "g_0_B_rate_limited",
+                        "time_in_force": None,
+                    }
+                ]
+            )
+        with self.assertRaises(ExchangeRateLimitError):
+            client.get_open_orders("ANSEMUSDT")
+        self.assertEqual(len(client.session.calls), 1)
+
+    def test_http_418_ip_ban_activates_local_cooldown(self):
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client.session = FakeSession(
+            FakeResponse(
+                {"code": -1003, "msg": "IP banned until 1783839999000"},
+                status_code=418,
+                headers={"Retry-After": "90"},
+            )
+        )
+
+        with self.assertRaises(ExchangeRateLimitError) as first:
+            client.get_open_orders("ANSEMUSDT")
+        with self.assertRaises(ExchangeRateLimitError):
+            client.get_open_orders("ANSEMUSDT")
+
+        self.assertGreaterEqual(first.exception.retry_after, 90)
+        self.assertEqual(len(client.session.calls), 1)
 
 
 if __name__ == "__main__":

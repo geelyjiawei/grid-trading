@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from itertools import pairwise
 from threading import RLock
 
@@ -867,7 +868,8 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     ticker = client.get_ticker(symbol)
     if ticker.get("retCode") != 0:
         raise HTTPException(status_code=400, detail=ticker.get("retMsg", "Failed to fetch current price"))
-    current_price = float(ticker["result"]["list"][0]["lastPrice"])
+    ticker_item = ticker["result"]["list"][0]
+    current_price = float(ticker_item["lastPrice"])
     initial_order_type = cfg.initial_order_type.lower().strip()
     sizing_mode = _position_sizing_mode(cfg)
 
@@ -882,6 +884,11 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
     market_filter = explicit_market_filter or lot_filter
     qty_step = lot_filter["qtyStep"]
     min_qty = float(lot_filter["minOrderQty"])
+    min_notional = float(
+        lot_filter.get("minNotionalValue")
+        or instrument.get("minNotionalValue")
+        or 0
+    )
     market_qty_step = str(market_filter.get("qtyStep") or qty_step)
     market_min_qty = float(market_filter.get("minOrderQty") or min_qty)
     if explicit_market_filter:
@@ -977,6 +984,13 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
 
     total_qty = _steps_to_qty(total_steps, qty_step)
 
+    initial_notional_price = reference_price
+    if direction in {"long", "short"} and initial_order_type == "market":
+        try:
+            initial_notional_price = float(ticker_item.get("markPrice") or current_price)
+        except (TypeError, ValueError):
+            initial_notional_price = current_price
+
     if direction in {"long", "short"} and initial_order_type == "market":
         market_steps = _round_down_steps(total_qty, market_qty_step)
         market_total_qty = _steps_to_qty(market_steps, market_qty_step)
@@ -1028,6 +1042,23 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
             for index in range(active_count)
         ]
 
+    if direction in {"long", "short"} and min_notional > 0:
+        if initial_order_type != "market":
+            initial_notional_price = float(
+                client.round_to_step(initial_notional_price, tick_size_text)
+            )
+        initial_notional = Decimal(str(initial_notional_price)) * Decimal(str(total_qty))
+        minimum_notional = Decimal(str(min_notional))
+        tolerance = max(minimum_notional * Decimal("1e-12"), Decimal("1e-18"))
+        if initial_notional + tolerance < minimum_notional:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Initial opening notional {initial_notional} is below the exchange minimum "
+                    f"{minimum_notional}; increase the per-grid quantity or investment"
+                ),
+            )
+
     limit_qty_tolerance = max(float(qty_step) * 1e-9, 1e-18)
     if min(per_order_qtys) + limit_qty_tolerance < min_qty:
         raise HTTPException(
@@ -1037,6 +1068,43 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
                 f"minimum {min_qty}; increase the per-grid quantity or investment"
             ),
         )
+
+    minimum_notional = Decimal(str(min_notional))
+    if minimum_notional > 0:
+        notional_tolerance = max(
+            minimum_notional * Decimal("1e-12"),
+            Decimal("1e-18"),
+        )
+        if direction in {"long", "short"}:
+            allocated_by_level = {
+                int(target[0]): qty
+                for target, qty in zip(active_targets, per_order_qtys, strict=True)
+            }
+            fallback_steps = total_steps // active_count
+            fallback_qty = _steps_to_qty(max(1, fallback_steps), qty_step)
+            notional_checks = [
+                (level_idx, allocated_by_level.get(level_idx, fallback_qty))
+                for level_idx in range(len(rounded_levels) - 1)
+            ]
+        else:
+            notional_checks = [
+                (int(target[0]), qty)
+                for target, qty in zip(active_targets, per_order_qtys, strict=True)
+            ]
+
+        for level_idx, qty in notional_checks:
+            open_price_index = level_idx + 1 if direction == "short" else level_idx
+            open_price = Decimal(str(rounded_levels[open_price_index]))
+            notional = open_price * Decimal(str(qty))
+            if notional + notional_tolerance < minimum_notional:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Per-grid round-trip notional {notional} at level {level_idx} is below "
+                        f"the exchange minimum {minimum_notional}; increase the per-grid "
+                        "quantity or investment"
+                    ),
+                )
 
     if grid_mode == "geometric":
         ratio = (levels[1] / levels[0]) if len(levels) > 1 else 1
@@ -1060,6 +1128,7 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         "symbol": symbol,
         "current_price": current_price,
         "reference_price": reference_price,
+        "initial_notional_price": initial_notional_price,
         "position_sizing_mode": sizing_mode,
         "grid_order_qty": cfg.grid_order_qty,
         "grid_step": grid_step,
@@ -1072,6 +1141,7 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         "qty_per_grid_max": max(per_order_qtys),
         "qty_step": qty_step,
         "min_qty": min_qty,
+        "min_notional": min_notional,
         "market_qty_step": market_qty_step,
         "market_min_qty": market_min_qty,
         "max_market_qty": max_market_qty,
