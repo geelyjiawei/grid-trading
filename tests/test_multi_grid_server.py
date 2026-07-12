@@ -2546,6 +2546,33 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["orderId"], "99")
         self.assertEqual(calls[0][2]["limit"], 1000)
 
+    def test_binance_order_trades_filters_other_orders_and_duplicate_trade_ids(self):
+        client = BinanceFuturesClient("", "", True)
+        requested = {
+            "orderId": 99,
+            "id": 1,
+            "side": "BUY",
+            "price": "100",
+            "qty": "0.2",
+            "quoteQty": "20",
+            "commission": "0.01",
+            "commissionAsset": "USDT",
+            "maker": True,
+        }
+        client._request = Mock(
+            return_value=[
+                requested,
+                {**requested, "orderId": 100, "id": 2},
+                dict(requested),
+            ]
+        )
+
+        response = client.get_order_trades("TESTUSDT", "99")
+
+        self.assertEqual(len(response["result"]["list"]), 1)
+        self.assertEqual(response["result"]["list"][0]["orderId"], "99")
+        self.assertEqual(response["result"]["list"][0]["tradeId"], "1")
+
     def test_binance_batch_orders_preserve_each_client_id_and_item_result(self):
         client = BinanceFuturesClient("", "", True)
         calls = []
@@ -2778,7 +2805,11 @@ class MultiGridServerTests(unittest.TestCase):
             return {
                 "retCode": 0,
                 "result": {
-                    "list": [trade(index) for index in range(100, 130)],
+                    "list": [
+                        trade(99),
+                        *[trade(index) for index in range(100, 130)],
+                        {**trade(130), "orderId": "other-order"},
+                    ],
                     "nextPageCursor": "",
                 },
             }
@@ -2790,6 +2821,42 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(len(response["result"]["list"]), 130)
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(item["qty"] == "0.1" for item in response["result"]["list"]))
+
+    def test_bybit_repeated_pagination_cursor_fails_closed(self):
+        client = BybitClient("key", "secret")
+        client._request = Mock(
+            return_value={
+                "retCode": 0,
+                "result": {"list": [], "nextPageCursor": "same-cursor"},
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "cursor did not advance"):
+            client.get_open_orders("MUUSDT")
+
+        self.assertEqual(client._request.call_count, 2)
+
+    def test_bybit_pagination_page_limit_fails_closed(self):
+        client = BybitClient("key", "secret")
+        client.MAX_PAGINATION_PAGES = 2
+        calls = []
+
+        def fake_request(method, path, *, params=None, payload=None, auth=False):
+            calls.append(str(params or ""))
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [{"orderId": str(len(calls))}],
+                    "nextPageCursor": f"page-{len(calls) + 1}",
+                },
+            }
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "pagination exceeded 2 pages"):
+            client.get_open_orders("MUUSDT")
+
+        self.assertEqual(len(calls), 2)
 
     def test_binance_fee_asset_price_cache_expires(self):
         client = BinanceFuturesClient("", "", True)

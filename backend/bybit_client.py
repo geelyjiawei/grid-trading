@@ -16,6 +16,7 @@ class BybitClient:
     ASSET_PRICE_TTL_SECONDS = 60
     HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS = 2048
     FEE_RATE_TTL_SECONDS = 300
+    MAX_PAGINATION_PAGES = 100
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -213,7 +214,7 @@ class BybitClient:
         cursor = ""
         seen_cursors: set[str] = set()
         last_response: dict = {"retCode": 0, "result": {"list": []}}
-        for _ in range(100):
+        for _ in range(self.MAX_PAGINATION_PAGES):
             params = f"{base_params}&limit={page_size}"
             if cursor:
                 params += f"&cursor={requests.utils.quote(cursor, safe='%')}"
@@ -228,10 +229,14 @@ class BybitClient:
                 items = items[:max_items]
                 break
             next_cursor = str(result.get("nextPageCursor", "") or "")
-            if not next_cursor or next_cursor in seen_cursors:
+            if not next_cursor:
                 break
+            if next_cursor in seen_cursors:
+                raise RuntimeError(f"Bybit pagination cursor did not advance for {path}")
             seen_cursors.add(next_cursor)
             cursor = next_cursor
+        else:
+            raise RuntimeError(f"Bybit pagination exceeded {self.MAX_PAGINATION_PAGES} pages for {path}")
 
         result = dict(last_response.get("result", {}) or {})
         result["list"] = items
@@ -319,7 +324,14 @@ class BybitClient:
         )
         if resp.get("retCode") != 0:
             return resp
-        resp["result"]["list"] = [self._normalize_trade(item) for item in resp["result"].get("list", [])]
+        matching: dict[tuple[str, ...], dict[str, Any]] = {}
+        for item in resp.get("result", {}).get("list", []):
+            if not isinstance(item, dict):
+                raise RuntimeError("Bybit order execution history contains an invalid row")
+            if str(item.get("orderId", "")) != str(order_id):
+                continue
+            matching[self._execution_identity(item)] = item
+        resp["result"]["list"] = [self._normalize_trade(item) for item in matching.values()]
         return resp
 
     def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
@@ -358,6 +370,21 @@ class BybitClient:
             "isMaker": str(item.get("isMaker", "")).lower() == "true",
             "time": item.get("execTime", ""),
         }
+
+    @staticmethod
+    def _execution_identity(item: dict[str, Any]) -> tuple[str, ...]:
+        execution_id = str(item.get("execId", "") or "")
+        if execution_id:
+            return ("id", execution_id)
+        return (
+            "shape",
+            str(item.get("orderId", "") or ""),
+            str(item.get("execTime", "") or ""),
+            str(item.get("side", "") or ""),
+            str(item.get("execPrice", "") or ""),
+            str(item.get("execQty", "") or ""),
+            str(item.get("execFee", "") or ""),
+        )
 
     def _historical_fee_asset_price(self, symbol: str, trade_time_ms: int) -> Decimal | None:
         minute_start = trade_time_ms - (trade_time_ms % 60_000)

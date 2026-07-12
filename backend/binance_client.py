@@ -391,9 +391,19 @@ class BinanceFuturesClient:
             params={"symbol": symbol.upper(), "orderId": order_id, "limit": 1000},
             auth=True,
         )
+        if not isinstance(trades, list):
+            raise RuntimeError("Binance order trade history returned an invalid response")
+
+        matching: dict[tuple[str, ...], dict[str, Any]] = {}
+        for item in trades:
+            if not isinstance(item, dict):
+                raise RuntimeError("Binance order trade history contains an invalid row")
+            if str(item.get("orderId", "")) != str(order_id):
+                continue
+            matching[self._trade_identity(item)] = item
         return {
             "retCode": 0,
-            "result": {"list": [self._normalize_trade(item) for item in trades]},
+            "result": {"list": [self._normalize_trade(item) for item in matching.values()]},
         }
 
     def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
@@ -407,6 +417,22 @@ class BinanceFuturesClient:
             "retCode": 0,
             "result": {"list": [self._normalize_trade(item) for item in trades]},
         }
+
+    @staticmethod
+    def _trade_identity(item: dict[str, Any]) -> tuple[str, ...]:
+        trade_id = str(item.get("id", "") or "")
+        if trade_id:
+            return ("id", trade_id)
+        return (
+            "shape",
+            str(item.get("orderId", "") or ""),
+            str(item.get("time", "") or ""),
+            str(item.get("side", "") or ""),
+            str(item.get("price", "") or ""),
+            str(item.get("qty", "") or ""),
+            str(item.get("commission", "") or ""),
+            str(item.get("commissionAsset", "") or ""),
+        )
 
     @staticmethod
     def _to_binance_side(side: str) -> str:
