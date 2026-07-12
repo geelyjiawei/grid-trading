@@ -93,6 +93,8 @@ class GridEngine:
         self.manual_stop_pending = False
         self.initialization_in_progress = False
         self.initialization_failed = False
+        self.initial_grid_deployment_pending = False
+        self.initial_grid_deployment_ledger: dict[str, dict[str, Any]] = {}
         self.ownership_conflicts: list[dict] = []
         self._pending_targets: dict | None = None
         self.paused_replacements: list[dict] = []
@@ -171,6 +173,8 @@ class GridEngine:
             "manual_stop_pending": self.manual_stop_pending,
             "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
+            "initial_grid_deployment_pending": self.initial_grid_deployment_pending,
+            "initial_grid_deployment_ledger": self.initial_grid_deployment_ledger,
             "ownership_conflicts": self.ownership_conflicts,
             "pending_targets": self._pending_targets,
             # This is live recovery work, not display history. Truncating it
@@ -250,6 +254,32 @@ class GridEngine:
             state.get("initialization_in_progress", False)
         )
         self.initialization_failed = bool(state.get("initialization_failed", False))
+        self.initial_grid_deployment_pending = bool(
+            state.get("initial_grid_deployment_pending", False)
+        )
+        initial_deployment_ledger_present = "initial_grid_deployment_ledger" in state
+        raw_initial_deployment_ledger = state.get("initial_grid_deployment_ledger")
+        initial_deployment_ledger_invalid = bool(
+            initial_deployment_ledger_present
+            and (
+                not isinstance(raw_initial_deployment_ledger, dict)
+                or any(
+                    not isinstance(value, dict)
+                    for value in (
+                        raw_initial_deployment_ledger.values()
+                        if isinstance(raw_initial_deployment_ledger, dict)
+                        else []
+                    )
+                )
+            )
+        )
+        if not isinstance(raw_initial_deployment_ledger, dict):
+            raw_initial_deployment_ledger = {}
+        self.initial_grid_deployment_ledger = {
+            str(key): dict(value)
+            for key, value in raw_initial_deployment_ledger.items()
+            if isinstance(value, dict)
+        }
         self.ownership_conflicts = list(state.get("ownership_conflicts") or [])
         self._pending_targets = state.get("pending_targets")
         self.paused_replacements = list(state.get("paused_replacements") or [])
@@ -277,7 +307,45 @@ class GridEngine:
             state.get("restore_previous_trigger_message") or ""
         )
 
-        if self.initialization_in_progress and not self.grid_ready:
+        invalid_initial_deployment = bool(
+            self.initial_grid_deployment_pending
+            and (
+                self.grid_ready
+                or not isinstance(self._pending_targets, dict)
+                or not self._pending_targets
+                or not initial_deployment_ledger_present
+                or initial_deployment_ledger_invalid
+            )
+        )
+        recoverable_initial_deployment = bool(
+            self.initial_grid_deployment_pending
+            and isinstance(self._pending_targets, dict)
+            and self._pending_targets
+            and not self.initialization_failed
+            and not self.manual_stop_pending
+            and not self.grid_ready
+        )
+        if invalid_initial_deployment:
+            self.initial_grid_deployment_pending = False
+            self.initial_grid_deployment_ledger.clear()
+            self.initialization_in_progress = False
+            self.initialization_failed = True
+            self.manual_stop_pending = True
+            self.grid_ready = False
+            self.trigger_message = (
+                "Initial grid deployment recovery state is inconsistent. Managed orders "
+                "will be reconciled and cancelled; the retained position will not be "
+                "market-closed automatically."
+            )
+        elif recoverable_initial_deployment:
+            self.initialization_in_progress = True
+        elif self.initial_grid_deployment_pending:
+            self.initial_grid_deployment_pending = False
+            self.initial_grid_deployment_ledger.clear()
+            self.initialization_in_progress = False
+        elif self.initialization_in_progress and not self.grid_ready:
+            self.initial_grid_deployment_pending = False
+            self.initial_grid_deployment_ledger.clear()
             self.initialization_in_progress = False
             self.initialization_failed = True
             self.manual_stop_pending = True
@@ -595,6 +663,9 @@ class GridEngine:
     async def stop(self):
         self._stopping = True
         self.manual_stop_pending = True
+        self.initialization_in_progress = False
+        self.initial_grid_deployment_pending = False
+        self.initial_grid_deployment_ledger.clear()
         self.running = True
         self._persist_state()
         await self._stop_user_stream()
@@ -630,6 +701,8 @@ class GridEngine:
         self.manual_stop_pending = False
         self.initialization_failed = False
         self.initialization_in_progress = False
+        self.initial_grid_deployment_pending = False
+        self.initial_grid_deployment_ledger.clear()
         self.paused_replacements.clear()
         self.grid_ready = False
         self._clear_restore_refresh_state()
@@ -895,6 +968,13 @@ class GridEngine:
             "manual_stop_pending": self.manual_stop_pending,
             "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
+            "initial_grid_deployment_pending": self.initial_grid_deployment_pending,
+            "initial_grid_deployment_submitted_count": (
+                len(self.initial_grid_deployment_ledger)
+                if self.initial_grid_deployment_pending
+                else 0
+            ),
+            "initial_grid_deployment_total_count": self._initial_grid_target_count(),
             "ownership_conflicts": self.ownership_conflicts,
             "paused_replacements": self.paused_replacements,
             "paused_replacements_count": len(self.paused_replacements),
@@ -1972,6 +2052,9 @@ class GridEngine:
             order.pop(field, None)
         self.grid_ready = False
         self.manual_stop_pending = True
+        self.initialization_in_progress = False
+        self.initial_grid_deployment_pending = False
+        self.initial_grid_deployment_ledger.clear()
         self.trigger_message = (
             f"Exchange accepted a grid order with a different shape ({reason}); "
             "new placement is stopped and managed orders will be cancelled without "
@@ -3023,6 +3106,7 @@ class GridEngine:
     def _reconcile_grid_position_protection(self):
         if (
             self.config["direction"] not in {"long", "short"}
+            or self.initial_grid_deployment_pending
             or self._stopping
             or self.pending_reduce_action
             or self.paused_replacements
@@ -5211,9 +5295,6 @@ class GridEngine:
             self._persist_state()
             self._deploy_pending_targets()
 
-        self.grid_ready = True
-        self._persist_state()
-
     def _prepare_pending_targets_after_opening_fill(
         self,
         fill_price: float,
@@ -5540,14 +5621,231 @@ class GridEngine:
             raise RuntimeError("Pending grid plan has no exchange orders")
         return plan
 
-    def _deploy_pending_targets(self, qty_scale: float = 1.0):
-        plan = self._validated_pending_target_plan(qty_scale)
-        placed_links: list[str] = []
+    @staticmethod
+    def _initial_grid_plan_key(spec: dict[str, Any]) -> str:
+        return "|".join(
+            (
+                str(spec["side"]),
+                str(int(spec["level_idx"])),
+                "1" if bool(spec.get("reduce_only")) else "0",
+            )
+        )
 
-        if self._supports_batch_orders():
-            placed_links.extend(self._place_batch_limit_orders(plan))
+    def _initial_grid_target_count(self) -> int:
+        if not self.initial_grid_deployment_pending:
+            return 0
+        pending = self._pending_targets or {}
+        total_count = len(pending.get("add_targets") or [])
+        if self.config.get("direction") in {"long", "short"}:
+            total_count += len(pending.get("profit_targets") or [])
+        return total_count
+
+    def _initial_grid_shape_error(self, spec: dict[str, Any], order: dict[str, Any]) -> str:
+        if order.get("accepted_shape_mismatch"):
+            return str(order.get("accepted_shape_mismatch"))
+        try:
+            if int(order.get("level_idx", -1)) != int(spec["level_idx"]):
+                return (
+                    f"level expected={spec['level_idx']} "
+                    f"actual={order.get('level_idx')}"
+                )
+        except (TypeError, ValueError):
+            return f"level expected={spec['level_idx']} actual={order.get('level_idx')}"
+        if str(order.get("order_type") or "Limit").lower() != "limit":
+            return f"order type expected=Limit actual={order.get('order_type')}"
+        expected = {
+            "side": str(spec["side"]),
+            "price": str(spec["price_text"]),
+            "qty": str(spec["qty_text"]),
+            "reduce_only": bool(spec["reduce_only"]),
+            "order_type": "Limit",
+        }
+        actual = {
+            "side": order.get("side"),
+            "price": order.get("price"),
+            "qty": order.get("qty"),
+            "reduceOnly": order.get("reduce_only"),
+        }
+        return self._accepted_shape_mismatch_reason(expected, actual)
+
+    def _initial_grid_deployment_entry(
+        self,
+        spec: dict[str, Any],
+        link_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "link_id": str(link_id),
+            "side": str(spec["side"]),
+            "level_idx": int(spec["level_idx"]),
+            "price": str(spec["price_text"]),
+            "qty": str(spec["qty_text"]),
+            "reduce_only": bool(spec["reduce_only"]),
+        }
+
+    def _initial_grid_missing_plan(
+        self,
+        plan: list[dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        plan_by_key = {self._initial_grid_plan_key(spec): spec for spec in plan}
+        if len(plan_by_key) != len(plan):
+            raise RuntimeError("Initial grid deployment plan contains duplicate target identities")
+
+        for key, entry in self.initial_grid_deployment_ledger.items():
+            spec = plan_by_key.get(key)
+            if spec is None:
+                raise RuntimeError(
+                    f"Initial grid deployment ledger contains unexpected target {key}"
+                )
+            if not str(entry.get("link_id") or ""):
+                raise RuntimeError(
+                    f"Initial grid deployment ledger target {key} has no client order ID"
+                )
+            shape_error = self._initial_grid_shape_error(spec, entry)
+            if shape_error:
+                raise RuntimeError(
+                    f"Initial grid deployment ledger shape differs for {key}: {shape_error}"
+                )
+            active = self.active_orders.get(str(entry["link_id"]))
+            if active:
+                shape_error = self._initial_grid_shape_error(spec, active)
+                if shape_error:
+                    raise RuntimeError(
+                        f"Initial grid active order differs for {key}: {shape_error}"
+                    )
+
+        active_by_plan_key: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for link_id, order in self.active_orders.items():
+            try:
+                key = self._initial_grid_plan_key(order)
+            except (KeyError, TypeError, ValueError):
+                continue
+            spec = plan_by_key.get(key)
+            if spec is None:
+                continue
+            if key in self.initial_grid_deployment_ledger:
+                # Once the original target is durably submitted, later partial
+                # fills and exact remainder/counter orders belong to the normal
+                # execution ledger. They must not be mistaken for a second
+                # initial target or compared with the original full quantity.
+                evolved_spec = {**spec, "qty_text": str(order.get("qty", ""))}
+                shape_error = self._initial_grid_shape_error(evolved_spec, order)
+                try:
+                    evolved_qty = Decimal(str(order.get("qty", 0) or 0))
+                except Exception:
+                    evolved_qty = Decimal("0")
+                if shape_error or evolved_qty <= 0:
+                    raise RuntimeError(
+                        "Initial grid evolved order differs from its submitted target "
+                        f"{key}: {shape_error or 'quantity is not positive'}"
+                    )
+                continue
+            shape_error = self._initial_grid_shape_error(spec, order)
+            if shape_error:
+                raise RuntimeError(
+                    f"Initial grid active order differs for {key}: {shape_error}"
+                )
+            active_by_plan_key.setdefault(key, []).append((str(link_id), order))
+
+        for key, matches in active_by_plan_key.items():
+            if len(matches) > 1:
+                raise RuntimeError(
+                    f"Initial grid deployment has duplicate active orders for target {key}"
+                )
+            if key not in self.initial_grid_deployment_ledger:
+                link_id, _ = matches[0]
+                self.initial_grid_deployment_ledger[key] = self._initial_grid_deployment_entry(
+                    plan_by_key[key],
+                    link_id,
+                )
+
+        missing = [
+            spec
+            for spec in plan
+            if self._initial_grid_plan_key(spec)
+            not in self.initial_grid_deployment_ledger
+        ]
+        return plan_by_key, missing
+
+    def _initial_grid_rate_limit_retry_remaining(
+        self,
+        missing: list[dict[str, Any]],
+    ) -> float:
+        remaining = self._rate_limit_remaining()
+        for spec in missing:
+            shape_key = self._order_shape_key(
+                str(spec["side"]),
+                str(spec["price_text"]),
+                str(spec["qty_text"]),
+                bool(spec["reduce_only"]),
+            )
+            retry = self._order_rejection_backoff.get(shape_key) or {}
+            if is_exchange_rate_limit_message(retry.get("message")):
+                remaining = max(remaining, self._order_shape_retry_remaining(shape_key))
+        return remaining
+
+    def _set_initial_grid_deployment_waiting_message(
+        self,
+        total_count: int,
+        retry_remaining: float,
+    ) -> None:
+        submitted_count = len(self.initial_grid_deployment_ledger)
+        wait_text = (
+            f"; retrying after {int(retry_remaining + 0.999)} second(s)"
+            if retry_remaining > 0
+            else ""
+        )
+        self.trigger_message = (
+            "Initial grid deployment is incomplete because the exchange rate-limited "
+            f"order placement: retained {submitted_count}/{total_count} exact target(s)"
+            f"{wait_text}. The confirmed position and existing orders are unchanged; "
+            "only the missing original targets will be resumed."
+        )
+        self._persist_state()
+
+    def _fail_initial_grid_deployment(self, reason: Any) -> None:
+        self.initial_grid_deployment_pending = False
+        self.initial_grid_deployment_ledger.clear()
+        self.initialization_in_progress = False
+        self.initialization_failed = True
+        self.manual_stop_pending = True
+        self.grid_ready = False
+        if self._qty_reaches_accounting_step(self._grid_position_qty()):
+            self.trigger_message = (
+                f"Opening fill was recorded, but grid deployment failed: {reason}. "
+                "Managed grid orders will be cancelled; the confirmed position is retained "
+                "for review and will not be market-closed automatically."
+            )
         else:
-            for spec in plan:
+            self.trigger_message = (
+                f"Initial grid deployment failed: {reason}. Managed grid orders will be "
+                "cancelled without submitting a position-changing fallback order."
+            )
+        self._mark_fast_poll()
+        self._persist_state()
+
+    def _deploy_pending_targets(self, qty_scale: float = 1.0) -> bool:
+        plan = self._validated_pending_target_plan(qty_scale)
+        if not self.initial_grid_deployment_pending:
+            self.initial_grid_deployment_pending = True
+            self.initial_grid_deployment_ledger = {}
+            self.initialization_in_progress = True
+            self.initialization_failed = False
+            self.grid_ready = False
+            # This state is durable before the first grid limit order is submitted.
+            self._persist_state()
+
+        plan_by_key, missing = self._initial_grid_missing_plan(plan)
+        self._persist_state()
+        retry_remaining = self._initial_grid_rate_limit_retry_remaining(missing)
+        if missing and retry_remaining > 0:
+            self._set_initial_grid_deployment_waiting_message(len(plan), retry_remaining)
+            return False
+
+        placed_links: list[str] = []
+        if missing and self._supports_batch_orders():
+            placed_links.extend(self._place_batch_limit_orders(missing))
+        elif missing:
+            for spec in missing:
                 link_id = self._place(
                     str(spec["side"]),
                     float(spec["price"]),
@@ -5559,30 +5857,50 @@ class GridEngine:
                 if link_id:
                     placed_links.append(link_id)
 
-        shape_mismatches = [
-            self.active_orders[link_id]
-            for link_id in set(placed_links)
-            if link_id in self.active_orders
-            and self.active_orders[link_id].get("accepted_shape_mismatch")
-        ]
-        if shape_mismatches:
-            raise RuntimeError(
-                "Initial grid deployment accepted an order with a different exchange shape; "
-                "the strategy was not marked ready and managed orders will be cancelled"
+        for link_id in set(placed_links):
+            order = self.active_orders.get(link_id)
+            if not order:
+                raise RuntimeError(
+                    f"Initial grid client order ID {link_id} is missing from the durable ledger"
+                )
+            key = self._initial_grid_plan_key(order)
+            spec = plan_by_key.get(key)
+            if spec is None:
+                raise RuntimeError(
+                    f"Initial grid accepted an unexpected target for client order ID {link_id}"
+                )
+            shape_error = self._initial_grid_shape_error(spec, order)
+            if shape_error:
+                raise RuntimeError(
+                    "Initial grid deployment accepted an order with a different exchange "
+                    f"shape: {shape_error}"
+                )
+            self.initial_grid_deployment_ledger[key] = self._initial_grid_deployment_entry(
+                spec,
+                link_id,
             )
-        if len(set(placed_links)) != len(plan):
+
+        _, missing = self._initial_grid_missing_plan(plan)
+        if missing:
+            retry_remaining = self._initial_grid_rate_limit_retry_remaining(missing)
+            if retry_remaining > 0:
+                self._set_initial_grid_deployment_waiting_message(len(plan), retry_remaining)
+                return False
             raise RuntimeError(
                 "Initial grid deployment is incomplete: "
                 f"prepared {len(plan)} order(s), exchange confirmed or retained "
-                f"{len(set(placed_links))}; the grid was not marked ready"
+                f"{len(self.initial_grid_deployment_ledger)}; the grid was not marked ready"
             )
 
         self.grid_ready = True
         self.waiting_initial_order = False
         self.initialization_in_progress = False
+        self.initial_grid_deployment_pending = False
+        self.initial_grid_deployment_ledger = {}
         self.trigger_message = ""
         self._pending_targets = None
         self._persist_state()
+        return True
 
     def _risk_hit(self, current_price: float) -> bool:
         direction = self.config["direction"]
@@ -5726,11 +6044,17 @@ class GridEngine:
 
                 rate_limit_remaining = self._rate_limit_remaining()
                 if rate_limit_remaining > 0:
-                    self.trigger_message = (
-                        "Exchange rate limit reached; normal grid requests are paused for "
-                        f"{int(rate_limit_remaining + 0.999)} second(s) without dropping any ledger work."
-                    )
-                    self._persist_state()
+                    if self.initial_grid_deployment_pending:
+                        self._set_initial_grid_deployment_waiting_message(
+                            self._initial_grid_target_count(),
+                            rate_limit_remaining,
+                        )
+                    else:
+                        self.trigger_message = (
+                            "Exchange rate limit reached; normal grid requests are paused for "
+                            f"{int(rate_limit_remaining + 0.999)} second(s) without dropping any ledger work."
+                        )
+                        self._persist_state()
                     await self._sleep_until_next_poll()
                     continue
                 if self.trigger_message.startswith("Exchange rate limit reached;"):
@@ -5754,6 +6078,21 @@ class GridEngine:
 
                 if self.waiting_initial_order:
                     await self._check_initial_order()
+
+                if self.initial_grid_deployment_pending:
+                    retry_remaining = self._rate_limit_remaining()
+                    if retry_remaining > 0:
+                        await self._sleep_until_next_poll()
+                        continue
+                    try:
+                        deployment_complete = self._deploy_pending_targets()
+                    except Exception as exc:
+                        self._fail_initial_grid_deployment(exc)
+                        await self._sleep_until_next_poll()
+                        continue
+                    if not deployment_complete:
+                        await self._sleep_until_next_poll()
+                        continue
 
                 if self.grid_ready and self._risk_hit(self.current_price):
                     if await self._shutdown_with_close():
@@ -5932,6 +6271,8 @@ class GridEngine:
         self.waiting_initial_order = False
         self.opening_order = None
         self.initialization_in_progress = False
+        self.initial_grid_deployment_pending = False
+        self.initial_grid_deployment_ledger.clear()
         self.initialization_failed = True
         self.manual_stop_pending = True
         self.grid_ready = False
@@ -6139,17 +6480,7 @@ class GridEngine:
             self._reset_reduce_lots_from_pending_targets(self.initial_entry_price)
             self._deploy_pending_targets()
         except Exception as exc:
-            self.initialization_in_progress = False
-            self.initialization_failed = True
-            self.manual_stop_pending = True
-            self.grid_ready = False
-            self.trigger_message = (
-                f"Opening fill was recorded, but grid deployment failed: {exc}. "
-                "Managed grid orders will be cancelled; the confirmed position is retained "
-                "for review and will not be market-closed automatically."
-            )
-            self._mark_fast_poll()
-            self._persist_state()
+            self._fail_initial_grid_deployment(exc)
             return
         self._persist_state()
 

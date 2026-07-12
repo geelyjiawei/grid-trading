@@ -6169,6 +6169,1054 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.orders), 1)
         self.assertEqual(len(engine.active_orders), 1)
 
+    async def test_initial_batch_rate_limit_retains_position_and_resumes_exact_plan(self):
+        class RateLimitedSecondBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests during initial grid deployment",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        client = RateLimitedSecondBatchClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.initial_grid_deployment_pending)
+        self.assertTrue(engine.initialization_in_progress)
+        self.assertFalse(engine.initialization_failed)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertFalse(engine.grid_ready)
+        self.assertEqual(engine.grid_position_net_qty, -10.0)
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+        self.assertEqual(len(engine.active_orders), 5)
+        self.assertEqual(len(engine.initial_grid_deployment_ledger), 5)
+        accepted_links = set(engine.active_orders)
+
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        self.assertTrue(engine._deploy_pending_targets())
+
+        limit_orders = [
+            order for order in client.orders if order.get("order_type") == "Limit"
+        ]
+        actual_shapes = {
+            (
+                order["side"],
+                str(order["price"]),
+                str(order["qty"]),
+                bool(order.get("reduce_only")),
+            )
+            for order in limit_orders
+        }
+        self.assertTrue(engine.grid_ready)
+        self.assertFalse(engine.initial_grid_deployment_pending)
+        self.assertFalse(engine.initialization_in_progress)
+        self.assertIsNone(engine._pending_targets)
+        self.assertEqual(len(limit_orders), 20)
+        self.assertEqual(len(actual_shapes), 20)
+        self.assertTrue(accepted_links.issubset(engine.active_orders))
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+
+    async def test_initial_single_order_rate_limit_resumes_without_duplicate_orders(self):
+        class RateLimitedSixthGridOrderClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.grid_limit_attempts = 0
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("g_"):
+                    self.grid_limit_attempts += 1
+                    if self.grid_limit_attempts == 6:
+                        raise ExchangeRateLimitError(
+                            "Too many requests during single initial placement",
+                            retry_after=11,
+                        )
+                return super().place_order(**kwargs)
+
+        client = RateLimitedSixthGridOrderClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.initial_grid_deployment_pending)
+        self.assertEqual(len(engine.active_orders), 5)
+        accepted_links = set(engine.active_orders)
+
+        engine._exchange_rate_limit_until = 0
+        self.assertFalse(engine._deploy_pending_targets())
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            5,
+        )
+        engine._order_rejection_backoff.clear()
+        self.assertTrue(engine._deploy_pending_targets())
+
+        limit_orders = [
+            order for order in client.orders if order.get("order_type") == "Limit"
+        ]
+        self.assertTrue(engine.grid_ready)
+        self.assertEqual(len(limit_orders), 20)
+        self.assertEqual(
+            len({str(order.get("order_link_id")) for order in limit_orders}),
+            20,
+        )
+        self.assertTrue(accepted_links.issubset(engine.active_orders))
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+
+    async def test_initial_single_rate_limit_result_resumes_without_duplicate_orders(self):
+        class RateLimitedResultClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.grid_attempts = 0
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("g_"):
+                    self.grid_attempts += 1
+                    if self.grid_attempts == 6:
+                        return {
+                            "retCode": -1003,
+                            "retMsg": "Too many requests in exchange result",
+                        }
+                return super().place_order(**kwargs)
+
+        client = RateLimitedResultClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.initial_grid_deployment_pending)
+        self.assertEqual(len(engine.active_orders), 5)
+        accepted_links = set(engine.active_orders)
+
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        self.assertTrue(engine._deploy_pending_targets())
+
+        limit_orders = [
+            order for order in client.orders if order.get("order_type") == "Limit"
+        ]
+        self.assertTrue(engine.grid_ready)
+        self.assertEqual(len(limit_orders), 20)
+        self.assertEqual(
+            len({str(order.get("order_link_id")) for order in limit_orders}),
+            20,
+        )
+        self.assertTrue(accepted_links.issubset(engine.active_orders))
+
+    async def test_initial_batch_item_rate_limit_retains_other_accepted_items(self):
+        class OneRateLimitedBatchItemClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.grid_item_attempts = 0
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("g_"):
+                    self.grid_item_attempts += 1
+                    if self.grid_item_attempts == 6:
+                        return {
+                            "retCode": -1003,
+                            "retMsg": "Too many requests for one batch item",
+                        }
+                return super().place_order(**kwargs)
+
+        client = OneRateLimitedBatchItemClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.initial_grid_deployment_pending)
+        self.assertEqual(len(engine.active_orders), 9)
+        self.assertEqual(len(engine.initial_grid_deployment_ledger), 9)
+        self.assertTrue(all(order["reduce_only"] for order in engine.active_orders.values()))
+        accepted_links = set(engine.active_orders)
+
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        self.assertTrue(engine._deploy_pending_targets())
+
+        limit_orders = [
+            order for order in client.orders if order.get("order_type") == "Limit"
+        ]
+        self.assertTrue(engine.grid_ready)
+        self.assertEqual(len(limit_orders), 20)
+        self.assertEqual(
+            len({str(order.get("order_link_id")) for order in limit_orders}),
+            20,
+        )
+        self.assertTrue(accepted_links.issubset(engine.active_orders))
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+
+    async def test_initial_grid_rate_limit_restart_preserves_partial_batch_and_resumes(self):
+        class RateLimitedSecondBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests before restart",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 20,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 1,
+            "leverage": 2,
+            "initial_order_type": "market",
+            "grid_order_post_only": False,
+        }
+        client = RateLimitedSecondBatchClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        source = GridEngine(client, config)
+        await source.initialize()
+        source.running = True
+        state = copy.deepcopy(source.to_state())
+        accepted_links = set(source.active_orders)
+        accepted_limit_count = len(
+            [order for order in client.orders if order.get("order_type") == "Limit"]
+        )
+
+        corrupt_state = copy.deepcopy(state)
+        corrupt_state["initial_grid_deployment_ledger"] = []
+        corrupt = GridEngine(client, config)
+        corrupt.restore_state(corrupt_state)
+        self.assertFalse(corrupt.initial_grid_deployment_pending)
+        self.assertTrue(corrupt.initialization_failed)
+        self.assertTrue(corrupt.manual_stop_pending)
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            accepted_limit_count,
+        )
+
+        restored = GridEngine(client, config)
+        restored.restore_state(state)
+
+        self.assertTrue(restored.initial_grid_deployment_pending)
+        self.assertTrue(restored.initialization_in_progress)
+        self.assertFalse(restored.initialization_failed)
+        self.assertFalse(restored.manual_stop_pending)
+        self.assertFalse(restored.grid_ready)
+        self.assertEqual(set(restored.active_orders), accepted_links)
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            accepted_limit_count,
+        )
+
+        restored._exchange_rate_limit_until = 0
+        restored._order_rejection_backoff.clear()
+        self.assertTrue(restored._deploy_pending_targets())
+
+        limit_orders = [
+            order for order in client.orders if order.get("order_type") == "Limit"
+        ]
+        self.assertTrue(restored.grid_ready)
+        self.assertEqual(len(limit_orders), 20)
+        self.assertEqual(
+            len({str(order.get("order_link_id")) for order in limit_orders}),
+            20,
+        )
+        self.assertTrue(accepted_links.issubset(restored.active_orders))
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+
+    async def test_initial_grid_restart_adopts_all_write_ahead_orders_without_resubmit(self):
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "neutral",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 20,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 1,
+            "leverage": 2,
+            "initial_order_type": "market",
+            "grid_order_post_only": False,
+        }
+        client = BatchFakeClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        source = GridEngine(client, config)
+        source._fetch_precision()
+        source.grid_levels = source._calculate_levels()
+        source.current_price = 100
+        source._prepare_pending_targets(100)
+        plan = source._validated_pending_target_plan()
+        source.initialization_in_progress = True
+        source.initial_grid_deployment_pending = True
+        source.initial_grid_deployment_ledger = {}
+        placed_links = source._place_batch_limit_orders(plan)
+        source.running = True
+        state = copy.deepcopy(source.to_state())
+        order_count_before = len(client.orders)
+
+        self.assertEqual(len(placed_links), 20)
+        self.assertEqual(source.initial_grid_deployment_ledger, {})
+
+        restored = GridEngine(client, config)
+        restored.restore_state(state)
+
+        self.assertTrue(restored.initial_grid_deployment_pending)
+        self.assertFalse(restored.grid_ready)
+        self.assertTrue(restored._deploy_pending_targets())
+        self.assertTrue(restored.grid_ready)
+        self.assertEqual(len(client.orders), order_count_before)
+        self.assertEqual(set(restored.active_orders), set(placed_links))
+
+    async def test_initial_grid_unknown_batch_is_retained_across_later_rate_limit(self):
+        class HiddenAcceptedBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+                self.hidden_links = set()
+                self.hide_accepted_batch = True
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    super().place_orders(orders)
+                    self.hidden_links.update(
+                        str(order.get("order_link_id")) for order in orders
+                    )
+                    raise TimeoutError("second batch acknowledgement was lost")
+                if self.batch_attempts == 3:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests after uncertain batch",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+            def get_open_orders(self, symbol):
+                response = super().get_open_orders(symbol)
+                if self.hide_accepted_batch:
+                    response["result"]["list"] = [
+                        order
+                        for order in response["result"]["list"]
+                        if str(order.get("orderLinkId")) not in self.hidden_links
+                    ]
+                return response
+
+            def get_order_by_link(self, symbol, order_link_id):
+                if self.hide_accepted_batch and str(order_link_id) in self.hidden_links:
+                    return {"retCode": 0, "result": {}}
+                return super().get_order_by_link(symbol, order_link_id)
+
+        client = HiddenAcceptedBatchClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+
+        uncertain_links = set(client.hidden_links)
+        self.assertEqual(len(uncertain_links), 5)
+        self.assertEqual(len(engine.initial_grid_deployment_ledger), 10)
+        self.assertTrue(
+            all(engine.active_orders[link].get("submission_pending") for link in uncertain_links)
+        )
+
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        self.assertTrue(engine._deploy_pending_targets())
+
+        limit_orders = [
+            order for order in client.orders if order.get("order_type") == "Limit"
+        ]
+        self.assertEqual(len(limit_orders), 20)
+        self.assertEqual(
+            len({str(order.get("order_link_id")) for order in limit_orders}),
+            20,
+        )
+        self.assertTrue(uncertain_links.issubset(engine.active_orders))
+
+        client.hide_accepted_batch = False
+        engine._reconcile_exchange_open_orders()
+
+        self.assertTrue(
+            all(
+                not engine.active_orders[link].get("submission_pending", False)
+                for link in uncertain_links
+            )
+        )
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            20,
+        )
+
+    async def test_initial_grid_fill_during_rate_limit_is_not_reopened_on_resume(self):
+        class RateLimitedSecondBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests while an initial target fills",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        client = RateLimitedSecondBatchClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+        filled_link, filled_state = next(iter(engine.active_orders.items()))
+        filled_order = next(
+            order
+            for order in client.orders
+            if str(order.get("orderId")) == str(filled_state["order_id"])
+        )
+        client.open_limit_order_ids.discard(str(filled_order["orderId"]))
+        filled_order["orderStatus"] = "FILLED"
+
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        self.assertTrue(engine._deploy_pending_targets())
+
+        initial_limit_links = {
+            str(order.get("order_link_id"))
+            for order in client.orders
+            if order.get("order_type") == "Limit"
+        }
+        self.assertEqual(len(initial_limit_links), 20)
+        self.assertIn(filled_link, initial_limit_links)
+
+        engine._reconcile_exchange_open_orders()
+
+        self.assertNotIn(filled_link, engine.active_orders)
+        self.assertEqual(
+            sum(
+                1
+                for order in client.orders
+                if str(order.get("order_link_id")) == filled_link
+            ),
+            1,
+        )
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            21,
+        )
+        self.assertEqual(len(engine.active_orders), 20)
+
+    async def test_initial_grid_resume_accepts_partial_remainder_for_submitted_target(self):
+        class RateLimitedSecondBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests before partial remainder",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        client = RateLimitedSecondBatchClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+        await engine.initialize()
+        covered_key, covered_entry = next(
+            iter(engine.initial_grid_deployment_ledger.items())
+        )
+        original_link = str(covered_entry["link_id"])
+        original = engine.active_orders.pop(original_link)
+        client.open_limit_order_ids.discard(str(original["order_id"]))
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        remainder_link = f"g_{original['level_idx']}_{original['side'][0]}_remainder"
+        self.assertEqual(
+            engine._place(
+                str(original["side"]),
+                float(original["price"]),
+                int(original["level_idx"]),
+                reduce_only=bool(original["reduce_only"]),
+                qty_override=0.6,
+                entry_price=original.get("entry_price"),
+                allow_duplicate=True,
+                link_id_override=remainder_link,
+            ),
+            remainder_link,
+        )
+
+        self.assertTrue(engine._deploy_pending_targets())
+
+        same_target = [
+            order
+            for order in engine.active_orders.values()
+            if engine._initial_grid_plan_key(order) == covered_key
+        ]
+        self.assertTrue(engine.grid_ready)
+        self.assertEqual(len(same_target), 1)
+        self.assertEqual(same_target[0]["link_id"], remainder_link)
+        self.assertEqual(float(same_target[0]["qty"]), 0.6)
+        self.assertNotIn(original_link, engine.active_orders)
+
+    async def test_run_loop_resumes_rate_limited_initial_grid_automatically(self):
+        class RateLimitedSecondBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests before automatic resume",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        client = RateLimitedSecondBatchClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+        await engine.initialize()
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        engine.running = True
+
+        async def stop_after_completed_tick():
+            if engine.grid_ready:
+                engine.running = False
+            await asyncio.sleep(0)
+
+        engine._sleep_until_next_poll = stop_after_completed_tick
+        await asyncio.wait_for(engine._run_loop(), timeout=1)
+
+        self.assertTrue(engine.grid_ready)
+        self.assertFalse(engine.initial_grid_deployment_pending)
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            20,
+        )
+
+    async def test_initial_batch_rate_limit_resume_is_symmetric_for_long_and_neutral(self):
+        class RateLimitedSecondBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests during symmetric deployment",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        for direction in ("long", "neutral"):
+            with self.subTest(direction=direction):
+                client = RateLimitedSecondBatchClient(
+                    "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+                )
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": direction,
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 20,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 1,
+                        "leverage": 2,
+                        "initial_order_type": "market",
+                        "grid_order_post_only": False,
+                    },
+                )
+
+                await engine.initialize()
+
+                self.assertTrue(engine.initial_grid_deployment_pending)
+                self.assertFalse(engine.grid_ready)
+                self.assertEqual(len(engine.active_orders), 5)
+                if direction == "long":
+                    self.assertEqual(engine.grid_position_net_qty, 10.0)
+                    self.assertEqual(client.positions[0]["side"], "Buy")
+                    self.assertTrue(
+                        all(order["reduce_only"] for order in engine.active_orders.values())
+                    )
+                else:
+                    self.assertEqual(engine.grid_position_net_qty, 0.0)
+                    self.assertEqual(client.positions, [])
+
+                engine._exchange_rate_limit_until = 0
+                engine._order_rejection_backoff.clear()
+                self.assertTrue(engine._deploy_pending_targets())
+
+                self.assertTrue(engine.grid_ready)
+                self.assertEqual(
+                    len(
+                        [
+                            order
+                            for order in client.orders
+                            if order.get("order_type") == "Limit"
+                        ]
+                    ),
+                    20,
+                )
+
+    async def test_corrupt_initial_deployment_ledger_fails_closed_without_new_order(self):
+        class RateLimitedSecondBatchClient(BatchFakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == 2:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests before ledger corruption",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        client = RateLimitedSecondBatchClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+        await engine.initialize()
+        first_entry = next(iter(engine.initial_grid_deployment_ledger.values()))
+        first_entry["qty"] = "9.9"
+        limit_count_before = len(
+            [order for order in client.orders if order.get("order_type") == "Limit"]
+        )
+        engine._exchange_rate_limit_until = 0
+        engine._order_rejection_backoff.clear()
+        engine.running = True
+
+        async def stop_after_failure_tick():
+            if engine.manual_stop_pending:
+                engine.running = False
+            await asyncio.sleep(0)
+
+        engine._sleep_until_next_poll = stop_after_failure_tick
+        await asyncio.wait_for(engine._run_loop(), timeout=1)
+
+        self.assertTrue(engine.initialization_failed)
+        self.assertTrue(engine.manual_stop_pending)
+        self.assertFalse(engine.initial_grid_deployment_pending)
+        self.assertFalse(engine.grid_ready)
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            limit_count_before,
+        )
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+
+    async def test_initial_batch_rate_limit_every_chunk_boundary_resumes_exactly(self):
+        class RateLimitedBatchClient(BatchFakeClient):
+            def __init__(self, fail_at, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fail_at = fail_at
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == self.fail_at:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        f"Too many requests at batch {self.fail_at}",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        for direction in ("long", "short", "neutral"):
+            for fail_at in (1, 2, 3, 4):
+                with self.subTest(direction=direction, fail_at=fail_at):
+                    client = RateLimitedBatchClient(
+                        fail_at,
+                        "100",
+                        tick_size="1",
+                        qty_step="0.1",
+                        min_qty="0.1",
+                    )
+                    engine = GridEngine(
+                        client,
+                        {
+                            "symbol": "TESTUSDT",
+                            "direction": direction,
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 20,
+                            "total_investment": 0,
+                            "position_sizing_mode": "fixed_grid_qty",
+                            "grid_order_qty": 0.2,
+                            "leverage": 2,
+                            "initial_order_type": "market",
+                            "grid_order_post_only": False,
+                        },
+                    )
+
+                    await engine.initialize()
+
+                    expected_partial = (fail_at - 1) * grid_engine.BATCH_ORDER_CHUNK_SIZE
+                    self.assertTrue(engine.initial_grid_deployment_pending)
+                    self.assertEqual(len(engine.active_orders), expected_partial)
+                    self.assertEqual(
+                        len(engine.initial_grid_deployment_ledger),
+                        expected_partial,
+                    )
+
+                    engine._exchange_rate_limit_until = 0
+                    engine._order_rejection_backoff.clear()
+                    self.assertTrue(engine._deploy_pending_targets())
+
+                    limit_orders = [
+                        order
+                        for order in client.orders
+                        if order.get("order_type") == "Limit"
+                    ]
+                    self.assertTrue(engine.grid_ready)
+                    self.assertEqual(len(limit_orders), 20)
+                    self.assertEqual(
+                        len(
+                            {
+                                (
+                                    order["side"],
+                                    str(order["price"]),
+                                    str(order["qty"]),
+                                    bool(order.get("reduce_only")),
+                                )
+                                for order in limit_orders
+                            }
+                        ),
+                        20,
+                    )
+
+    async def test_initial_single_rate_limit_multiple_order_boundaries_resume_exactly(self):
+        class RateLimitedOrderClient(FakeClient):
+            def __init__(self, fail_at, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fail_at = fail_at
+                self.grid_attempts = 0
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("g_"):
+                    self.grid_attempts += 1
+                    if self.grid_attempts == self.fail_at:
+                        raise ExchangeRateLimitError(
+                            f"Too many requests at order {self.fail_at}",
+                            retry_after=17,
+                        )
+                return super().place_order(**kwargs)
+
+        for direction in ("long", "short"):
+            for fail_at in (1, 2, 6, 11, 20):
+                with self.subTest(direction=direction, fail_at=fail_at):
+                    client = RateLimitedOrderClient(
+                        fail_at,
+                        "100",
+                        tick_size="1",
+                        qty_step="0.1",
+                        min_qty="0.1",
+                    )
+                    engine = GridEngine(
+                        client,
+                        {
+                            "symbol": "TESTUSDT",
+                            "direction": direction,
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 20,
+                            "total_investment": 0,
+                            "position_sizing_mode": "fixed_grid_qty",
+                            "grid_order_qty": 0.2,
+                            "leverage": 2,
+                            "initial_order_type": "market",
+                            "grid_order_post_only": False,
+                        },
+                    )
+
+                    await engine.initialize()
+
+                    self.assertTrue(engine.initial_grid_deployment_pending)
+                    self.assertEqual(len(engine.active_orders), fail_at - 1)
+                    accepted_links = set(engine.active_orders)
+
+                    engine._exchange_rate_limit_until = 0
+                    engine._order_rejection_backoff.clear()
+                    self.assertTrue(engine._deploy_pending_targets())
+
+                    limit_orders = [
+                        order
+                        for order in client.orders
+                        if order.get("order_type") == "Limit"
+                    ]
+                    self.assertTrue(engine.grid_ready)
+                    self.assertEqual(len(limit_orders), 20)
+                    self.assertEqual(
+                        len({str(order.get("order_link_id")) for order in limit_orders}),
+                        20,
+                    )
+                    self.assertTrue(accepted_links.issubset(engine.active_orders))
+
+    async def test_initial_batch_rate_limit_handles_partial_final_chunks_and_grid_sizes(self):
+        class RateLimitedBatchClient(BatchFakeClient):
+            def __init__(self, fail_at, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fail_at = fail_at
+                self.batch_attempts = 0
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                if self.batch_attempts == self.fail_at:
+                    self.batch_calls.append([dict(order) for order in orders])
+                    raise ExchangeRateLimitError(
+                        "Too many requests on final initial batch",
+                        retry_after=17,
+                    )
+                return super().place_orders(orders)
+
+        for grid_count in (17, 25, 35, 40, 100):
+            with self.subTest(grid_count=grid_count):
+                # The midpoint is a level for even counts. For odd counts it is
+                # between two levels, so both surrounding entry targets exist.
+                expected_plan_count = grid_count + (grid_count % 2)
+                final_batch = (
+                    expected_plan_count + grid_engine.BATCH_ORDER_CHUNK_SIZE - 1
+                ) // grid_engine.BATCH_ORDER_CHUNK_SIZE
+                client = RateLimitedBatchClient(
+                    final_batch,
+                    "100",
+                    tick_size="0.1",
+                    qty_step="0.1",
+                    min_qty="0.1",
+                )
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "short",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": grid_count,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 0.2,
+                        "leverage": 2,
+                        "initial_order_type": "market",
+                        "grid_order_post_only": False,
+                    },
+                )
+
+                await engine.initialize()
+
+                expected_partial = (final_batch - 1) * grid_engine.BATCH_ORDER_CHUNK_SIZE
+                self.assertTrue(engine.initial_grid_deployment_pending)
+                self.assertEqual(len(engine.active_orders), expected_partial)
+
+                engine._exchange_rate_limit_until = 0
+                engine._order_rejection_backoff.clear()
+                self.assertTrue(engine._deploy_pending_targets())
+
+                limit_orders = [
+                    order
+                    for order in client.orders
+                    if order.get("order_type") == "Limit"
+                ]
+                self.assertTrue(engine.grid_ready)
+                self.assertEqual(len(limit_orders), expected_plan_count)
+                self.assertEqual(
+                    len({str(order.get("order_link_id")) for order in limit_orders}),
+                    expected_plan_count,
+                )
+
     async def test_batch_quantity_shrink_stops_grid_and_keeps_order_cancellable(self):
         class ShrinkingBatchClient(BatchFakeClient):
             def place_orders(self, orders):

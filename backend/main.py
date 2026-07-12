@@ -1783,6 +1783,8 @@ async def start_grid(cfg: GridConfig):
         )
         if has_exchange_state:
             engine.initialization_in_progress = False
+            engine.initial_grid_deployment_pending = False
+            engine.initial_grid_deployment_ledger.clear()
             engine.initialization_failed = True
             engine.manual_stop_pending = True
             engine.grid_ready = False
@@ -2056,6 +2058,9 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     manual_stop_pending = False
     initialization_failed = False
     initialization_in_progress = False
+    initial_grid_deployment_pending = False
+    initial_grid_deployment_submitted_count = 0
+    initial_grid_deployment_total_count = 0
     if engine:
         status = engine.get_status()
         expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
@@ -2074,6 +2079,15 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         manual_stop_pending = bool(status.get("manual_stop_pending"))
         initialization_failed = bool(status.get("initialization_failed"))
         initialization_in_progress = bool(status.get("initialization_in_progress"))
+        initial_grid_deployment_pending = bool(
+            status.get("initial_grid_deployment_pending")
+        )
+        initial_grid_deployment_submitted_count = int(
+            status.get("initial_grid_deployment_submitted_count", 0) or 0
+        )
+        initial_grid_deployment_total_count = int(
+            status.get("initial_grid_deployment_total_count", 0) or 0
+        )
         pending_submissions = [
             {
                 "order_link_id": order.get("link_id", ""),
@@ -2146,6 +2160,9 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "manual_stop_pending": manual_stop_pending,
         "initialization_failed": initialization_failed,
         "initialization_in_progress": initialization_in_progress,
+        "initial_grid_deployment_pending": initial_grid_deployment_pending,
+        "initial_grid_deployment_submitted_count": initial_grid_deployment_submitted_count,
+        "initial_grid_deployment_total_count": initial_grid_deployment_total_count,
         "state_store_error": _grid_state_integrity_error,
         "history_store_error": _grid_history_integrity_error,
         "positions": positions,

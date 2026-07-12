@@ -649,6 +649,97 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertTrue(saved["running"])
         self.assertTrue(saved["opening_order"]["submission_retry_safe"])
 
+    def test_rate_limited_initial_grid_deployment_returns_running_recoverable_state(self):
+        class RateLimitedGridDeploymentClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.batch_attempts = 0
+                self.batch_calls = []
+
+            def place_orders(self, orders):
+                self.batch_attempts += 1
+                self.batch_calls.append([dict(order) for order in orders])
+                if self.batch_attempts == 2:
+                    raise ExchangeRateLimitError(
+                        "Too many requests during initial grid deployment",
+                        retry_after=60,
+                    )
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [self.place_order(**order) for order in orders],
+                    },
+                }
+
+        client = RateLimitedGridDeploymentClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("GRIDLIMITUSDT")
+        payload.update(
+            {
+                "direction": "short",
+                "grid_count": 20,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            }
+        )
+
+        response = self.client.post("/api/grid/start", json=payload)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        engine = main._get_engine("binance", "GRIDLIMITUSDT")
+        self.assertIsNotNone(engine)
+        self.assertTrue(engine.running)
+        self.assertTrue(engine.initial_grid_deployment_pending)
+        self.assertTrue(engine.initialization_in_progress)
+        self.assertFalse(engine.initialization_failed)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertFalse(engine.grid_ready)
+        self.assertEqual(len(engine.active_orders), 5)
+        self.assertEqual(len(engine.initial_grid_deployment_ledger), 5)
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Market"]),
+            1,
+        )
+        self.assertEqual(
+            len([order for order in client.orders if order.get("order_type") == "Limit"]),
+            5,
+        )
+
+        saved = main._load_grid_state_file()["grids"][
+            main._engine_key("binance", "GRIDLIMITUSDT")
+        ]
+        self.assertTrue(saved["running"])
+        self.assertTrue(saved["initial_grid_deployment_pending"])
+        self.assertEqual(len(saved["initial_grid_deployment_ledger"]), 5)
+
+        risk = self.client.get(
+            "/api/risk/GRIDLIMITUSDT?exchange=binance"
+        ).json()
+        self.assertTrue(risk["initial_grid_deployment_pending"])
+        self.assertEqual(risk["initial_grid_deployment_submitted_count"], 5)
+        self.assertEqual(risk["initial_grid_deployment_total_count"], 20)
+        self.assertTrue(risk["has_risk"])
+        history = self.client.get(
+            "/api/grid/history?exchange=binance"
+        ).json()["runs"]
+        run = next(item for item in history if item["symbol"] == "GRIDLIMITUSDT")
+        self.assertEqual(run["status"], "running")
+
+        stop = self.client.post(
+            "/api/grid/stop/GRIDLIMITUSDT?exchange=binance"
+        )
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertIsNone(main._get_engine("binance", "GRIDLIMITUSDT"))
+        self.assertEqual(float(client.positions[0]["size"]), 10.0)
+        self.assertEqual(client.open_limit_order_ids, set())
+
     def test_nonrunning_engine_with_unconfirmed_orders_blocks_restart_and_can_be_stopped(self):
         config = self._payload("MUUSDT")
         config["exchange"] = "binance"
