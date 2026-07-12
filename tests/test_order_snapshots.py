@@ -617,6 +617,69 @@ class AdapterOrderSnapshotTests(unittest.TestCase):
         client._request = lambda *args, **kwargs: rejected
         self.assertIs(client.place_order(**self.order_request()), rejected)
 
+    def test_binance_style_cancel_ack_requires_full_cancelled_order(self):
+        factories = (
+            lambda: BinanceFuturesClient("", "", True),
+            lambda: AsterFuturesClient("", "", base_url="https://example.test"),
+        )
+        valid = binance_order(status="CANCELED")
+        valid.pop("time")
+        corruptions = {
+            "missing side": lambda row: row.pop("side"),
+            "wrong order": lambda row: row.__setitem__("orderId", 1002),
+            "wrong symbol": lambda row: row.__setitem__("symbol", "OTHERUSDT"),
+            "not cancelled": lambda row: row.__setitem__("status", "NEW"),
+            "execution beyond quantity": lambda row: row.__setitem__(
+                "executedQty", "2.01"
+            ),
+        }
+        for factory in factories:
+            client = factory()
+            with self.subTest(client=type(client).__name__, case="valid"):
+                client._request = lambda *args, **kwargs: copy.deepcopy(valid)
+                result = client.cancel_order("MUUSDT", "1001")["result"]
+                self.assertEqual(result["orderId"], "1001")
+                self.assertEqual(result["orderStatus"], "CANCELED")
+
+            for label, mutate in corruptions.items():
+                with self.subTest(client=type(client).__name__, case=label):
+                    response = copy.deepcopy(valid)
+                    mutate(response)
+                    client._request = (
+                        lambda *args, _response=response, **kwargs: _response
+                    )
+                    with self.assertRaises(ExchangeRequestUncertainError):
+                        client.cancel_order("MUUSDT", "1001")
+
+    def test_bybit_cancel_ack_identity_is_validated_before_success(self):
+        client = BybitClient("", "", True)
+        valid = {
+            "retCode": 0,
+            "result": {"orderId": "1001", "orderLinkId": "g_1_S_snapshot"},
+        }
+        client._request = lambda *args, **kwargs: valid
+        result = client.cancel_order("MUUSDT", "1001")["result"]
+        self.assertEqual(result["orderId"], "1001")
+
+        for response in (
+            {"retCode": 0, "result": {}},
+            {
+                "retCode": 0,
+                "result": {"orderId": "1002", "orderLinkId": "g_1_S_snapshot"},
+            },
+            [],
+        ):
+            with self.subTest(response=response):
+                client._request = (
+                    lambda *args, _response=response, **kwargs: _response
+                )
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.cancel_order("MUUSDT", "1001")
+
+        rejected = {"retCode": 10001, "retMsg": "parameter error"}
+        client._request = lambda *args, **kwargs: rejected
+        self.assertIs(client.cancel_order("MUUSDT", "1001"), rejected)
+
 
 if __name__ == "__main__":
     unittest.main()

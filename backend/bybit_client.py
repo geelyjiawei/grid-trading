@@ -279,12 +279,32 @@ class BybitClient:
         return {**response, "result": result}
 
     def cancel_order(self, symbol: str, order_id: str) -> dict:
-        return self._request(
+        symbol = symbol.upper()
+        order_id = str(order_id)
+        response = self._request(
             "POST",
             "/v5/order/cancel",
             payload={"category": "linear", "symbol": symbol, "orderId": order_id},
             auth=True,
         )
+        if not isinstance(response, dict):
+            raise ExchangeRequestUncertainError(
+                "Bybit cancellation acknowledgement must be an object"
+            )
+        if response.get("retCode") != 0:
+            return response
+        try:
+            result = normalize_order_ack_row(
+                response.get("result"),
+                expected_symbol=symbol,
+                expected_order_id=order_id,
+                context=f"{symbol} cancellation acknowledgement",
+            )
+        except RuntimeError as exc:
+            raise ExchangeRequestUncertainError(
+                f"Bybit cancellation acknowledgement is not authoritative: {exc}"
+            ) from exc
+        return {**response, "result": result}
 
     def cancel_all_orders(self, symbol: str) -> dict:
         return self._request(

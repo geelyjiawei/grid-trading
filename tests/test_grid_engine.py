@@ -12217,6 +12217,95 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.orders), 1)
         self.assertEqual(engine.paused_replacements, [])
 
+    async def test_stop_retains_cancelled_order_until_lagging_trades_match_snapshot(self):
+        class LaggingCancelTradesClient(FakeClient):
+            confirmed_trade_qty = 0.4
+
+            def cancel_order(self, symbol, order_id):
+                order = next(
+                    item for item in self.orders if str(item["orderId"]) == str(order_id)
+                )
+                self.open_limit_order_ids.discard(str(order_id))
+                order["orderStatus"] = "CANCELED"
+                return {"retCode": 0}
+
+            def get_order(self, symbol, order_id):
+                response = super().get_order(symbol, order_id)
+                response["result"].update(
+                    {
+                        "orderStatus": "CANCELED",
+                        "executedQty": "0.6",
+                        "cumQuote": "60.6",
+                        "avgPrice": "101",
+                    }
+                )
+                return response
+
+            def get_order_trades(self, symbol, order_id):
+                qty = self.confirmed_trade_qty
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "qty": str(qty),
+                                "price": "101",
+                                "volume": str(qty * 101),
+                                "feeUsdt": str(qty * 101 * 0.0002),
+                                "feeAsset": "USDT",
+                                "isMaker": True,
+                            }
+                        ]
+                    },
+                }
+
+        client = LaggingCancelTradesClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 1,
+            "qty_per_grid": 1,
+            "leverage": 2,
+            "grid_order_post_only": False,
+        }
+        engine = GridEngine(client, config)
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.reduce_lots_complete = True
+        link_id = engine._place("Sell", 101, 0, reduce_only=False, qty_override=1)
+        engine.running = True
+
+        with patch("grid_engine.asyncio.sleep", new=unittest.mock.AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                await engine.stop()
+
+        self.assertIn(link_id, engine.active_orders)
+        self.assertTrue(engine.manual_stop_pending)
+        self.assertAlmostEqual(engine.grid_position_net_qty, -0.4)
+        durable = copy.deepcopy(engine.to_state())
+
+        client.confirmed_trade_qty = 0.6
+        restored = GridEngine(client, config)
+        restored.restore_state(durable)
+        await restored.stop()
+
+        self.assertEqual(restored.active_orders, {})
+        self.assertFalse(restored.manual_stop_pending)
+        self.assertAlmostEqual(restored.grid_position_net_qty, -0.6)
+        self.assertAlmostEqual(
+            sum(float(fill["qty"]) for fill in restored.filled_orders),
+            0.6,
+        )
+        self.assertEqual(len(client.orders), 1)
+
     async def test_stop_accounts_partial_opening_fill_without_touching_baseline_position(self):
         class PartialOpeningFillOnCancelClient(FakeClient):
             def __init__(self, *args, **kwargs):

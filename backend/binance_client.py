@@ -17,6 +17,7 @@ from exchange_errors import (
 )
 from exchange_snapshots import (
     OPEN_ORDER_STATUSES,
+    normalize_binance_style_cancel_ack,
     normalize_binance_style_order_ack,
     normalize_binance_style_order_rows,
     normalize_futures_balance_rows,
@@ -559,13 +560,25 @@ class BinanceFuturesClient:
         return f"{base_url}/{listen_key}"
 
     def cancel_order(self, symbol: str, order_id: str) -> dict:
-        self._request(
+        symbol = symbol.upper()
+        order_id = str(order_id)
+        response = self._request(
             "DELETE",
             "/fapi/v1/order",
-            params={"symbol": symbol.upper(), "orderId": order_id},
+            params={"symbol": symbol, "orderId": order_id},
             auth=True,
         )
-        return {"retCode": 0}
+        try:
+            result = normalize_binance_style_cancel_ack(
+                response,
+                expected_symbol=symbol,
+                expected_order_id=order_id,
+            )
+        except RuntimeError as exc:
+            raise ExchangeRequestUncertainError(
+                f"Binance cancellation acknowledgement is not authoritative: {exc}"
+            ) from exc
+        return {"retCode": 0, "result": result}
 
     def cancel_all_orders(self, symbol: str) -> dict:
         self._request(

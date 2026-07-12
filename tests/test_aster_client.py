@@ -366,6 +366,63 @@ class AsterClientTests(unittest.TestCase):
                 with self.assertRaises(ExchangeRequestUncertainError):
                     client.cancel_order("ASTERUSDT", "123")
 
+    def test_cancel_acknowledgement_must_match_requested_order(self):
+        acknowledgement = {
+            "symbol": "ASTERUSDT",
+            "orderId": 999,
+            "clientOrderId": "g_1_S_cancel",
+            "side": "SELL",
+            "price": "1.25",
+            "origQty": "4",
+            "avgPrice": "0",
+            "executedQty": "0",
+            "cumQuote": "0",
+            "status": "CANCELED",
+            "reduceOnly": False,
+            "timeInForce": "GTC",
+            "type": "LIMIT",
+        }
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client.session = FakeSession(FakeResponse(acknowledgement))
+
+        with self.assertRaises(ExchangeRequestUncertainError):
+            client.cancel_order("ASTERUSDT", "123")
+
+    def test_cancel_acknowledgement_accepts_official_partial_cancel_shape(self):
+        acknowledgement = {
+            "symbol": "ASTERUSDT",
+            "orderId": 123,
+            "clientOrderId": "g_1_S_cancel",
+            "side": "SELL",
+            "price": "1.25",
+            "origQty": "4",
+            "avgPrice": "1.25",
+            "executedQty": "1",
+            "cumQuote": "1.25",
+            "status": "CANCELED",
+            "reduceOnly": False,
+            "timeInForce": "GTC",
+            "type": "LIMIT",
+        }
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client.session = FakeSession(FakeResponse(acknowledgement))
+
+        response = client.cancel_order("ASTERUSDT", "123")
+
+        self.assertEqual(response["result"]["orderId"], "123")
+        self.assertEqual(response["result"]["orderStatus"], "CANCELED")
+        self.assertEqual(response["result"]["executedQty"], "1")
+
     def test_signature_payload_uses_eip712_message_body(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
 

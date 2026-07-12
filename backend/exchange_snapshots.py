@@ -675,12 +675,14 @@ def normalize_order_ack_row(
     row: Any,
     *,
     expected_symbol: str = "",
+    expected_order_id: str = "",
     expected_link_id: str = "",
     context: str | None = None,
 ) -> dict:
     validated = validate_order_row(
         row,
         expected_symbol=expected_symbol,
+        expected_order_id=expected_order_id,
         expected_link_id=expected_link_id,
         require_details=False,
         context=context,
@@ -708,6 +710,7 @@ def normalize_binance_style_order_ack(
     row: Any,
     *,
     expected_symbol: str = "",
+    expected_order_id: str = "",
     expected_link_id: str = "",
 ) -> dict:
     context = _order_context(expected_symbol, None)
@@ -745,9 +748,45 @@ def normalize_binance_style_order_ack(
     return normalize_order_ack_row(
         mapped,
         expected_symbol=expected_symbol,
+        expected_order_id=expected_order_id,
         expected_link_id=expected_link_id,
         context=context,
     )
+
+
+def normalize_binance_style_cancel_ack(
+    row: Any,
+    *,
+    expected_symbol: str,
+    expected_order_id: str,
+) -> dict:
+    context = f"{expected_symbol.upper()} cancellation acknowledgement"
+    if not isinstance(row, dict):
+        raise RuntimeError(f"{context} must be an object")
+    required_fields = {
+        "symbol",
+        "orderId",
+        "clientOrderId",
+        "side",
+        "price",
+        "origQty",
+        "executedQty",
+        "status",
+        "reduceOnly",
+        "timeInForce",
+        "type",
+    }
+    missing = sorted(field for field in required_fields if field not in row)
+    if missing:
+        raise RuntimeError(f"{context} is missing {', '.join(missing)}")
+    normalized = normalize_binance_style_order_ack(
+        row,
+        expected_symbol=expected_symbol,
+        expected_order_id=expected_order_id,
+    )
+    if normalized.get("orderStatus") != "CANCELED":
+        raise RuntimeError(f"{context} does not confirm a cancelled order")
+    return normalized
 
 
 def _execution_context(symbol: str, context: str | None) -> str:

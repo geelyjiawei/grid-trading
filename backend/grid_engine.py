@@ -567,6 +567,21 @@ class GridEngine:
     def _record_opening_execution_for_stop(self, order: dict, stats: dict) -> bool:
         return self._record_opening_execution_delta(order, stats)
 
+    @staticmethod
+    def _reported_execution_qty(snapshot: dict) -> tuple[bool, Decimal | None]:
+        for key in ("executedQty", "cumExecQty", "cumQty", "cum_exec_qty"):
+            value = snapshot.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                qty = Decimal(str(value))
+            except Exception:
+                return True, None
+            if not qty.is_finite() or qty < 0:
+                return True, None
+            return True, qty
+        return False, None
+
     def _terminal_order_accounted_for_stop(
         self,
         order: dict,
@@ -587,6 +602,33 @@ class GridEngine:
         processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
         fully_accounted = processed_qty + self._qty_tolerance_decimal() >= planned_qty
         if self._is_cancelled_status(status):
+            execution_reported, executed_qty = self._reported_execution_qty(snapshot)
+            if execution_reported and executed_qty is None:
+                logger.error(
+                    "Cancelled order has invalid executed quantity; retaining it for "
+                    "reconciliation symbol=%s order_id=%s link_id=%s",
+                    self.config.get("symbol"),
+                    order.get("order_id"),
+                    order.get("link_id"),
+                )
+                self._mark_fast_poll()
+                return False
+            if (
+                executed_qty is not None
+                and processed_qty + self._qty_tolerance_decimal() < executed_qty
+            ):
+                logger.warning(
+                    "Cancelled order execution details are lagging; retaining it for "
+                    "reconciliation symbol=%s order_id=%s link_id=%s processed_qty=%s "
+                    "exchange_executed_qty=%s",
+                    self.config.get("symbol"),
+                    order.get("order_id"),
+                    order.get("link_id"),
+                    processed_qty,
+                    executed_qty,
+                )
+                self._mark_fast_poll()
+                return False
             return True
         if self._is_filled_status(status):
             return fully_accounted

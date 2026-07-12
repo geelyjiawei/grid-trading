@@ -4132,6 +4132,98 @@ class MultiGridServerTests(unittest.TestCase):
                 with self.assertRaises(ExchangeRequestUncertainError):
                     client.cancel_order("TESTUSDT", "123")
 
+    def test_binance_cancel_acknowledgement_must_match_requested_order(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 200
+        response.text = "cancel acknowledgement"
+        response.headers = {}
+        response.json.return_value = {
+            "symbol": "TESTUSDT",
+            "orderId": 999,
+            "clientOrderId": "g_0_S_cancel",
+            "side": "SELL",
+            "price": "101",
+            "origQty": "1",
+            "avgPrice": "0",
+            "executedQty": "0",
+            "cumQuote": "0",
+            "status": "CANCELED",
+            "reduceOnly": False,
+            "timeInForce": "GTC",
+            "type": "LIMIT",
+        }
+        client.session.request = Mock(return_value=response)
+
+        with self.assertRaises(ExchangeRequestUncertainError):
+            client.cancel_order("TESTUSDT", "123")
+
+    def test_binance_cancel_acknowledgement_accepts_official_shape(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        response = Mock()
+        response.status_code = 200
+        response.text = "cancel acknowledgement"
+        response.headers = {}
+        response.json.return_value = {
+            "symbol": "TESTUSDT",
+            "orderId": 123,
+            "clientOrderId": "g_0_S_cancel",
+            "side": "SELL",
+            "price": "101",
+            "origQty": "1",
+            "avgPrice": "101",
+            "executedQty": "0.4",
+            "cumQuote": "40.4",
+            "status": "CANCELED",
+            "reduceOnly": False,
+            "timeInForce": "GTC",
+            "type": "LIMIT",
+        }
+        client.session.request = Mock(return_value=response)
+
+        result = client.cancel_order("TESTUSDT", "123")
+
+        self.assertEqual(result["result"]["orderId"], "123")
+        self.assertEqual(result["result"]["orderStatus"], "CANCELED")
+        self.assertEqual(result["result"]["executedQty"], "0.4")
+
+    def test_bybit_cancel_acknowledgement_must_match_requested_order(self):
+        client = BybitClient("key", "secret")
+        response = Mock()
+        response.status_code = 200
+        response.text = "cancel acknowledgement"
+        response.headers = {}
+        response.json.return_value = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {"orderId": "wrong-order", "orderLinkId": ""},
+        }
+
+        with patch("bybit_client.requests.post", return_value=response):
+            with self.assertRaises(ExchangeRequestUncertainError):
+                client.cancel_order("TESTUSDT", "requested-order")
+
+    def test_bybit_cancel_acknowledgement_accepts_official_shape(self):
+        client = BybitClient("key", "secret")
+        response = Mock()
+        response.status_code = 200
+        response.text = "cancel acknowledgement"
+        response.headers = {}
+        response.json.return_value = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "orderId": "requested-order",
+                "orderLinkId": "g_0_S_cancel",
+            },
+        }
+
+        with patch("bybit_client.requests.post", return_value=response):
+            result = client.cancel_order("TESTUSDT", "requested-order")
+
+        self.assertEqual(result["result"]["orderId"], "requested-order")
+        self.assertEqual(result["result"]["orderLinkId"], "g_0_S_cancel")
+
     def test_bybit_order_trades_follows_cursor_and_normalizes_all_executions(self):
         client = BybitClient("key", "secret")
         calls = []
