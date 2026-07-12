@@ -44,6 +44,139 @@ COMPLETED_REPAIR_MESSAGE_PREFIXES = (
 )
 
 
+def _position_decimal(
+    value: Any,
+    *,
+    context: str,
+    row_index: int,
+    field: str,
+    allow_blank: bool = False,
+) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        if allow_blank and value is None:
+            return None
+        raise RuntimeError(f"{context} row {row_index} has invalid {field}")
+    text = str(value).strip()
+    if not text:
+        if allow_blank:
+            return None
+        raise RuntimeError(f"{context} row {row_index} has invalid {field}")
+    try:
+        parsed = Decimal(text)
+    except Exception as exc:
+        raise RuntimeError(f"{context} row {row_index} has invalid {field}") from exc
+    if not parsed.is_finite():
+        raise RuntimeError(f"{context} row {row_index} has non-finite {field}")
+    return parsed
+
+
+def validate_position_response(response: Any, *, symbol: str = "") -> list[dict]:
+    label = str(symbol or "").upper().strip()
+    context = f"{label} position snapshot" if label else "position snapshot"
+    if not isinstance(response, dict):
+        raise RuntimeError(f"{context} response must be an object")
+    if response.get("retCode") != 0:
+        message = str(response.get("retMsg") or "exchange rejected the request")
+        raise RuntimeError(f"{context} request failed: {message}")
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{context} result must be an object")
+    raw_positions = result.get("list")
+    if not isinstance(raw_positions, list):
+        raise RuntimeError(f"{context} list must be an array")
+
+    positions: list[dict] = []
+    positive_sides: set[str] = set()
+    for row_index, raw_position in enumerate(raw_positions):
+        if not isinstance(raw_position, dict):
+            raise RuntimeError(f"{context} row {row_index} must be an object")
+        if label:
+            if "symbol" not in raw_position:
+                raise RuntimeError(f"{context} row {row_index} is missing symbol")
+            row_symbol = str(raw_position.get("symbol") or "").upper().strip()
+            if row_symbol != label:
+                raise RuntimeError(
+                    f"{context} row {row_index} belongs to {row_symbol or 'an empty symbol'}"
+                )
+        if "size" not in raw_position:
+            raise RuntimeError(f"{context} row {row_index} is missing size")
+
+        qty = _position_decimal(
+            raw_position.get("size"),
+            context=context,
+            row_index=row_index,
+            field="size",
+        )
+        assert qty is not None
+        if qty < 0:
+            raise RuntimeError(f"{context} row {row_index} has negative size")
+
+        side_value = raw_position.get("side")
+        side = "" if side_value is None else str(side_value).strip()
+        if side not in {"", "Buy", "Sell"}:
+            raise RuntimeError(f"{context} row {row_index} has invalid side")
+        if qty > 0 and side not in {"Buy", "Sell"}:
+            raise RuntimeError(f"{context} row {row_index} has size without a position side")
+        if qty > 0:
+            if side in positive_sides:
+                raise RuntimeError(f"{context} contains duplicate positive {side} rows")
+            positive_sides.add(side)
+
+        entry_price = None
+        for field in ("avgPrice", "entryPrice", "entry_price"):
+            if field not in raw_position:
+                continue
+            candidate = _position_decimal(
+                raw_position.get(field),
+                context=context,
+                row_index=row_index,
+                field=field,
+                allow_blank=True,
+            )
+            if candidate is None:
+                continue
+            if candidate < 0:
+                raise RuntimeError(f"{context} row {row_index} has negative {field}")
+            if entry_price is not None and candidate != entry_price:
+                raise RuntimeError(f"{context} row {row_index} has conflicting entry prices")
+            entry_price = candidate
+
+        mark_price = None
+        if "markPrice" in raw_position:
+            mark_price = _position_decimal(
+                raw_position.get("markPrice"),
+                context=context,
+                row_index=row_index,
+                field="markPrice",
+                allow_blank=True,
+            )
+            if mark_price is not None and mark_price < 0:
+                raise RuntimeError(f"{context} row {row_index} has negative markPrice")
+
+        unrealised_pnl = None
+        if "unrealisedPnl" in raw_position:
+            unrealised_pnl = _position_decimal(
+                raw_position.get("unrealisedPnl"),
+                context=context,
+                row_index=row_index,
+                field="unrealisedPnl",
+                allow_blank=True,
+            )
+
+        positions.append(
+            {
+                "raw": raw_position,
+                "side": side,
+                "qty": qty,
+                "entry_price": entry_price,
+                "mark_price": mark_price,
+                "unrealised_pnl": unrealised_pnl,
+            }
+        )
+    return positions
+
+
 class GridEngine:
     def __init__(self, client, config: dict, state_callback: Callable[["GridEngine"], None] | None = None):
         self.client = client
@@ -3006,19 +3139,15 @@ class GridEngine:
         return False
 
     def _position_size(self, side: str) -> float:
-        resp = self.client.get_positions(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to fetch positions"))
-
-        total = 0.0
-        for position in resp["result"].get("list", []):
-            if position.get("side") != side:
-                continue
-            try:
-                total += float(position.get("size", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-        return total
+        total = sum(
+            (
+                position["qty"]
+                for position in self._validated_position_rows()
+                if position["side"] == side
+            ),
+            Decimal("0"),
+        )
+        return float(total)
 
     def _actual_position_net_qty(self) -> float:
         return sum(self._signed_qty(item["side"], item["qty"]) for item in self._position_snapshots())
@@ -3032,30 +3161,25 @@ class GridEngine:
             return min(0.0, actual_grid_qty)
         return actual_grid_qty
 
-    def _position_snapshots(self) -> list[dict]:
-        resp = self.client.get_positions(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to fetch positions"))
+    def _validated_position_rows(self) -> list[dict]:
+        symbol = str(self.config.get("symbol") or "").upper()
+        response = self.client.get_positions(symbol)
+        return validate_position_response(response, symbol=symbol)
 
+    def _position_snapshots(self) -> list[dict]:
         positions = []
-        for position in resp["result"].get("list", []):
-            side = str(position.get("side") or "")
-            try:
-                qty = abs(float(position.get("size", 0) or 0))
-            except (TypeError, ValueError):
-                qty = 0.0
-            if side not in {"Buy", "Sell"} or not self._qty_reaches_accounting_step(qty):
+        for position in self._validated_position_rows():
+            qty = position["qty"]
+            if qty <= 0 or not self._qty_reaches_accounting_step(qty):
                 continue
-            try:
-                entry_price = float(
-                    position.get("avgPrice")
-                    or position.get("entryPrice")
-                    or position.get("entry_price")
-                    or 0
-                )
-            except (TypeError, ValueError):
-                entry_price = 0.0
-            positions.append({"side": side, "qty": qty, "entry_price": entry_price})
+            entry_price = position["entry_price"] or Decimal("0")
+            positions.append(
+                {
+                    "side": position["side"],
+                    "qty": float(qty),
+                    "entry_price": float(entry_price),
+                }
+            )
         return positions
 
     def _capture_baseline_position(self, open_side: str):

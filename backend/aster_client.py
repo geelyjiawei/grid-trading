@@ -911,6 +911,7 @@ class AsterFuturesClient:
         side = "Buy" if amount > 0 else "Sell"
         size = abs(amount)
         return {
+            "symbol": str(item.get("symbol", "") or "").upper(),
             "side": side,
             "size": str(size.normalize()) if size else "0",
             "avgPrice": item.get("entryPrice", "0"),

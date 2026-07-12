@@ -1851,6 +1851,98 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(snapshot["unmanaged_delta_qty"], -0.01)
         self.assertTrue(snapshot["has_risk"])
 
+    def test_position_and_risk_endpoints_reject_invalid_position_snapshot(self):
+        main._client.positions = [
+            {"side": "Sell", "size": "invalid", "avgPrice": "100"}
+        ]
+
+        positions_response = self.client.get("/api/positions/BADUSDT?exchange=binance")
+        risk_response = self.client.get("/api/risk/BADUSDT?exchange=binance")
+
+        self.assertEqual(positions_response.status_code, 502)
+        self.assertIn("position snapshot", positions_response.json()["detail"])
+        self.assertEqual(risk_response.status_code, 502)
+        self.assertIn("position snapshot", risk_response.json()["detail"])
+
+    def test_position_endpoint_maps_upstream_failures_without_false_success(self):
+        cases = (
+            (
+                "transport failure",
+                Mock(side_effect=TimeoutError("positions offline")),
+                502,
+                "position snapshot request failed",
+            ),
+            (
+                "exchange rejection",
+                Mock(return_value={"retCode": 1001, "retMsg": "position denied"}),
+                400,
+                "position denied",
+            ),
+            (
+                "malformed response",
+                Mock(return_value=[]),
+                502,
+                "position snapshot",
+            ),
+        )
+
+        for label, get_positions_mock, expected_status, expected_detail in cases:
+            with self.subTest(label=label):
+                with patch.object(main._client, "get_positions", get_positions_mock):
+                    response = self.client.get(
+                        "/api/positions/BADUSDT?exchange=binance"
+                    )
+                self.assertEqual(response.status_code, expected_status)
+                self.assertIn(expected_detail, response.json()["detail"])
+
+    def test_grid_status_exposes_invalid_position_snapshot_instead_of_zero_delta(self):
+        main._client.positions = [
+            {"side": "Sell", "size": "invalid", "avgPrice": "100"}
+        ]
+        exchange = main._active_exchange
+        engine = main.GridEngine(
+            main._client,
+            {
+                "symbol": "BADUSDT",
+                "exchange": exchange,
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 100,
+                "leverage": 2,
+            },
+        )
+        engine.running = True
+        main._engines[main._engine_key(exchange, "BADUSDT")] = engine
+
+        response = self.client.get("/api/grid/status/BADUSDT?exchange=binance")
+
+        self.assertEqual(response.status_code, 200)
+        status = response.json()
+        self.assertFalse(status["position_snapshot_valid"])
+        self.assertIn("position snapshot", status["position_snapshot_error"])
+        self.assertIsNone(status["account_position_net_qty"])
+        self.assertIsNone(status["position_delta_from_grid"])
+        self.assertIsNone(status["account_unrealised_pnl"])
+
+    def test_binance_compatible_position_adapters_preserve_symbol_identity(self):
+        raw_position = {
+            "symbol": "ANSEMUSDT",
+            "positionAmt": "-2",
+            "entryPrice": "0.4",
+            "markPrice": "0.39",
+            "unRealizedProfit": "0.02",
+        }
+
+        for client_class in (BinanceFuturesClient, AsterFuturesClient):
+            with self.subTest(client=client_class.__name__):
+                normalized = client_class._normalize_position(raw_position)
+                self.assertEqual(normalized["symbol"], "ANSEMUSDT")
+                self.assertEqual(normalized["side"], "Sell")
+                self.assertEqual(normalized["size"], "2")
+
     def test_risk_endpoint_tracks_pending_submission_by_client_order_id(self):
         main._client = FakeClient("100", qty_step="0.1", min_qty="0.1")
         exchange = main._active_exchange

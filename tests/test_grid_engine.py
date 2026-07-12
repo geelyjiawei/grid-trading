@@ -244,7 +244,15 @@ class FakeClient:
         return response
 
     def get_positions(self, symbol):
-        return {"retCode": 0, "result": {"list": self.positions}}
+        rows = []
+        for position in self.positions:
+            if isinstance(position, dict):
+                row = dict(position)
+                row.setdefault("symbol", symbol)
+                rows.append(row)
+            else:
+                rows.append(position)
+        return {"retCode": 0, "result": {"list": rows}}
 
     def round_to_step(self, value, step):
         step_decimal = Decimal(str(step))
@@ -3482,6 +3490,252 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.manual_stop_pending)
         self.assertFalse(engine.grid_ready)
         self.assertIn(link_id, engine.active_orders)
+
+    async def test_invalid_position_snapshots_are_rejected_before_accounting(self):
+        class PositionResponseClient(FakeClient):
+            def __init__(self, response):
+                super().__init__("100")
+                self.response = response
+
+            def get_positions(self, symbol):
+                return copy.deepcopy(self.response)
+
+        invalid_responses = {
+            "top-level list": [],
+            "exchange rejection": {"retCode": 1001, "retMsg": "position unavailable"},
+            "missing result": {"retCode": 0},
+            "invalid result": {"retCode": 0, "result": []},
+            "invalid position list": {"retCode": 0, "result": {"list": {}}},
+            "invalid row": {"retCode": 0, "result": {"list": [None]}},
+            "missing size": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "TESTUSDT", "side": "Sell", "avgPrice": "100"}
+                    ]
+                },
+            },
+            "blank size": {
+                "retCode": 0,
+                "result": {
+                    "list": [{"symbol": "TESTUSDT", "side": "Sell", "size": ""}]
+                },
+            },
+            "boolean size": {
+                "retCode": 0,
+                "result": {
+                    "list": [{"symbol": "TESTUSDT", "side": "Sell", "size": True}]
+                },
+            },
+            "nonnumeric size": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "TESTUSDT", "side": "Sell", "size": "invalid"}
+                    ]
+                },
+            },
+            "negative size": {
+                "retCode": 0,
+                "result": {
+                    "list": [{"symbol": "TESTUSDT", "side": "Sell", "size": "-1"}]
+                },
+            },
+            "nan size": {
+                "retCode": 0,
+                "result": {
+                    "list": [{"symbol": "TESTUSDT", "side": "Sell", "size": "NaN"}]
+                },
+            },
+            "infinite size": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "TESTUSDT", "side": "Sell", "size": "Infinity"}
+                    ]
+                },
+            },
+            "positive size without side": {
+                "retCode": 0,
+                "result": {
+                    "list": [{"symbol": "TESTUSDT", "side": "", "size": "1"}]
+                },
+            },
+            "invalid side": {
+                "retCode": 0,
+                "result": {
+                    "list": [{"symbol": "TESTUSDT", "side": "Short", "size": "1"}]
+                },
+            },
+            "missing symbol": {
+                "retCode": 0,
+                "result": {"list": [{"side": "Sell", "size": "1"}]},
+            },
+            "wrong symbol": {
+                "retCode": 0,
+                "result": {
+                    "list": [{"symbol": "OTHERUSDT", "side": "Sell", "size": "1"}]
+                },
+            },
+            "duplicate positive side": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "TESTUSDT", "side": "Sell", "size": "1"},
+                        {"symbol": "TESTUSDT", "side": "Sell", "size": "2"},
+                    ]
+                },
+            },
+            "invalid entry price": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "TESTUSDT",
+                            "side": "Sell",
+                            "size": "1",
+                            "avgPrice": "invalid",
+                        }
+                    ]
+                },
+            },
+            "negative entry price": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "TESTUSDT",
+                            "side": "Sell",
+                            "size": "1",
+                            "avgPrice": "-1",
+                        }
+                    ]
+                },
+            },
+            "conflicting entry prices": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "TESTUSDT",
+                            "side": "Sell",
+                            "size": "1",
+                            "avgPrice": "100",
+                            "entryPrice": "101",
+                        }
+                    ]
+                },
+            },
+            "invalid mark price": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "TESTUSDT",
+                            "side": "Sell",
+                            "size": "1",
+                            "markPrice": "invalid",
+                        }
+                    ]
+                },
+            },
+            "negative mark price": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "TESTUSDT",
+                            "side": "Sell",
+                            "size": "1",
+                            "markPrice": "-1",
+                        }
+                    ]
+                },
+            },
+            "invalid unrealized pnl": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "TESTUSDT",
+                            "side": "Sell",
+                            "size": "1",
+                            "unrealisedPnl": "invalid",
+                        }
+                    ]
+                },
+            },
+        }
+
+        for label, response in invalid_responses.items():
+            with self.subTest(label=label):
+                engine = GridEngine(
+                    PositionResponseClient(response),
+                    {"symbol": "TESTUSDT", "direction": "short"},
+                )
+                with self.assertRaisesRegex(RuntimeError, "position snapshot"):
+                    engine._position_snapshots()
+
+    async def test_invalid_baseline_position_snapshot_never_cancels_managed_orders(self):
+        client = FakeClient("100", qty_step="0.1", min_qty="0.1")
+        client.positions = [{"side": "Sell", "size": "invalid", "avgPrice": "100"}]
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "short"})
+        engine._fetch_precision()
+        engine.baseline_position_side = "Sell"
+        engine.baseline_position_qty = 2.0
+        engine.running = True
+        engine.grid_ready = True
+        link_id = engine._place("Buy", 95, 1, reduce_only=True, qty_override=0.5)
+
+        with self.assertRaisesRegex(RuntimeError, "position snapshot"):
+            engine._halt_if_baseline_breached()
+
+        self.assertEqual(client.cancelled_orders, [])
+        self.assertFalse(engine._stopping)
+        self.assertTrue(engine.running)
+        self.assertTrue(engine.grid_ready)
+        self.assertIn(link_id, engine.active_orders)
+
+    async def test_valid_flat_and_hedged_position_snapshot_contract(self):
+        client = FakeClient("100", qty_step="0.01", min_qty="0.01")
+        client.positions = [
+            {
+                "symbol": "TESTUSDT",
+                "side": "",
+                "size": "0",
+                "avgPrice": None,
+                "markPrice": None,
+                "unrealisedPnl": None,
+            },
+            {"side": "Sell", "size": "0", "avgPrice": "0"},
+            {
+                "side": "Buy",
+                "size": "1.25",
+                "avgPrice": "100",
+                "markPrice": "101",
+                "unrealisedPnl": "1.25",
+            },
+            {
+                "side": "Sell",
+                "size": "2.5",
+                "avgPrice": "99",
+                "markPrice": "101",
+                "unrealisedPnl": "-5",
+            },
+        ]
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "neutral"})
+        engine._fetch_precision()
+
+        snapshots = engine._position_snapshots()
+
+        self.assertEqual(
+            snapshots,
+            [
+                {"side": "Buy", "qty": 1.25, "entry_price": 100.0},
+                {"side": "Sell", "qty": 2.5, "entry_price": 99.0},
+            ],
+        )
+        self.assertEqual(engine._actual_position_net_qty(), -1.25)
 
     async def test_unrealized_pnl_uses_partial_reduce_order_remaining_quantity(self):
         client = FakeClient("90", tick_size="1", qty_step="0.01", min_qty="0.1")

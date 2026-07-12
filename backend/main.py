@@ -29,7 +29,7 @@ from aster_client import AsterFuturesClient
 from binance_client import BinanceFuturesClient
 from bybit_client import BybitClient
 from fee_rates import normalize_fee_rate
-from grid_engine import GridEngine
+from grid_engine import GridEngine, validate_position_response
 from secret_store import decrypt_text, encrypt_text, storage_backend
 
 
@@ -1614,19 +1614,14 @@ def get_fee_rates(symbol: str, exchange: str | None = None):
 @app.get("/api/positions/{symbol}")
 def get_positions(symbol: str, exchange: str | None = None):
     client = _get_client(exchange)
-    resp = client.get_positions(symbol.upper())
-    if resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch positions"))
+    symbol = symbol.upper()
+    position_rows = _validated_position_rows_or_http(client, symbol)
 
     positions = []
-    for item in resp["result"].get("list", []):
-        try:
-            size = float(item.get("size", 0))
-        except (TypeError, ValueError):
-            size = 0
-
-        if size <= 0:
+    for position in position_rows:
+        if position["qty"] <= 0:
             continue
+        item = position["raw"]
 
         positions.append(
             {
@@ -1896,49 +1891,68 @@ def _engine_status(engine: GridEngine) -> dict:
     status = engine.get_status()
     exchange = _engine_exchange(engine)
     status["exchange"] = exchange
-    account_unrealised_pnl = 0.0
-    actual_position_net_qty = 0.0
+    account_unrealised_pnl: Decimal | None = Decimal("0")
+    actual_position_net_qty: Decimal | None = Decimal("0")
     mark_price = None
+    position_snapshot_error = ""
     try:
         client = engine.client
-        resp = client.get_positions(str(status.get("symbol", "")).upper())
-        if resp.get("retCode") == 0:
-            for item in resp.get("result", {}).get("list", []):
-                side = str(item.get("side") or "")
-                try:
-                    size = float(item.get("size", 0) or 0)
-                except (TypeError, ValueError):
-                    size = 0.0
-                if side == "Buy":
-                    actual_position_net_qty += size
-                elif side == "Sell":
-                    actual_position_net_qty -= size
-                try:
-                    account_unrealised_pnl += float(item.get("unrealisedPnl", 0) or 0)
-                except (TypeError, ValueError):
-                    pass
-                if mark_price is None:
-                    try:
-                        mark_price = float(item.get("markPrice", 0) or 0)
-                    except (TypeError, ValueError):
-                        mark_price = None
-    except Exception:
-        account_unrealised_pnl = 0.0
+        symbol = str(status.get("symbol", "")).upper()
+        rows = validate_position_response(client.get_positions(symbol), symbol=symbol)
+        for position in rows:
+            qty = position["qty"]
+            if position["side"] == "Buy":
+                actual_position_net_qty += qty
+            elif position["side"] == "Sell":
+                actual_position_net_qty -= qty
+            account_unrealised_pnl += position["unrealised_pnl"] or Decimal("0")
+            if mark_price is None and position["mark_price"] is not None:
+                mark_price = float(position["mark_price"])
+    except Exception as exc:
+        logger.warning(
+            "Position snapshot unavailable while rendering grid status exchange=%s symbol=%s msg=%s",
+            exchange,
+            status.get("symbol"),
+            exc,
+        )
+        position_snapshot_error = str(exc)
+        account_unrealised_pnl = None
+        actual_position_net_qty = None
 
     realized_net = float(status.get("total_profit", 0) or 0)
     grid_unrealised_pnl = (
         engine.estimate_grid_unrealized_pnl(mark_price)
-        if mark_price is not None and mark_price > 0
-        else 0.0
+        if not position_snapshot_error and mark_price is not None and mark_price > 0
+        else 0.0 if not position_snapshot_error else None
     )
     expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
     status["realized_gross_profit"] = status.get("gross_profit", 0)
     status["realized_net_profit"] = round(realized_net, 4)
-    status["unrealised_pnl"] = round(grid_unrealised_pnl, 4)
-    status["account_unrealised_pnl"] = round(account_unrealised_pnl, 4)
-    status["account_position_net_qty"] = round(actual_position_net_qty, 8)
-    status["position_delta_from_grid"] = round(actual_position_net_qty - expected_position_net_qty, 8)
-    status["total_equity_profit"] = round(realized_net + grid_unrealised_pnl, 4)
+    status["position_snapshot_valid"] = not position_snapshot_error
+    status["position_snapshot_error"] = position_snapshot_error
+    status["unrealised_pnl"] = (
+        round(grid_unrealised_pnl, 4) if grid_unrealised_pnl is not None else None
+    )
+    status["account_unrealised_pnl"] = (
+        round(float(account_unrealised_pnl), 4)
+        if account_unrealised_pnl is not None
+        else None
+    )
+    status["account_position_net_qty"] = (
+        round(float(actual_position_net_qty), 8)
+        if actual_position_net_qty is not None
+        else None
+    )
+    status["position_delta_from_grid"] = (
+        round(float(actual_position_net_qty) - expected_position_net_qty, 8)
+        if actual_position_net_qty is not None
+        else None
+    )
+    status["total_equity_profit"] = (
+        round(realized_net + grid_unrealised_pnl, 4)
+        if grid_unrealised_pnl is not None
+        else None
+    )
     return status
 
 
@@ -1960,6 +1974,25 @@ def grid_history(limit: int = 100):
 def _is_grid_order(item: dict) -> bool:
     link_id = str(item.get("orderLinkId") or item.get("order_link_id") or "")
     return link_id.startswith(("g_", "open_", "init_", "repair_"))
+
+
+def _validated_position_rows_or_http(client, symbol: str) -> list[dict]:
+    try:
+        response = client.get_positions(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{symbol} position snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch positions"),
+        )
+    try:
+        return validate_position_response(response, symbol=symbol)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 def _managed_order_ids(engine: GridEngine | None) -> set[str]:
@@ -2018,22 +2051,18 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         and str(item.get("orderLinkId", "") or "") not in managed_links
     ]
 
-    position_resp = client.get_positions(symbol)
-    if position_resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=position_resp.get("retMsg", "Failed to fetch positions"))
+    position_rows = _validated_position_rows_or_http(client, symbol)
     positions = []
-    actual_position_net_qty = 0.0
-    for item in position_resp["result"].get("list", []):
-        try:
-            size = float(item.get("size", 0))
-        except (TypeError, ValueError):
-            size = 0
+    actual_position_net_qty_decimal = Decimal("0")
+    for position in position_rows:
+        size = position["qty"]
         if size > 0:
-            side = item.get("side", "")
+            side = position["side"]
             if side == "Buy":
-                actual_position_net_qty += size
+                actual_position_net_qty_decimal += size
             elif side == "Sell":
-                actual_position_net_qty -= size
+                actual_position_net_qty_decimal -= size
+            item = position["raw"]
             positions.append(
                 {
                     "side": side,
@@ -2043,6 +2072,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
                     "unrealised_pnl": item.get("unrealisedPnl", "0"),
                 }
             )
+    actual_position_net_qty = float(actual_position_net_qty_decimal)
 
     unmanaged_position = bool(positions and not engine)
     unmanaged_delta_qty = 0.0
