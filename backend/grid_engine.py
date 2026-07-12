@@ -1967,6 +1967,7 @@ class GridEngine:
             "submission_last_not_found_at",
             "submission_updated_at",
             "submission_retry_blocked",
+            "submission_retry_safe",
         ):
             order.pop(field, None)
         self.grid_ready = False
@@ -2044,6 +2045,8 @@ class GridEngine:
         order.pop("submission_not_found_count", None)
         order.pop("submission_last_not_found_at", None)
         order.pop("submission_updated_at", None)
+        order.pop("submission_retry_blocked", None)
+        order.pop("submission_retry_safe", None)
         return True
 
     @staticmethod
@@ -2117,6 +2120,43 @@ class GridEngine:
         self._mark_fast_poll()
         self._persist_state()
 
+    @staticmethod
+    def _is_rate_limit_result(result: dict[str, Any]) -> bool:
+        try:
+            code = int(result.get("retCode"))
+        except (TypeError, ValueError):
+            code = None
+        return code in {-1003, 418, 429, 10006} or is_exchange_rate_limit_message(
+            result.get("retMsg")
+        )
+
+    def _mark_submission_rate_limited(
+        self,
+        order: dict,
+        error: Exception | str,
+        *,
+        retry_after: float | None = None,
+    ) -> None:
+        delay = (
+            float(retry_after)
+            if retry_after is not None
+            else ORDER_REJECTION_BACKOFF_MAX_SECONDS
+        )
+        order["status"] = "SUBMIT_RATE_LIMITED"
+        order["submission_pending"] = True
+        order["submission_error"] = str(error)
+        order["submission_retry_safe"] = True
+        order.pop("submission_retry_blocked", None)
+        order["submission_updated_at"] = time.time()
+        order["submission_not_found_count"] = 0
+        order["submission_last_not_found_at"] = 0.0
+        self._record_order_rejection(
+            "",
+            str(error),
+            rate_limit_retry_after=delay,
+            track_shape=False,
+        )
+
     def _submission_snapshot_by_link(self, link_id: str) -> tuple[dict | None, bool]:
         getter = getattr(self.client, "get_order_by_link", None)
         if not callable(getter):
@@ -2164,7 +2204,9 @@ class GridEngine:
     def _retry_pending_submission(self, order: dict) -> str:
         if order.get("submission_retry_blocked"):
             return "pending"
-        if str(order.get("order_type") or "Limit").lower() == "market":
+        order_type = str(order.get("order_type") or "Limit")
+        safe_retry = bool(order.get("submission_retry_safe"))
+        if order_type.lower() == "market" and not safe_retry:
             # An exchange may allow a client order ID to be reused after the
             # original market order has already filled. Resubmitting an unknown
             # market write can therefore double the position even with the same
@@ -2178,7 +2220,7 @@ class GridEngine:
             self._persist_state()
             return "pending"
         attempts = int(order.get("submission_attempts", 1) or 1)
-        if attempts >= SUBMISSION_MAX_RETRIES:
+        if attempts >= SUBMISSION_MAX_RETRIES and not safe_retry:
             order["status"] = "SUBMIT_UNRESOLVED"
             return "pending"
         order["submission_attempts"] = attempts + 1
@@ -2186,9 +2228,9 @@ class GridEngine:
         order["submission_last_not_found_at"] = 0.0
         order["submission_updated_at"] = time.time()
         order["status"] = "SUBMITTING"
+        order.pop("submission_retry_safe", None)
         self._persist_state()
         try:
-            order_type = str(order.get("order_type") or "Limit")
             result = self.client.place_order(
                 symbol=self.config["symbol"],
                 side=str(order["side"]),
@@ -2205,6 +2247,15 @@ class GridEngine:
                 ),
             )
         except Exception as exc:
+            if isinstance(exc, ExchangeRateLimitError) or is_exchange_rate_limit_message(exc):
+                self._mark_submission_rate_limited(
+                    order,
+                    exc,
+                    retry_after=(
+                        exc.retry_after if isinstance(exc, ExchangeRateLimitError) else None
+                    ),
+                )
+                return "pending"
             if self._is_uncertain_submission_exception(exc) or self._is_duplicate_client_order_rejection(
                 str(exc)
             ):
@@ -2221,6 +2272,9 @@ class GridEngine:
             if order.get("accepted_shape_mismatch"):
                 return "mismatch"
         message = str(result.get("retMsg") or "submission not confirmed")
+        if self._is_rate_limit_result(result):
+            self._mark_submission_rate_limited(order, message)
+            return "pending"
         if (
             result.get("retCode") == 0
             or self._is_duplicate_client_order_rejection(message)
@@ -2384,6 +2438,12 @@ class GridEngine:
             if outcome == "confirmed":
                 return True
             if outcome == "rejected":
+                rejection = str(
+                    order.get("submission_error") or "opening remainder was rejected"
+                )
+                if self._qty_reaches_accounting_step(self.opening_filled_qty):
+                    self._fail_opening_completion(rejection)
+                    return False
                 self.waiting_initial_order = False
                 self.opening_order = None
                 self.running = False
@@ -4387,6 +4447,21 @@ class GridEngine:
                 order_link_id=link_id,
             )
         except Exception as exc:
+            if isinstance(exc, ExchangeRateLimitError) or is_exchange_rate_limit_message(exc):
+                self._mark_submission_rate_limited(
+                    self.opening_order,
+                    exc,
+                    retry_after=(
+                        exc.retry_after if isinstance(exc, ExchangeRateLimitError) else None
+                    ),
+                )
+                self.trigger_message = (
+                    "Initial market opening is rate limited; the original client order ID "
+                    "is retained and will be retried only after cooldown and authoritative "
+                    "exchange absence checks."
+                )
+                self._persist_state()
+                return False
             if self._is_uncertain_submission_exception(exc):
                 self._mark_submission_unknown(self.opening_order, exc)
                 self.trigger_message = (
@@ -4401,6 +4476,15 @@ class GridEngine:
             raise
         if result.get("retCode") != 0:
             message = str(result.get("retMsg") or "Failed to place initial market order")
+            if self._is_rate_limit_result(result):
+                self._mark_submission_rate_limited(self.opening_order, message)
+                self.trigger_message = (
+                    "Initial market opening is rate limited; the original client order ID "
+                    "is retained and will be retried only after cooldown and authoritative "
+                    "exchange absence checks."
+                )
+                self._persist_state()
+                return False
             if self._is_uncertain_submission_result(result):
                 self._mark_submission_unknown(self.opening_order, message)
                 return False
@@ -4509,6 +4593,21 @@ class GridEngine:
                 time_in_force="PostOnly" if post_only else None,
             )
         except Exception as exc:
+            if isinstance(exc, ExchangeRateLimitError) or is_exchange_rate_limit_message(exc):
+                self._mark_submission_rate_limited(
+                    self.opening_order,
+                    exc,
+                    retry_after=(
+                        exc.retry_after if isinstance(exc, ExchangeRateLimitError) else None
+                    ),
+                )
+                self.trigger_message = (
+                    f"{order_label.title()} opening is rate limited; the original client "
+                    "order ID is retained and will be retried only after cooldown and "
+                    "authoritative exchange absence checks."
+                )
+                self._persist_state()
+                return
             if self._is_uncertain_submission_exception(exc):
                 self._mark_submission_unknown(self.opening_order, exc)
                 self.trigger_message = (
@@ -4523,6 +4622,15 @@ class GridEngine:
             raise
         if result.get("retCode") != 0:
             message = str(result.get("retMsg") or "Failed to place initial limit order")
+            if self._is_rate_limit_result(result):
+                self._mark_submission_rate_limited(self.opening_order, message)
+                self.trigger_message = (
+                    f"{order_label.title()} opening is rate limited; the original client "
+                    "order ID is retained and will be retried only after cooldown and "
+                    "authoritative exchange absence checks."
+                )
+                self._persist_state()
+                return
             if self._is_uncertain_submission_result(result):
                 self._mark_submission_unknown(self.opening_order, message)
                 return

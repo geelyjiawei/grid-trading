@@ -8819,6 +8819,438 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.opening_order.get("submission_retry_blocked"))
         self.assertEqual(engine.opening_order.get("submission_attempts"), 1)
 
+    async def test_rate_limited_initial_limit_open_retries_same_client_order_id(self):
+        class RateLimitedLimitClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.opening_links = []
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("open_"):
+                    self.opening_links.append(link_id)
+                    if len(self.opening_links) == 1:
+                        raise ExchangeRateLimitError(
+                            "Too many requests while opening",
+                            retry_after=17,
+                        )
+                return super().place_order(**kwargs)
+
+            def get_order_history(self, symbol, limit=50):
+                return {"retCode": 0, "result": {"list": []}}
+
+        client = RateLimitedLimitClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "limit",
+                "initial_order_price": 100,
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertFalse(engine.grid_ready)
+        self.assertTrue(engine.opening_order.get("submission_pending"))
+        self.assertTrue(engine.opening_order.get("submission_retry_safe"))
+        self.assertGreater(engine._rate_limit_remaining(), 16)
+        original_link = engine.opening_order["link_id"]
+
+        saved = copy.deepcopy(engine.to_state())
+        restored = GridEngine(client, dict(engine.config))
+        restored.restore_state(saved)
+        engine = restored
+        self.assertEqual(engine.opening_order["link_id"], original_link)
+        self.assertTrue(engine.opening_order.get("submission_retry_safe"))
+
+        engine._exchange_rate_limit_until = 0
+        engine.opening_order["submission_updated_at"] = 0
+        engine.opening_order["submission_not_found_count"] = (
+            grid_engine.SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+        )
+        engine.opening_order["submission_last_not_found_at"] = 0
+
+        resolved = engine._resolve_opening_submission([])
+
+        self.assertTrue(resolved)
+        self.assertEqual(client.opening_links, [original_link, original_link])
+        self.assertTrue(engine.opening_order["order_id"])
+        self.assertFalse(engine.opening_order.get("submission_pending", False))
+        self.assertFalse(engine.opening_order.get("submission_retry_safe", False))
+
+    async def test_repeated_opening_rate_limits_do_not_exhaust_safe_retry(self):
+        class RepeatedRateLimitClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.opening_links = []
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("open_"):
+                    self.opening_links.append(link_id)
+                    if len(self.opening_links) <= grid_engine.SUBMISSION_MAX_RETRIES + 2:
+                        return {
+                            "retCode": -1003,
+                            "retMsg": "Too many new orders; current limit reached",
+                        }
+                return super().place_order(**kwargs)
+
+            def get_order_history(self, symbol, limit=50):
+                return {"retCode": 0, "result": {"list": []}}
+
+        client = RepeatedRateLimitClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "limit",
+                "initial_order_price": 100,
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+        original_link = engine.opening_order["link_id"]
+        for _ in range(grid_engine.SUBMISSION_MAX_RETRIES + 1):
+            engine._exchange_rate_limit_until = 0
+            engine.opening_order["submission_updated_at"] = 0
+            engine.opening_order["submission_not_found_count"] = (
+                grid_engine.SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+            )
+            engine.opening_order["submission_last_not_found_at"] = 0
+            self.assertFalse(engine._resolve_opening_submission([]))
+            self.assertTrue(engine.opening_order.get("submission_retry_safe"))
+            self.assertNotEqual(engine.opening_order.get("status"), "SUBMIT_UNRESOLVED")
+
+        engine._exchange_rate_limit_until = 0
+        engine.opening_order["submission_updated_at"] = 0
+        engine.opening_order["submission_not_found_count"] = (
+            grid_engine.SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+        )
+        engine.opening_order["submission_last_not_found_at"] = 0
+
+        self.assertTrue(engine._resolve_opening_submission([]))
+        self.assertEqual(set(client.opening_links), {original_link})
+        self.assertEqual(
+            len(client.opening_links),
+            grid_engine.SUBMISSION_MAX_RETRIES + 3,
+        )
+        self.assertTrue(engine.opening_order["order_id"])
+
+    async def test_rate_limited_initial_market_open_retries_after_authoritative_absence(self):
+        class RateLimitedMarketClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.market_links = []
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Market" and not kwargs.get("reduce_only"):
+                    self.market_links.append(link_id)
+                    if len(self.market_links) == 1:
+                        raise ExchangeRateLimitError(
+                            "Too many requests while opening",
+                            retry_after=17,
+                        )
+                return super().place_order(**kwargs)
+
+            def get_order_trades(self, symbol, order_id):
+                return fake_trade_response(self, order_id)
+
+            def get_order_history(self, symbol, limit=50):
+                return {"retCode": 0, "result": {"list": []}}
+
+        client = RateLimitedMarketClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+                "initial_order_type": "market",
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertFalse(engine.grid_ready)
+        self.assertEqual(client.orders, [])
+        self.assertTrue(engine.opening_order.get("submission_retry_safe"))
+        original_link = engine.opening_order["link_id"]
+
+        engine._exchange_rate_limit_until = 0
+        engine.opening_order["submission_updated_at"] = 0
+        engine.opening_order["submission_not_found_count"] = (
+            grid_engine.SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+        )
+        engine.opening_order["submission_last_not_found_at"] = 0
+
+        await engine._check_initial_order()
+
+        self.assertEqual(client.market_links, [original_link, original_link])
+        self.assertEqual(
+            len(
+                [
+                    order
+                    for order in client.orders
+                    if order.get("order_type") == "Market"
+                    and not order.get("reduce_only")
+                ]
+            ),
+            1,
+        )
+        self.assertTrue(engine.grid_ready)
+        self.assertFalse(engine.waiting_initial_order)
+        self.assertIsNone(engine.opening_order)
+
+    async def test_rate_limited_partial_opening_remainder_survives_and_retries(self):
+        class RateLimitedRemainderClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.trade_details = {}
+                self.opening_links = []
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("open_"):
+                    self.opening_links.append(link_id)
+                    if len(self.opening_links) == 2:
+                        raise ExchangeRateLimitError(
+                            "Too many requests while refilling opening remainder",
+                            retry_after=17,
+                        )
+                return super().place_order(**kwargs)
+
+            def get_order_trades(self, symbol, order_id):
+                return {
+                    "retCode": 0,
+                    "result": {"list": self.trade_details.get(str(order_id), [])},
+                }
+
+            def get_order_history(self, symbol, limit=50):
+                return {"retCode": 0, "result": {"list": []}}
+
+        client = RateLimitedRemainderClient(
+            "100", tick_size="1", qty_step="1", min_qty="1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 100,
+                "leverage": 2,
+                "initial_order_type": "limit",
+                "initial_order_price": 100,
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+        first_opening = dict(engine.opening_order)
+        first_exchange_order = next(
+            item for item in client.orders if item["orderId"] == first_opening["order_id"]
+        )
+        client.trade_details[first_opening["order_id"]] = [
+            {
+                "price": "100",
+                "qty": "42",
+                "volume": "4200",
+                "feeUsdt": "0.84",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        ]
+        client.open_limit_order_ids.discard(first_opening["order_id"])
+        first_exchange_order["orderStatus"] = "CANCELED"
+
+        await engine._check_initial_order()
+
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertFalse(engine.grid_ready)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertEqual(engine.opening_order["qty"], "158")
+        self.assertTrue(engine.opening_order.get("submission_retry_safe"))
+        self.assertEqual(Decimal(str(engine.opening_filled_qty)), Decimal("42"))
+        remainder_link = engine.opening_order["link_id"]
+
+        engine._exchange_rate_limit_until = 0
+        engine.opening_order["submission_updated_at"] = 0
+        engine.opening_order["submission_not_found_count"] = (
+            grid_engine.SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+        )
+        engine.opening_order["submission_last_not_found_at"] = 0
+        self.assertTrue(engine._resolve_opening_submission([]))
+
+        replacement = dict(engine.opening_order)
+        replacement_exchange_order = next(
+            item for item in client.orders if item["orderId"] == replacement["order_id"]
+        )
+        client.trade_details[replacement["order_id"]] = [
+            {
+                "price": "100",
+                "qty": "158",
+                "volume": "15800",
+                "feeUsdt": "3.16",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        ]
+        client.open_limit_order_ids.discard(replacement["order_id"])
+        replacement_exchange_order["orderStatus"] = "FILLED"
+
+        await engine._check_initial_order()
+
+        self.assertEqual(
+            client.opening_links,
+            [first_opening["link_id"], remainder_link, remainder_link],
+        )
+        self.assertTrue(engine.grid_ready)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertEqual(Decimal(str(engine.initial_qty)), Decimal("200"))
+        self.assertEqual(
+            {Decimal(str(order["qty"])) for order in engine.active_orders.values()},
+            {Decimal("100")},
+        )
+
+    async def test_rejected_partial_opening_remainder_retains_owned_position(self):
+        class RejectedRemainderClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.trade_details = {}
+                self.opening_calls = 0
+
+            def place_order(self, **kwargs):
+                link_id = str(kwargs.get("order_link_id", ""))
+                if kwargs.get("order_type") == "Limit" and link_id.startswith("open_"):
+                    self.opening_calls += 1
+                    if self.opening_calls == 2:
+                        raise ExchangeRateLimitError(
+                            "Too many requests while refilling opening remainder",
+                            retry_after=17,
+                        )
+                    if self.opening_calls == 3:
+                        return {"retCode": 400, "retMsg": "opening remainder rejected"}
+                return super().place_order(**kwargs)
+
+            def get_order_trades(self, symbol, order_id):
+                return {
+                    "retCode": 0,
+                    "result": {"list": self.trade_details.get(str(order_id), [])},
+                }
+
+            def get_order_history(self, symbol, limit=50):
+                return {"retCode": 0, "result": {"list": []}}
+
+        client = RejectedRemainderClient(
+            "100", tick_size="1", qty_step="1", min_qty="1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 100,
+                "leverage": 2,
+                "initial_order_type": "limit",
+                "initial_order_price": 100,
+                "grid_order_post_only": False,
+            },
+        )
+
+        await engine.initialize()
+        opening = dict(engine.opening_order)
+        exchange_order = next(
+            item for item in client.orders if item["orderId"] == opening["order_id"]
+        )
+        client.trade_details[opening["order_id"]] = [
+            {
+                "price": "100",
+                "qty": "42",
+                "volume": "4200",
+                "feeUsdt": "0.84",
+                "feeAsset": "USDT",
+                "isMaker": True,
+            }
+        ]
+        client.open_limit_order_ids.discard(opening["order_id"])
+        exchange_order["orderStatus"] = "CANCELED"
+
+        await engine._check_initial_order()
+
+        engine._exchange_rate_limit_until = 0
+        engine.opening_order["submission_updated_at"] = 0
+        engine.opening_order["submission_not_found_count"] = (
+            grid_engine.SUBMISSION_REQUIRED_NOT_FOUND_CHECKS
+        )
+        engine.opening_order["submission_last_not_found_at"] = 0
+
+        self.assertFalse(engine._resolve_opening_submission([]))
+        self.assertFalse(engine.grid_ready)
+        self.assertFalse(engine.waiting_initial_order)
+        self.assertTrue(engine.initialization_failed)
+        self.assertTrue(engine.manual_stop_pending)
+        self.assertIsNone(engine.opening_order)
+        self.assertEqual(Decimal(str(engine.initial_qty)), Decimal("42"))
+        self.assertEqual(Decimal(str(engine.grid_position_net_qty)), Decimal("-42"))
+        self.assertIn("retained for review", engine.trigger_message)
+        self.assertEqual(
+            [
+                order
+                for order in client.orders
+                if order.get("order_type") == "Market" and order.get("reduce_only")
+            ],
+            [],
+        )
+
     async def test_unconfirmed_market_reduce_is_never_automatically_resubmitted(self):
         class MissingReduceClient(FakeClient):
             def __init__(self, *args, **kwargs):

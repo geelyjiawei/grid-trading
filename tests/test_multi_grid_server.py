@@ -601,6 +601,54 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertNotIn(key, main._engines)
         self.assertEqual(float(main._client.positions[0]["size"]), 2.0)
 
+    def test_rate_limited_initial_opening_starts_in_recoverable_wait_state(self):
+        class RateLimitedStartClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.market_calls = 0
+
+            def place_order(self, **kwargs):
+                if kwargs.get("order_type") == "Market" and not kwargs.get("reduce_only"):
+                    self.market_calls += 1
+                    raise ExchangeRateLimitError(
+                        "Too many requests while opening",
+                        retry_after=60,
+                    )
+                return super().place_order(**kwargs)
+
+            def get_order_history(self, symbol, limit=50):
+                return {"retCode": 0, "result": {"list": []}}
+
+        client = RateLimitedStartClient("100")
+        main._client = client
+        main._clients["binance"] = client
+
+        response = self.client.post(
+            "/api/grid/start",
+            json=self._payload("LIMITWAITUSDT"),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        engine = main._get_engine("binance", "LIMITWAITUSDT")
+        self.assertIsNotNone(engine)
+        self.assertTrue(engine.running)
+        self.assertTrue(engine.waiting_initial_order)
+        self.assertFalse(engine.grid_ready)
+        self.assertFalse(engine.initialization_failed)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertTrue(engine.opening_order.get("submission_pending"))
+        self.assertTrue(engine.opening_order.get("submission_retry_safe"))
+        self.assertGreater(engine._rate_limit_remaining(), 59)
+        self.assertEqual(client.market_calls, 1)
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.positions, [])
+
+        saved = main._load_grid_state_file()["grids"][
+            main._engine_key("binance", "LIMITWAITUSDT")
+        ]
+        self.assertTrue(saved["running"])
+        self.assertTrue(saved["opening_order"]["submission_retry_safe"])
+
     def test_nonrunning_engine_with_unconfirmed_orders_blocks_restart_and_can_be_stopped(self):
         config = self._payload("MUUSDT")
         config["exchange"] = "binance"
