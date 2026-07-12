@@ -304,46 +304,420 @@ class AsterClientTests(unittest.TestCase):
         self.assertEqual(order["side"], "Sell")
         self.assertTrue(order["reduceOnly"])
         self.assertEqual(trade["side"], "Buy")
-        self.assertEqual(trade["feeUsdt"], "-0.01")
+        self.assertEqual(trade["fee"], "0.01")
+        self.assertEqual(trade["feeUsdt"], "0.01")
         self.assertEqual(position["side"], "Sell")
         self.assertEqual(position["size"], "0.2")
 
-    def test_get_order_trades_filters_order_id_client_side(self):
+    def test_commission_sign_variants_normalize_to_positive_fee_cost(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
-        client.session = FakeSession(
-            FakeResponse(
-                [
+
+        for commission in ("0.01", "-0.01"):
+            with self.subTest(commission=commission):
+                trade = client._normalize_trade(
                     {
                         "orderId": 1,
-                        "id": 10,
+                        "id": 2,
                         "side": "BUY",
-                        "price": "99",
-                        "qty": "0.2",
-                        "quoteQty": "19.8",
-                        "commission": "-0.01",
+                        "price": "10",
+                        "qty": "1",
+                        "quoteQty": "10",
+                        "commission": commission,
                         "commissionAsset": "USDT",
-                    },
-                    {
-                        "orderId": 2,
-                        "id": 11,
-                        "side": "BUY",
-                        "price": "98",
-                        "qty": "0.2",
-                        "quoteQty": "19.6",
-                        "commission": "-0.01",
-                        "commissionAsset": "USDT",
-                    },
-                ]
-            )
-        )
+                    }
+                )
+
+                self.assertEqual(trade["fee"], "0.01")
+                self.assertEqual(trade["feeUsdt"], "0.01")
+
+    def test_get_order_trades_filters_order_id_client_side(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 2,
+                    "executedQty": "0.2",
+                    "time": 1_000,
+                    "updateTime": 2_000,
+                }
+            return [
+                {
+                    "orderId": 1,
+                    "id": 10,
+                    "side": "BUY",
+                    "price": "99",
+                    "qty": "0.2",
+                    "quoteQty": "19.8",
+                    "commission": "-0.01",
+                    "commissionAsset": "USDT",
+                    "time": 1_500,
+                },
+                {
+                    "orderId": 2,
+                    "id": 11,
+                    "side": "BUY",
+                    "price": "98",
+                    "qty": "0.2",
+                    "quoteQty": "19.6",
+                    "commission": "-0.01",
+                    "commissionAsset": "USDT",
+                    "time": 2_000,
+                },
+            ]
+
+        client._request = fake_request
 
         trades = client.get_order_trades("ASTERUSDT", "2")
-        params = client.session.calls[0]["params"]
+        params = calls[1][2]
 
         self.assertNotIn("orderId", params)
         self.assertEqual(params["limit"], 1000)
+        self.assertIn("startTime", params)
+        self.assertIn("endTime", params)
         self.assertEqual(len(trades["result"]["list"]), 1)
         self.assertEqual(trades["result"]["list"][0]["orderId"], "2")
+
+    def test_order_trade_lookup_expands_for_partial_fills_across_time(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        calls = []
+
+        def trade(trade_id, qty, timestamp):
+            return {
+                "orderId": 42,
+                "id": trade_id,
+                "side": "BUY",
+                "price": "10",
+                "qty": qty,
+                "quoteQty": str(float(qty) * 10),
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "time": timestamp,
+            }
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 42,
+                    "executedQty": "0.3",
+                    "time": 1_000,
+                    "updateTime": 1_000_000,
+                }
+            if params["startTime"] >= 700_000:
+                return [trade(3, "0.1", 900_000)]
+            return [
+                trade(1, "0.1", 1_000),
+                trade(2, "0.1", 500_000),
+                trade(3, "0.1", 900_000),
+            ]
+
+        client._request = fake_request
+
+        response = client.get_order_trades("ASTERUSDT", "42")
+
+        self.assertEqual([item["tradeId"] for item in response["result"]["list"]], ["1", "2", "3"])
+        self.assertEqual(len(calls), 3)
+        self.assertLess(calls[2][2]["startTime"], calls[1][2]["startTime"])
+
+    def test_order_trade_lookup_paginates_a_full_time_window_by_trade_id(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        trade_calls = []
+
+        def target_trade():
+            return {
+                "orderId": 77,
+                "id": 2_001,
+                "side": "SELL",
+                "price": "5",
+                "qty": "0.2",
+                "quoteQty": "1",
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "time": 1_000_000,
+            }
+
+        def fake_request(method, path, *, params=None, auth=False):
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 77,
+                    "executedQty": "0.2",
+                    "time": 1_000_000,
+                    "updateTime": 1_000_000,
+                }
+            trade_calls.append(dict(params))
+            if len(trade_calls) == 1:
+                return [
+                    {
+                        "orderId": 9000 + index,
+                        "id": index,
+                        "side": "BUY",
+                        "price": "1",
+                        "qty": "1",
+                        "time": 700_000 + index,
+                    }
+                    for index in range(1000)
+                ]
+            if params.get("fromId") == 1000:
+                return [target_trade()]
+            return []
+
+        client._request = fake_request
+
+        response = client.get_order_trades("ASTERUSDT", "77")
+
+        self.assertEqual(len(response["result"]["list"]), 1)
+        self.assertEqual(response["result"]["list"][0]["qty"], "0.2")
+        self.assertEqual(len(trade_calls), 2)
+        self.assertEqual(trade_calls[1]["fromId"], 1000)
+        self.assertNotIn("startTime", trade_calls[1])
+        self.assertNotIn("endTime", trade_calls[1])
+
+    def test_order_trade_lookup_splits_order_lifetime_into_seven_day_windows(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        created = 1_000_000
+        updated = created + (8 * 24 * 60 * 60 * 1000)
+        trade_calls = []
+
+        def trade(trade_id, timestamp):
+            return {
+                "orderId": 78,
+                "id": trade_id,
+                "side": "SELL",
+                "price": "5",
+                "qty": "0.1",
+                "quoteQty": "0.5",
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "time": timestamp,
+            }
+
+        def fake_request(method, path, *, params=None, auth=False):
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 78,
+                    "executedQty": "0.2",
+                    "time": created,
+                    "updateTime": updated,
+                }
+            trade_calls.append(dict(params))
+            if params["startTime"] == updated - client.TRADE_PROBE_PADDING_MS:
+                return [trade(2, updated)]
+            if params["startTime"] <= created <= params["endTime"]:
+                return [trade(1, created)]
+            if params["startTime"] <= updated <= params["endTime"]:
+                return [trade(2, updated)]
+            return []
+
+        client._request = fake_request
+
+        response = client.get_order_trades("ASTERUSDT", "78")
+
+        self.assertEqual([item["tradeId"] for item in response["result"]["list"]], ["1", "2"])
+        full_windows = trade_calls[1:]
+        self.assertEqual(len(full_windows), 2)
+        self.assertTrue(
+            all(
+                item["endTime"] - item["startTime"] <= client.TRADE_WINDOW_LIMIT_MS
+                for item in full_windows
+            )
+        )
+
+    def test_order_trade_lookup_rejects_nonadvancing_trade_cursor(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        trade_calls = 0
+
+        def fake_request(method, path, *, params=None, auth=False):
+            nonlocal trade_calls
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 79,
+                    "executedQty": "1",
+                    "time": 1_000_000,
+                    "updateTime": 1_000_000,
+                }
+            trade_calls += 1
+            if trade_calls == 1:
+                return [
+                    {
+                        "orderId": 9000 + index,
+                        "id": index,
+                        "side": "BUY",
+                        "price": "1",
+                        "qty": "1",
+                        "time": 700_000 + index,
+                    }
+                    for index in range(1000)
+                ]
+            return [
+                {
+                    "orderId": 79,
+                    "id": 999,
+                    "side": "BUY",
+                    "price": "1",
+                    "qty": "1",
+                    "time": 1_000_000,
+                }
+            ]
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "did not advance"):
+            client.get_order_trades("ASTERUSDT", "79")
+
+    def test_order_trade_lookup_caps_history_requests(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.TRADE_PAGE_LIMIT = 2
+        client.MAX_TRADE_HISTORY_QUERIES = 1
+        trade_calls = 0
+
+        def fake_request(method, path, *, params=None, auth=False):
+            nonlocal trade_calls
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 80,
+                    "executedQty": "1",
+                    "time": 1_000_000,
+                    "updateTime": 1_000_000,
+                }
+            trade_calls += 1
+            return [
+                {
+                    "orderId": 9000 + index,
+                    "id": index,
+                    "side": "BUY",
+                    "price": "1",
+                    "qty": "1",
+                    "time": 1_000_000 + index,
+                }
+                for index in range(2)
+            ]
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "too many paginated queries"):
+            client.get_order_trades("ASTERUSDT", "80")
+        self.assertEqual(trade_calls, 1)
+
+    def test_order_trade_lookup_rejects_unordered_full_page(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        client.TRADE_PAGE_LIMIT = 2
+
+        def fake_request(method, path, *, params=None, auth=False):
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 81,
+                    "executedQty": "1",
+                    "time": 1_000_000,
+                    "updateTime": 1_000_000,
+                }
+            return [
+                {
+                    "orderId": 9002,
+                    "id": 2,
+                    "side": "BUY",
+                    "price": "1",
+                    "qty": "1",
+                    "time": 1_000_002,
+                },
+                {
+                    "orderId": 9001,
+                    "id": 1,
+                    "side": "BUY",
+                    "price": "1",
+                    "qty": "1",
+                    "time": 1_000_001,
+                },
+            ]
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "not strictly ordered"):
+            client.get_order_trades("ASTERUSDT", "81")
+
+    def test_order_trade_lookup_rejects_incomplete_execution_quantity(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+
+        def fake_request(method, path, *, params=None, auth=False):
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": 88,
+                    "executedQty": "0.3",
+                    "time": 1_000_000,
+                    "updateTime": 1_000_000,
+                }
+            return [
+                {
+                    "orderId": 88,
+                    "id": 1,
+                    "side": "BUY",
+                    "price": "10",
+                    "qty": "0.1",
+                    "quoteQty": "1",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                    "time": 1_000_000,
+                }
+            ]
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            client.get_order_trades("ASTERUSDT", "88")
+
+    def test_order_trade_lookup_falls_back_when_order_is_definitively_missing(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((path, params))
+            if path == "/fapi/v3/order":
+                raise RuntimeError("Order does not exist")
+            return [
+                {
+                    "orderId": 99,
+                    "id": 4,
+                    "side": "SELL",
+                    "price": "2",
+                    "qty": "1",
+                    "quoteQty": "2",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                    "time": 1_000_000,
+                }
+            ]
+
+        client._request = fake_request
+
+        response = client.get_order_trades("ASTERUSDT", "99")
+
+        self.assertEqual(response["result"]["list"][0]["orderId"], "99")
+        self.assertEqual(calls[1][1], {"symbol": "ASTERUSDT", "limit": 1000})
+
+    def test_order_trade_lookup_never_trusts_full_fallback_page(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+
+        def fake_request(method, path, *, params=None, auth=False):
+            if path == "/fapi/v3/order":
+                raise RuntimeError("Unknown order")
+            return [
+                {
+                    "orderId": index,
+                    "id": index,
+                    "side": "BUY",
+                    "price": "1",
+                    "qty": "1",
+                    "time": index,
+                }
+                for index in range(1000)
+            ]
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "page is full"):
+            client.get_order_trades("ASTERUSDT", "missing")
 
     def test_get_order_by_link_uses_orig_client_order_id(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")

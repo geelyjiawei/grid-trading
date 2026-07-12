@@ -18,6 +18,10 @@ class AsterFuturesClient:
     exchange = "aster"
     ASSET_PRICE_TTL_SECONDS = 60
     UNCERTAIN_EXECUTION_CODES = {-1006, -1007}
+    TRADE_PAGE_LIMIT = 1000
+    TRADE_PROBE_PADDING_MS = 5 * 60 * 1000
+    TRADE_WINDOW_LIMIT_MS = (7 * 24 * 60 * 60 * 1000) - 1
+    MAX_TRADE_HISTORY_QUERIES = 64
 
     def __init__(
         self,
@@ -402,15 +406,242 @@ class AsterFuturesClient:
         )
         return {"retCode": 0, "result": {"list": [self._normalize_order(item) for item in orders]}}
 
+    @staticmethod
+    def _trade_identity(item: dict[str, Any]) -> tuple[str, ...]:
+        trade_id = str(item.get("id", "") or "")
+        if trade_id:
+            return ("id", trade_id)
+        return (
+            "shape",
+            str(item.get("orderId", "") or ""),
+            str(item.get("time", "") or ""),
+            str(item.get("side", "") or ""),
+            str(item.get("price", "") or ""),
+            str(item.get("qty", "") or ""),
+        )
+
+    def _get_user_trades_window(
+        self,
+        symbol: str,
+        start_time: int,
+        end_time: int,
+    ) -> list[dict[str, Any]]:
+        if end_time < start_time:
+            return []
+
+        windows: list[tuple[int, int]] = []
+        window_start = max(0, int(start_time))
+        final_end = max(window_start, int(end_time))
+        while window_start <= final_end:
+            window_end = min(final_end, window_start + self.TRADE_WINDOW_LIMIT_MS)
+            windows.append((window_start, window_end))
+            window_start = window_end + 1
+
+        rows: dict[tuple[str, ...], dict[str, Any]] = {}
+        query_count = 0
+        for current_start, current_end in windows:
+            query_count += 1
+            if query_count > self.MAX_TRADE_HISTORY_QUERIES:
+                raise RuntimeError("Aster trade history requires too many time-window queries")
+
+            page = self._request(
+                "GET",
+                "/fapi/v3/userTrades",
+                params={
+                    "symbol": symbol,
+                    "startTime": current_start,
+                    "endTime": current_end,
+                    "limit": self.TRADE_PAGE_LIMIT,
+                },
+                auth=True,
+            )
+            if not isinstance(page, list):
+                raise RuntimeError("Aster trade history returned an invalid response")
+
+            while True:
+                page_ids: list[int] = []
+                page_times: list[int] = []
+                reached_window_end = False
+                for item in page:
+                    if not isinstance(item, dict):
+                        raise RuntimeError("Aster trade history contains an invalid row")
+                    try:
+                        trade_id = int(item.get("id", ""))
+                        trade_time = int(item.get("time", ""))
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "Aster trade history row has no numeric id or time"
+                        ) from exc
+                    page_ids.append(trade_id)
+                    page_times.append(trade_time)
+                    if trade_time > current_end:
+                        reached_window_end = True
+                        continue
+                    if trade_time >= current_start:
+                        rows[self._trade_identity(item)] = item
+
+                if len(page) < self.TRADE_PAGE_LIMIT or reached_window_end:
+                    break
+                if not page_ids:
+                    raise RuntimeError("Aster trade history cannot advance without trade ids")
+                if (
+                    page_ids != sorted(page_ids)
+                    or page_times != sorted(page_times)
+                    or len(set(page_ids)) != len(page_ids)
+                ):
+                    raise RuntimeError(
+                        "Aster full trade history page is not strictly ordered"
+                    )
+
+                next_from_id = max(page_ids) + 1
+                query_count += 1
+                if query_count > self.MAX_TRADE_HISTORY_QUERIES:
+                    raise RuntimeError("Aster trade history requires too many paginated queries")
+                next_page = self._request(
+                    "GET",
+                    "/fapi/v3/userTrades",
+                    params={
+                        "symbol": symbol,
+                        "fromId": next_from_id,
+                        "limit": self.TRADE_PAGE_LIMIT,
+                    },
+                    auth=True,
+                )
+                if not isinstance(next_page, list):
+                    raise RuntimeError("Aster trade history returned an invalid response")
+                if next_page:
+                    try:
+                        minimum_next_id = min(int(item.get("id", "")) for item in next_page)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "Aster trade history row has no numeric trade id"
+                        ) from exc
+                    if minimum_next_id < next_from_id:
+                        raise RuntimeError("Aster trade history pagination did not advance")
+                page = next_page
+
+        return sorted(
+            rows.values(),
+            key=lambda item: (
+                int(item.get("time", 0) or 0),
+                int(item.get("id", 0) or 0),
+            ),
+        )
+
+    @staticmethod
+    def _matching_order_trades(
+        rows: list[dict[str, Any]],
+        order_id: str,
+    ) -> list[dict[str, Any]]:
+        matching: dict[tuple[str, ...], dict[str, Any]] = {}
+        for item in rows:
+            if str(item.get("orderId", "")) != str(order_id):
+                continue
+            matching[AsterFuturesClient._trade_identity(item)] = item
+        return sorted(
+            matching.values(),
+            key=lambda item: (
+                int(item.get("time", 0) or 0),
+                int(item.get("id", 0) or 0),
+            ),
+        )
+
+    @staticmethod
+    def _trade_qty(rows: list[dict[str, Any]]) -> Decimal:
+        return sum(
+            (Decimal(str(item.get("qty", "0") or "0")) for item in rows),
+            Decimal("0"),
+        )
+
     def get_order_trades(self, symbol: str, order_id: str) -> dict:
-        trades = self._request(
+        symbol = symbol.upper()
+        order_id = str(order_id)
+        detail: dict[str, Any] | None = None
+        try:
+            detail = self._request(
+                "GET",
+                "/fapi/v3/order",
+                params={"symbol": symbol, "orderId": order_id},
+                auth=True,
+            )
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "order does not exist" not in message and "unknown order" not in message:
+                raise
+
+        if detail is not None and not isinstance(detail, dict):
+            raise RuntimeError("Aster order lookup returned an invalid response")
+
+        expected_qty: Decimal | None = None
+        if detail is not None:
+            expected_qty = Decimal(str(detail.get("executedQty", "0") or "0"))
+            if expected_qty <= 0:
+                return {"retCode": 0, "result": {"list": []}}
+
+            created_time = int(detail.get("time", detail.get("updateTime", 0)) or 0)
+            updated_time = int(detail.get("updateTime", created_time) or created_time)
+            if updated_time > 0:
+                probe_start = max(0, updated_time - self.TRADE_PROBE_PADDING_MS)
+                probe_end = updated_time + self.TRADE_PROBE_PADDING_MS
+                probe_rows = self._get_user_trades_window(symbol, probe_start, probe_end)
+                matches = self._matching_order_trades(probe_rows, order_id)
+                matched_qty = self._trade_qty(matches)
+                if matched_qty == expected_qty:
+                    return {
+                        "retCode": 0,
+                        "result": {"list": [self._normalize_trade(item) for item in matches]},
+                    }
+                if matched_qty > expected_qty:
+                    raise RuntimeError(
+                        "Aster trade history quantity exceeds the order executed quantity"
+                    )
+
+                if created_time > 0:
+                    full_start = max(
+                        0,
+                        min(created_time, updated_time) - self.TRADE_PROBE_PADDING_MS,
+                    )
+                    full_end = max(created_time, updated_time) + self.TRADE_PROBE_PADDING_MS
+                    full_rows = self._get_user_trades_window(symbol, full_start, full_end)
+                    matches = self._matching_order_trades(full_rows, order_id)
+                    matched_qty = self._trade_qty(matches)
+                    if matched_qty == expected_qty:
+                        return {
+                            "retCode": 0,
+                            "result": {
+                                "list": [self._normalize_trade(item) for item in matches]
+                            },
+                        }
+                    if matched_qty > expected_qty:
+                        raise RuntimeError(
+                            "Aster trade history quantity exceeds the order executed quantity"
+                        )
+
+                raise RuntimeError(
+                    "Aster trade history is incomplete for the order executed quantity"
+                )
+
+        recent = self._request(
             "GET",
             "/fapi/v3/userTrades",
-            params={"symbol": symbol.upper(), "limit": 1000},
+            params={"symbol": symbol, "limit": self.TRADE_PAGE_LIMIT},
             auth=True,
         )
-        trades = [item for item in trades if str(item.get("orderId", "")) == str(order_id)]
-        return {"retCode": 0, "result": {"list": [self._normalize_trade(item) for item in trades]}}
+        if not isinstance(recent, list):
+            raise RuntimeError("Aster trade history returned an invalid response")
+        matches = self._matching_order_trades(recent, order_id)
+        if expected_qty is not None and self._trade_qty(matches) != expected_qty:
+            raise RuntimeError(
+                "Aster recent trade history is incomplete for the order executed quantity"
+            )
+        if len(recent) >= self.TRADE_PAGE_LIMIT:
+            raise RuntimeError(
+                "Aster recent trade page is full and the order time is unavailable"
+            )
+        return {
+            "retCode": 0,
+            "result": {"list": [self._normalize_trade(item) for item in matches]},
+        }
 
     def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
         trades = self._request(
@@ -449,7 +680,10 @@ class AsterFuturesClient:
         price = Decimal(str(item.get("price", "0")))
         qty = Decimal(str(item.get("qty", "0")))
         volume = Decimal(str(item.get("quoteQty") or (price * qty)))
-        fee_amount = Decimal(str(item.get("commission", "0")))
+        # Production V3 currently reports paid commission as positive, while
+        # the official V3 response example uses a negative balance delta.
+        # The normalized client contract represents fee cost as positive.
+        fee_amount = abs(Decimal(str(item.get("commission", "0"))))
         fee_asset = str(item.get("commissionAsset", "USDT")).upper()
         fee_usdt = self._fee_to_usdt(fee_amount, fee_asset)
         return {
