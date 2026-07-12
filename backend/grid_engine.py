@@ -75,6 +75,9 @@ class GridEngine:
         self.initial_side = ""
         self.initial_qty = 0.0
         self.initial_entry_price = 0.0
+        self.opening_target_qty = 0.0
+        self.opening_filled_qty = 0.0
+        self.opening_filled_volume = 0.0
         self.baseline_position_side = ""
         self.baseline_position_qty = 0.0
         self.baseline_position_entry_price = 0.0
@@ -150,6 +153,9 @@ class GridEngine:
             "initial_side": self.initial_side,
             "initial_qty": self.initial_qty,
             "initial_entry_price": self.initial_entry_price,
+            "opening_target_qty": self.opening_target_qty,
+            "opening_filled_qty": self.opening_filled_qty,
+            "opening_filled_volume": self.opening_filled_volume,
             "baseline_position_side": self.baseline_position_side,
             "baseline_position_qty": self.baseline_position_qty,
             "baseline_position_entry_price": self.baseline_position_entry_price,
@@ -220,6 +226,9 @@ class GridEngine:
         self.initial_side = str(state.get("initial_side") or "")
         self.initial_qty = float(state.get("initial_qty") or 0)
         self.initial_entry_price = float(state.get("initial_entry_price") or 0)
+        self.opening_target_qty = float(state.get("opening_target_qty") or 0)
+        self.opening_filled_qty = float(state.get("opening_filled_qty") or 0)
+        self.opening_filled_volume = float(state.get("opening_filled_volume") or 0)
         self.baseline_position_side = str(state.get("baseline_position_side") or "")
         self.baseline_position_qty = float(state.get("baseline_position_qty") or 0)
         self.baseline_position_entry_price = float(state.get("baseline_position_entry_price") or 0)
@@ -423,11 +432,51 @@ class GridEngine:
                 return "absent"
         return "pending"
 
-    def _record_opening_execution_for_stop(self, order: dict, stats: dict) -> bool:
+    def _begin_opening_progress(self, side: str, target_qty: float) -> None:
+        target = self._normalized_qty_decimal(target_qty, self.qty_step)
+        self.initial_side = side
+        self.initial_qty = 0.0
+        self.initial_entry_price = 0.0
+        self.opening_target_qty = float(target)
+        self.opening_filled_qty = 0.0
+        self.opening_filled_volume = 0.0
+        self._set_grid_position_net_qty(0)
+
+    def _opening_target_qty_decimal(self) -> Decimal:
+        candidates = (
+            self.opening_target_qty,
+            self.config.get("derived_total_qty"),
+        )
+        for candidate in candidates:
+            try:
+                qty = Decimal(str(candidate or 0))
+            except Exception:
+                continue
+            if qty > 0:
+                return self._normalized_qty_decimal(qty, self.qty_step)
+
+        order_qty = Decimal(str((self.opening_order or {}).get("qty", 0) or 0))
+        filled_qty = Decimal(str(self.opening_filled_qty or 0))
+        return self._normalized_qty_decimal(order_qty + filled_qty, self.qty_step)
+
+    def _record_opening_execution_delta(self, order: dict, stats: dict) -> bool:
         delta_stats = self._fill_delta_stats(order, stats)
         if not delta_stats:
             return False
+
         self._mark_order_fill_processed(order, stats)
+        filled_qty = Decimal(str(self.opening_filled_qty or 0)) + Decimal(
+            str(delta_stats["qty"])
+        )
+        filled_volume = Decimal(str(self.opening_filled_volume or 0)) + Decimal(
+            str(delta_stats["volume"])
+        )
+        self.opening_filled_qty = float(filled_qty)
+        self.opening_filled_volume = float(filled_volume)
+        self.initial_side = str(order.get("side") or self.initial_side)
+        self.initial_qty = float(filled_qty)
+        self.initial_entry_price = float(filled_volume / filled_qty) if filled_qty > 0 else 0.0
+        self._set_initial_grid_position(self.initial_side, self.initial_qty)
         self._record_trade_value(
             delta_stats["price"],
             delta_stats["qty"],
@@ -436,14 +485,11 @@ class GridEngine:
             fee_asset=delta_stats["fee_asset"],
             fee_source=delta_stats["fee_source"],
         )
-        total_qty = float(order.get("processed_fill_qty", 0) or 0)
-        total_volume = float(order.get("processed_fill_volume", 0) or 0)
-        self.initial_side = str(order.get("side") or self.initial_side)
-        self.initial_qty = total_qty
-        self.initial_entry_price = total_volume / total_qty if total_qty > 0 else 0.0
-        self._set_initial_grid_position(self.initial_side, total_qty)
         self._persist_state()
         return True
+
+    def _record_opening_execution_for_stop(self, order: dict, stats: dict) -> bool:
+        return self._record_opening_execution_delta(order, stats)
 
     def _terminal_order_accounted_for_stop(
         self,
@@ -887,6 +933,12 @@ class GridEngine:
             "initial_side": self.initial_side,
             "initial_qty": round(self.initial_qty, 8),
             "initial_entry_price": round(self.initial_entry_price, 10),
+            "opening_target_qty": round(self.opening_target_qty, 8),
+            "opening_filled_qty": round(self.opening_filled_qty, 8),
+            "opening_remaining_qty": round(
+                max(0.0, self.opening_target_qty - self.opening_filled_qty),
+                8,
+            ),
             "baseline_position": {
                 "side": self.baseline_position_side,
                 "qty": round(self.baseline_position_qty, 8),
@@ -4301,8 +4353,6 @@ class GridEngine:
                 )
         link_id = f"init_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
         self.initial_side = side
-        self.initial_qty = float(qty_text)
-        self.initial_entry_price = 0.0
         self.waiting_initial_order = True
         self.opening_order = {
             "link_id": link_id,
@@ -4376,7 +4426,7 @@ class GridEngine:
             result.get("result", {}) or {},
             allow_estimate=not hasattr(self.client, "get_order_trades"),
         )
-        planned_qty = Decimal(str(self.initial_qty))
+        planned_qty = Decimal(str(self.opening_order.get("qty", 0) or 0))
         confirmed_qty = Decimal(str((stats or {}).get("qty", 0) or 0))
         if not stats or confirmed_qty + self._qty_tolerance_decimal() < planned_qty:
             self.trigger_message = (
@@ -4386,17 +4436,7 @@ class GridEngine:
             self._mark_fast_poll()
             self._persist_state()
             return False
-        self.initial_qty = stats["qty"]
-        self.initial_entry_price = stats["price"]
-        self._set_initial_grid_position(side, stats["qty"])
-        self._record_trade_value(
-            stats["price"],
-            stats["qty"],
-            volume=stats["volume"],
-            fee=stats["fee"],
-            fee_asset=stats["fee_asset"],
-            fee_source=stats["fee_source"],
-        )
+        self._record_opening_execution_delta(self.opening_order, stats)
         self.opening_order = None
         self.waiting_initial_order = False
         self.initialization_in_progress = True
@@ -4431,8 +4471,6 @@ class GridEngine:
             )
         link_id = f"open_{side[0]}_{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
         self.initial_side = side
-        self.initial_qty = float(qty_text)
-        self.initial_entry_price = 0.0
         self.waiting_initial_order = True
         order_label = "post-only" if post_only else "limit"
         self.trigger_message = f"Waiting for {order_label} opening order at {price_text}"
@@ -5042,6 +5080,7 @@ class GridEngine:
         total_qty = self._prepare_pending_targets(reference_price)
 
         if direction in {"long", "short"}:
+            self._begin_opening_progress(open_side, total_qty)
             if initial_order_type in {"post_only", "limit"}:
                 self._place_limit_open(
                     open_side,
@@ -5052,7 +5091,10 @@ class GridEngine:
                 return
             if not self._place_market_open(open_side, total_qty):
                 return
-            self._prepare_pending_targets(self.initial_entry_price or current_price, self.initial_qty)
+            self._prepare_pending_targets_after_opening_fill(
+                self.initial_entry_price or current_price,
+                self.initial_qty,
+            )
             self._reset_reduce_lots_from_pending_targets(self.initial_entry_price or current_price)
             self._deploy_pending_targets()
 
@@ -5063,6 +5105,31 @@ class GridEngine:
 
         self.grid_ready = True
         self._persist_state()
+
+    def _prepare_pending_targets_after_opening_fill(
+        self,
+        fill_price: float,
+        fill_qty: float,
+    ) -> None:
+        if self._position_sizing_mode() != "fixed_grid_qty":
+            self._prepare_pending_targets(fill_price, fill_qty)
+            return
+
+        if not self._pending_targets:
+            raise RuntimeError(
+                "The fixed-grid opening plan is unavailable; no grid order was submitted"
+            )
+        target_qty = self._opening_target_qty_decimal()
+        confirmed_qty = self._normalized_qty_decimal(fill_qty, self.qty_step)
+        if abs(confirmed_qty - target_qty) > self._qty_tolerance_decimal():
+            raise RuntimeError(
+                "The fixed-grid opening quantity does not match its original plan: "
+                f"target={target_qty} confirmed={confirmed_qty}"
+            )
+        # Keep the pre-submission target identities and exact per-level quantity.
+        # If the market crosses levels while the opening order executes, those
+        # original GTC legs catch up naturally instead of redistributing inventory.
+        self.config["derived_total_qty"] = float(target_qty)
 
     def _target_orders_for_price(self, reference_price: float) -> tuple[list[tuple[int, float, str]], list[tuple[int, float, str]]]:
         levels = self.grid_levels
@@ -5753,6 +5820,92 @@ class GridEngine:
         )
         self._persist_state()
 
+    def _fail_opening_completion(self, reason: str) -> None:
+        self.waiting_initial_order = False
+        self.opening_order = None
+        self.initialization_in_progress = False
+        self.initialization_failed = True
+        self.manual_stop_pending = True
+        self.grid_ready = False
+        self.trigger_message = (
+            f"Opening fill was recorded, but the fixed-grid opening could not be completed: "
+            f"{reason}. The confirmed position is retained for review and will not be "
+            "market-closed automatically."
+        )
+        self._mark_fast_poll()
+        self._persist_state()
+
+    def _continue_fixed_grid_opening(self, status: str) -> bool:
+        target_qty = self._opening_target_qty_decimal()
+        filled_qty = self._normalized_qty_decimal(self.opening_filled_qty, self.qty_step)
+        remaining_qty = self._normalized_qty_decimal(
+            max(Decimal("0"), target_qty - filled_qty),
+            self.qty_step,
+        )
+        if remaining_qty <= self._qty_tolerance_decimal():
+            return True
+
+        order = dict(self.opening_order or {})
+        side = str(order.get("side") or self.initial_side)
+        order_type = str(order.get("order_type") or "Limit").lower()
+        post_only = str(order.get("time_in_force") or "") == "PostOnly"
+        self.waiting_initial_order = False
+        self.opening_order = None
+
+        try:
+            if order_type == "market":
+                completed = self._place_market_open(side, float(remaining_qty))
+                if not completed:
+                    self.trigger_message = (
+                        f"Initial market order ended as {status} after a partial fill; "
+                        f"waiting for the remaining {self._fq(float(remaining_qty))} opening "
+                        "quantity without changing the per-grid plan."
+                    )
+                    self._persist_state()
+                    return False
+                return True
+
+            current_price = self._get_current_price()
+            self.current_price = current_price
+            retry_price = self._initial_limit_price(
+                side,
+                current_price,
+                post_only=post_only,
+            )
+            if not (self.grid_levels[0] < retry_price < self.grid_levels[-1]):
+                raise RuntimeError(
+                    f"replacement price {retry_price} is outside the configured grid range"
+                )
+            self._place_limit_open(
+                side,
+                float(remaining_qty),
+                retry_price,
+                post_only=post_only,
+            )
+        except Exception as exc:
+            if self.opening_order:
+                self.waiting_initial_order = True
+                self.grid_ready = False
+                self.trigger_message = (
+                    f"Opening remainder may already be on the exchange: {exc}. The retained "
+                    "client order ID will be reconciled without another submission."
+                )
+                self._mark_fast_poll()
+                with contextlib.suppress(Exception):
+                    self._persist_state()
+                return False
+            self._fail_opening_completion(str(exc))
+            return False
+
+        order_label = "Post-only" if post_only else "Limit"
+        self.trigger_message = (
+            f"{order_label} opening order ended as {status} after a partial fill; "
+            f"refilling the exact remaining {self.opening_order['qty']} before deploying "
+            "the unchanged fixed-grid plan."
+        )
+        self._persist_state()
+        return False
+
     async def _check_initial_order(self):
         if not self.opening_order:
             return
@@ -5841,37 +5994,41 @@ class GridEngine:
             self._persist_state()
             return
 
-        qty_scale = stats["qty"] / planned_qty if planned_qty > 0 else 0
-        if qty_scale <= 0:
-            self.waiting_initial_order = False
-            self.running = False
-            self.trigger_message = "Opening order fill quantity is too small; please restart the grid."
-            self._clear_restore_refresh_state()
-            self._persist_state()
-            return
-
         # The exchange fill is authoritative even if the subsequent grid plan
         # cannot be deployed. Record ownership before any validation that can
         # fail so a real position can never disappear from the local ledger.
-        self.initial_qty = stats["qty"]
-        self.initial_entry_price = stats["price"]
-        self._set_initial_grid_position(self.initial_side, stats["qty"])
-        self._record_trade_value(
-            stats["price"],
-            stats["qty"],
-            volume=stats["volume"],
-            fee=stats["fee"],
-            fee_asset=stats["fee_asset"],
-            fee_source=stats["fee_source"],
-        )
+        self._record_opening_execution_delta(self.opening_order, stats)
+
+        if self._position_sizing_mode() == "fixed_grid_qty":
+            target_qty = self._opening_target_qty_decimal()
+            filled_qty = self._normalized_qty_decimal(
+                self.opening_filled_qty,
+                self.qty_step,
+            )
+            if filled_qty + self._qty_tolerance_decimal() < target_qty:
+                if not self._continue_fixed_grid_opening(status):
+                    return
+                filled_qty = self._normalized_qty_decimal(
+                    self.opening_filled_qty,
+                    self.qty_step,
+                )
+            if abs(filled_qty - target_qty) > self._qty_tolerance_decimal():
+                self._fail_opening_completion(
+                    f"target quantity {target_qty} differs from confirmed quantity {filled_qty}"
+                )
+                return
+
         self.opening_order = None
         self.waiting_initial_order = False
         self.initialization_in_progress = True
         self._persist_state()
 
         try:
-            self._prepare_pending_targets(stats["price"], stats["qty"])
-            self._reset_reduce_lots_from_pending_targets(stats["price"])
+            self._prepare_pending_targets_after_opening_fill(
+                self.initial_entry_price,
+                self.initial_qty,
+            )
+            self._reset_reduce_lots_from_pending_targets(self.initial_entry_price)
             self._deploy_pending_targets()
         except Exception as exc:
             self.initialization_in_progress = False
