@@ -24,6 +24,7 @@ NORMAL_POLL_SECONDS = 3.0
 FAST_POLL_SECONDS = 0.3
 FAST_POLL_WINDOW_SECONDS = 15.0
 USER_STREAM_KEEPALIVE_SECONDS = 30 * 60
+USER_STREAM_RECONNECT_SECONDS = 5.0
 BATCH_ORDER_CHUNK_SIZE = 5
 POSITION_SYNC_GRACE_SECONDS = 2.0
 SUBMISSION_RETRY_SECONDS = 10.0
@@ -720,6 +721,23 @@ class GridEngine:
                 return
             await asyncio.to_thread(self.client.keepalive_user_stream, listen_key)
 
+    async def _next_user_stream_message(self, websocket, keepalive_task: asyncio.Task):
+        receive_task = asyncio.create_task(websocket.recv())
+        try:
+            done, _ = await asyncio.wait(
+                {receive_task, keepalive_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if keepalive_task in done:
+                await keepalive_task
+                return None
+            return await receive_task
+        finally:
+            if not receive_task.done():
+                receive_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await receive_task
+
     def _is_relevant_user_stream_event(self, event: dict[str, Any]) -> bool:
         event_type = str(event.get("e") or "")
         if event_type not in {"ORDER_TRADE_UPDATE", "TRADE_LITE"}:
@@ -737,19 +755,26 @@ class GridEngine:
         while self.running and not self._stopping:
             keepalive_task: asyncio.Task | None = None
             listen_key = ""
+            reconnect_delay = 0.0
             try:
                 listen_key = await asyncio.to_thread(self.client.start_user_stream)
                 if not listen_key:
                     raise RuntimeError("Empty listen key")
                 self._user_stream_listen_key = listen_key
-                keepalive_task = asyncio.create_task(self._keepalive_user_stream(listen_key))
                 async with websockets.connect(
                     self.client.user_stream_url(listen_key),
                     ping_interval=20,
                     close_timeout=5,
                 ) as websocket:
-                    async for raw_message in websocket:
-                        if not self.running or self._stopping:
+                    keepalive_task = asyncio.create_task(
+                        self._keepalive_user_stream(listen_key)
+                    )
+                    while self.running and not self._stopping:
+                        raw_message = await self._next_user_stream_message(
+                            websocket,
+                            keepalive_task,
+                        )
+                        if raw_message is None:
                             break
                         try:
                             event = json.loads(raw_message)
@@ -761,18 +786,41 @@ class GridEngine:
                 raise
             except Exception as exc:
                 if self.running and not self._stopping:
+                    reconnect_delay = USER_STREAM_RECONNECT_SECONDS
+                    if isinstance(exc, ExchangeRateLimitError):
+                        reconnect_delay = max(reconnect_delay, float(exc.retry_after))
+                        with contextlib.suppress(Exception):
+                            self._record_order_rejection(
+                                "user_stream",
+                                str(exc),
+                                rate_limit_retry_after=float(exc.retry_after),
+                                track_shape=False,
+                            )
+                    elif is_exchange_rate_limit_message(exc):
+                        reconnect_delay = max(
+                            reconnect_delay,
+                            ORDER_REJECTION_BACKOFF_MAX_SECONDS,
+                        )
+                        with contextlib.suppress(Exception):
+                            self._record_order_rejection(
+                                "user_stream",
+                                str(exc),
+                                rate_limit_retry_after=reconnect_delay,
+                                track_shape=False,
+                            )
                     logger.warning(
                         "Binance user stream disconnected symbol=%s msg=%s",
                         self.config.get("symbol"),
                         exc,
                     )
-                    await asyncio.sleep(5)
             finally:
                 if keepalive_task:
                     keepalive_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
                         await keepalive_task
                 await self._close_user_stream_listen_key(listen_key)
+            if reconnect_delay > 0 and self.running and not self._stopping:
+                await asyncio.sleep(reconnect_delay)
 
     def get_status(self) -> dict:
         return {

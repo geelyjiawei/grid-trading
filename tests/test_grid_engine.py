@@ -15,6 +15,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from exchange_errors import ExchangeRateLimitError  # noqa: E402
+import grid_engine  # noqa: E402
 from grid_engine import GridEngine  # noqa: E402
 
 
@@ -1367,12 +1368,9 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, exc_type, exc, traceback):
                 return False
 
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
+            async def recv(self):
                 engine.running = False
-                raise StopAsyncIteration
+                return '{"e":"ACCOUNT_UPDATE"}'
 
         class FakeWebsockets:
             @staticmethod
@@ -1384,6 +1382,145 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             await engine._user_stream_loop()
 
         self.assertEqual(closed_keys, ["listen-key-1"])
+        self.assertEqual(engine._user_stream_listen_key, "")
+
+    async def test_user_stream_keepalive_failure_closes_key_and_reconnects(self):
+        client = FakeClient("100")
+        started_keys = []
+        closed_keys = []
+        keepalive_calls = 0
+
+        def start_user_stream():
+            key = f"listen-key-{len(started_keys) + 1}"
+            started_keys.append(key)
+            return key
+
+        def keepalive_user_stream(listen_key):
+            nonlocal keepalive_calls
+            keepalive_calls += 1
+            if keepalive_calls == 1:
+                raise RuntimeError("simulated keepalive failure")
+            engine.running = False
+            return {"retCode": 0}
+
+        client.start_user_stream = start_user_stream
+        client.keepalive_user_stream = keepalive_user_stream
+        client.close_user_stream = lambda listen_key: closed_keys.append(listen_key) or {
+            "retCode": 0
+        }
+        client.user_stream_url = lambda listen_key: f"wss://example.invalid/{listen_key}"
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "short"})
+
+        class FakeSocket:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def recv(self):
+                await asyncio.sleep(60)
+
+        class FakeWebsockets:
+            @staticmethod
+            def connect(*args, **kwargs):
+                return FakeSocket()
+
+        engine.running = True
+        with (
+            patch.object(grid_engine, "USER_STREAM_KEEPALIVE_SECONDS", 0),
+            patch.object(grid_engine, "USER_STREAM_RECONNECT_SECONDS", 0),
+            patch.dict(sys.modules, {"websockets": FakeWebsockets}),
+        ):
+            await asyncio.wait_for(engine._user_stream_loop(), timeout=1)
+
+        self.assertEqual(started_keys, ["listen-key-1", "listen-key-2"])
+        self.assertEqual(closed_keys, ["listen-key-1", "listen-key-2"])
+        self.assertEqual(keepalive_calls, 2)
+        self.assertEqual(engine._user_stream_listen_key, "")
+
+    async def test_user_stream_keepalive_rate_limit_registers_cooldown_before_retry(self):
+        client = FakeClient("100")
+        closed_keys = []
+        client.start_user_stream = lambda: "listen-key-rate-limit"
+        client.keepalive_user_stream = lambda listen_key: (_ for _ in ()).throw(
+            ExchangeRateLimitError("listen key rate limited", retry_after=17)
+        )
+        client.close_user_stream = lambda listen_key: closed_keys.append(listen_key) or {
+            "retCode": 0
+        }
+        client.user_stream_url = lambda listen_key: f"wss://example.invalid/{listen_key}"
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "short"})
+
+        class FakeSocket:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def recv(self):
+                await asyncio.sleep(60)
+
+        class FakeWebsockets:
+            @staticmethod
+            def connect(*args, **kwargs):
+                return FakeSocket()
+
+        engine.running = True
+        with (
+            patch.object(grid_engine, "USER_STREAM_KEEPALIVE_SECONDS", 0),
+            patch.dict(sys.modules, {"websockets": FakeWebsockets}),
+        ):
+            stream_task = asyncio.create_task(engine._user_stream_loop())
+            for _ in range(100):
+                if closed_keys:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(closed_keys, ["listen-key-rate-limit"])
+            self.assertGreater(engine._rate_limit_remaining(), 15)
+            stream_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await stream_task
+
+        self.assertEqual(engine._user_stream_listen_key, "")
+
+    async def test_stopping_user_stream_cancels_blocked_receive_and_closes_key(self):
+        client = FakeClient("100")
+        connected = asyncio.Event()
+        closed_keys = []
+        client.start_user_stream = lambda: "listen-key-stop"
+        client.keepalive_user_stream = lambda listen_key: {"retCode": 0}
+        client.close_user_stream = lambda listen_key: closed_keys.append(listen_key) or {
+            "retCode": 0
+        }
+        client.user_stream_url = lambda listen_key: f"wss://example.invalid/{listen_key}"
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "short"})
+
+        class FakeSocket:
+            async def __aenter__(self):
+                connected.set()
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def recv(self):
+                await asyncio.sleep(60)
+
+        class FakeWebsockets:
+            @staticmethod
+            def connect(*args, **kwargs):
+                return FakeSocket()
+
+        engine.running = True
+        with patch.dict(sys.modules, {"websockets": FakeWebsockets}):
+            engine._user_stream_task = asyncio.create_task(engine._user_stream_loop())
+            await asyncio.wait_for(connected.wait(), timeout=1)
+            await engine._stop_user_stream()
+
+        self.assertIsNone(engine._user_stream_task)
+        self.assertEqual(closed_keys, ["listen-key-stop"])
         self.assertEqual(engine._user_stream_listen_key, "")
 
     async def test_short_grid_deploys_market_short_buys_below_and_sells_above(self):
