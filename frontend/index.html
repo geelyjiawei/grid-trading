@@ -173,18 +173,18 @@
             </div>
             <div class="form-group">
               <label for="maker-fee-rate">挂单手续费率 Maker（%）</label>
-              <input id="maker-fee-rate" class="form-input" type="number" value="0.02" min="0" max="1" step="0.001" />
+              <input id="maker-fee-rate" class="form-input" type="number" value="" min="0" max="1" step="0.000001" placeholder="读取账户实际费率" readonly />
             </div>
           </div>
 
           <div class="form-row">
             <div class="form-group">
               <label for="taker-fee-rate">吃单手续费率 Taker（%）</label>
-              <input id="taker-fee-rate" class="form-input" type="number" value="0.05" min="0" max="1" step="0.001" />
+              <input id="taker-fee-rate" class="form-input" type="number" value="" min="0" max="1" step="0.000001" placeholder="读取账户实际费率" readonly />
             </div>
             <div class="form-group">
               <label>手续费说明</label>
-              <div class="form-hint">Binance 合约默认按挂单 0.02%、吃单 0.05% 兜底；成交明细返回真实手续费时，优先使用真实手续费。</div>
+              <div id="fee-rate-hint" class="form-hint">将从当前交易所账户读取该交易对的实际费率；读取失败时不会启动网格。</div>
             </div>
           </div>
 

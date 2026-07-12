@@ -640,6 +640,8 @@ class GridEngine:
             "fee_rate": self._fee_rate(),
             "maker_fee_rate": self._maker_fee_rate(),
             "taker_fee_rate": self._taker_fee_rate(),
+            "fee_rate_source": self.config.get("fee_rate_source", "saved_config"),
+            "fee_rate_fetched_at": self.config.get("fee_rate_fetched_at"),
             "start_time": self.start_time,
             "current_price": self.current_price,
             "market_qty_step": self.market_qty_step,

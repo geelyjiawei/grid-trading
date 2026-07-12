@@ -755,6 +755,32 @@ class AsterClientTests(unittest.TestCase):
 
         self.assertEqual(response, {"retCode": 0, "result": {}})
 
+    def test_fee_rates_use_signed_exchange_endpoint_and_short_cache(self):
+        client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            return {
+                "symbol": "ANSEMUSDT",
+                "makerCommissionRate": "0",
+                "takerCommissionRate": "0.000400",
+            }
+
+        client._request = fake_request
+
+        first = client.get_fee_rates("ansemusdt")
+        second = client.get_fee_rates("ANSEMUSDT")
+
+        self.assertEqual(
+            calls,
+            [("GET", "/fapi/v3/commissionRate", {"symbol": "ANSEMUSDT"}, True)],
+        )
+        self.assertEqual(first["result"]["makerFeeRate"], "0")
+        self.assertEqual(first["result"]["takerFeeRate"], "0.000400")
+        self.assertEqual(first["result"]["source"], "exchange")
+        self.assertEqual(second["result"]["source"], "exchange_cache")
+
 
 if __name__ == "__main__":
     unittest.main()

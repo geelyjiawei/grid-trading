@@ -27,6 +27,7 @@ from auth import (
 from aster_client import AsterFuturesClient
 from binance_client import BinanceFuturesClient
 from bybit_client import BybitClient
+from fee_rates import normalize_fee_rate
 from grid_engine import GridEngine
 from secret_store import decrypt_text, encrypt_text, storage_backend
 
@@ -739,6 +740,10 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
         "grid_order_qty": config.get("grid_order_qty"),
         "initial_order_type": config.get("initial_order_type", "market"),
         "initial_order_price": config.get("initial_order_price"),
+        "maker_fee_rate": engine._maker_fee_rate(),
+        "taker_fee_rate": engine._taker_fee_rate(),
+        "fee_rate_source": config.get("fee_rate_source", "saved_config"),
+        "fee_rate_fetched_at": config.get("fee_rate_fetched_at"),
         "status": status,
         "started_at": engine.start_time or time.time(),
         "updated_at": time.time(),
@@ -790,6 +795,56 @@ def _validate_fee_rates(cfg: "GridConfig"):
         value = getattr(cfg, field)
         if value is not None and (value < 0 or value > 0.01):
             raise HTTPException(status_code=400, detail=f"{field} must be between 0 and 0.01")
+
+
+def _exchange_fee_rates(client, symbol: str) -> dict:
+    try:
+        response = client.get_fee_rates(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch account fee rates for {symbol}: {exc}",
+        ) from exc
+    if not isinstance(response, dict):
+        raise HTTPException(status_code=502, detail="Exchange returned an invalid fee rate response")
+    if response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=response.get("retMsg", f"Failed to fetch account fee rates for {symbol}"),
+        )
+
+    result = response.get("result") or {}
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Exchange returned an invalid fee rate response")
+    try:
+        maker_fee_rate = normalize_fee_rate(result.get("makerFeeRate"), "maker fee rate")
+        taker_fee_rate = normalize_fee_rate(result.get("takerFeeRate"), "taker fee rate")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try:
+        fetched_at = int(result.get("fetchedAt") or int(time.time() * 1000))
+    except (TypeError, ValueError):
+        fetched_at = int(time.time() * 1000)
+    return {
+        "symbol": symbol,
+        "maker_fee_rate": maker_fee_rate,
+        "taker_fee_rate": taker_fee_rate,
+        "source": str(result.get("source") or "exchange"),
+        "fetched_at": fetched_at,
+    }
+
+
+def _with_exchange_fee_rates(client, cfg: "GridConfig", symbol: str) -> tuple["GridConfig", dict]:
+    rates = _exchange_fee_rates(client, symbol)
+    updated = cfg.model_copy(
+        update={
+            "fee_rate": float(rates["taker_fee_rate"]),
+            "maker_fee_rate": float(rates["maker_fee_rate"]),
+            "taker_fee_rate": float(rates["taker_fee_rate"]),
+        }
+    )
+    _validate_fee_rates(updated)
+    return updated, rates
 
 
 def _position_sizing_mode(cfg: "GridConfig") -> str:
@@ -1431,6 +1486,14 @@ def get_balance(exchange: str | None = None):
     }
 
 
+@app.get("/api/fees/{symbol}")
+def get_fee_rates(symbol: str, exchange: str | None = None):
+    exchange = _normalize_exchange(exchange or _active_exchange)
+    client = _get_client(exchange)
+    rates = _exchange_fee_rates(client, symbol.upper().strip())
+    return {"exchange": exchange, **rates}
+
+
 @app.get("/api/positions/{symbol}")
 def get_positions(symbol: str, exchange: str | None = None):
     client = _get_client(exchange)
@@ -1484,7 +1547,6 @@ def grid_preview(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="grid_order_qty must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
-    _validate_fee_rates(cfg)
     if direction not in {"long", "short", "neutral"}:
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
@@ -1496,8 +1558,12 @@ def grid_preview(cfg: GridConfig):
     if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
+    cfg, fee_rates = _with_exchange_fee_rates(client, cfg, symbol)
+
     preview = _preview_grid(client, cfg, symbol, direction, grid_mode)
     preview["exchange"] = exchange
+    preview["fee_rate_source"] = fee_rates["source"]
+    preview["fee_rate_fetched_at"] = fee_rates["fetched_at"]
     return preview
 
 
@@ -1523,7 +1589,6 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="grid_order_qty must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
-    _validate_fee_rates(cfg)
     if direction not in {"long", "short", "neutral"}:
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
@@ -1534,6 +1599,8 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="limit initial orders are only supported for long or short grids")
     if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
+
+    cfg, fee_rates = _with_exchange_fee_rates(client, cfg, symbol)
 
     # Never interpret a damaged durable ledger as an empty account. This check
     # runs before any exchange order or position-changing request.
@@ -1546,6 +1613,8 @@ async def start_grid(cfg: GridConfig):
     engine_config["grid_mode"] = grid_mode
     engine_config["initial_order_type"] = initial_order_type
     engine_config["position_sizing_mode"] = sizing_mode
+    engine_config["fee_rate_source"] = fee_rates["source"]
+    engine_config["fee_rate_fetched_at"] = fee_rates["fetched_at"]
     engine_config["run_id"] = f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
     engine_config["strict_order_ownership"] = True
     engine = GridEngine(client, engine_config, state_callback=_save_engine_state)

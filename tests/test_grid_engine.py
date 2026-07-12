@@ -42,6 +42,9 @@ class FakeClient:
         self.reject_reduce_limit = False
         self.cancelled_orders = []
         self.instant_fill_reduce_limits = False
+        self.maker_fee_rate = "0.0002"
+        self.taker_fee_rate = "0.0005"
+        self.fee_rate_calls = []
 
     def get_instrument_info(self, symbol):
         return {
@@ -66,6 +69,19 @@ class FakeClient:
 
     def get_ticker(self, symbol):
         return {"retCode": 0, "result": {"list": [{"lastPrice": str(self.ticker_price)}]}}
+
+    def get_fee_rates(self, symbol):
+        self.fee_rate_calls.append(symbol)
+        return {
+            "retCode": 0,
+            "result": {
+                "symbol": symbol,
+                "makerFeeRate": self.maker_fee_rate,
+                "takerFeeRate": self.taker_fee_rate,
+                "source": "exchange",
+                "fetchedAt": 1714012800000,
+            },
+        }
 
     def place_order(self, **kwargs):
         if (

@@ -9,11 +9,13 @@ from urllib.parse import urlencode
 import requests
 
 from exchange_errors import ExchangeRequestUncertainError
+from fee_rates import fee_rate_response
 
 
 class BinanceFuturesClient:
     exchange = "binance"
     ASSET_PRICE_TTL_SECONDS = 60
+    FEE_RATE_TTL_SECONDS = 300
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -24,6 +26,7 @@ class BinanceFuturesClient:
         self.session = requests.Session()
         self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
         self._instrument_info_cache: dict[str, tuple[dict, float]] = {}
+        self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
 
     def _sign(self, params: dict[str, Any]) -> str:
         query = urlencode(params, doseq=True)
@@ -150,6 +153,42 @@ class BinanceFuturesClient:
                 ]
             },
         }
+
+    def get_fee_rates(self, symbol: str) -> dict:
+        symbol = symbol.upper()
+        cached = self._fee_rate_cache.get(symbol)
+        cache_clock = time.monotonic()
+        if cached and cache_clock - cached[3] < self.FEE_RATE_TTL_SECONDS:
+            return fee_rate_response(
+                symbol,
+                cached[0],
+                cached[1],
+                source="exchange_cache",
+                fetched_at=cached[2],
+            )
+
+        data = self._request(
+            "GET",
+            "/fapi/v1/commissionRate",
+            params={"symbol": symbol},
+            auth=True,
+        )
+        fetched_at = int(time.time() * 1000)
+        response = fee_rate_response(
+            symbol,
+            data.get("makerCommissionRate"),
+            data.get("takerCommissionRate"),
+            source="exchange",
+            fetched_at=fetched_at,
+        )
+        result = response["result"]
+        self._fee_rate_cache[symbol] = (
+            result["makerFeeRate"],
+            result["takerFeeRate"],
+            fetched_at,
+            cache_clock,
+        )
+        return response
 
     def set_leverage(self, symbol: str, leverage: str) -> dict:
         self._request(

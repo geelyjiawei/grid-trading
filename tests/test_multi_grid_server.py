@@ -730,6 +730,101 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(status["unrealised_pnl"], 0.0)
         self.assertAlmostEqual(status["total_equity_profit"], status["realized_net_profit"])
 
+    def test_fee_rates_endpoint_returns_account_values(self):
+        main._client.maker_fee_rate = "0"
+        main._client.taker_fee_rate = "0.0004"
+
+        response = self.client.get("/api/fees/ANSEMUSDT?exchange=binance")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "exchange": "binance",
+                "symbol": "ANSEMUSDT",
+                "maker_fee_rate": "0",
+                "taker_fee_rate": "0.0004",
+                "source": "exchange",
+                "fetched_at": 1714012800000,
+            },
+        )
+        self.assertEqual(main._client.fee_rate_calls, ["ANSEMUSDT"])
+
+    def test_grid_preview_uses_account_rates_not_submitted_rates(self):
+        main._client = FakeClient("100")
+        main._client.maker_fee_rate = "0"
+        main._client.taker_fee_rate = "0.0004"
+        payload = self._payload("FEEUSDT")
+        payload.update(
+            {
+                "fee_rate": 0.009,
+                "maker_fee_rate": 0.009,
+                "taker_fee_rate": 0.009,
+            }
+        )
+
+        response = self.client.post("/api/grid/preview", json=payload)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["maker_fee_rate"], 0.0)
+        self.assertEqual(data["taker_fee_rate"], 0.0004)
+        self.assertEqual(data["fee_rate_source"], "exchange")
+        self.assertAlmostEqual(data["per_grid_close_fee"], 0.0)
+        self.assertAlmostEqual(data["per_grid_open_fee"], 0.04)
+
+    def test_grid_start_persists_account_rates_not_submitted_rates(self):
+        main._client = FakeClient("100")
+        main._client.maker_fee_rate = "0.0001"
+        main._client.taker_fee_rate = "0.0006"
+        payload = self._payload("FEEUSDT")
+        payload.update({"maker_fee_rate": 0, "taker_fee_rate": 0, "fee_rate": 0})
+
+        response = self.client.post("/api/grid/start", json=payload)
+        engine = main._get_engine("binance", "FEEUSDT")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(engine)
+        self.assertEqual(engine.config["maker_fee_rate"], 0.0001)
+        self.assertEqual(engine.config["taker_fee_rate"], 0.0006)
+        self.assertEqual(engine.config["fee_rate"], 0.0006)
+        self.assertEqual(engine.config["fee_rate_source"], "exchange")
+        status = self.client.get("/api/grid/status/FEEUSDT?exchange=binance").json()
+        history = self.client.get("/api/grid/history?exchange=binance").json()["runs"]
+        record = next(item for item in history if item["symbol"] == "FEEUSDT")
+        self.assertEqual(status["maker_fee_rate"], 0.0001)
+        self.assertEqual(status["taker_fee_rate"], 0.0006)
+        self.assertEqual(status["fee_rate_source"], "exchange")
+        self.assertEqual(record["maker_fee_rate"], 0.0001)
+        self.assertEqual(record["taker_fee_rate"], 0.0006)
+        self.assertEqual(record["fee_rate_source"], "exchange")
+
+    def test_grid_start_fails_before_orders_when_fee_rate_lookup_fails(self):
+        main._client = FakeClient("100")
+
+        def fail_fee_lookup(symbol):
+            raise RuntimeError("fee endpoint unavailable")
+
+        main._client.get_fee_rates = fail_fee_lookup
+
+        response = self.client.post("/api/grid/start", json=self._payload("FEEFAILUSDT"))
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("fee endpoint unavailable", response.json()["detail"])
+        self.assertEqual(main._client.orders, [])
+        self.assertIsNone(main._get_engine("binance", "FEEFAILUSDT"))
+
+    def test_grid_start_rejects_malformed_exchange_fee_rates_before_orders(self):
+        main._client = FakeClient("100")
+        main._client.maker_fee_rate = "NaN"
+
+        response = self.client.post("/api/grid/start", json=self._payload("BADFEEUSDT"))
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("invalid maker fee rate", response.json()["detail"])
+        self.assertEqual(main._client.orders, [])
+        self.assertIsNone(main._get_engine("binance", "BADFEEUSDT"))
+
     def test_grid_preview_uses_active_grid_count_and_exchange_qty_step(self):
         main._client = FakeClient("100")
         payload = {
@@ -2297,6 +2392,46 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(info["marketLotSizeFilter"]["minOrderQty"], "0.1")
         self.assertEqual(info["marketLotSizeFilter"]["maxOrderQty"], "120")
 
+    def test_binance_fee_rates_use_signed_endpoint_and_short_cache(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        calls = []
+
+        def fake_request(method, path, *, params=None, auth=False, api_key=False):
+            calls.append((method, path, params, auth))
+            return {
+                "symbol": "BTCUSDT",
+                "makerCommissionRate": "0.000200",
+                "takerCommissionRate": "0.000500",
+            }
+
+        client._request = fake_request
+
+        first = client.get_fee_rates("btcusdt")
+        second = client.get_fee_rates("BTCUSDT")
+
+        self.assertEqual(
+            calls,
+            [("GET", "/fapi/v1/commissionRate", {"symbol": "BTCUSDT"}, True)],
+        )
+        self.assertEqual(first["result"]["makerFeeRate"], "0.000200")
+        self.assertEqual(first["result"]["takerFeeRate"], "0.000500")
+        self.assertEqual(second["result"]["source"], "exchange_cache")
+
+    def test_binance_fee_rate_cache_expiry_requeries_exchange(self):
+        client = BinanceFuturesClient("key", "secret", True)
+        client.FEE_RATE_TTL_SECONDS = 0
+        client._request = Mock(
+            return_value={
+                "makerCommissionRate": "0.0002",
+                "takerCommissionRate": "0.0005",
+            }
+        )
+
+        client.get_fee_rates("BTCUSDT")
+        client.get_fee_rates("BTCUSDT")
+
+        self.assertEqual(client._request.call_count, 2)
+
     def test_binance_get_order_by_link_uses_orig_client_order_id(self):
         client = BinanceFuturesClient("", "", True)
         calls = []
@@ -2453,6 +2588,55 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(calls[1][1], "/v5/order/history")
         self.assertIn("orderLinkId=g_2_B_recover", calls[1][2])
         self.assertEqual(response["result"]["orderId"], "bybit-1")
+
+    def test_bybit_fee_rates_use_signed_endpoint_and_short_cache(self):
+        client = BybitClient("key", "secret", True)
+        calls = []
+
+        def fake_request(method, path, *, params="", payload=None, auth=False):
+            calls.append((method, path, params, auth))
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "makerFeeRate": "0.0001",
+                            "takerFeeRate": "0.0006",
+                        }
+                    ]
+                },
+            }
+
+        client._request = fake_request
+
+        first = client.get_fee_rates("btcusdt")
+        second = client.get_fee_rates("BTCUSDT")
+
+        self.assertEqual(
+            calls,
+            [("GET", "/v5/account/fee-rate", "category=linear&symbol=BTCUSDT", True)],
+        )
+        self.assertEqual(first["result"]["makerFeeRate"], "0.0001")
+        self.assertEqual(first["result"]["takerFeeRate"], "0.0006")
+        self.assertEqual(second["result"]["source"], "exchange_cache")
+
+    def test_bybit_fee_rate_error_response_is_never_cached_as_success(self):
+        client = BybitClient("key", "secret", True)
+        client._request = Mock(
+            return_value={
+                "retCode": 10001,
+                "retMsg": "invalid account",
+                "result": {
+                    "list": [{"makerFeeRate": "0", "takerFeeRate": "0"}],
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "invalid account"):
+            client.get_fee_rates("BTCUSDT")
+
+        self.assertEqual(client._fee_rate_cache, {})
 
     def test_bybit_open_orders_follows_every_cursor_page(self):
         client = BybitClient("key", "secret")

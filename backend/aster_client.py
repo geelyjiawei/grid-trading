@@ -12,6 +12,7 @@ from eth_account import Account
 from eth_account.messages import encode_typed_data
 
 from exchange_errors import ExchangeRequestUncertainError
+from fee_rates import fee_rate_response
 
 
 class AsterFuturesClient:
@@ -22,6 +23,7 @@ class AsterFuturesClient:
     TRADE_PROBE_PADDING_MS = 5 * 60 * 1000
     TRADE_WINDOW_LIMIT_MS = (7 * 24 * 60 * 60 * 1000) - 1
     MAX_TRADE_HISTORY_QUERIES = 64
+    FEE_RATE_TTL_SECONDS = 300
 
     def __init__(
         self,
@@ -57,6 +59,7 @@ class AsterFuturesClient:
         self.session = requests.Session()
         self._asset_price_cache: dict[str, tuple[Decimal, float]] = {}
         self._instrument_info_cache: dict[str, tuple[dict, float]] = {}
+        self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
         self._nonce_lock = threading.Lock()
         self._last_nonce = 0
 
@@ -642,6 +645,42 @@ class AsterFuturesClient:
             "retCode": 0,
             "result": {"list": [self._normalize_trade(item) for item in matches]},
         }
+
+    def get_fee_rates(self, symbol: str) -> dict:
+        symbol = symbol.upper()
+        cached = self._fee_rate_cache.get(symbol)
+        cache_clock = time.monotonic()
+        if cached and cache_clock - cached[3] < self.FEE_RATE_TTL_SECONDS:
+            return fee_rate_response(
+                symbol,
+                cached[0],
+                cached[1],
+                source="exchange_cache",
+                fetched_at=cached[2],
+            )
+
+        data = self._request(
+            "GET",
+            "/fapi/v3/commissionRate",
+            params={"symbol": symbol},
+            auth=True,
+        )
+        fetched_at = int(time.time() * 1000)
+        response = fee_rate_response(
+            symbol,
+            data.get("makerCommissionRate"),
+            data.get("takerCommissionRate"),
+            source="exchange",
+            fetched_at=fetched_at,
+        )
+        result = response["result"]
+        self._fee_rate_cache[symbol] = (
+            result["makerFeeRate"],
+            result["takerFeeRate"],
+            fetched_at,
+            cache_clock,
+        )
+        return response
 
     def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
         trades = self._request(

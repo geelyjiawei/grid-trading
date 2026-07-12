@@ -8,10 +8,13 @@ from typing import Any
 import requests
 
 from exchange_errors import ExchangeRequestUncertainError
+from fee_rates import fee_rate_response
 
 
 class BybitClient:
+    exchange = "bybit"
     ASSET_PRICE_TTL_SECONDS = 60
+    FEE_RATE_TTL_SECONDS = 300
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -19,6 +22,7 @@ class BybitClient:
         self.base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.recv_window = "5000"
         self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
+        self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
 
     def _sign(self, payload: str, timestamp: str) -> str:
         raw = f"{timestamp}{self.api_key}{self.recv_window}{payload}"
@@ -153,6 +157,47 @@ class BybitClient:
             payload={"category": "linear", "symbol": symbol},
             auth=True,
         )
+
+    def get_fee_rates(self, symbol: str) -> dict:
+        symbol = symbol.upper()
+        cached = self._fee_rate_cache.get(symbol)
+        cache_clock = time.monotonic()
+        if cached and cache_clock - cached[3] < self.FEE_RATE_TTL_SECONDS:
+            return fee_rate_response(
+                symbol,
+                cached[0],
+                cached[1],
+                source="exchange_cache",
+                fetched_at=cached[2],
+            )
+
+        data = self._request(
+            "GET",
+            "/v5/account/fee-rate",
+            params=f"category=linear&symbol={symbol}",
+            auth=True,
+        )
+        if data.get("retCode") != 0:
+            raise RuntimeError(str(data.get("retMsg") or f"Bybit fee rate query failed for {symbol}"))
+        items = data.get("result", {}).get("list") or []
+        if not items:
+            raise RuntimeError(f"Bybit returned no fee rate for {symbol}")
+        fetched_at = int(time.time() * 1000)
+        response = fee_rate_response(
+            symbol,
+            items[0].get("makerFeeRate"),
+            items[0].get("takerFeeRate"),
+            source="exchange",
+            fetched_at=fetched_at,
+        )
+        result = response["result"]
+        self._fee_rate_cache[symbol] = (
+            result["makerFeeRate"],
+            result["takerFeeRate"],
+            fetched_at,
+            cache_clock,
+        )
+        return response
 
     def _get_paginated(
         self,

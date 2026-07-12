@@ -5,12 +5,14 @@ let toastTimer = null;
 let latestPrice = NaN;
 let authRequired = false;
 let activeDetailPanel = "positions";
-let activeExchange = "bybit";
+let activeExchange = "";
 let currentRiskSymbol = "";
 let previewRequestSeq = 0;
 let exchangeOpenOrders = [];
 let exchangeTrades = [];
 let exchangeConfigs = {};
+let feeRateRequestSeq = 0;
+let feeRateState = { verified: false, exchange: "", symbol: "" };
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -116,6 +118,7 @@ function bindEvents() {
   updateSizingModeVisibility(false);
 
   document.getElementById("symbol-input").addEventListener("change", async () => {
+    await loadFeeRates();
     await fetchPrice();
     updatePreview();
     if (!isSymbolRunning(getSymbol())) {
@@ -127,6 +130,7 @@ function bindEvents() {
   document.getElementById("active-exchange-select").addEventListener("change", async () => {
     activeExchange = document.getElementById("active-exchange-select").value;
     syncExchangeInputs();
+    await loadFeeRates();
     await fetchPrice();
     await fetchBalance();
     await pollGridStatus();
@@ -158,6 +162,71 @@ function withExchange(url, exchange = activeExchange) {
   return `${url}${url.includes("?") ? "&" : "?"}${exchangeQuery(exchange)}`;
 }
 
+function formatFeeRatePercent(rate) {
+  const percent = Number(rate) * 100;
+  if (!Number.isFinite(percent)) return "";
+  return percent.toFixed(6).replace(/0+$/, "").replace(/\.$/, "") || "0";
+}
+
+function clearFeeRates(message) {
+  previewRequestSeq += 1;
+  document.getElementById("maker-fee-rate").value = "";
+  document.getElementById("taker-fee-rate").value = "";
+  document.getElementById("fee-rate-hint").textContent = message;
+  feeRateState = { verified: false, exchange: activeExchange, symbol: getSymbol() };
+}
+
+function applyFeeRates(data, exchange, symbol) {
+  document.getElementById("maker-fee-rate").value = formatFeeRatePercent(data.maker_fee_rate);
+  document.getElementById("taker-fee-rate").value = formatFeeRatePercent(data.taker_fee_rate);
+  const source = data.source === "exchange_cache" ? "账户实际费率（短时缓存）" : "账户实际费率";
+  document.getElementById("fee-rate-hint").textContent = `${exchangeDisplayName(exchange)} ${symbol} ${source}；目标限价预估按 Maker，若实际吃单会按成交明细的 Taker 费用记账；正式启动时后端会再次校验。`;
+  feeRateState = { verified: true, exchange, symbol };
+}
+
+function feeRatesReady() {
+  return feeRateState.verified
+    && feeRateState.exchange === activeExchange
+    && feeRateState.symbol === getSymbol();
+}
+
+async function loadFeeRates({ notify = false } = {}) {
+  const exchange = activeExchange;
+  const symbol = getSymbol();
+  const requestSeq = ++feeRateRequestSeq;
+  if (!symbol) {
+    clearFeeRates("请先输入交易对，再读取账户实际费率。");
+    return false;
+  }
+  if (!exchangeConfigs[exchange]?.configured) {
+    clearFeeRates(`请先保存 ${exchangeDisplayName(exchange)} 账户配置，再读取实际手续费率。`);
+    return false;
+  }
+
+  clearFeeRates(`正在读取 ${exchangeDisplayName(exchange)} ${symbol} 的账户实际费率…`);
+  try {
+    const data = await api(withExchange(`/api/fees/${symbol}`, exchange));
+    if (requestSeq !== feeRateRequestSeq || exchange !== activeExchange || symbol !== getSymbol()) {
+      return false;
+    }
+    applyFeeRates(data, exchange, symbol);
+    updatePreview();
+    return true;
+  } catch (error) {
+    if (requestSeq !== feeRateRequestSeq || exchange !== activeExchange || symbol !== getSymbol()) {
+      return false;
+    }
+    clearFeeRates(`账户实际费率读取失败：${error.message}。为避免利润误算，当前不能启动网格。`);
+    document.getElementById("grid-preview").classList.add("hidden");
+    if (notify) showToast(`手续费率读取失败：${error.message}`, "error");
+    return false;
+  }
+}
+
+async function ensureFeeRates() {
+  return feeRatesReady() || loadFeeRates({ notify: true });
+}
+
 function syncExchangeInputs() {
   const activeSelect = document.getElementById("active-exchange-select");
   const configSelect = document.getElementById("cfg-exchange");
@@ -182,6 +251,7 @@ async function loadConfig() {
     syncExchangeInputs();
     renderConfigStatus(config);
     renderConfigDraftHint();
+    await loadFeeRates({ notify: false });
     if (config.configs?.[activeExchange]?.configured || config.configured) {
       await fetchBalance();
     }
@@ -234,6 +304,7 @@ function setDirection(direction) {
   document.getElementById("btn-long").className = `dir-btn${direction === "long" ? " active long" : ""}`;
   document.getElementById("btn-short").className = `dir-btn${direction === "short" ? " active short" : ""}`;
   document.getElementById("btn-neutral").className = `dir-btn${direction === "neutral" ? " active" : ""}`;
+  updatePreview();
 }
 
 async function updatePreview() {
@@ -249,6 +320,12 @@ async function updatePreview() {
   const gridMode = document.getElementById("grid-mode").value;
   const box = document.getElementById("grid-preview");
   const symbol = getSymbol();
+  const exchange = activeExchange;
+
+  if (!feeRatesReady()) {
+    box.classList.add("hidden");
+    return;
+  }
 
   const hasSizingInput = sizingMode === "fixed_grid_qty"
     ? gridOrderQty > 0
@@ -261,7 +338,7 @@ async function updatePreview() {
   const requestSeq = ++previewRequestSeq;
   try {
     const preview = await api("/api/grid/preview", "POST", {
-      exchange: activeExchange,
+      exchange,
       symbol,
       direction: currentDirection,
       grid_mode: gridMode,
@@ -282,7 +359,21 @@ async function updatePreview() {
       stop_loss_price: parseOptionalNumber("stop-loss-price"),
       take_profit_price: parseOptionalNumber("take-profit-price"),
     });
-    if (requestSeq !== previewRequestSeq) return;
+    if (
+      requestSeq !== previewRequestSeq
+      || exchange !== activeExchange
+      || symbol !== getSymbol()
+    ) return;
+
+    applyFeeRates(
+      {
+        maker_fee_rate: preview.maker_fee_rate,
+        taker_fee_rate: preview.taker_fee_rate,
+        source: preview.fee_rate_source,
+      },
+      exchange,
+      symbol,
+    );
 
     const minQty = Number(preview.qty_per_grid_min || 0);
     const maxQty = Number(preview.qty_per_grid_max || 0);
@@ -302,7 +393,11 @@ async function updatePreview() {
     document.getElementById("prev-total-qty").textContent = formatOrderQty(preview.total_qty);
     box.classList.remove("hidden");
   } catch (_) {
-    box.classList.add("hidden");
+    if (
+      requestSeq === previewRequestSeq
+      && exchange === activeExchange
+      && symbol === getSymbol()
+    ) box.classList.add("hidden");
   }
 }
 
@@ -350,6 +445,8 @@ async function fetchBalance() {
 }
 
 async function startGrid() {
+  if (!(await ensureFeeRates())) return;
+
   const sizingMode = document.getElementById("position-sizing-mode").value;
   const payload = {
     exchange: activeExchange,
@@ -714,6 +811,7 @@ async function selectGridSymbol(exchange, symbol) {
   syncExchangeInputs();
   document.getElementById("symbol-input").value = symbol;
   showToast(`已切换到 ${exchangeDisplayName(activeExchange)} · ${symbol}`, "success");
+  await loadFeeRates();
   await fetchPrice();
   await fetchBalance();
   await pollGridStatus();
