@@ -6584,6 +6584,10 @@ class GridEngine:
             changed = self._bind_fixed_grid_replacement_to_level_coverage(order) or changed
             replacement_link_id = str(order.get("replacement_link_id") or "")
             if replacement_link_id and replacement_link_id in self.active_orders:
+                if order.get("completed_pair_counted"):
+                    self.active_orders[replacement_link_id][
+                        "completed_pair_counted"
+                    ] = True
                 changed = True
                 continue
             plan = self._queued_replacement_order_plan(order)
@@ -6676,10 +6680,23 @@ class GridEngine:
             if order.get("completed_pair_counted") and link_id in self.active_orders:
                 self.active_orders[link_id]["completed_pair_counted"] = True
 
+        def retry_ready(order: dict, now: float) -> bool:
+            if now < float(order.get("replacement_retry_after", 0) or 0):
+                return False
+            return self._rate_limit_remaining() <= 0
+
+        def defer_retry(order: dict, now: float) -> None:
+            attempts = int(order.get("replacement_retry_attempts", 0) or 0) + 1
+            order["replacement_retry_attempts"] = attempts
+            order["replacement_retry_after"] = now + min(
+                30.0,
+                NORMAL_POLL_SECONDS * (2 ** min(attempts, 4)),
+            )
+
         for order in pending:
             if order.get("replacement_mode") == "same_order":
                 now = time.time()
-                if now < float(order.get("replacement_retry_after", 0) or 0):
+                if not retry_ready(order, now):
                     continue
                 side = str(order["side"])
                 level_idx = int(order["level_idx"])
@@ -6705,12 +6722,10 @@ class GridEngine:
                     dequeue(order)
                     self._persist_state()
                 else:
-                    attempts = int(order.get("replacement_retry_attempts", 0) or 0) + 1
-                    order["replacement_retry_attempts"] = attempts
-                    order["replacement_retry_after"] = now + min(
-                        30.0,
-                        NORMAL_POLL_SECONDS * (2 ** min(attempts, 4)),
-                    )
+                    defer_retry(order, now)
+                continue
+            now = time.time()
+            if not retry_ready(order, now):
                 continue
             if not self._should_place_counter_order_now(order):
                 continue
@@ -6728,6 +6743,19 @@ class GridEngine:
             if self._place_counter_order(order):
                 dequeue(order)
                 self._persist_state()
+            else:
+                defer_retry(order, now)
+        covered_replacements = {
+            id(order)
+            for order in self.paused_replacements
+            if self._fixed_grid_open_replacement_is_covered(order)
+        }
+        if covered_replacements:
+            self.paused_replacements = [
+                order
+                for order in self.paused_replacements
+                if id(order) not in covered_replacements
+            ]
         self.trigger_message = (
             ""
             if not self.paused_replacements
@@ -7060,6 +7088,46 @@ class GridEngine:
         if persist_state:
             self._persist_state()
 
+    def _fixed_grid_open_counter_deficit(
+        self,
+        side: str,
+        level_idx: int,
+    ) -> float:
+        lots = self._reduce_lot_decimal_map()
+        level_target = Decimal(str(self._target_open_qty_for_level(level_idx)))
+        lot_qty = lots.get(level_idx, {}).get("qty", Decimal("0"))
+        target_qty = float(max(Decimal("0"), level_target - lot_qty))
+        return self._active_order_remaining_qty_deficit(
+            side,
+            level_idx,
+            False,
+            target_qty,
+        )
+
+    def _fixed_grid_open_replacement_is_covered(self, order: dict) -> bool:
+        if order.get("replacement_mode") == "same_order":
+            return False
+        try:
+            plan = self._queued_replacement_order_plan(order)
+        except Exception:
+            return False
+        if (
+            not plan
+            or bool(plan.get("reduce_only"))
+            or self._position_sizing_mode() != "fixed_grid_qty"
+            or self.config.get("direction") not in {"long", "short"}
+            or str(plan.get("side") or "") != self._open_side_for_direction()
+            or not self.reduce_lots_complete
+        ):
+            return False
+        return (
+            self._fixed_grid_open_counter_deficit(
+                str(plan["side"]),
+                int(plan["level_idx"]),
+            )
+            <= 0
+        )
+
     def _place_counter_leg(
         self,
         side: str,
@@ -7073,10 +7141,10 @@ class GridEngine:
     ) -> bool:
         requested_qty = float(qty)
         if not reduce_only:
-            target_qty = requested_qty
             if (
                 self._position_sizing_mode() == "fixed_grid_qty"
                 and self.config.get("direction") in {"long", "short"}
+                and side == self._open_side_for_direction()
             ):
                 if not self.reduce_lots_complete:
                     logger.warning(
@@ -7088,17 +7156,14 @@ class GridEngine:
                         requested_qty,
                     )
                     return False
-                lots = self._reduce_lot_decimal_map()
-                level_target = Decimal(str(self._target_open_qty_for_level(level_idx)))
-                lot_qty = lots.get(level_idx, {}).get("qty", Decimal("0"))
-                target_qty = float(max(Decimal("0"), level_target - lot_qty))
-
-            deficit = self._active_order_remaining_qty_deficit(
-                side,
-                level_idx,
-                reduce_only,
-                target_qty,
-            )
+                deficit = self._fixed_grid_open_counter_deficit(side, level_idx)
+            else:
+                deficit = self._active_order_remaining_qty_deficit(
+                    side,
+                    level_idx,
+                    reduce_only,
+                    requested_qty,
+                )
             if deficit <= 0:
                 return True
             qty = deficit

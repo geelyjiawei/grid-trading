@@ -5531,6 +5531,99 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_crash_adopted_replacement_preserves_completed_pair_marker(self):
+        client = FakeClient(
+            "100",
+            tick_size="1",
+            qty_step="1",
+            min_qty="1",
+        )
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "long",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 0,
+            "qty_per_grid": 1,
+            "leverage": 2,
+        }
+        replacement_link_id = "g_0_S_counted_retry"
+        durable_state = {}
+
+        def crash_after_acceptance_before_marker_copy(current_engine):
+            snapshot = copy.deepcopy(current_engine.to_state())
+            durable_state.clear()
+            durable_state.update(snapshot)
+            active = snapshot["active_orders"].get(replacement_link_id)
+            if (
+                active
+                and active.get("order_id")
+                and not active.get("completed_pair_counted")
+            ):
+                raise OSError("simulated crash before completion marker copy")
+
+        engine = GridEngine(
+            client,
+            config,
+            state_callback=crash_after_acceptance_before_marker_copy,
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.paused_replacements = [
+            {
+                "link_id": "g_0_S_counted_source",
+                "order_id": "counted-source",
+                "level_idx": 0,
+                "side": "Sell",
+                "price": "110",
+                "qty": "1",
+                "status": "QUEUED_REPLACEMENT",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": True,
+                "entry_price": 90,
+                "completed_pair_counted": True,
+                "replacement_mode": "same_order",
+                "replacement_source_link_id": "g_0_S_counted_source",
+                "replacement_link_id": replacement_link_id,
+                "replacement_retry_attempts": 0,
+                "replacement_retry_after": 0,
+            }
+        ]
+
+        with self.assertRaisesRegex(OSError, "completion marker copy"):
+            engine._resume_paused_replacements()
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertIn(replacement_link_id, durable_state["active_orders"])
+        self.assertFalse(
+            durable_state["active_orders"][replacement_link_id].get(
+                "completed_pair_counted", False
+            )
+        )
+        self.assertTrue(
+            durable_state["paused_replacements"][0]["completed_pair_counted"]
+        )
+
+        restored = GridEngine(client, copy.deepcopy(config))
+        restored.restore_state({**durable_state, "running": False})
+        restored._resume_paused_replacements()
+
+        self.assertEqual(restored.paused_replacements, [])
+        self.assertTrue(
+            restored.active_orders[replacement_link_id]["completed_pair_counted"]
+        )
+        self.assertEqual(
+            sum(
+                1
+                for item in client.orders
+                if item.get("order_link_id") == replacement_link_id
+            ),
+            1,
+        )
+
     async def test_accepted_counter_replacement_is_not_duplicated_after_pre_dequeue_crash(self):
         client = FakeClient("100")
         config = {
@@ -9439,6 +9532,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(engine.paused_replacements), 1)
         self.assertEqual(client.orders, [])
 
+        engine.paused_replacements[0]["replacement_retry_after"] = 0
         engine._resume_paused_replacements()
 
         self.assertEqual(engine.paused_replacements, [])
@@ -12689,6 +12783,213 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.orders), 1)
         self.assertEqual(client.orders[0]["qty"], "17")
         self.assertEqual(engine.paused_replacements, [])
+
+    async def test_counter_replacement_rejection_honors_durable_backoff(self):
+        class RejectingCounterClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.reject_counter = True
+                self.counter_attempts = []
+
+            def place_order(self, **kwargs):
+                if (
+                    kwargs.get("order_type") == "Limit"
+                    and kwargs.get("side") == "Sell"
+                    and not kwargs.get("reduce_only")
+                ):
+                    self.counter_attempts.append(dict(kwargs))
+                    if self.reject_counter:
+                        return {
+                            "retCode": 400,
+                            "retMsg": "temporary deterministic rejection",
+                        }
+                return super().place_order(**kwargs)
+
+        client = RejectingCounterClient(
+            "100",
+            tick_size="1",
+            qty_step="1",
+            min_qty="1",
+        )
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "neutral",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 20,
+            "qty_per_grid": 20,
+            "leverage": 2,
+        }
+        engine = GridEngine(client, config)
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        source = {
+            "link_id": "g_0_B_backoff_source",
+            "order_id": "backoff-source",
+            "level_idx": 0,
+            "side": "Buy",
+            "price": "90",
+            "qty": "8",
+            "status": "FILLED",
+            "order_type": "Limit",
+            "time_in_force": "GTC",
+            "reduce_only": False,
+            "processed_fill_qty": 0,
+            "processed_fill_volume": 0,
+            "processed_fill_fee": 0,
+        }
+
+        with patch("grid_engine.time.time", return_value=1000.0):
+            self.assertTrue(
+                engine._record_execution_delta(
+                    source,
+                    {
+                        "price": 90,
+                        "qty": 8,
+                        "volume": 720,
+                        "fee": 0,
+                        "fee_asset": "USDT",
+                        "fee_source": "exchange",
+                        "maker_count": 1,
+                        "taker_count": 0,
+                    },
+                )
+            )
+            engine._resume_paused_replacements()
+
+        self.assertEqual(len(client.counter_attempts), 1)
+        self.assertEqual(len(engine.paused_replacements), 1)
+        queued = engine.paused_replacements[0]
+        self.assertEqual(queued["replacement_retry_attempts"], 1)
+        retry_after = float(queued["replacement_retry_after"])
+        self.assertGreater(retry_after, 1000.0)
+        replacement_link_id = queued["replacement_link_id"]
+        durable = copy.deepcopy(engine.to_state())
+
+        restored = GridEngine(client, copy.deepcopy(config))
+        restored.restore_state({**durable, "running": False})
+        with patch("grid_engine.time.time", return_value=retry_after - 0.001):
+            restored._resume_paused_replacements()
+        self.assertEqual(len(client.counter_attempts), 1)
+
+        client.reject_counter = False
+        with patch("grid_engine.time.time", return_value=retry_after + 0.001):
+            restored._resume_paused_replacements()
+
+        self.assertEqual(len(client.counter_attempts), 2)
+        self.assertEqual(
+            {item["order_link_id"] for item in client.counter_attempts},
+            {replacement_link_id},
+        )
+        self.assertEqual(restored.paused_replacements, [])
+        self.assertIn(replacement_link_id, restored.active_orders)
+
+    async def test_counter_replacement_waits_for_global_rate_limit_without_retry_inflation(self):
+        class RateLimitedCounterClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.rate_limit_counter = True
+                self.counter_attempts = []
+
+            def place_order(self, **kwargs):
+                if (
+                    kwargs.get("order_type") == "Limit"
+                    and kwargs.get("side") == "Sell"
+                    and not kwargs.get("reduce_only")
+                ):
+                    self.counter_attempts.append(dict(kwargs))
+                    if self.rate_limit_counter:
+                        self.rate_limit_counter = False
+                        raise ExchangeRateLimitError(
+                            "Too many requests",
+                            retry_after=17,
+                        )
+                return super().place_order(**kwargs)
+
+        client = RateLimitedCounterClient(
+            "100",
+            tick_size="1",
+            qty_step="1",
+            min_qty="1",
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "qty_per_grid": 20,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        replacement_link_id = "g_0_S_rate_limited_counter"
+        engine.paused_replacements = [
+            {
+                "link_id": "g_0_B_rate_limited_source",
+                "order_id": "rate-limited-source",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "90",
+                "qty": "8",
+                "fill_price": 90,
+                "status": "FILLED",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": False,
+                "replacement_mode": "counter_order",
+                "replacement_link_id": replacement_link_id,
+            }
+        ]
+
+        with patch("grid_engine.time.time", return_value=1000.0):
+            engine._resume_paused_replacements()
+
+        self.assertEqual(len(client.counter_attempts), 1)
+        self.assertEqual(
+            engine.paused_replacements[0]["replacement_retry_attempts"],
+            1,
+        )
+        local_retry_after = float(
+            engine.paused_replacements[0]["replacement_retry_after"]
+        )
+        exchange_retry_after = float(engine._exchange_rate_limit_until)
+        self.assertLess(local_retry_after, exchange_retry_after)
+
+        with patch(
+            "grid_engine.time.time",
+            return_value=local_retry_after + 0.001,
+        ):
+            engine._resume_paused_replacements()
+
+        self.assertEqual(len(client.counter_attempts), 1)
+        self.assertEqual(
+            engine.paused_replacements[0]["replacement_retry_attempts"],
+            1,
+        )
+
+        with patch(
+            "grid_engine.time.time",
+            return_value=exchange_retry_after + 0.001,
+        ):
+            engine._resume_paused_replacements()
+
+        self.assertEqual(len(client.counter_attempts), 2)
+        self.assertEqual(
+            {item["order_link_id"] for item in client.counter_attempts},
+            {replacement_link_id},
+        )
+        self.assertEqual(engine.paused_replacements, [])
+        self.assertIn(replacement_link_id, engine.active_orders)
 
     def _directional_sub_minimum_counter_engine(self, direction):
         client = FakeClient(
