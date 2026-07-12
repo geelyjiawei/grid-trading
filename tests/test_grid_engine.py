@@ -12380,6 +12380,210 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.orders[0]["qty"], "17")
         self.assertEqual(engine.paused_replacements, [])
 
+    def _directional_sub_minimum_counter_engine(self, direction):
+        client = FakeClient(
+            "100",
+            tick_size="1",
+            qty_step="0.01",
+            min_qty="0.1",
+        )
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": direction,
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 0.2,
+            "qty_per_grid": 0.2,
+            "leverage": 2,
+            "grid_order_post_only": False,
+            "maker_fee_rate": 0,
+            "taker_fee_rate": 0,
+        }
+        engine = GridEngine(client, config)
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.grid_ready = True
+        engine.target_qty_by_level = {"0": 0.2}
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 0.2, "entry_value": 20.0}
+        }
+        engine.grid_position_net_qty = -0.2 if direction == "short" else 0.2
+        return client, engine
+
+    def _record_directional_reduce_fill(self, engine, direction, qty, suffix):
+        side = "Buy" if direction == "short" else "Sell"
+        price = 90 if direction == "short" else 110
+        link_id = f"g_0_{side[0]}_small_reduce_{suffix}"
+        source = {
+            "link_id": link_id,
+            "order_id": f"small-reduce-{suffix}",
+            "level_idx": 0,
+            "side": side,
+            "price": str(price),
+            "qty": str(qty),
+            "status": "FILLED",
+            "order_type": "Limit",
+            "time_in_force": "GTC",
+            "reduce_only": True,
+            "entry_price": 100,
+            "processed_fill_qty": 0,
+            "processed_fill_volume": 0,
+            "processed_fill_fee": 0,
+        }
+        engine.active_orders[link_id] = source
+        recorded = engine._record_execution_delta(
+            source,
+            {
+                "price": price,
+                "qty": str(qty),
+                "volume": str(Decimal(str(price)) * Decimal(str(qty))),
+                "fee": 0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+        # The normal terminal-order handler removes the filled source after
+        # the execution and counter intent have been persisted atomically.
+        engine.active_orders.pop(link_id, None)
+        return recorded
+
+    async def test_directional_sub_minimum_open_counter_remains_durably_queued(self):
+        for direction in ("short", "long"):
+            with self.subTest(direction=direction):
+                client, engine = self._directional_sub_minimum_counter_engine(direction)
+
+                self.assertTrue(
+                    self._record_directional_reduce_fill(
+                        engine,
+                        direction,
+                        Decimal("0.02"),
+                        "first",
+                    )
+                )
+
+                self.assertEqual(client.orders, [])
+                self.assertEqual(len(engine.paused_replacements), 1)
+                self.assertEqual(engine.paused_replacements[0]["qty"], "0.02")
+                coverage = engine.grid_coverage_snapshot()
+                self.assertEqual(coverage["missing_by_level"][0]["missing_qty"], 0.02)
+
+    async def test_exchange_reconcile_keeps_directional_sub_minimum_counter_queued(self):
+        for direction in ("short", "long"):
+            with self.subTest(direction=direction):
+                client, engine = self._directional_sub_minimum_counter_engine(direction)
+                engine.running = True
+                side = "Buy" if direction == "short" else "Sell"
+                price = 90 if direction == "short" else 110
+                link_id = engine._place(
+                    side,
+                    price,
+                    0,
+                    reduce_only=True,
+                    qty_override=Decimal("0.02"),
+                    entry_price=100,
+                    allow_duplicate=True,
+                )
+                order = engine.active_orders[link_id]
+                order_id = str(order["order_id"])
+                client.open_limit_order_ids.discard(order_id)
+                exchange_order = next(
+                    item for item in client.orders if str(item["orderId"]) == order_id
+                )
+                exchange_order["orderStatus"] = "FILLED"
+                client.trade_details = {
+                    order_id: [
+                        {
+                            "price": str(price),
+                            "qty": "0.02",
+                            "volume": str(Decimal(str(price)) * Decimal("0.02")),
+                            "feeUsdt": "0",
+                            "feeAsset": "USDT",
+                            "isMaker": True,
+                        }
+                    ]
+                }
+                client.get_order_trades = lambda symbol, oid: fake_trade_response(client, oid)
+
+                await engine._check_fills()
+
+                self.assertNotIn(link_id, engine.active_orders)
+                self.assertEqual(len(engine.paused_replacements), 1)
+                self.assertEqual(engine.paused_replacements[0]["qty"], "0.02")
+                self.assertEqual(
+                    [
+                        item
+                        for item in engine.active_orders.values()
+                        if not item.get("reduce_only")
+                    ],
+                    [],
+                )
+                coverage = engine.grid_coverage_snapshot()
+                self.assertEqual(coverage["missing_by_level"][0]["missing_qty"], 0.02)
+
+    async def test_directional_sub_minimum_open_counters_coalesce_to_exact_coverage(self):
+        for direction in ("short", "long"):
+            with self.subTest(direction=direction):
+                client, engine = self._directional_sub_minimum_counter_engine(direction)
+                self._record_directional_reduce_fill(
+                    engine,
+                    direction,
+                    Decimal("0.02"),
+                    "first",
+                )
+                self.assertEqual(len(engine.paused_replacements), 1)
+                self._record_directional_reduce_fill(
+                    engine,
+                    direction,
+                    Decimal("0.08"),
+                    "second",
+                )
+
+                self.assertEqual(len(client.orders), 1)
+                self.assertEqual(client.orders[0]["side"], "Sell" if direction == "short" else "Buy")
+                self.assertEqual(client.orders[0]["qty"], "0.10")
+                self.assertEqual(engine.paused_replacements, [])
+                coverage = engine.grid_coverage_snapshot()
+                self.assertFalse(coverage["has_risk"], msg=coverage)
+                self.assertEqual(coverage["coverage_qty"], 0.2)
+
+    async def test_directional_sub_minimum_counter_survives_restart_before_coalescing(self):
+        for direction in ("short", "long"):
+            with self.subTest(direction=direction):
+                client, engine = self._directional_sub_minimum_counter_engine(direction)
+                self._record_directional_reduce_fill(
+                    engine,
+                    direction,
+                    Decimal("0.02"),
+                    "before-restart",
+                )
+                durable_state = copy.deepcopy(engine.to_state())
+
+                restored = GridEngine(client, copy.deepcopy(engine.config))
+                restored.restore_state({**durable_state, "running": False})
+                self.assertEqual(len(restored.paused_replacements), 1)
+                self.assertEqual(restored.paused_replacements[0]["qty"], "0.02")
+
+                self._record_directional_reduce_fill(
+                    restored,
+                    direction,
+                    Decimal("0.08"),
+                    "after-restart",
+                )
+
+                self.assertEqual(len(client.orders), 1)
+                self.assertEqual(client.orders[0]["qty"], "0.10")
+                self.assertEqual(restored.paused_replacements, [])
+                coverage = restored.grid_coverage_snapshot()
+                self.assertFalse(coverage["has_risk"], msg=coverage)
+                self.assertEqual(coverage["coverage_qty"], 0.2)
+
     async def test_coalesced_counter_survives_restart_and_places_once(self):
         client = FakeClient(
             "0.28",

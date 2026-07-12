@@ -1569,10 +1569,13 @@ class GridEngine:
         requested = Decimal(str(qty))
         active = Decimal(str(self._active_order_remaining_qty(side, level_idx, reduce_only)))
         deficit = requested - active
-        minimum_order_qty = max(Decimal(self.qty_step), Decimal(str(self.min_qty)))
-        if deficit < minimum_order_qty:
+        # This method measures ledger coverage, not whether a new order can be
+        # submitted immediately. A valid step-sized deficit below minQty must
+        # reach _place(), whose rejection keeps the exact counter task queued
+        # until matching fragments can be coalesced.
+        if deficit <= 0 or not self._qty_reaches_accounting_step(deficit):
             return 0.0
-        return float(deficit)
+        return float(self._normalized_qty_decimal(deficit, self.qty_step))
 
     def _active_order_qty_deficit(self, side: str, level_idx: int, reduce_only: bool, qty: float) -> float:
         requested = Decimal(str(qty))
