@@ -10,6 +10,9 @@ data/
 __pycache__/
 .coverage
 htmlcov/
+/target/
+vue-frontend/node_modules/
+vue-frontend/dist/
 *.key
 *.pem
 *.p8

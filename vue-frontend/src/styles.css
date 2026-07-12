@@ -1,0 +1,65 @@
+:root {
+  font-family: "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  color: #f2f7f5;
+  background: #071117;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button {
+  border: 1px solid #2c4853;
+  border-radius: 14px;
+  padding: 0.75rem 1.1rem;
+  color: #f2f7f5;
+  background: #11232d;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: wait; }
+.shell {
+  min-height: 100vh;
+  padding: clamp(1rem, 4vw, 4rem);
+  background:
+    radial-gradient(circle at 10% 10%, rgba(32, 172, 132, 0.15), transparent 32rem),
+    linear-gradient(145deg, #071117 0%, #0b1820 55%, #071117 100%);
+}
+.masthead, .strategy-panel, .notice {
+  width: min(1080px, 100%);
+  margin: 0 auto 1.25rem;
+  border: 1px solid #203a46;
+  border-radius: 24px;
+  background: rgba(12, 28, 37, 0.9);
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.24);
+}
+.masthead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: clamp(1.3rem, 4vw, 2.5rem);
+}
+h1, h2, h3, p { margin-top: 0; }
+h1 { margin-bottom: 0.45rem; font-size: clamp(2rem, 5vw, 3.8rem); letter-spacing: -0.05em; }
+h2, h3 { margin-bottom: 0.35rem; }
+.subtitle, .strategy p, .empty { color: #94aab5; }
+.eyebrow { margin-bottom: 0.5rem; color: #46d9a6; font-size: 0.75rem; letter-spacing: 0.15em; text-transform: uppercase; }
+.strategy-panel { padding: clamp(1.2rem, 3vw, 2rem); }
+.section-heading, .strategy { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.section-heading { margin-bottom: 1rem; }
+.section-heading > strong { color: #46d9a6; font-size: 2rem; }
+.strategy {
+  padding: 1rem 1.2rem;
+  border: 1px solid #203a46;
+  border-radius: 18px;
+  background: #10212a;
+}
+.strategy + .strategy { margin-top: 0.75rem; }
+.strategy-metrics { text-align: right; }
+.strategy-metrics strong { display: block; color: #46d9a6; }
+.strategy-metrics span { color: #94aab5; font-size: 0.85rem; }
+.notice { padding: 1rem 1.25rem; color: #ffd071; }
+.notice.danger { border-color: #8d3d41; color: #ff8f91; }
+@media (max-width: 640px) {
+  .masthead, .strategy { align-items: flex-start; flex-direction: column; }
+  .strategy-metrics { text-align: left; }
+}

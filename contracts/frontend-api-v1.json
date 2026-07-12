@@ -1,0 +1,22 @@
+{
+  "contract_version": 1,
+  "endpoints": [
+    "/api/auth/login",
+    "/api/auth/status",
+    "/api/balance",
+    "/api/config",
+    "/api/fees/{symbol}",
+    "/api/grid/history?limit=100",
+    "/api/grid/preview",
+    "/api/grid/start",
+    "/api/grid/status",
+    "/api/grid/stop/{symbol}",
+    "/api/orders/open/{symbol}",
+    "/api/positions/{symbol}",
+    "/api/price/{symbol}",
+    "/api/risk/cancel-orphans/{symbol}",
+    "/api/risk/{symbol}",
+    "/api/trades/{symbol}?limit=100"
+  ],
+  "source": "frontend/app.js"
+}
