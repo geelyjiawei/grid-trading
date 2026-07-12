@@ -785,6 +785,160 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertNotIn(key, main._engines)
         self.assertEqual(float(main._client.positions[0]["size"]), 2.0)
 
+    def test_pre_exchange_start_failure_is_archived_without_saved_state(self):
+        class RejectInitialGridClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.limit_attempts = 0
+
+            def place_order(self, **kwargs):
+                if kwargs.get("order_type") == "Limit":
+                    self.limit_attempts += 1
+                    return {
+                        "retCode": -2010,
+                        "retMsg": "definitive test rejection",
+                        "result": {},
+                    }
+                return super().place_order(**kwargs)
+
+        client = RejectInitialGridClient("100")
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("STARTREJECTUSDT")
+        payload.update(
+            {
+                "direction": "neutral",
+                "grid_order_post_only": True,
+            }
+        )
+
+        response = self.client.post("/api/grid/start", json=payload)
+
+        self.assertEqual(response.status_code, 400, response.text)
+        key = main._engine_key("binance", "STARTREJECTUSDT")
+        self.assertEqual(client.limit_attempts, 4)
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.positions, [])
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["symbol"] == "STARTREJECTUSDT"
+        )
+        self.assertEqual(record["status"], "failed")
+        self.assertIsNone(record["stopped_at"])
+
+        retry_client = FakeClient("100")
+        main._client = retry_client
+        main._clients["binance"] = retry_client
+        retry = self.client.post("/api/grid/start", json=payload)
+        self.assertEqual(retry.status_code, 200, retry.text)
+        retry_engine = main._engines[key]
+        self.assertNotEqual(retry_engine.config["run_id"], record["run_id"])
+        retry_stop = self.client.post(
+            "/api/grid/stop/STARTREJECTUSDT?exchange=binance"
+        )
+        self.assertEqual(retry_stop.status_code, 200, retry_stop.text)
+
+    def test_failed_start_history_write_retains_state_until_restart_retry(self):
+        class RejectInitialGridClient(FakeClient):
+            def place_order(self, **kwargs):
+                if kwargs.get("order_type") == "Limit":
+                    return {
+                        "retCode": -2010,
+                        "retMsg": "definitive test rejection",
+                        "result": {},
+                    }
+                return super().place_order(**kwargs)
+
+        client = RejectInitialGridClient("100")
+        main._client = client
+        main._clients["binance"] = client
+        payload = self._payload("FAILHISTORYUSDT")
+        payload.update(
+            {
+                "direction": "neutral",
+                "grid_order_post_only": True,
+            }
+        )
+        original_upsert = main._upsert_grid_history
+
+        def fail_failed_history(engine, status="running"):
+            if status == "failed":
+                return False
+            return original_upsert(engine, status)
+
+        with patch.object(
+            main,
+            "_upsert_grid_history",
+            side_effect=fail_failed_history,
+        ):
+            response = self.client.post("/api/grid/start", json=payload)
+
+        self.assertEqual(response.status_code, 503, response.text)
+        key = main._engine_key("binance", "FAILHISTORYUSDT")
+        retained = main._engines[key]
+        self.assertFalse(retained.running)
+        self.assertTrue(retained.initialization_failed)
+        self.assertTrue(retained.stop_finalize_pending)
+        self.assertIn(key, main._load_grid_state_file()["grids"])
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.positions, [])
+
+        main._engines.clear()
+        main._restore_saved_engines()
+
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["symbol"] == "FAILHISTORYUSDT"
+        )
+        self.assertEqual(record["status"], "failed")
+
+    def test_initial_deployment_ledger_alone_blocks_failed_start_cleanup(self):
+        async def fail_after_durable_deployment_intent(engine):
+            engine.initialization_in_progress = True
+            engine.initial_grid_deployment_pending = True
+            engine.initial_grid_deployment_ledger = {
+                "Sell|0|110.0|1.0|0": {
+                    "link_id": "g_0_S_durableintent",
+                    "side": "Sell",
+                    "level_idx": 0,
+                    "price": "110.0",
+                    "qty": "1.0",
+                    "reduce_only": False,
+                }
+            }
+            engine._persist_state()
+            raise RuntimeError("exchange acknowledgement interrupted")
+
+        with patch.object(
+            main.GridEngine,
+            "initialize",
+            new=fail_after_durable_deployment_intent,
+        ):
+            response = self.client.post(
+                "/api/grid/start",
+                json=self._payload("LEDGERONLYUSDT"),
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        key = main._engine_key("binance", "LEDGERONLYUSDT")
+        retained = main._engines[key]
+        self.assertTrue(retained.initialization_failed)
+        self.assertTrue(retained.initial_grid_deployment_ledger)
+        saved = main._load_grid_state_file()["grids"][key]
+        self.assertTrue(saved["initial_grid_deployment_ledger"])
+
+        stop = self.client.post(
+            "/api/grid/stop/LEDGERONLYUSDT?exchange=binance"
+        )
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertNotIn(key, main._engines)
+
     def test_rate_limited_initial_opening_starts_in_recoverable_wait_state(self):
         class RateLimitedStartClient(FakeClient):
             def __init__(self, *args, **kwargs):

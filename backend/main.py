@@ -554,6 +554,16 @@ def _engine_requires_cleanup(engine: GridEngine | None) -> bool:
     )
 
 
+def _engine_has_exchange_state(engine: GridEngine) -> bool:
+    return bool(
+        engine.active_orders
+        or engine.opening_order
+        or engine.pending_reduce_action
+        or engine.initial_grid_deployment_ledger
+        or engine._qty_reaches_accounting_step(engine._grid_position_qty())
+    )
+
+
 def _get_engine(exchange: str | None, symbol: str) -> GridEngine | None:
     symbol = str(symbol or "").upper().strip()
     with _engines_lock:
@@ -1317,7 +1327,11 @@ def _save_engine_state(engine: GridEngine):
     )
     finalize_stop = registered and _stop_finalization_ready(engine)
     history_status = (
-        "stopped"
+        (
+            "failed"
+            if getattr(engine, "initialization_failed", False) is True
+            else "stopped"
+        )
         if finalize_stop
         else ("running" if engine.running else "saved")
     )
@@ -1358,8 +1372,13 @@ def _save_engine_state(engine: GridEngine):
 
         if finalize_stop:
             if not history_saved:
+                finalization_label = (
+                    "failed grid start"
+                    if history_status == "failed"
+                    else "stopped grid"
+                )
                 engine.trigger_message = (
-                    "Exchange cleanup is complete, but the stopped grid history could not "
+                    f"The {finalization_label} history could not "
                     "be saved. The full ledger is retained and finalization can be retried."
                 )
                 state["updated_at"] = time.time()
@@ -1926,16 +1945,10 @@ async def start_grid(cfg: GridConfig):
     except HTTPException:
         raise
     except Exception as exc:
-        has_exchange_state = bool(
-            engine.active_orders
-            or engine.opening_order
-            or engine.pending_reduce_action
-            or engine._qty_reaches_accounting_step(engine._grid_position_qty())
-        )
+        has_exchange_state = _engine_has_exchange_state(engine)
         if has_exchange_state:
             engine.initialization_in_progress = False
             engine.initial_grid_deployment_pending = False
-            engine.initial_grid_deployment_ledger.clear()
             engine.initialization_failed = True
             engine.manual_stop_pending = True
             engine.grid_ready = False
@@ -1962,9 +1975,43 @@ async def start_grid(cfg: GridConfig):
         engine.running = False
         if engine._task:
             engine._task.cancel()
+            engine._task = None
+        engine.initialization_in_progress = False
+        engine.initial_grid_deployment_pending = False
+        engine.initialization_failed = True
+        engine.manual_stop_pending = False
+        engine.grid_ready = False
+        engine.stop_finalize_pending = True
+        engine.trigger_message = (
+            f"Grid initialization failed before any exchange order or position was created: "
+            f"{exc}. Archiving the failed start without leaving a saved grid."
+        )
         with _engines_lock:
-            if _engines.get(engine_key) is engine:
-                _engines.pop(engine_key, None)
+            _engines[engine_key] = engine
+        try:
+            finalized = _save_engine_state(engine)
+        except Exception as finalize_exc:
+            logger.exception(
+                "Failed to archive pre-exchange grid start exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                finalize_exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Grid initialization failed before exchange work, but its durable failure "
+                    "record could not be finalized. The retained ledger must be retried."
+                ),
+            ) from finalize_exc
+        if not finalized:
+            raise HTTPException(
+                status_code=503,
+                detail=engine.trigger_message or (
+                    "Grid initialization failed before exchange work, but failure history "
+                    "finalization is still pending."
+                ),
+            )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         with _engines_lock:

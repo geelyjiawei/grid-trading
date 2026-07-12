@@ -1131,6 +1131,7 @@ function mapRunStatus(status) {
   if (status === "stopped") return "已停止";
   if (status === "closed") return "已关闭";
   if (status === "saved") return "已保存";
+  if (status === "failed") return "启动失败";
   return status || "--";
 }
 
