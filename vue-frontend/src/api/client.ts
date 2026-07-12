@@ -1,9 +1,21 @@
 import type {
   ApiErrorBody,
+  ApiConfigResponse,
+  BalanceSnapshot,
   AuthStatus,
   Exchange,
+  FeeRates,
   GridConfigRequest,
+  GridHistoryResponse,
+  GridPreview,
   GridStatusList,
+  LoginRequest,
+  OpenOrdersResponse,
+  PositionsResponse,
+  PriceSnapshot,
+  RiskSnapshot,
+  SaveApiConfigRequest,
+  TradesResponse,
 } from "./types";
 
 export class ApiError extends Error {
@@ -44,11 +56,33 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   return body as T;
 }
 
+export function withExchange(path: string, exchange: Exchange): string {
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}exchange=${encodeURIComponent(exchange)}`;
+}
+
 export const api = {
   authStatus: () => request<AuthStatus>("/api/auth/status"),
+  login: (credentials: LoginRequest) =>
+    request<{ ok?: boolean; message?: string }>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify(credentials),
+    }),
+  config: () => request<ApiConfigResponse>("/api/config"),
+  saveConfig: (config: SaveApiConfigRequest) =>
+    request<{ ok?: boolean; message: string }>("/api/config", {
+      method: "POST",
+      body: JSON.stringify(config),
+    }),
+  feeRates: (exchange: Exchange, symbol: string) =>
+    request<FeeRates>(withExchange(`/api/fees/${encodeURIComponent(symbol)}`, exchange)),
+  price: (exchange: Exchange, symbol: string) =>
+    request<PriceSnapshot>(withExchange(`/api/price/${encodeURIComponent(symbol)}`, exchange)),
+  balance: (exchange: Exchange) =>
+    request<BalanceSnapshot>(withExchange("/api/balance", exchange)),
   gridStatus: () => request<GridStatusList>("/api/grid/status"),
   preview: (config: GridConfigRequest) =>
-    request<Record<string, unknown>>("/api/grid/preview", {
+    request<GridPreview>("/api/grid/preview", {
       method: "POST",
       body: JSON.stringify(config),
     }),
@@ -62,4 +96,21 @@ export const api = {
       `/api/grid/stop/${encodeURIComponent(symbol)}?exchange=${encodeURIComponent(exchange)}`,
       { method: "POST" },
     ),
+  openOrders: (exchange: Exchange, symbol: string) =>
+    request<OpenOrdersResponse>(
+      withExchange(`/api/orders/open/${encodeURIComponent(symbol)}`, exchange),
+    ),
+  trades: (exchange: Exchange, symbol: string) =>
+    request<TradesResponse>(
+      withExchange(`/api/trades/${encodeURIComponent(symbol)}?limit=100`, exchange),
+    ),
+  positions: (exchange: Exchange, symbol: string) =>
+    request<PositionsResponse>(
+      withExchange(`/api/positions/${encodeURIComponent(symbol)}`, exchange),
+    ),
+  risk: (exchange: Exchange, symbol: string) =>
+    request<RiskSnapshot>(
+      withExchange(`/api/risk/${encodeURIComponent(symbol)}`, exchange),
+    ),
+  history: () => request<GridHistoryResponse>("/api/grid/history?limit=100"),
 };

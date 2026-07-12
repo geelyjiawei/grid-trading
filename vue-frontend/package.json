@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:mock-api": "node test-support/mock-api.cjs",
     "build": "vue-tsc --noEmit && vite build",
     "test": "vitest run --environment jsdom",
     "typecheck": "vue-tsc --noEmit"

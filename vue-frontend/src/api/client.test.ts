@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, api, request } from "./client";
+import { ApiError, api, request, withExchange } from "./client";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -59,6 +59,32 @@ describe("typed API client", () => {
 
     await expect(request("/api/grid/preview")).rejects.toThrow(
       "upper price invalid; qty invalid",
+    );
+  });
+
+  it("adds an exchange selector without dropping an existing query", () => {
+    expect(withExchange("/api/trades/MUUSDT?limit=100", "aster")).toBe(
+      "/api/trades/MUUSDT?limit=100&exchange=aster",
+    );
+  });
+
+  it("posts login credentials as JSON without putting them in the URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.login({ username: "admin", password: "temporary", code: "123456" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/auth/login",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ username: "admin", password: "temporary", code: "123456" }),
+      }),
     );
   });
 });

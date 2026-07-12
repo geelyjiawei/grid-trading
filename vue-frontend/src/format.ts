@@ -1,0 +1,35 @@
+import type { Direction, Exchange } from "./api/types";
+
+export function exchangeName(exchange: Exchange): string {
+  if (exchange === "binance") return "Binance";
+  if (exchange === "aster") return "AsterDEX";
+  return "Bybit";
+}
+
+export function directionName(direction?: Direction): string {
+  if (direction === "long") return "做多";
+  if (direction === "short") return "做空";
+  if (direction === "neutral") return "中性";
+  return "--";
+}
+
+export function finiteNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+export function formatNumber(value: unknown, maximumFractionDigits = 4): string {
+  const number = finiteNumber(value);
+  if (number === null) return "--";
+  return number.toLocaleString("zh-CN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits,
+  });
+}
+
+export function formatPercent(value: unknown, fractionDigits = 2): string {
+  const number = finiteNumber(value);
+  if (number === null) return "--";
+  return `${number >= 0 ? "+" : ""}${number.toFixed(fractionDigits)}%`;
+}
