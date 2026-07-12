@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from itertools import pairwise
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
 _engines_lock = RLock()
 _state_files_lock = RLock()
+_config_file_lock = RLock()
 _starting_engine_keys: set[str] = set()
 SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
 DEFAULT_EXCHANGE = "bybit"
@@ -50,8 +52,17 @@ class GridHistoryIntegrityError(RuntimeError):
     """Raised when strategy history cannot be read without risking data loss."""
 
 
+class ApiConfigIntegrityError(RuntimeError):
+    """Raised when encrypted exchange credentials cannot be read safely."""
+
+
 _grid_state_integrity_error = ""
 _grid_history_integrity_error = ""
+_api_config_integrity_error = ""
+_api_config_read_error = ""
+_api_config_write_error = ""
+_api_config_tracked_path = ""
+_api_config_file_was_present = False
 
 
 def _set_grid_history_integrity_error(message: str):
@@ -59,6 +70,29 @@ def _set_grid_history_integrity_error(message: str):
     if message and _grid_history_integrity_error != message:
         logger.error(message)
     _grid_history_integrity_error = message
+
+
+def _sync_api_config_integrity_error():
+    global _api_config_integrity_error
+    _api_config_integrity_error = " ".join(
+        error for error in (_api_config_read_error, _api_config_write_error) if error
+    )
+
+
+def _set_api_config_read_error(message: str):
+    global _api_config_read_error
+    if message and _api_config_read_error != message:
+        logger.error(message)
+    _api_config_read_error = message
+    _sync_api_config_integrity_error()
+
+
+def _set_api_config_write_error(message: str):
+    global _api_config_write_error
+    if message and _api_config_write_error != message:
+        logger.error(message)
+    _api_config_write_error = message
+    _sync_api_config_integrity_error()
 
 BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
@@ -169,7 +203,10 @@ def _load_env_api_config() -> dict | None:
 
 
 def _load_api_configs() -> dict[str, dict]:
-    file_configs = _load_file_api_configs()
+    try:
+        file_configs = _load_file_api_configs()
+    except ApiConfigIntegrityError:
+        file_configs = {}
     env_configs = _load_env_api_configs()
     merged = dict(env_configs)
     for exchange, config in file_configs.items():
@@ -195,123 +232,255 @@ def _select_api_config(configs: dict[str, dict], exchange: str | None = None) ->
 
 
 def _load_api_config() -> dict:
-    file_configs = _load_file_api_configs()
+    try:
+        file_configs = _load_file_api_configs()
+    except ApiConfigIntegrityError:
+        file_configs = {}
     if file_configs:
         return _select_api_config(file_configs) or _default_api_config()
     env_configs = _load_env_api_configs()
     return _select_api_config(env_configs) or _default_api_config()
 
 
-def _load_file_api_configs() -> dict[str, dict]:
-    if not os.path.exists(API_CONFIG_FILE):
-        return {}
+def _track_api_config_path() -> str:
+    global _api_config_tracked_path, _api_config_file_was_present
+    path = os.path.abspath(API_CONFIG_FILE)
+    if path != _api_config_tracked_path:
+        _api_config_tracked_path = path
+        _api_config_file_was_present = os.path.exists(path)
+    return path
 
-    try:
-        with open(API_CONFIG_FILE, "r", encoding="utf-8") as file:
-            config = json.load(file)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.error(
-            "Failed to read API configuration path=%s error_type=%s",
-            API_CONFIG_FILE,
-            type(exc).__name__,
-        )
-        return {}
 
-    try:
-        if isinstance(config.get("configs"), dict):
-            loaded: dict[str, dict] = {}
-            for exchange_key, item in config.get("configs", {}).items():
-                if not isinstance(item, dict):
-                    continue
-                exchange = _normalize_exchange(item.get("exchange") or exchange_key)
-                if item.get("encrypted"):
-                    loaded[exchange] = {
-                        "api_key": decrypt_text(str(item.get("api_key", ""))),
-                        "api_secret": decrypt_text(str(item.get("api_secret", ""))),
-                        "exchange": exchange,
-                        "testnet": bool(item.get("testnet", False)),
-                        "source": "file",
-                    }
-                else:
-                    loaded[exchange] = {
-                        "api_key": str(item.get("api_key", "")),
-                        "api_secret": str(item.get("api_secret", "")),
-                        "exchange": exchange,
-                        "testnet": bool(item.get("testnet", False)),
-                        "source": "file",
-                    }
-            return loaded
+def _mark_api_config_file_present():
+    global _api_config_file_was_present
+    _api_config_file_was_present = True
 
-        if config.get("encrypted"):
-            legacy = {
-                "api_key": decrypt_text(str(config.get("api_key", ""))),
-                "api_secret": decrypt_text(str(config.get("api_secret", ""))),
-                "exchange": _normalize_exchange(config.get("exchange")),
-                "testnet": bool(config.get("testnet", False)),
-                "source": "file",
-            }
-            return {legacy["exchange"]: legacy}
 
-        # One-time migration for configs saved before encrypted storage existed.
-        migrated = {
-            "api_key": str(config.get("api_key", "")),
-            "api_secret": str(config.get("api_secret", "")),
-            "exchange": _normalize_exchange(config.get("exchange")),
-            "testnet": bool(config.get("testnet", False)),
+def _decode_api_config_entry(item: dict, exchange: str) -> tuple[dict, bool]:
+    encrypted = item.get("encrypted", False)
+    if not isinstance(encrypted, bool):
+        raise ValueError("encrypted must be a boolean")
+
+    api_key = item.get("api_key")
+    api_secret = item.get("api_secret")
+    if not isinstance(api_key, str) or not api_key:
+        raise ValueError("api_key must be a non-empty string")
+    if not isinstance(api_secret, str) or not api_secret:
+        raise ValueError("api_secret must be a non-empty string")
+
+    testnet = item.get("testnet", False)
+    if not isinstance(testnet, bool):
+        raise ValueError("testnet must be a boolean")
+
+    if encrypted:
+        api_key = decrypt_text(api_key)
+        api_secret = decrypt_text(api_secret)
+        if not api_key or not api_secret:
+            raise ValueError("decrypted credentials must not be empty")
+
+    return (
+        {
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "exchange": exchange,
+            "testnet": testnet,
             "source": "file",
-        }
-        if migrated["api_key"] or migrated["api_secret"]:
-            _save_api_config(migrated)
-        return {migrated["exchange"]: migrated}
-    except Exception as exc:
-        # Never log decrypted values, but do surface that credentials were not
-        # restored instead of silently falling back to an unconfigured client.
-        logger.error(
-            "Failed to decrypt or migrate API configuration path=%s error_type=%s",
-            API_CONFIG_FILE,
-            type(exc).__name__,
-        )
-        return {}
+        },
+        not encrypted,
+    )
+
+
+def _load_file_api_configs() -> dict[str, dict]:
+    with _config_file_lock:
+        config_path = _track_api_config_path()
+        if not os.path.exists(config_path):
+            if _api_config_file_was_present:
+                message = (
+                    "The encrypted API configuration file disappeared after it was loaded. "
+                    "Credential updates are blocked to prevent losing other exchanges."
+                )
+                _set_api_config_read_error(message)
+                raise ApiConfigIntegrityError(message)
+            _set_api_config_read_error("")
+            return {}
+
+        try:
+            _mark_api_config_file_present()
+            with open(config_path, "r", encoding="utf-8") as file:
+                config = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            message = (
+                "The encrypted API configuration file cannot be read safely. The original "
+                "file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message) from exc
+
+        if not isinstance(config, dict):
+            message = (
+                "The encrypted API configuration file has an invalid root structure. The "
+                "original file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message)
+        if not config:
+            message = (
+                "The encrypted API configuration file is unexpectedly empty. The original "
+                "file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message)
+
+        try:
+            if "configs" in config:
+                if config.get("version") != 2:
+                    raise ValueError("unsupported multi-exchange config version")
+                raw_configs = config.get("configs")
+                if not isinstance(raw_configs, dict) or not raw_configs:
+                    raise ValueError("configs must be a non-empty object")
+                loaded: dict[str, dict] = {}
+                needs_migration = False
+                for exchange_key, item in raw_configs.items():
+                    if not isinstance(item, dict):
+                        raise ValueError("each exchange config must be an object")
+                    raw_exchange = str(exchange_key).strip().lower()
+                    if raw_exchange not in SUPPORTED_EXCHANGES:
+                        raise ValueError("unsupported exchange in API config")
+                    declared_exchange = item.get("exchange", raw_exchange)
+                    if not isinstance(declared_exchange, str):
+                        raise ValueError("exchange must be a string")
+                    if declared_exchange.strip().lower() != raw_exchange:
+                        raise ValueError("exchange key and value do not match")
+                    loaded_item, plaintext = _decode_api_config_entry(
+                        item,
+                        raw_exchange,
+                    )
+                    loaded[raw_exchange] = loaded_item
+                    needs_migration = needs_migration or plaintext
+                if needs_migration:
+                    _write_api_configs(loaded)
+                _set_api_config_read_error("")
+                return loaded
+
+            raw_exchange = str(config.get("exchange") or DEFAULT_EXCHANGE).strip().lower()
+            if raw_exchange not in SUPPORTED_EXCHANGES:
+                raise ValueError("unsupported exchange in API config")
+            legacy, plaintext = _decode_api_config_entry(config, raw_exchange)
+            if plaintext:
+                # One-time migration for configs saved before encrypted storage existed.
+                _write_api_configs({raw_exchange: legacy})
+            _set_api_config_read_error("")
+            return {raw_exchange: legacy}
+        except ApiConfigIntegrityError:
+            raise
+        except Exception as exc:
+            # Never log decrypted values. Preserve the source file so a bad key,
+            # malformed entry, or failed migration cannot erase other exchanges.
+            message = (
+                "The encrypted API configuration cannot be decrypted or migrated safely. "
+                "The original file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message) from exc
 
 
 def _write_api_configs(configs: dict[str, dict]):
-    encrypted_configs = {}
-    for exchange, config in configs.items():
-        exchange = _normalize_exchange(exchange)
-        encrypted_configs[exchange] = {
-            "encrypted": True,
-            "backend": storage_backend(),
-            "exchange": exchange,
-            "api_key": encrypt_text(str(config.get("api_key", ""))),
-            "api_secret": encrypt_text(str(config.get("api_secret", ""))),
-            "testnet": bool(config.get("testnet", False)),
-        }
+    with _config_file_lock:
+        config_path = _track_api_config_path()
+        tmp_path = ""
+        try:
+            if not isinstance(configs, dict) or not configs:
+                raise ValueError("at least one API configuration is required")
 
-    encrypted_config = {
-        "version": 2,
-        "encrypted": True,
-        "backend": storage_backend(),
-        "configs": encrypted_configs,
-    }
-    config_dir = os.path.dirname(API_CONFIG_FILE)
-    if config_dir:
-        os.makedirs(config_dir, exist_ok=True)
-    with open(API_CONFIG_FILE, "w", encoding="utf-8") as file:
-        json.dump(encrypted_config, file, ensure_ascii=False, indent=2)
-    _private_chmod(API_CONFIG_FILE)
+            backend = storage_backend()
+            encrypted_configs = {}
+            for exchange_key, config in configs.items():
+                exchange = str(exchange_key).strip().lower()
+                if exchange not in SUPPORTED_EXCHANGES:
+                    raise ValueError("unsupported exchange in API config")
+                if not isinstance(config, dict):
+                    raise ValueError("each exchange config must be an object")
+                declared_exchange = str(config.get("exchange") or exchange).strip().lower()
+                if declared_exchange != exchange:
+                    raise ValueError("exchange key and value do not match")
+                api_key = config.get("api_key")
+                api_secret = config.get("api_secret")
+                if not isinstance(api_key, str) or not api_key:
+                    raise ValueError("api_key must be a non-empty string")
+                if not isinstance(api_secret, str) or not api_secret:
+                    raise ValueError("api_secret must be a non-empty string")
+                testnet = config.get("testnet", False)
+                if not isinstance(testnet, bool):
+                    raise ValueError("testnet must be a boolean")
+                encrypted_configs[exchange] = {
+                    "encrypted": True,
+                    "backend": backend,
+                    "exchange": exchange,
+                    "api_key": encrypt_text(api_key),
+                    "api_secret": encrypt_text(api_secret),
+                    "testnet": testnet,
+                }
+
+            encrypted_config = {
+                "version": 2,
+                "encrypted": True,
+                "backend": backend,
+                "configs": encrypted_configs,
+            }
+            config_dir = os.path.dirname(config_path)
+            os.makedirs(config_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=config_dir,
+                prefix=f".{os.path.basename(config_path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as file:
+                tmp_path = file.name
+                if os.name != "nt":
+                    os.chmod(tmp_path, 0o600)
+                json.dump(encrypted_config, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(tmp_path, config_path)
+            tmp_path = ""
+            _fsync_parent_directory(config_path)
+            _private_chmod(config_path)
+        except Exception:
+            _set_api_config_write_error(
+                "The encrypted API configuration file cannot be written safely. The "
+                "previous credential file is being preserved."
+            )
+            raise
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning(
+                        "Failed to remove temporary API config file path=%s",
+                        tmp_path,
+                    )
+        _mark_api_config_file_present()
+        _set_api_config_read_error("")
+        _set_api_config_write_error("")
 
 
 def _save_api_config(config: dict):
-    exchange = _normalize_exchange(config.get("exchange"))
-    configs = _load_file_api_configs()
-    configs[exchange] = {
-        "exchange": exchange,
-        "api_key": str(config.get("api_key", "")),
-        "api_secret": str(config.get("api_secret", "")),
-        "testnet": bool(config.get("testnet", False)),
-        "source": "file",
-    }
-    _write_api_configs(configs)
+    with _config_file_lock:
+        exchange = _normalize_exchange(config.get("exchange"))
+        configs = _load_file_api_configs()
+        configs[exchange] = {
+            "exchange": exchange,
+            "api_key": str(config.get("api_key", "")),
+            "api_secret": str(config.get("api_secret", "")),
+            "testnet": bool(config.get("testnet", False)),
+            "source": "file",
+        }
+        _write_api_configs(configs)
 
 
 def _mask_api_key(api_key: str) -> str:
@@ -1152,6 +1321,11 @@ def auth_logout(response: Response):
 
 @app.get("/api/config")
 def get_config():
+    try:
+        _load_file_api_configs()
+    except ApiConfigIntegrityError:
+        # Return the in-memory status together with the durable storage warning.
+        pass
     _refresh_active_exchange()
     api_key = _api_config.get("api_key", "")
     configs = {}
@@ -1174,6 +1348,7 @@ def get_config():
         "configured": bool(api_key),
         "source": _api_config.get("source", "none"),
         "storage": storage_backend(),
+        "storage_error": _api_config_integrity_error,
     }
 
 
@@ -1184,6 +1359,11 @@ def set_config(cfg: ApiConfig):
     exchange = _normalize_exchange(cfg.exchange)
     if any(engine.running and _engine_exchange(engine) == exchange for engine in _engine_snapshot()):
         raise HTTPException(status_code=400, detail=f"Stop running {exchange.title()} grids before changing this API config")
+
+    try:
+        _load_file_api_configs()
+    except ApiConfigIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     candidate = _build_client(exchange, cfg.api_key.strip(), cfg.api_secret.strip(), cfg.testnet)
     try:
@@ -1201,8 +1381,10 @@ def set_config(cfg: ApiConfig):
     saved_config["exchange"] = exchange
     try:
         _save_api_config(saved_config)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=f"API verified but not saved securely: {exc}") from exc
+    except ApiConfigIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=f"API verified but not saved securely: {exc}") from exc
 
     _api_configs[exchange] = {**saved_config, "source": "file"}
     _clients[exchange] = candidate

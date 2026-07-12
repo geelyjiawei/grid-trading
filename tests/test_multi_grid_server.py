@@ -69,6 +69,11 @@ class MultiGridServerTests(unittest.TestCase):
         self._original_client = main._client
         self._original_grid_state_integrity_error = main._grid_state_integrity_error
         self._original_grid_history_integrity_error = main._grid_history_integrity_error
+        self._original_api_config_integrity_error = main._api_config_integrity_error
+        self._original_api_config_read_error = main._api_config_read_error
+        self._original_api_config_write_error = main._api_config_write_error
+        self._original_api_config_tracked_path = main._api_config_tracked_path
+        self._original_api_config_file_was_present = main._api_config_file_was_present
         self._state_tmp = tempfile.TemporaryDirectory()
         main.GRID_STATE_FILE = str(Path(self._state_tmp.name) / "grid_state.json")
         main.GRID_HISTORY_FILE = str(Path(self._state_tmp.name) / "grid_history.json")
@@ -91,6 +96,11 @@ class MultiGridServerTests(unittest.TestCase):
         main._client = fake_client
         main._grid_state_integrity_error = ""
         main._grid_history_integrity_error = ""
+        main._api_config_integrity_error = ""
+        main._api_config_read_error = ""
+        main._api_config_write_error = ""
+        main._api_config_tracked_path = ""
+        main._api_config_file_was_present = False
         self.client = TestClient(main.app)
 
     def tearDown(self):
@@ -106,6 +116,11 @@ class MultiGridServerTests(unittest.TestCase):
         main._client = self._original_client
         main._grid_state_integrity_error = self._original_grid_state_integrity_error
         main._grid_history_integrity_error = self._original_grid_history_integrity_error
+        main._api_config_integrity_error = self._original_api_config_integrity_error
+        main._api_config_read_error = self._original_api_config_read_error
+        main._api_config_write_error = self._original_api_config_write_error
+        main._api_config_tracked_path = self._original_api_config_tracked_path
+        main._api_config_file_was_present = self._original_api_config_file_was_present
         self._state_tmp.cleanup()
         if self._original_grid_config_key is None:
             os.environ.pop("GRID_CONFIG_KEY", None)
@@ -1630,8 +1645,349 @@ class MultiGridServerTests(unittest.TestCase):
             self.assertIn('"encrypted": true', saved_text)
             self.assertNotIn(config["api_key"], saved_text)
             self.assertNotIn(config["api_secret"], saved_text)
+            if os.name != "nt":
+                self.assertEqual(Path(main.API_CONFIG_FILE).stat().st_mode & 0o777, 0o600)
 
         main.API_CONFIG_FILE = original_path
+
+    def test_corrupt_api_config_is_preserved_and_blocks_credential_overwrite(self):
+        corrupt_bytes = b'{"version": 2, "configs": {'
+        Path(main.API_CONFIG_FILE).write_bytes(corrupt_bytes)
+        replacement = {
+            "exchange": "aster",
+            "api_key": "0x0000000000000000000000000000000000000abc",
+            "api_secret": "0x" + "1" * 64,
+            "testnet": False,
+        }
+
+        with self.assertRaises(main.ApiConfigIntegrityError):
+            main._save_api_config(replacement)
+
+        self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), corrupt_bytes)
+        response = self.client.post("/api/config", json=replacement)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), corrupt_bytes)
+        config_status = self.client.get("/api/config").json()
+        self.assertEqual(
+            config_status["storage_error"],
+            main._api_config_integrity_error,
+        )
+
+    def test_api_config_status_detects_corruption_after_successful_load(self):
+        original = {
+            "binance": {
+                "exchange": "binance",
+                "api_key": "runtime-binance-key",
+                "api_secret": "runtime-binance-secret",
+                "testnet": False,
+            }
+        }
+        main._write_api_configs(original)
+        self.assertEqual(set(main._load_file_api_configs()), {"binance"})
+        corrupt_bytes = b'{"version": 2, "configs": {'
+        Path(main.API_CONFIG_FILE).write_bytes(corrupt_bytes)
+
+        response = self.client.get("/api/config")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("cannot be read safely", response.json()["storage_error"])
+        self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), corrupt_bytes)
+
+    def test_missing_loaded_api_config_blocks_partial_recreation(self):
+        original = {
+            "binance": {
+                "exchange": "binance",
+                "api_key": "missing-binance-key",
+                "api_secret": "missing-binance-secret",
+                "testnet": False,
+            }
+        }
+        main._write_api_configs(original)
+        Path(main.API_CONFIG_FILE).unlink()
+
+        with self.assertRaises(main.ApiConfigIntegrityError):
+            main._save_api_config(
+                {
+                    "exchange": "aster",
+                    "api_key": "0x0000000000000000000000000000000000000abc",
+                    "api_secret": "0x" + "4" * 64,
+                    "testnet": False,
+                }
+            )
+
+        self.assertFalse(Path(main.API_CONFIG_FILE).exists())
+        self.assertIn("disappeared after it was loaded", main._api_config_integrity_error)
+
+    def test_malformed_api_config_structures_are_never_overwritten(self):
+        malformed_configs = [
+            {},
+            {"version": 2, "configs": {}},
+            {
+                "version": 99,
+                "configs": {
+                    "binance": {
+                        "encrypted": False,
+                        "exchange": "binance",
+                        "api_key": "unsupported-version-key",
+                        "api_secret": "unsupported-version-secret",
+                        "testnet": False,
+                    }
+                },
+            },
+            {
+                "version": 2,
+                "configs": {
+                    "binance": {
+                        "encrypted": True,
+                        "exchange": "binance",
+                        "api_key": "ciphertext-without-secret",
+                        "testnet": False,
+                    }
+                },
+            },
+            {
+                "version": 2,
+                "configs": {
+                    "binance": {
+                        "encrypted": "true",
+                        "exchange": "binance",
+                        "api_key": "not-valid-ciphertext",
+                        "api_secret": "not-valid-ciphertext",
+                        "testnet": False,
+                    }
+                },
+            },
+            {
+                "version": 2,
+                "configs": {
+                    "binance": {
+                        "encrypted": False,
+                        "exchange": "aster",
+                        "api_key": "mismatched-key",
+                        "api_secret": "mismatched-secret",
+                        "testnet": False,
+                    }
+                },
+            },
+            {
+                "version": 2,
+                "configs": {
+                    "binance": {
+                        "encrypted": False,
+                        "exchange": "binance",
+                        "api_key": "invalid-testnet-key",
+                        "api_secret": "invalid-testnet-secret",
+                        "testnet": "false",
+                    }
+                },
+            },
+        ]
+
+        for malformed in malformed_configs:
+            with self.subTest(malformed=malformed):
+                original_bytes = json.dumps(malformed).encode("utf-8")
+                Path(main.API_CONFIG_FILE).write_bytes(original_bytes)
+
+                with self.assertRaises(main.ApiConfigIntegrityError):
+                    main._save_api_config(
+                        {
+                            "exchange": "aster",
+                            "api_key": "0x0000000000000000000000000000000000000abc",
+                            "api_secret": "0x" + "5" * 64,
+                            "testnet": False,
+                        }
+                    )
+
+                self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), original_bytes)
+
+    def test_environment_credentials_remain_available_when_file_is_corrupt(self):
+        corrupt_bytes = b'{"version": 2, "configs": {'
+        Path(main.API_CONFIG_FILE).write_bytes(corrupt_bytes)
+        env = {
+            "BINANCE_API_KEY": "fallback-binance-key",
+            "BINANCE_API_SECRET": "fallback-binance-secret",
+            "BINANCE_TESTNET": "false",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            loaded = main._load_api_configs()
+
+        self.assertEqual(loaded["binance"]["api_key"], env["BINANCE_API_KEY"])
+        self.assertEqual(loaded["binance"]["source"], "env")
+        self.assertIn("cannot be read safely", main._api_config_integrity_error)
+        self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), corrupt_bytes)
+
+    def test_api_config_atomic_replace_failure_preserves_previous_credentials(self):
+        original = {
+            "binance": {
+                "exchange": "binance",
+                "api_key": "original-binance-key",
+                "api_secret": "original-binance-secret",
+                "testnet": False,
+            }
+        }
+        main._write_api_configs(original)
+        original_bytes = Path(main.API_CONFIG_FILE).read_bytes()
+        replacement = {
+            **original,
+            "aster": {
+                "exchange": "aster",
+                "api_key": "0x0000000000000000000000000000000000000abc",
+                "api_secret": "0x" + "2" * 64,
+                "testnet": False,
+            },
+        }
+
+        with (
+            patch.object(
+                main.os,
+                "replace",
+                side_effect=PermissionError("atomic replace denied"),
+            ),
+            self.assertRaises(PermissionError),
+        ):
+            main._write_api_configs(replacement)
+
+        self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), original_bytes)
+        self.assertIn("previous credential file", main._api_config_integrity_error)
+        self.assertEqual(
+            list(Path(main.API_CONFIG_FILE).parent.glob(".api_config.json.*.tmp")),
+            [],
+        )
+
+        config_status = self.client.get("/api/config").json()
+        self.assertIn("previous credential file", config_status["storage_error"])
+
+        main._write_api_configs(original)
+        self.assertEqual(self.client.get("/api/config").json()["storage_error"], "")
+
+    def test_api_config_encryption_failure_preserves_previous_credentials(self):
+        original = {
+            "binance": {
+                "exchange": "binance",
+                "api_key": "encryption-binance-key",
+                "api_secret": "encryption-binance-secret",
+                "testnet": False,
+            }
+        }
+        main._write_api_configs(original)
+        original_bytes = Path(main.API_CONFIG_FILE).read_bytes()
+
+        with (
+            patch.object(
+                main,
+                "encrypt_text",
+                side_effect=RuntimeError("encryption backend unavailable"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            main._write_api_configs(
+                {
+                    **original,
+                    "aster": {
+                        "exchange": "aster",
+                        "api_key": "0x0000000000000000000000000000000000000abc",
+                        "api_secret": "0x" + "6" * 64,
+                        "testnet": False,
+                    },
+                }
+            )
+
+        self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), original_bytes)
+        self.assertIn("previous credential file", main._api_config_write_error)
+        self.assertEqual(
+            list(Path(main.API_CONFIG_FILE).parent.glob(".api_config.json.*.tmp")),
+            [],
+        )
+
+    def test_plaintext_multi_exchange_config_is_migrated_without_data_loss(self):
+        plaintext = {
+            "version": 2,
+            "configs": {
+                "binance": {
+                    "exchange": "binance",
+                    "api_key": "legacy-binance-key",
+                    "api_secret": "legacy-binance-secret",
+                    "testnet": False,
+                },
+                "aster": {
+                    "exchange": "aster",
+                    "api_key": "0x0000000000000000000000000000000000000abc",
+                    "api_secret": "0x" + "7" * 64,
+                    "testnet": False,
+                },
+            },
+        }
+        Path(main.API_CONFIG_FILE).write_text(
+            json.dumps(plaintext),
+            encoding="utf-8",
+        )
+
+        loaded = main._load_file_api_configs()
+        saved_text = Path(main.API_CONFIG_FILE).read_text(encoding="utf-8")
+
+        self.assertEqual(set(loaded), {"binance", "aster"})
+        self.assertEqual(loaded["binance"]["api_secret"], "legacy-binance-secret")
+        self.assertNotIn("legacy-binance-key", saved_text)
+        self.assertNotIn("legacy-binance-secret", saved_text)
+        self.assertIn('"encrypted": true', saved_text)
+
+    def test_wrong_config_key_preserves_ciphertext_until_key_is_restored(self):
+        original = {
+            "binance": {
+                "exchange": "binance",
+                "api_key": "key-rotation-binance-key",
+                "api_secret": "key-rotation-binance-secret",
+                "testnet": False,
+            }
+        }
+        main._write_api_configs(original)
+        original_bytes = Path(main.API_CONFIG_FILE).read_bytes()
+        correct_key = os.environ["GRID_CONFIG_KEY"]
+        try:
+            os.environ["GRID_CONFIG_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+            with self.assertRaises(main.ApiConfigIntegrityError):
+                main._load_file_api_configs()
+
+            self.assertEqual(Path(main.API_CONFIG_FILE).read_bytes(), original_bytes)
+            self.assertIn("cannot be decrypted", main._api_config_read_error)
+        finally:
+            os.environ["GRID_CONFIG_KEY"] = correct_key
+
+        loaded = main._load_file_api_configs()
+        self.assertEqual(loaded["binance"]["api_secret"], "key-rotation-binance-secret")
+        self.assertEqual(main._api_config_integrity_error, "")
+
+    def test_concurrent_api_config_saves_preserve_every_exchange(self):
+        configs = [
+            {
+                "exchange": "binance",
+                "api_key": "concurrent-binance-key",
+                "api_secret": "concurrent-binance-secret",
+                "testnet": False,
+            },
+            {
+                "exchange": "aster",
+                "api_key": "0x0000000000000000000000000000000000000abc",
+                "api_secret": "0x" + "3" * 64,
+                "testnet": False,
+            },
+        ]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(main._save_api_config, config) for config in configs]
+            for future in futures:
+                future.result(timeout=5)
+
+        loaded = main._load_file_api_configs()
+        self.assertEqual(set(loaded), {"binance", "aster"})
+        self.assertEqual(loaded["binance"]["api_secret"], "concurrent-binance-secret")
+        self.assertEqual(loaded["aster"]["api_secret"], "0x" + "3" * 64)
+        saved_text = Path(main.API_CONFIG_FILE).read_text(encoding="utf-8")
+        for config in configs:
+            self.assertNotIn(config["api_key"], saved_text)
+            self.assertNotIn(config["api_secret"], saved_text)
 
     def test_api_config_can_be_loaded_from_environment(self):
         original_path = main.API_CONFIG_FILE

@@ -194,6 +194,12 @@ function renderConfigStatus(config) {
   const statusEl = document.getElementById("cfg-status");
   if (!statusEl) return;
 
+  if (config.storage_error) {
+    statusEl.textContent = "API 加密配置文件无法安全读取。原文件已保留，新的配置保存已暂停；请先检查服务器配置文件和加密密钥。";
+    statusEl.className = "config-status";
+    return;
+  }
+
   if (!config.configured) {
     const configured = Object.values(config.configs || {}).filter((item) => item.configured);
     statusEl.textContent = configured.length
