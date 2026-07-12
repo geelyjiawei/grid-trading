@@ -2061,6 +2061,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError("fill ledger rebuild should not run when reduce protection is complete")
 
         engine._reduce_lots_from_fill_ledger = fail_if_called
+        engine.trigger_message = "Repaired 1 missing reduce-only protection order(s) from fill ledger: 0.01"
 
         engine._reconcile_grid_position_protection()
 
@@ -3448,6 +3449,160 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                         float(cashflow_gross_equity - Decimal(str(engine.total_fee))),
                         engine.total_profit
                         + engine.estimate_grid_unrealized_pnl(float(mark_price)),
+                        places=7,
+                        msg=context,
+                    )
+
+    async def test_decimal_twenty_level_random_transitions_survive_restarts(self):
+        grid_logger = logging.getLogger("grid_engine")
+        logger_was_disabled = grid_logger.disabled
+        grid_logger.disabled = True
+        self.addCleanup(setattr, grid_logger, "disabled", logger_was_disabled)
+
+        class FlakyDecimalClient(FakeClient):
+            def __init__(self):
+                super().__init__("100", tick_size="1", qty_step="0.01", min_qty="0.01")
+                self.reject_next_limit = False
+
+            def place_order(self, **kwargs):
+                if self.reject_next_limit and kwargs.get("order_type") == "Limit":
+                    self.reject_next_limit = False
+                    return {"retCode": 503, "retMsg": "temporary deterministic rejection"}
+                return super().place_order(**kwargs)
+
+        for direction in ("short", "long"):
+            for seed in range(10):
+                rng = random.Random(seed)
+                client = FlakyDecimalClient()
+                config = {
+                    "symbol": "TESTUSDT",
+                    "direction": direction,
+                    "grid_mode": "arithmetic",
+                    "upper_price": 110,
+                    "lower_price": 90,
+                    "grid_count": 20,
+                    "total_investment": 0,
+                    "position_sizing_mode": "fixed_grid_qty",
+                    "grid_order_qty": 0.2,
+                    "leverage": 2,
+                    "grid_order_post_only": False,
+                    "maker_fee_rate": 0,
+                    "taker_fee_rate": 0,
+                    "trigger_price": None,
+                    "stop_loss_price": None,
+                    "take_profit_price": None,
+                }
+                engine = GridEngine(client, config)
+                await engine.initialize()
+
+                opening_qty = Decimal(str(engine.initial_qty))
+                opening_value = Decimal(str(engine.initial_entry_price)) * opening_qty
+                cashflow = opening_value if direction == "short" else -opening_value
+                trade_net_qty = -opening_qty if direction == "short" else opening_qty
+                qty_step = Decimal("0.01")
+
+                for transition in range(120):
+                    candidates = [
+                        order
+                        for order in engine.active_orders.values()
+                        if Decimal(str(order.get("qty", 0) or 0))
+                        - Decimal(str(order.get("processed_fill_qty", 0) or 0))
+                        >= qty_step
+                    ]
+                    self.assertTrue(candidates)
+                    order = rng.choice(candidates)
+                    link_id = str(order["link_id"])
+                    planned = Decimal(str(order["qty"]))
+                    processed = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+                    remaining_steps = int((planned - processed) / qty_step)
+                    client.reject_next_limit = rng.random() < 0.12
+
+                    if rng.random() < 0.2:
+                        client.cancel_order("TESTUSDT", str(order["order_id"]))
+                        engine._handle_cancelled_order(link_id, order)
+                    else:
+                        cumulative = processed + qty_step * rng.randint(1, remaining_steps)
+                        price = Decimal(str(order["price"]))
+                        fill_qty = cumulative - processed
+                        fill_value = price * fill_qty
+                        if order["side"] == "Buy":
+                            cashflow -= fill_value
+                            trade_net_qty += fill_qty
+                        else:
+                            cashflow += fill_value
+                            trade_net_qty -= fill_qty
+                        self.assertTrue(
+                            engine._record_execution_delta(
+                                order,
+                                {
+                                    "price": float(price),
+                                    "qty": str(cumulative),
+                                    "volume": str(price * cumulative),
+                                    "fee": 0.0,
+                                    "fee_asset": "USDT",
+                                    "fee_source": "exchange",
+                                    "maker_count": 1,
+                                    "taker_count": 0,
+                                },
+                            )
+                        )
+                        if cumulative == planned:
+                            engine.active_orders.pop(link_id, None)
+                            client.open_limit_order_ids.discard(str(order["order_id"]))
+
+                    client.reject_next_limit = False
+                    for queued in engine.paused_replacements:
+                        queued["replacement_retry_after"] = 0.0
+                    engine._resume_paused_replacements()
+                    engine._repair_missing_reduce_protection_from_ledger()
+                    engine._repair_open_side_coverage_from_lots()
+                    self.assertEqual(engine.paused_replacements, [])
+
+                    if (transition + 1) % 20 == 0:
+                        position_qty = abs(trade_net_qty)
+                        client.positions = []
+                        if position_qty:
+                            client.positions.append(
+                                {
+                                    "side": "Sell" if trade_net_qty < 0 else "Buy",
+                                    "size": str(position_qty),
+                                    "avgPrice": "100",
+                                }
+                            )
+                        saved = copy.deepcopy(engine.to_state())
+                        saved["running"] = True
+                        restored = GridEngine(client, config)
+                        restored.restore_state(saved)
+                        engine = restored
+
+                    coverage = engine.grid_coverage_snapshot()
+                    protection = engine.reduce_protection_snapshot()
+                    context = (
+                        f"direction={direction} seed={seed} transition={transition} "
+                        f"coverage={coverage} protection={protection}"
+                    )
+                    self.assertFalse(coverage["has_risk"], msg=context)
+                    self.assertFalse(protection["has_risk"], msg=context)
+                    self.assertEqual(Decimal(str(coverage["coverage_qty"])), Decimal("4.0"))
+                    self.assertEqual(coverage["missing_by_level"], [], msg=context)
+                    self.assertEqual(coverage["excess_by_level"], [], msg=context)
+
+                    lot_qty = sum(
+                        (Decimal(str(lot["qty"])) for lot in engine.reduce_lots_by_level.values()),
+                        Decimal("0"),
+                    )
+                    expected_position = -lot_qty if direction == "short" else lot_qty
+                    self.assertEqual(Decimal(str(engine.grid_position_net_qty)), expected_position)
+                    self.assertEqual(trade_net_qty, expected_position)
+
+                    mark_price = Decimal(str(engine.current_price))
+                    cashflow_gross_equity = cashflow + mark_price * trade_net_qty
+                    accounted_gross_equity = Decimal(str(engine.gross_profit)) + Decimal(
+                        str(engine.estimate_grid_unrealized_pnl(float(mark_price)))
+                    )
+                    self.assertAlmostEqual(
+                        float(cashflow_gross_equity),
+                        float(accounted_gross_equity),
                         places=7,
                         msg=context,
                     )

@@ -29,6 +29,11 @@ SUBMISSION_NOT_FOUND_CHECK_INTERVAL_SECONDS = 0.5
 MANAGED_CANCEL_MAX_ROUNDS = 5
 MANAGED_CANCEL_RETRY_SECONDS = 0.25
 ORDER_LINK_RANDOM_HEX_LENGTH = 16
+COMPLETED_REPAIR_MESSAGE_PREFIXES = (
+    "Repaired ",
+    "Restored ",
+    "Placed boundary reduce-only fallback",
+)
 
 
 class GridEngine:
@@ -2663,7 +2668,8 @@ class GridEngine:
             return
 
         if not self._qty_reaches_accounting_step(self._grid_position_qty()):
-            self._repair_flat_open_side_grid()
+            if not self._repair_flat_open_side_grid():
+                self._clear_completed_repair_message()
             return
 
         if self._repair_missing_reduce_protection_from_ledger():
@@ -2672,7 +2678,16 @@ class GridEngine:
         if self._repair_open_side_coverage_from_lots():
             return
 
-        self._repair_missing_reduce_at_boundary()
+        if self._repair_missing_reduce_at_boundary():
+            return
+        self._clear_completed_repair_message()
+
+    def _clear_completed_repair_message(self) -> bool:
+        if not self.trigger_message.startswith(COMPLETED_REPAIR_MESSAGE_PREFIXES):
+            return False
+        self.trigger_message = ""
+        self._persist_state()
+        return True
 
     @staticmethod
     def _lot_add(lots: dict[int, dict[str, Decimal]], level_idx: int, qty: Decimal, entry_price: Decimal):
