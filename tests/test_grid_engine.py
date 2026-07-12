@@ -637,6 +637,25 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 msg=direction,
             )
 
+    async def test_repeated_trade_value_updates_do_not_accumulate_float_dust(self):
+        engine = GridEngine(FakeClient("100"), {"symbol": "MUUSDT", "direction": "short"})
+
+        for _ in range(1000):
+            engine._record_trade_value(
+                1,
+                0.001,
+                gross_profit=0.0003,
+                volume=0.001,
+                fee=0.0002,
+                fee_asset="USDT",
+                fee_source="exchange",
+            )
+
+        self.assertEqual(Decimal(str(engine.total_volume)), Decimal("1.0"))
+        self.assertEqual(Decimal(str(engine.total_fee)), Decimal("0.2"))
+        self.assertEqual(Decimal(str(engine.gross_profit)), Decimal("0.3"))
+        self.assertEqual(Decimal(str(engine.total_profit)), Decimal("0.1"))
+
     async def test_reduce_protection_detects_level_gaps_even_when_total_matches(self):
         client = FakeClient("100")
         engine = GridEngine(
@@ -3317,6 +3336,10 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
                 await engine.initialize()
+                opening_qty = Decimal(str(engine.initial_qty))
+                opening_value = Decimal(str(engine.initial_entry_price)) * opening_qty
+                cashflow = opening_value if direction == "short" else -opening_value
+                trade_net_qty = -opening_qty if direction == "short" else opening_qty
 
                 for transition in range(100):
                     candidates = [
@@ -3342,6 +3365,14 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         cumulative = processed + rng.randint(1, remaining)
                         price = float(order["price"])
+                        fill_qty = Decimal(cumulative - processed)
+                        fill_value = Decimal(str(price)) * fill_qty
+                        if order["side"] == "Buy":
+                            cashflow -= fill_value
+                            trade_net_qty += fill_qty
+                        else:
+                            cashflow += fill_value
+                            trade_net_qty -= fill_qty
                         self.assertTrue(
                             engine._record_execution_delta(
                                 order,
@@ -3380,6 +3411,30 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                     )
                     expected_position = -lot_qty if direction == "short" else lot_qty
                     self.assertAlmostEqual(engine.grid_position_net_qty, expected_position)
+                    self.assertAlmostEqual(
+                        float(trade_net_qty),
+                        engine.grid_position_net_qty,
+                        msg=context,
+                    )
+
+                    mark_price = Decimal(str(engine.current_price))
+                    cashflow_gross_equity = cashflow + mark_price * trade_net_qty
+                    accounted_gross_equity = Decimal(str(engine.gross_profit)) + Decimal(
+                        str(engine.estimate_grid_unrealized_pnl(float(mark_price)))
+                    )
+                    self.assertAlmostEqual(
+                        float(cashflow_gross_equity),
+                        float(accounted_gross_equity),
+                        places=7,
+                        msg=context,
+                    )
+                    self.assertAlmostEqual(
+                        float(cashflow_gross_equity - Decimal(str(engine.total_fee))),
+                        engine.total_profit
+                        + engine.estimate_grid_unrealized_pnl(float(mark_price)),
+                        places=7,
+                        msg=context,
+                    )
 
     async def test_fixed_grid_reduce_normalization_does_not_hide_incomplete_ledger(self):
         client = FakeClient("0.418", tick_size="0.001", qty_step="1", min_qty="1")

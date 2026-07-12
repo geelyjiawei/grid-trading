@@ -783,21 +783,38 @@ class GridEngine:
         fee_asset: str = "USDT",
         fee_source: str = "estimated",
     ) -> dict:
-        notional = volume if volume is not None else price * qty
-        fee = fee if fee is not None else self._estimate_fee(notional)
-        net_profit = gross_profit - fee
+        price_decimal = Decimal(str(price))
+        qty_decimal = Decimal(str(qty))
+        notional_decimal = (
+            Decimal(str(volume))
+            if volume is not None
+            else price_decimal * qty_decimal
+        )
+        fee_decimal = (
+            Decimal(str(fee))
+            if fee is not None
+            else Decimal(str(self._estimate_fee(float(notional_decimal))))
+        )
+        gross_profit_decimal = Decimal(str(gross_profit))
+        net_profit_decimal = gross_profit_decimal - fee_decimal
 
-        self.total_volume += notional
-        self.total_fee += fee
-        self.total_profit += net_profit
-        if gross_profit:
-            self.gross_profit += gross_profit
+        self.total_volume = float(
+            Decimal(str(self.total_volume)) + notional_decimal
+        )
+        self.total_fee = float(Decimal(str(self.total_fee)) + fee_decimal)
+        self.total_profit = float(
+            Decimal(str(self.total_profit)) + net_profit_decimal
+        )
+        if gross_profit_decimal:
+            self.gross_profit = float(
+                Decimal(str(self.gross_profit)) + gross_profit_decimal
+            )
 
         return {
-            "volume": notional,
-            "fee": fee,
-            "gross_profit": gross_profit,
-            "net_profit": net_profit,
+            "volume": float(notional_decimal),
+            "fee": float(fee_decimal),
+            "gross_profit": float(gross_profit_decimal),
+            "net_profit": float(net_profit_decimal),
             "fee_asset": fee_asset,
             "fee_source": fee_source,
         }
