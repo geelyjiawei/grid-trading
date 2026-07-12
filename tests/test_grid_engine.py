@@ -218,6 +218,7 @@ class FakeClient:
             "retCode": 0,
             "result": {
                 "orderId": str(order_id),
+                "orderLinkId": str(order.get("order_link_id", "") or ""),
                 "orderStatus": status,
                 "side": order.get("side", ""),
                 "price": order.get("price", "0"),
@@ -8313,6 +8314,180 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.filled_orders, [])
         self.assertEqual(len(client.orders), order_count)
         self.assertIn(order["link_id"], engine.active_orders)
+
+    async def test_untrusted_order_id_snapshot_never_closes_or_replaces_managed_order(self):
+        for response_variant in (
+            "wrong_order_id_cancelled",
+            "wrong_link_cancelled",
+            "missing_order_id_cancelled",
+            "wrong_order_id_filled",
+            "missing_link_filled",
+            "invalid_result",
+            "invalid_response",
+            "missing_result",
+            "shape_mismatch_cancelled",
+        ):
+            with self.subTest(response_variant=response_variant):
+                class MisleadingOrderStatusClient(FakeClient):
+                    def get_order(self, symbol, order_id):
+                        if response_variant == "invalid_response":
+                            return []
+                        if response_variant == "invalid_result":
+                            return {"retCode": 0, "result": []}
+                        if response_variant == "missing_result":
+                            return {"retCode": 0}
+
+                        source = next(
+                            item
+                            for item in self.orders
+                            if str(item.get("orderId")) == str(order_id)
+                        )
+                        status = (
+                            "FILLED"
+                            if response_variant.endswith("filled")
+                            else "CANCELED"
+                        )
+                        snapshot = {
+                            "orderId": str(order_id),
+                            "orderLinkId": str(source.get("order_link_id") or ""),
+                            "orderStatus": status,
+                            "side": source.get("side"),
+                            "price": source.get("price"),
+                            "qty": source.get("qty"),
+                            "reduceOnly": source.get("reduce_only", False),
+                        }
+                        if response_variant.startswith("wrong_order_id"):
+                            snapshot["orderId"] = "another-order-id"
+                        elif response_variant.startswith("wrong_link"):
+                            snapshot["orderLinkId"] = "another-client-order-id"
+                        elif response_variant.startswith("missing_order_id"):
+                            snapshot.pop("orderId")
+                        elif response_variant.startswith("missing_link"):
+                            snapshot.pop("orderLinkId")
+                        elif response_variant.startswith("shape_mismatch"):
+                            snapshot["qty"] = "2"
+                        return {"retCode": 0, "result": snapshot}
+
+                    def get_order_history(self, symbol, limit=1000):
+                        return {"retCode": 0, "result": {"list": []}}
+
+                client = MisleadingOrderStatusClient(
+                    "100",
+                    tick_size="1",
+                    qty_step="1",
+                    min_qty="1",
+                )
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "short",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 1,
+                        "leverage": 2,
+                    },
+                )
+                engine._fetch_precision()
+                engine.grid_levels = [90, 110]
+                link_id = engine._place(
+                    "Sell",
+                    110,
+                    0,
+                    reduce_only=False,
+                    qty_override=1,
+                )
+
+                engine._reconcile_exchange_open_orders([])
+
+                self.assertEqual(len(client.orders), 1)
+                self.assertIn(link_id, engine.active_orders)
+                self.assertEqual(engine.paused_replacements, [])
+                self.assertEqual(engine.filled_orders, [])
+                self.assertEqual(engine.grid_position_net_qty, 0.0)
+                self.assertEqual(
+                    engine.manual_stop_pending,
+                    response_variant == "shape_mismatch_cancelled",
+                )
+
+    async def test_terminal_history_snapshot_must_match_both_order_identities(self):
+        for response_variant in (
+            "wrong_order_id",
+            "wrong_link_id",
+            "missing_order_id",
+            "missing_link_id",
+            "invalid_history",
+        ):
+            with self.subTest(response_variant=response_variant):
+                class ConflictingHistoryClient(FakeClient):
+                    def get_order(self, symbol, order_id):
+                        raise ConnectionError("direct order lookup unavailable")
+
+                    def get_order_history(self, symbol, limit=1000):
+                        if response_variant == "invalid_history":
+                            return {"retCode": 0, "result": {"list": "not-a-list"}}
+                        source = self.orders[0]
+                        snapshot = {
+                            "orderId": str(source["orderId"]),
+                            "orderLinkId": str(source.get("order_link_id") or ""),
+                            "orderStatus": "CANCELED",
+                            "side": source.get("side"),
+                            "price": source.get("price"),
+                            "qty": source.get("qty"),
+                            "reduceOnly": source.get("reduce_only", False),
+                        }
+                        if response_variant == "wrong_order_id":
+                            snapshot["orderId"] = "another-order-id"
+                        elif response_variant == "wrong_link_id":
+                            snapshot["orderLinkId"] = "another-client-order-id"
+                        elif response_variant == "missing_order_id":
+                            snapshot.pop("orderId")
+                        elif response_variant == "missing_link_id":
+                            snapshot.pop("orderLinkId")
+                        return {"retCode": 0, "result": {"list": [snapshot]}}
+
+                client = ConflictingHistoryClient(
+                    "100",
+                    tick_size="1",
+                    qty_step="1",
+                    min_qty="1",
+                )
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "short",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 1,
+                        "leverage": 2,
+                    },
+                )
+                engine._fetch_precision()
+                engine.grid_levels = [90, 110]
+                link_id = engine._place(
+                    "Sell",
+                    110,
+                    0,
+                    reduce_only=False,
+                    qty_override=1,
+                )
+
+                engine._reconcile_exchange_open_orders([])
+
+                self.assertEqual(len(client.orders), 1)
+                self.assertIn(link_id, engine.active_orders)
+                self.assertEqual(engine.paused_replacements, [])
+                self.assertEqual(engine.filled_orders, [])
+                self.assertEqual(engine.grid_position_net_qty, 0.0)
 
     async def test_cancelled_order_snapshot_replaces_only_unfilled_remainder(self):
         class CancelledPartialSnapshotClient(FakeClient):

@@ -6940,6 +6940,71 @@ class GridEngine:
     def _get_order_status(self, order: dict) -> str:
         return self._order_status_from_snapshot(self._get_order_snapshot(order))
 
+    @staticmethod
+    def _order_snapshot_identity_mismatch_reason(order: dict, snapshot: dict) -> str:
+        if not isinstance(snapshot, dict):
+            return "result is not an object"
+
+        expected_order_id = str(order.get("order_id", "") or "")
+        expected_link_id = str(order.get("link_id", "") or "")
+        if not expected_order_id and not expected_link_id:
+            return "local order has no exchange or client identity"
+
+        if expected_order_id:
+            actual_order_id = str(snapshot.get("orderId", "") or "")
+            if actual_order_id != expected_order_id:
+                return (
+                    f"order ID expected={expected_order_id} "
+                    f"actual={actual_order_id or 'missing'}"
+                )
+        if expected_link_id:
+            actual_link_id = str(
+                snapshot.get("orderLinkId", "")
+                or snapshot.get("order_link_id", "")
+                or ""
+            )
+            if actual_link_id != expected_link_id:
+                return (
+                    f"client order ID expected={expected_link_id} "
+                    f"actual={actual_link_id or 'missing'}"
+                )
+        return ""
+
+    def _validated_terminal_order_snapshot(
+        self,
+        order: dict,
+        snapshot: dict,
+        *,
+        source: str,
+    ) -> dict:
+        identity_reason = self._order_snapshot_identity_mismatch_reason(order, snapshot)
+        if identity_reason:
+            logger.error(
+                "Rejected untrusted order snapshot symbol=%s order_id=%s link_id=%s "
+                "source=%s reason=%s",
+                self.config.get("symbol"),
+                order.get("order_id"),
+                order.get("link_id"),
+                source,
+                identity_reason,
+            )
+            return {}
+
+        shape_reason = self._accepted_shape_mismatch_reason(order, snapshot)
+        if shape_reason:
+            logger.error(
+                "Terminal order snapshot changed immutable exchange shape "
+                "symbol=%s order_id=%s link_id=%s source=%s reason=%s",
+                self.config.get("symbol"),
+                order.get("order_id"),
+                order.get("link_id"),
+                source,
+                shape_reason,
+            )
+            self._record_accepted_shape_mismatch(order, snapshot, shape_reason)
+            return {}
+        return snapshot
+
     def _get_order_snapshot(self, order: dict) -> dict:
         if not hasattr(self.client, "get_order"):
             return self._get_order_from_history(order)
@@ -6947,6 +7012,12 @@ class GridEngine:
             resp = self.client.get_order(self.config["symbol"], str(order.get("order_id", "")))
         except Exception as exc:
             logger.warning("Fetch order status failed order_id=%s msg=%s", order.get("order_id"), exc)
+            return self._get_order_from_history(order)
+        if not isinstance(resp, dict):
+            logger.error(
+                "Fetch order status returned an invalid response object order_id=%s",
+                order.get("order_id"),
+            )
             return self._get_order_from_history(order)
         if resp.get("retCode") != 0:
             logger.warning(
@@ -6956,7 +7027,18 @@ class GridEngine:
             )
             return self._get_order_from_history(order)
 
-        snapshot = resp.get("result", {}) or {}
+        raw_snapshot = resp.get("result")
+        if not isinstance(raw_snapshot, dict) or not raw_snapshot:
+            return self._get_order_from_history(order)
+        snapshot = self._validated_terminal_order_snapshot(
+            order,
+            raw_snapshot,
+            source="direct order lookup",
+        )
+        if not snapshot:
+            if order.get("accepted_shape_mismatch"):
+                return {}
+            return self._get_order_from_history(order)
         if self._order_status_from_snapshot(snapshot) == "UNKNOWN":
             history_snapshot = self._get_order_from_history(order)
             if history_snapshot:
@@ -6977,6 +7059,12 @@ class GridEngine:
         except Exception as exc:
             logger.warning("Fetch order history failed order_id=%s msg=%s", order_id, exc)
             return {}
+        if not isinstance(resp, dict):
+            logger.error(
+                "Fetch order history returned an invalid response object order_id=%s",
+                order_id,
+            )
+            return {}
         if resp.get("retCode") != 0:
             logger.warning(
                 "Fetch order history rejected order_id=%s msg=%s",
@@ -6985,11 +7073,33 @@ class GridEngine:
             )
             return {}
 
-        for item in resp.get("result", {}).get("list", []):
-            if order_id and str(item.get("orderId", "") or "") == order_id:
-                return item
-            if link_id and str(item.get("orderLinkId", "") or item.get("order_link_id", "") or "") == link_id:
-                return item
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            return {}
+        items = result.get("list")
+        if not isinstance(items, list):
+            return {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_order_id = str(item.get("orderId", "") or "")
+            item_link_id = str(
+                item.get("orderLinkId", "") or item.get("order_link_id", "") or ""
+            )
+            matches_any_identity = bool(
+                (order_id and item_order_id == order_id)
+                or (link_id and item_link_id == link_id)
+            )
+            if not matches_any_identity:
+                continue
+            snapshot = self._validated_terminal_order_snapshot(
+                order,
+                item,
+                source="order history",
+            )
+            if snapshot:
+                return snapshot
+            return {}
         return {}
 
     def _execution_stats_from_order_snapshot(
