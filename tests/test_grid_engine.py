@@ -9133,6 +9133,11 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             "missing_link_id",
             "invalid_row",
             "invalid_list",
+            "wrong_symbol",
+            "invalid_status",
+            "nan_quantity",
+            "infinite_price",
+            "invalid_reduce_only",
         ):
             with self.subTest(response_variant=response_variant):
                 client = FakeClient(
@@ -9188,8 +9193,25 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                     open_orders = [bad_snapshot]
                 elif response_variant == "invalid_row":
                     open_orders = [None]
-                else:
+                elif response_variant == "invalid_list":
                     open_orders = "not-a-list"
+                elif response_variant == "wrong_symbol":
+                    bad_snapshot["symbol"] = "OTHERUSDT"
+                    open_orders = [bad_snapshot]
+                elif response_variant == "invalid_status":
+                    bad_snapshot["orderStatus"] = "MAYBE"
+                    open_orders = [bad_snapshot]
+                elif response_variant == "nan_quantity":
+                    bad_snapshot["qty"] = "NaN"
+                    open_orders = [bad_snapshot]
+                elif response_variant == "infinite_price":
+                    bad_snapshot["price"] = "Infinity"
+                    open_orders = [bad_snapshot]
+                elif response_variant == "invalid_reduce_only":
+                    bad_snapshot["reduceOnly"] = "maybe"
+                    open_orders = [bad_snapshot]
+                else:
+                    raise AssertionError(response_variant)
 
                 with self.assertRaisesRegex(RuntimeError, "open-order snapshot"):
                     engine._reconcile_exchange_open_orders(open_orders)
@@ -11982,6 +12004,53 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.manual_stop_pending)
         self.assertFalse(engine.grid_ready)
         self.assertEqual(len(client.orders), 1)
+
+    async def test_every_valid_confirmed_shape_mismatch_halts_grid_with_exchange_fact(self):
+        cases = {
+            "side": ("side", "Buy", "expected=Sell actual=Buy"),
+            "price": ("price", "100.9", "expected=101.0 actual=100.9"),
+            "reduce only": (
+                "reduce_only",
+                True,
+                "reduce-only expected=False actual=True",
+            ),
+        }
+        for label, (field, actual, message) in cases.items():
+            with self.subTest(label=label):
+                client = FakeClient(
+                    "100",
+                    tick_size="0.1",
+                    qty_step="0.1",
+                    min_qty="0.1",
+                )
+                engine = GridEngine(
+                    client,
+                    {"symbol": "TESTUSDT", "direction": "short"},
+                )
+                engine._fetch_precision()
+                link_id = engine._place(
+                    "Sell",
+                    101,
+                    1,
+                    reduce_only=False,
+                    qty_override=1,
+                )
+                client.orders[0][field] = actual
+
+                changed = engine._reconcile_exchange_open_orders()
+
+                order = engine.active_orders[link_id]
+                self.assertTrue(changed)
+                self.assertIn(message, order["accepted_shape_mismatch"])
+                self.assertTrue(engine.manual_stop_pending)
+                self.assertFalse(engine.grid_ready)
+                self.assertEqual(len(client.orders), 1)
+                if field == "side":
+                    self.assertEqual(order["side"], "Buy")
+                elif field == "price":
+                    self.assertEqual(order["price"], "100.9")
+                else:
+                    self.assertTrue(order["reduce_only"])
 
     async def test_generated_grid_client_order_id_uses_exchange_safe_entropy(self):
         client = FakeClient("100")

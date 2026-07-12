@@ -383,7 +383,14 @@ class AsterClientTests(unittest.TestCase):
 
     def test_signed_request_adds_nonce_user_signer_and_signature(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
-        client.session = FakeSession(FakeResponse({"orderId": 123}))
+        client.session = FakeSession(
+            FakeResponse(
+                {
+                    "orderId": 123,
+                    "clientOrderId": "g_1_B_test",
+                }
+            )
+        )
 
         response = client.place_order(
             symbol="ASTERUSDT",
@@ -1070,13 +1077,20 @@ class AsterClientTests(unittest.TestCase):
         client.session = FakeSession(
             FakeResponse(
                 {
+                    "symbol": "ANSEMUSDT",
                     "orderId": 88,
                     "clientOrderId": "g_3_B_recover",
                     "side": "BUY",
                     "price": "0.38",
                     "origQty": "100",
+                    "avgPrice": "0",
+                    "executedQty": "0",
+                    "cumQuote": "0",
                     "status": "NEW",
                     "reduceOnly": "true",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "time": 1714012800000,
                 }
             )
         )

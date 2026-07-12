@@ -3184,13 +3184,20 @@ class MultiGridServerTests(unittest.TestCase):
         def fake_request(method, path, *, params=None, auth=False):
             calls.append((method, path, params, auth))
             return {
+                "symbol": "TESTUSDT",
                 "orderId": 99,
                 "clientOrderId": "g_4_S_recover",
                 "side": "SELL",
                 "price": "101",
                 "origQty": "2",
+                "avgPrice": "0",
+                "executedQty": "0",
+                "cumQuote": "0",
                 "status": "NEW",
                 "reduceOnly": False,
+                "timeInForce": "GTC",
+                "type": "LIMIT",
+                "time": 1714012800000,
             }
 
         client._request = fake_request
@@ -3766,9 +3773,20 @@ class MultiGridServerTests(unittest.TestCase):
                 "result": {
                     "list": [
                         {
+                            "symbol": "TESTUSDT",
                             "orderId": "bybit-1",
                             "orderLinkId": "g_2_B_recover",
+                            "side": "Buy",
+                            "price": "100",
+                            "qty": "1",
+                            "avgPrice": "100",
+                            "cumExecQty": "1",
+                            "cumExecValue": "100",
                             "orderStatus": "Filled",
+                            "reduceOnly": True,
+                            "timeInForce": "GTC",
+                            "orderType": "Limit",
+                            "createdTime": "1714012800000",
                         }
                     ]
                 },
@@ -3875,20 +3893,38 @@ class MultiGridServerTests(unittest.TestCase):
         client = BybitClient("key", "secret")
         calls = []
 
+        def order(index):
+            return {
+                "symbol": "MUUSDT",
+                "orderId": str(index),
+                "orderLinkId": f"g_{index}_B_page",
+                "side": "Buy",
+                "price": "100",
+                "qty": "1",
+                "avgPrice": "",
+                "cumExecQty": "0",
+                "cumExecValue": "0",
+                "orderStatus": "New",
+                "reduceOnly": False,
+                "timeInForce": "GTC",
+                "orderType": "Limit",
+                "createdTime": str(1714012800000 + index),
+            }
+
         def fake_request(method, path, *, params=None, payload=None, auth=False):
             calls.append(str(params or ""))
             if "cursor=" not in str(params or ""):
                 return {
                     "retCode": 0,
                     "result": {
-                        "list": [{"orderId": str(index)} for index in range(50)],
+                        "list": [order(index) for index in range(50)],
                         "nextPageCursor": "page%3D2%26offset%3D50",
                     },
                 }
             return {
                 "retCode": 0,
                 "result": {
-                    "list": [{"orderId": str(index)} for index in range(50, 75)],
+                    "list": [order(index) for index in range(50, 75)],
                     "nextPageCursor": "",
                 },
             }

@@ -17,8 +17,10 @@ from exchange_errors import (
     is_exchange_rate_limit_message,
 )
 from exchange_snapshots import (
+    OPEN_ORDER_STATUSES,
     validate_execution_response,
     validate_instrument_response,
+    validate_order_row,
     validate_position_response,
     validate_ticker_response,
 )
@@ -1950,16 +1952,16 @@ class GridEngine:
         seen_order_ids: set[str] = set()
         seen_link_ids: set[str] = set()
         for index, item in enumerate(open_orders):
-            if not isinstance(item, dict):
-                raise RuntimeError(
-                    f"Invalid open-order snapshot: row {index} is not an object"
-                )
-            order_id = str(item.get("orderId", "") or "")
-            link_id = str(item.get("orderLinkId", "") or "")
-            if not order_id:
-                raise RuntimeError(
-                    f"Invalid open-order snapshot: row {index} has no order ID"
-                )
+            snapshot = validate_order_row(
+                item,
+                expected_symbol=str(self.config.get("symbol") or ""),
+                require_details=False,
+                allowed_statuses=OPEN_ORDER_STATUSES,
+                row_index=index,
+                context="Invalid open-order snapshot",
+            )
+            order_id = snapshot["order_id"]
+            link_id = snapshot["link_id"]
             if order_id in seen_order_ids:
                 raise RuntimeError(
                     "Invalid open-order snapshot: duplicate exchange order ID"
@@ -1984,6 +1986,22 @@ class GridEngine:
                     raise RuntimeError(
                         "Invalid open-order snapshot: managed client order ID maps to a "
                         "different exchange order ID"
+                    )
+
+            managed_order = managed_by_id or managed_by_link
+            if managed_order is not None:
+                required_fields = ["side", "qty", "reduceOnly"]
+                if str(managed_order.get("order_type") or "").lower() == "limit":
+                    required_fields.append("price")
+                missing_fields = [
+                    field
+                    for field in required_fields
+                    if field not in item or item.get(field) in (None, "")
+                ]
+                if missing_fields:
+                    raise RuntimeError(
+                        "Invalid open-order snapshot: managed order is missing "
+                        + ", ".join(missing_fields)
                     )
 
             seen_order_ids.add(order_id)
@@ -2049,13 +2067,21 @@ class GridEngine:
 
         snapshot_reduce_only = snapshot.get("reduceOnly")
         expected_reduce_only = bool(order.get("reduce_only", False))
-        if (
-            snapshot_reduce_only is not None
-            and self._truthy(snapshot_reduce_only) != expected_reduce_only
-        ):
+        accepted_reduce_only: bool | None = None
+        if isinstance(snapshot_reduce_only, bool):
+            accepted_reduce_only = snapshot_reduce_only
+        elif isinstance(snapshot_reduce_only, str):
+            reduce_text = snapshot_reduce_only.strip().lower()
+            if reduce_text in {"true", "false"}:
+                accepted_reduce_only = reduce_text == "true"
+        elif snapshot_reduce_only is not None:
+            return f"reduce-only expected={expected_reduce_only} actual={snapshot_reduce_only}"
+        if snapshot_reduce_only is not None and accepted_reduce_only is None:
+            return f"reduce-only expected={expected_reduce_only} actual={snapshot_reduce_only}"
+        if accepted_reduce_only is not None and accepted_reduce_only != expected_reduce_only:
             return (
                 f"reduce-only expected={expected_reduce_only} "
-                f"actual={self._truthy(snapshot_reduce_only)}"
+                f"actual={accepted_reduce_only}"
             )
 
         snapshot_qty = snapshot.get("qty")
@@ -2066,7 +2092,9 @@ class GridEngine:
             except Exception:
                 return f"quantity expected={order.get('qty')} actual={snapshot_qty}"
             if (
-                accepted_qty < 0
+                not expected_qty.is_finite()
+                or not accepted_qty.is_finite()
+                or accepted_qty <= 0
                 or abs(accepted_qty - expected_qty) > self._qty_tolerance_decimal()
             ):
                 return f"quantity expected={order.get('qty')} actual={snapshot_qty}"
@@ -2083,7 +2111,12 @@ class GridEngine:
                 tolerance = max(abs(tick) * Decimal("1e-9"), Decimal("1e-18"))
             except Exception:
                 return f"price expected={order.get('price')} actual={snapshot_price}"
-            if accepted_price <= 0 or abs(accepted_price - expected_price) > tolerance:
+            if (
+                not expected_price.is_finite()
+                or not accepted_price.is_finite()
+                or accepted_price <= 0
+                or abs(accepted_price - expected_price) > tolerance
+            ):
                 return f"price expected={order.get('price')} actual={snapshot_price}"
 
         return ""

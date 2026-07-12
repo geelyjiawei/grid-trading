@@ -1,4 +1,5 @@
 import math
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -106,6 +107,647 @@ def validate_positive_integer(
     if parsed != parsed.to_integral_value():
         raise RuntimeError(f"{context} row {row_index} has non-integer {field}")
     return int(parsed)
+
+
+ORDER_STATUSES = frozenset(
+    {
+        "ACTIVE",
+        "CANCELED",
+        "CREATED",
+        "DEACTIVATED",
+        "EXPIRED",
+        "EXPIRED_IN_MATCH",
+        "FILLED",
+        "NEW",
+        "PARTIALLY_FILLED",
+        "PARTIALLY_FILLED_CANCELED",
+        "PENDING_CANCEL",
+        "REJECTED",
+        "TRIGGERED",
+        "UNTRIGGERED",
+    }
+)
+OPEN_ORDER_STATUSES = frozenset(
+    {
+        "ACTIVE",
+        "CREATED",
+        "NEW",
+        "PARTIALLY_FILLED",
+        "PENDING_CANCEL",
+        "TRIGGERED",
+        "UNTRIGGERED",
+    }
+)
+MARKET_ORDER_TYPES = frozenset(
+    {
+        "MARKET",
+        "STOP_MARKET",
+        "TAKE_PROFIT_MARKET",
+        "TRAILING_STOP_MARKET",
+    }
+)
+
+
+def _enum_key(value: Any, *, context: str, row_index: int, field: str) -> str:
+    text = snapshot_text(
+        value,
+        context=context,
+        row_index=row_index,
+        field=field,
+    )
+    return re.sub(r"[^A-Za-z0-9]", "", text).upper()
+
+
+def canonical_order_status(
+    value: Any,
+    *,
+    context: str,
+    row_index: int,
+) -> str:
+    aliases = {
+        "ACTIVE": "ACTIVE",
+        "CANCELED": "CANCELED",
+        "CANCELLED": "CANCELED",
+        "CREATED": "CREATED",
+        "DEACTIVATED": "DEACTIVATED",
+        "EXPIRED": "EXPIRED",
+        "EXPIREDINMATCH": "EXPIRED_IN_MATCH",
+        "FILLED": "FILLED",
+        "NEW": "NEW",
+        "PARTIALLYFILLED": "PARTIALLY_FILLED",
+        "PARTIALFILLED": "PARTIALLY_FILLED",
+        "FILLEDPARTIALLY": "PARTIALLY_FILLED",
+        "PARTIALLYFILLEDCANCELED": "PARTIALLY_FILLED_CANCELED",
+        "PARTIALLYFILLEDCANCELLED": "PARTIALLY_FILLED_CANCELED",
+        # Kept for the misspelling published by one Bybit API explorer page.
+        "PARTILLYFILLEDCANCELLED": "PARTIALLY_FILLED_CANCELED",
+        "PENDINGCANCEL": "PENDING_CANCEL",
+        "REJECTED": "REJECTED",
+        "TRIGGERED": "TRIGGERED",
+        "UNTRIGGERED": "UNTRIGGERED",
+    }
+    key = _enum_key(
+        value,
+        context=context,
+        row_index=row_index,
+        field="orderStatus",
+    )
+    status = aliases.get(key, "")
+    if status not in ORDER_STATUSES:
+        raise RuntimeError(f"{context} row {row_index} has invalid orderStatus")
+    return status
+
+
+def canonical_order_type(
+    value: Any,
+    *,
+    context: str,
+    row_index: int,
+) -> str:
+    aliases = {
+        "LIMIT": "LIMIT",
+        "LIMITMAKER": "LIMIT_MAKER",
+        "MARKET": "MARKET",
+        "STOP": "STOP",
+        "STOPMARKET": "STOP_MARKET",
+        "TAKEPROFIT": "TAKE_PROFIT",
+        "TAKEPROFITMARKET": "TAKE_PROFIT_MARKET",
+        "TRAILINGSTOPMARKET": "TRAILING_STOP_MARKET",
+        "UNKNOWN": "UNKNOWN",
+    }
+    key = _enum_key(
+        value,
+        context=context,
+        row_index=row_index,
+        field="orderType",
+    )
+    order_type = aliases.get(key, "")
+    if not order_type:
+        raise RuntimeError(f"{context} row {row_index} has invalid orderType")
+    return order_type
+
+
+def canonical_time_in_force(
+    value: Any,
+    *,
+    context: str,
+    row_index: int,
+) -> str:
+    aliases = {
+        "FOK": "FOK",
+        "FILLORKILL": "FOK",
+        "GTC": "GTC",
+        "GOODTILCANCEL": "GTC",
+        "GOODTILCANCELED": "GTC",
+        "GOODTILCANCELLED": "GTC",
+        "GTX": "GTX",
+        "GTD": "GTD",
+        "GOODTILLDATE": "GTD",
+        "IOC": "IOC",
+        "IMMEDIATEORCANCEL": "IOC",
+        "POSTONLY": "POST_ONLY",
+        "RPI": "RPI",
+    }
+    key = _enum_key(
+        value,
+        context=context,
+        row_index=row_index,
+        field="timeInForce",
+    )
+    time_in_force = aliases.get(key, "")
+    if not time_in_force:
+        raise RuntimeError(f"{context} row {row_index} has invalid timeInForce")
+    return time_in_force
+
+
+def _order_context(symbol: str, context: str | None) -> str:
+    if context:
+        return context
+    label = str(symbol or "").upper().strip()
+    return f"{label} order snapshot" if label else "order snapshot"
+
+
+def _optional_order_text(
+    row: dict,
+    field: str,
+    *,
+    context: str,
+    row_index: int,
+) -> str:
+    value = row.get(field)
+    if value is None or value == "":
+        return ""
+    return snapshot_text(
+        value,
+        context=context,
+        row_index=row_index,
+        field=field,
+    )
+
+
+def _nonnegative_order_decimal(
+    row: dict,
+    field: str,
+    *,
+    context: str,
+    row_index: int,
+    required: bool,
+    allow_blank: bool = False,
+) -> Decimal | None:
+    if field not in row:
+        if required:
+            raise RuntimeError(f"{context} row {row_index} is missing {field}")
+        return None
+    parsed = snapshot_decimal(
+        row.get(field),
+        context=context,
+        row_index=row_index,
+        field=field,
+        allow_blank=allow_blank,
+    )
+    if parsed is None:
+        parsed = Decimal("0")
+    if parsed < 0:
+        raise RuntimeError(f"{context} row {row_index} has negative {field}")
+    return parsed
+
+
+def validate_order_row(
+    row: Any,
+    *,
+    expected_symbol: str = "",
+    expected_order_id: str = "",
+    expected_link_id: str = "",
+    require_details: bool = True,
+    allowed_statuses: frozenset[str] | set[str] | None = None,
+    row_index: int = 0,
+    context: str | None = None,
+) -> dict:
+    label = str(expected_symbol or "").upper().strip()
+    expected_order = str(expected_order_id or "").strip()
+    expected_link = str(expected_link_id or "").strip()
+    snapshot_context = _order_context(label, context)
+    if not isinstance(row, dict):
+        raise RuntimeError(f"{snapshot_context} row {row_index} must be an object")
+
+    order_id = snapshot_text(
+        row.get("orderId"),
+        context=snapshot_context,
+        row_index=row_index,
+        field="orderId",
+    )
+    link_id = _optional_order_text(
+        row,
+        "orderLinkId",
+        context=snapshot_context,
+        row_index=row_index,
+    )
+    if expected_order and order_id != expected_order:
+        raise RuntimeError(
+            f"{snapshot_context} row {row_index} belongs to order {order_id}"
+        )
+    if expected_link and link_id != expected_link:
+        raise RuntimeError(
+            f"{snapshot_context} row {row_index} belongs to client order "
+            f"{link_id or 'an empty client order ID'}"
+        )
+
+    symbol = ""
+    if require_details or "symbol" in row:
+        symbol = snapshot_text(
+            row.get("symbol"),
+            context=snapshot_context,
+            row_index=row_index,
+            field="symbol",
+        ).upper()
+        if label and symbol != label:
+            raise RuntimeError(
+                f"{snapshot_context} row {row_index} belongs to {symbol}"
+            )
+
+    side = ""
+    if require_details or "side" in row:
+        side_key = _enum_key(
+            row.get("side"),
+            context=snapshot_context,
+            row_index=row_index,
+            field="side",
+        )
+        side = {"BUY": "Buy", "SELL": "Sell"}.get(side_key, "")
+        if not side:
+            raise RuntimeError(f"{snapshot_context} row {row_index} has invalid side")
+
+    order_type = ""
+    if require_details or "orderType" in row:
+        order_type = canonical_order_type(
+            row.get("orderType"),
+            context=snapshot_context,
+            row_index=row_index,
+        )
+
+    reduce_only = None
+    if require_details or "reduceOnly" in row:
+        reduce_only = snapshot_boolean(
+            row.get("reduceOnly"),
+            context=snapshot_context,
+            row_index=row_index,
+            field="reduceOnly",
+            allow_strings=True,
+        )
+    close_on_trigger = None
+    if "closeOnTrigger" in row:
+        close_on_trigger = snapshot_boolean(
+            row.get("closeOnTrigger"),
+            context=snapshot_context,
+            row_index=row_index,
+            field="closeOnTrigger",
+            allow_strings=True,
+        )
+    close_position = None
+    if "closePosition" in row:
+        close_position = snapshot_boolean(
+            row.get("closePosition"),
+            context=snapshot_context,
+            row_index=row_index,
+            field="closePosition",
+            allow_strings=True,
+        )
+
+    qty = None
+    if require_details or "qty" in row:
+        if "qty" not in row:
+            raise RuntimeError(f"{snapshot_context} row {row_index} is missing qty")
+        qty = snapshot_decimal(
+            row.get("qty"),
+            context=snapshot_context,
+            row_index=row_index,
+            field="qty",
+        )
+        assert qty is not None
+        if qty < 0 or (
+            qty == 0
+            and not ((reduce_only and close_on_trigger) or close_position)
+        ):
+            raise RuntimeError(
+                f"{snapshot_context} row {row_index} has non-positive qty"
+            )
+    close_all_position = bool(
+        qty == 0 and ((reduce_only and close_on_trigger) or close_position)
+    )
+
+    price = _nonnegative_order_decimal(
+        row,
+        "price",
+        context=snapshot_context,
+        row_index=row_index,
+        required=require_details,
+        allow_blank=order_type in MARKET_ORDER_TYPES,
+    )
+    if price is not None and order_type and order_type not in MARKET_ORDER_TYPES and price <= 0:
+        raise RuntimeError(f"{snapshot_context} row {row_index} has non-positive price")
+
+    avg_price = _nonnegative_order_decimal(
+        row,
+        "avgPrice",
+        context=snapshot_context,
+        row_index=row_index,
+        required=require_details,
+        allow_blank=True,
+    )
+    executed_qty = _nonnegative_order_decimal(
+        row,
+        "executedQty",
+        context=snapshot_context,
+        row_index=row_index,
+        required=require_details,
+        allow_blank=False,
+    )
+    cum_quote = _nonnegative_order_decimal(
+        row,
+        "cumQuote",
+        context=snapshot_context,
+        row_index=row_index,
+        required=require_details,
+        allow_blank=False,
+    )
+    if (
+        qty is not None
+        and executed_qty is not None
+        and not close_all_position
+        and executed_qty > qty
+    ):
+        raise RuntimeError(
+            f"{snapshot_context} row {row_index} executedQty exceeds qty"
+        )
+
+    status = ""
+    if require_details or "orderStatus" in row:
+        status = canonical_order_status(
+            row.get("orderStatus"),
+            context=snapshot_context,
+            row_index=row_index,
+        )
+        if allowed_statuses is not None and status not in allowed_statuses:
+            raise RuntimeError(
+                f"{snapshot_context} row {row_index} has non-open orderStatus {status}"
+            )
+        if status == "PARTIALLY_FILLED" and (
+            qty is None
+            or executed_qty is None
+            or executed_qty <= 0
+            or (not close_all_position and executed_qty >= qty)
+        ):
+            raise RuntimeError(
+                f"{snapshot_context} row {row_index} has inconsistent partial execution"
+            )
+        if status == "FILLED" and (
+            qty is None
+            or executed_qty is None
+            or (close_all_position and executed_qty <= 0)
+            or (not close_all_position and executed_qty != qty)
+        ):
+            raise RuntimeError(
+                f"{snapshot_context} row {row_index} has inconsistent filled execution"
+            )
+
+    time_in_force = ""
+    if require_details or "timeInForce" in row:
+        time_in_force = canonical_time_in_force(
+            row.get("timeInForce"),
+            context=snapshot_context,
+            row_index=row_index,
+        )
+
+    created_time = None
+    if require_details or "createdTime" in row:
+        created_time = validate_positive_integer(
+            row.get("createdTime"),
+            context=snapshot_context,
+            field="createdTime",
+            row_index=row_index,
+        )
+
+    return {
+        "raw": row,
+        "symbol": symbol,
+        "order_id": order_id,
+        "link_id": link_id,
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "avg_price": avg_price,
+        "executed_qty": executed_qty,
+        "cum_quote": cum_quote,
+        "status": status,
+        "reduce_only": reduce_only,
+        "close_on_trigger": close_on_trigger,
+        "close_position": close_position,
+        "close_all_position": close_all_position,
+        "time_in_force": time_in_force,
+        "order_type": order_type,
+        "created_time": created_time,
+    }
+
+
+def validate_order_rows(
+    rows: Any,
+    *,
+    expected_symbol: str = "",
+    expected_order_id: str = "",
+    expected_link_id: str = "",
+    require_details: bool = True,
+    allowed_statuses: frozenset[str] | set[str] | None = None,
+    unique_link_ids: bool = False,
+    require_single: bool = False,
+    allow_empty: bool = True,
+    context: str | None = None,
+) -> list[dict]:
+    snapshot_context = _order_context(expected_symbol, context)
+    if not isinstance(rows, list):
+        raise RuntimeError(f"{snapshot_context} list must be an array")
+    if require_single and len(rows) != 1:
+        raise RuntimeError(f"{snapshot_context} must contain exactly one order")
+    if not allow_empty and not rows:
+        raise RuntimeError(f"{snapshot_context} must contain an order")
+
+    validated: list[dict] = []
+    seen_order_ids: set[str] = set()
+    seen_link_ids: set[str] = set()
+    for row_index, row in enumerate(rows):
+        item = validate_order_row(
+            row,
+            expected_symbol=expected_symbol,
+            expected_order_id=expected_order_id,
+            expected_link_id=expected_link_id,
+            require_details=require_details,
+            allowed_statuses=allowed_statuses,
+            row_index=row_index,
+            context=snapshot_context,
+        )
+        order_id = item["order_id"]
+        if order_id in seen_order_ids:
+            raise RuntimeError(
+                f"{snapshot_context} contains duplicate exchange order ID {order_id}"
+            )
+        seen_order_ids.add(order_id)
+        link_id = item["link_id"]
+        if unique_link_ids and link_id:
+            if link_id in seen_link_ids:
+                raise RuntimeError(
+                    f"{snapshot_context} contains duplicate client order ID {link_id}"
+                )
+            seen_link_ids.add(link_id)
+        validated.append(item)
+    return validated
+
+
+def normalize_binance_style_order_rows(
+    rows: Any,
+    *,
+    expected_symbol: str,
+    expected_order_id: str = "",
+    expected_link_id: str = "",
+    allowed_statuses: frozenset[str] | set[str] | None = None,
+    unique_link_ids: bool = False,
+    require_single: bool = False,
+) -> list[dict]:
+    mapped: Any = rows
+    if isinstance(rows, list):
+        mapped = []
+        for item in rows:
+            if not isinstance(item, dict):
+                mapped.append(item)
+                continue
+            raw_side = item.get("side")
+            side_key = str(raw_side or "").upper()
+            side = {"BUY": "Buy", "SELL": "Sell"}.get(side_key, raw_side)
+            snapshot = {
+                "symbol": item.get("symbol"),
+                "orderId": item.get("orderId"),
+                "orderLinkId": item.get("clientOrderId"),
+                "side": side,
+                "price": item.get("price"),
+                "qty": item.get("origQty"),
+                "avgPrice": item.get("avgPrice"),
+                "executedQty": item.get("executedQty"),
+                "cumQuote": item.get("cumQuote"),
+                "orderStatus": item.get("status"),
+                "reduceOnly": item.get("reduceOnly"),
+                "timeInForce": item.get("timeInForce"),
+                "orderType": item.get("type"),
+                "createdTime": item.get("time"),
+            }
+            if "closePosition" in item:
+                snapshot["closePosition"] = item.get("closePosition")
+            mapped.append(snapshot)
+
+    validated = validate_order_rows(
+        mapped,
+        expected_symbol=expected_symbol,
+        expected_order_id=expected_order_id,
+        expected_link_id=expected_link_id,
+        require_details=True,
+        allowed_statuses=allowed_statuses,
+        unique_link_ids=unique_link_ids,
+        require_single=require_single,
+    )
+    normalized: list[dict] = []
+    for item in validated:
+        row = dict(item["raw"])
+        row.update(
+            {
+                "symbol": item["symbol"],
+                "orderId": item["order_id"],
+                "orderLinkId": item["link_id"],
+                "side": item["side"],
+                "orderStatus": item["status"],
+                "reduceOnly": item["reduce_only"],
+                "timeInForce": item["time_in_force"],
+                "orderType": item["order_type"],
+                "createdTime": str(item["created_time"]),
+            }
+        )
+        normalized.append(row)
+    return normalized
+
+
+def normalize_order_ack_row(
+    row: Any,
+    *,
+    expected_symbol: str = "",
+    expected_link_id: str = "",
+    context: str | None = None,
+) -> dict:
+    validated = validate_order_row(
+        row,
+        expected_symbol=expected_symbol,
+        expected_link_id=expected_link_id,
+        require_details=False,
+        context=context,
+    )
+    normalized = dict(validated["raw"])
+    normalized["orderId"] = validated["order_id"]
+    normalized["orderLinkId"] = validated["link_id"]
+    for output, source in (
+        ("symbol", "symbol"),
+        ("side", "side"),
+        ("orderStatus", "status"),
+        ("timeInForce", "time_in_force"),
+        ("orderType", "order_type"),
+    ):
+        if validated[source]:
+            normalized[output] = validated[source]
+    if validated["reduce_only"] is not None:
+        normalized["reduceOnly"] = validated["reduce_only"]
+    if validated["created_time"] is not None:
+        normalized["createdTime"] = str(validated["created_time"])
+    return normalized
+
+
+def normalize_binance_style_order_ack(
+    row: Any,
+    *,
+    expected_symbol: str = "",
+    expected_link_id: str = "",
+) -> dict:
+    context = _order_context(expected_symbol, None)
+    if not isinstance(row, dict):
+        raise RuntimeError(f"{context} acknowledgement must be an object")
+    mapped: dict[str, Any] = {
+        "orderId": row.get("orderId"),
+        "orderLinkId": row.get("clientOrderId"),
+    }
+    field_map = {
+        "symbol": "symbol",
+        "side": "side",
+        "price": "price",
+        "origQty": "qty",
+        "avgPrice": "avgPrice",
+        "executedQty": "executedQty",
+        "cumQuote": "cumQuote",
+        "status": "orderStatus",
+        "reduceOnly": "reduceOnly",
+        "closePosition": "closePosition",
+        "timeInForce": "timeInForce",
+        "type": "orderType",
+        "time": "createdTime",
+    }
+    for source, target in field_map.items():
+        if source in row:
+            mapped[target] = row.get(source)
+    raw_side = mapped.get("side")
+    if raw_side is not None:
+        side_key = str(raw_side or "").upper()
+        mapped["side"] = {"BUY": "Buy", "SELL": "Sell"}.get(
+            side_key,
+            raw_side,
+        )
+    return normalize_order_ack_row(
+        mapped,
+        expected_symbol=expected_symbol,
+        expected_link_id=expected_link_id,
+        context=context,
+    )
 
 
 def _execution_context(symbol: str, context: str | None) -> str:

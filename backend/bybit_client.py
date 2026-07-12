@@ -14,12 +14,15 @@ from exchange_errors import (
     is_exchange_rate_limit_message,
 )
 from exchange_snapshots import (
+    OPEN_ORDER_STATUSES,
+    normalize_order_ack_row,
     snapshot_boolean,
     snapshot_decimal,
     snapshot_text,
     validate_balance_response,
     validate_execution_response,
     validate_execution_row,
+    validate_order_rows,
     validate_positive_decimal,
     validate_positive_integer,
     validate_price_cache_entry,
@@ -250,7 +253,30 @@ class BybitClient:
             payload["timeInForce"] = time_in_force or "GTC"
         if order_link_id:
             payload["orderLinkId"] = order_link_id
-        return self._request("POST", "/v5/order/create", payload=payload, auth=True)
+        response = self._request(
+            "POST",
+            "/v5/order/create",
+            payload=payload,
+            auth=True,
+        )
+        if not isinstance(response, dict):
+            raise ExchangeRequestUncertainError(
+                "Bybit order acknowledgement must be an object"
+            )
+        if response.get("retCode") != 0:
+            return response
+        try:
+            result = normalize_order_ack_row(
+                response.get("result"),
+                expected_symbol=symbol,
+                expected_link_id=order_link_id,
+                context=f"{symbol.upper()} order snapshot",
+            )
+        except RuntimeError as exc:
+            raise ExchangeRequestUncertainError(
+                f"Bybit order acknowledgement is not authoritative: {exc}"
+            ) from exc
+        return {**response, "result": result}
 
     def cancel_order(self, symbol: str, order_id: str) -> dict:
         return self._request(
@@ -332,16 +358,25 @@ class BybitClient:
             if cursor:
                 params += f"&cursor={requests.utils.quote(cursor, safe='%')}"
             response = self._request("GET", path, params=params, auth=True)
+            if not isinstance(response, dict):
+                raise RuntimeError(f"Bybit pagination response must be an object for {path}")
             last_response = response
             if response.get("retCode") != 0:
                 return response
-            result = response.get("result", {}) or {}
-            page_items = list(result.get("list", []) or [])
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError(f"Bybit pagination result must be an object for {path}")
+            page_items = result.get("list")
+            if not isinstance(page_items, list):
+                raise RuntimeError(f"Bybit pagination list must be an array for {path}")
             items.extend(page_items)
             if max_items is not None and len(items) >= max_items:
                 items = items[:max_items]
                 break
-            next_cursor = str(result.get("nextPageCursor", "") or "")
+            cursor_value = result.get("nextPageCursor", "")
+            if cursor_value is not None and not isinstance(cursor_value, str):
+                raise RuntimeError(f"Bybit pagination cursor must be text for {path}")
+            next_cursor = str(cursor_value or "")
             if not next_cursor:
                 break
             if next_cursor in seen_cursors:
@@ -356,22 +391,130 @@ class BybitClient:
         result["nextPageCursor"] = ""
         return {**last_response, "result": result}
 
+    @staticmethod
+    def _order_snapshot_fields(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        normalized = dict(item)
+        normalized.update(
+            {
+                "symbol": item.get("symbol"),
+                "orderId": item.get("orderId"),
+                "orderLinkId": item.get("orderLinkId"),
+                "side": item.get("side"),
+                "price": item.get("price"),
+                "qty": item.get("qty"),
+                "avgPrice": item.get("avgPrice"),
+                "executedQty": item.get("cumExecQty"),
+                "cumQuote": item.get("cumExecValue"),
+                "orderStatus": item.get("orderStatus"),
+                "reduceOnly": item.get("reduceOnly"),
+                "timeInForce": item.get("timeInForce"),
+                "orderType": item.get("orderType"),
+                "createdTime": item.get("createdTime"),
+            }
+        )
+        return normalized
+
+    def _validated_order_snapshots(
+        self,
+        rows: Any,
+        *,
+        expected_symbol: str,
+        expected_order_id: str = "",
+        expected_link_id: str = "",
+        allowed_statuses: frozenset[str] | set[str] | None = None,
+        unique_link_ids: bool = False,
+        require_single: bool = False,
+    ) -> list[dict]:
+        mapped = (
+            [self._order_snapshot_fields(item) for item in rows]
+            if isinstance(rows, list)
+            else rows
+        )
+        validated = validate_order_rows(
+            mapped,
+            expected_symbol=expected_symbol,
+            expected_order_id=expected_order_id,
+            expected_link_id=expected_link_id,
+            require_details=True,
+            allowed_statuses=allowed_statuses,
+            unique_link_ids=unique_link_ids,
+            require_single=require_single,
+        )
+        normalized: list[dict] = []
+        for item in validated:
+            row = dict(item["raw"])
+            row.update(
+                {
+                    "symbol": item["symbol"],
+                    "orderId": item["order_id"],
+                    "orderLinkId": item["link_id"],
+                    "side": item["side"],
+                    "orderStatus": item["status"],
+                    "reduceOnly": item["reduce_only"],
+                    "timeInForce": item["time_in_force"],
+                    "orderType": item["order_type"],
+                    "createdTime": str(item["created_time"]),
+                }
+            )
+            normalized.append(row)
+        return normalized
+
+    @staticmethod
+    def _order_query_rows(response: Any, *, symbol: str) -> list:
+        context = f"{symbol} order snapshot"
+        if not isinstance(response, dict):
+            raise RuntimeError(f"{context} response must be an object")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"{context} result must be an object")
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            raise RuntimeError(f"{context} list must be an array")
+        return rows
+
     def get_open_orders(self, symbol: str) -> dict:
-        return self._get_paginated(
+        symbol = symbol.upper()
+        response = self._get_paginated(
             "/v5/order/realtime",
             base_params=f"category=linear&symbol={symbol}&openOnly=0",
             page_size=50,
         )
+        if response.get("retCode") != 0:
+            return response
+        rows = self._order_query_rows(response, symbol=symbol)
+        result = dict(response["result"])
+        result["list"] = self._validated_order_snapshots(
+            rows,
+            expected_symbol=symbol,
+            allowed_statuses=OPEN_ORDER_STATUSES,
+            unique_link_ids=True,
+        )
+        return {**response, "result": result}
 
     def get_order(self, symbol: str, order_id: str) -> dict:
+        symbol = symbol.upper()
+        order_id = str(order_id)
         resp = self._request(
             "GET",
             "/v5/order/realtime",
             params=f"category=linear&symbol={symbol}&orderId={order_id}",
             auth=True,
         )
-        if resp.get("retCode") == 0 and resp.get("result", {}).get("list"):
-            return {"retCode": 0, "result": resp["result"]["list"][0]}
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"{symbol} order snapshot response must be an object")
+        if resp.get("retCode") != 0:
+            return resp
+        realtime_rows = self._order_query_rows(resp, symbol=symbol)
+        if realtime_rows:
+            rows = self._validated_order_snapshots(
+                realtime_rows,
+                expected_symbol=symbol,
+                expected_order_id=order_id,
+                require_single=True,
+            )
+            return {"retCode": 0, "result": rows[0]}
 
         history = self._request(
             "GET",
@@ -379,12 +522,24 @@ class BybitClient:
             params=f"category=linear&symbol={symbol}&orderId={order_id}",
             auth=True,
         )
+        if not isinstance(history, dict):
+            raise RuntimeError(f"{symbol} order snapshot response must be an object")
         if history.get("retCode") != 0:
             return history
-        items = history.get("result", {}).get("list", [])
-        return {"retCode": 0, "result": items[0] if items else {}}
+        history_rows = self._order_query_rows(history, symbol=symbol)
+        if not history_rows:
+            return {"retCode": 0, "result": {}}
+        rows = self._validated_order_snapshots(
+            history_rows,
+            expected_symbol=symbol,
+            expected_order_id=order_id,
+            require_single=True,
+        )
+        return {"retCode": 0, "result": rows[0]}
 
     def get_order_by_link(self, symbol: str, order_link_id: str) -> dict:
+        symbol = symbol.upper()
+        order_link_id = str(order_link_id)
         resp = self._request(
             "GET",
             "/v5/order/realtime",
@@ -393,11 +548,19 @@ class BybitClient:
             ),
             auth=True,
         )
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"{symbol} order snapshot response must be an object")
         if resp.get("retCode") != 0:
             return resp
-        items = resp.get("result", {}).get("list", [])
-        if items:
-            return {"retCode": 0, "result": items[0]}
+        realtime_rows = self._order_query_rows(resp, symbol=symbol)
+        if realtime_rows:
+            rows = self._validated_order_snapshots(
+                realtime_rows,
+                expected_symbol=symbol,
+                expected_link_id=order_link_id,
+                require_single=True,
+            )
+            return {"retCode": 0, "result": rows[0]}
 
         history = self._request(
             "GET",
@@ -407,10 +570,20 @@ class BybitClient:
             ),
             auth=True,
         )
+        if not isinstance(history, dict):
+            raise RuntimeError(f"{symbol} order snapshot response must be an object")
         if history.get("retCode") != 0:
             return history
-        items = history.get("result", {}).get("list", [])
-        return {"retCode": 0, "result": items[0] if items else {}}
+        history_rows = self._order_query_rows(history, symbol=symbol)
+        if not history_rows:
+            return {"retCode": 0, "result": {}}
+        rows = self._validated_order_snapshots(
+            history_rows,
+            expected_symbol=symbol,
+            expected_link_id=order_link_id,
+            require_single=True,
+        )
+        return {"retCode": 0, "result": rows[0]}
 
     def get_positions(self, symbol: str) -> dict:
         return self._request(
@@ -421,13 +594,23 @@ class BybitClient:
         )
 
     def get_order_history(self, symbol: str, limit: int = 50) -> dict:
+        symbol = symbol.upper()
         safe_limit = max(1, min(int(limit or 50), 1000))
-        return self._get_paginated(
+        response = self._get_paginated(
             "/v5/order/history",
             base_params=f"category=linear&symbol={symbol}",
             page_size=min(50, safe_limit),
             max_items=safe_limit,
         )
+        if response.get("retCode") != 0:
+            return response
+        rows = self._order_query_rows(response, symbol=symbol)
+        result = dict(response["result"])
+        result["list"] = self._validated_order_snapshots(
+            rows,
+            expected_symbol=symbol,
+        )
+        return {**response, "result": result}
 
     def get_order_trades(self, symbol: str, order_id: str) -> dict:
         symbol = symbol.upper()

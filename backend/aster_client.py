@@ -17,6 +17,9 @@ from exchange_errors import (
     is_exchange_rate_limit_message,
 )
 from exchange_snapshots import (
+    OPEN_ORDER_STATUSES,
+    normalize_binance_style_order_ack,
+    normalize_binance_style_order_rows,
     normalize_futures_balance_rows,
     snapshot_boolean,
     snapshot_decimal,
@@ -381,8 +384,16 @@ class AsterFuturesClient:
             time_in_force=time_in_force,
         )
         result = self._request("POST", "/fapi/v3/order", params=params, auth=True)
-        normalized = self._normalize_order(result)
-        normalized["orderId"] = str(result.get("orderId", normalized.get("orderId", "")))
+        try:
+            normalized = normalize_binance_style_order_ack(
+                result,
+                expected_symbol=symbol,
+                expected_link_id=order_link_id,
+            )
+        except RuntimeError as exc:
+            raise ExchangeRequestUncertainError(
+                f"Aster order acknowledgement is not authoritative: {exc}"
+            ) from exc
         return {"retCode": 0, "result": normalized}
 
     def place_orders(self, orders: list[dict[str, Any]]) -> dict:
@@ -407,19 +418,57 @@ class AsterFuturesClient:
             params={"batchOrders": payload},
             auth=True,
         )
+        if not isinstance(results, list) or len(results) != len(orders):
+            raise ExchangeRequestUncertainError(
+                "Aster batch acknowledgement count does not match the request"
+            )
         normalized = []
-        for item in results if isinstance(results, list) else []:
+        seen_order_ids: set[str] = set()
+        seen_link_ids: set[str] = set()
+        for index, item in enumerate(results):
             if isinstance(item, dict) and "orderId" in item:
-                normalized_item = self._normalize_order(item)
-                normalized_item["orderId"] = str(item.get("orderId", normalized_item.get("orderId", "")))
+                request = orders[index]
+                try:
+                    normalized_item = normalize_binance_style_order_ack(
+                        item,
+                        expected_symbol=str(request.get("symbol") or ""),
+                        expected_link_id=str(request.get("order_link_id") or ""),
+                    )
+                except RuntimeError as exc:
+                    raise ExchangeRequestUncertainError(
+                        f"Aster batch acknowledgement is not authoritative: {exc}"
+                    ) from exc
+                order_id = str(normalized_item["orderId"])
+                link_id = str(normalized_item.get("orderLinkId") or "")
+                if order_id in seen_order_ids or (link_id and link_id in seen_link_ids):
+                    raise ExchangeRequestUncertainError(
+                        "Aster batch acknowledgement contains duplicate order identities"
+                    )
+                seen_order_ids.add(order_id)
+                if link_id:
+                    seen_link_ids.add(link_id)
                 normalized.append({"retCode": 0, "result": normalized_item})
             else:
-                message = item.get("msg", "Batch order failed") if isinstance(item, dict) else "Batch order failed"
+                if not isinstance(item, dict) or "code" not in item:
+                    raise ExchangeRequestUncertainError(
+                        "Aster batch acknowledgement contains an unidentified item"
+                    )
+                try:
+                    error_code = int(item.get("code", 0))
+                except (TypeError, ValueError) as exc:
+                    raise ExchangeRequestUncertainError(
+                        "Aster batch acknowledgement contains an invalid error code"
+                    ) from exc
+                if error_code == 0:
+                    raise ExchangeRequestUncertainError(
+                        "Aster batch acknowledgement omitted an accepted order identity"
+                    )
+                message = item.get("msg", "Batch order failed")
                 if is_exchange_rate_limit_message(message):
                     self._activate_rate_limit(str(message))
                 normalized.append(
                     {
-                        "retCode": int(item.get("code", -1) or -1) if isinstance(item, dict) else -1,
+                        "retCode": error_code,
                         "retMsg": message,
                         "result": {},
                     }
@@ -445,29 +494,50 @@ class AsterFuturesClient:
         return {"retCode": 0}
 
     def get_open_orders(self, symbol: str) -> dict:
+        symbol = symbol.upper()
         orders = self._request(
             "GET",
             "/fapi/v3/openOrders",
-            params={"symbol": symbol.upper()},
+            params={"symbol": symbol},
             auth=True,
         )
-        return {"retCode": 0, "result": {"list": [self._normalize_order(item) for item in orders]}}
+        return {
+            "retCode": 0,
+            "result": {
+                "list": normalize_binance_style_order_rows(
+                    orders,
+                    expected_symbol=symbol,
+                    allowed_statuses=OPEN_ORDER_STATUSES,
+                    unique_link_ids=True,
+                )
+            },
+        }
 
     def get_order(self, symbol: str, order_id: str) -> dict:
+        symbol = symbol.upper()
+        order_id = str(order_id)
         order = self._request(
             "GET",
             "/fapi/v3/order",
-            params={"symbol": symbol.upper(), "orderId": order_id},
+            params={"symbol": symbol, "orderId": order_id},
             auth=True,
         )
-        return {"retCode": 0, "result": self._normalize_order(order)}
+        rows = normalize_binance_style_order_rows(
+            [order],
+            expected_symbol=symbol,
+            expected_order_id=order_id,
+            require_single=True,
+        )
+        return {"retCode": 0, "result": rows[0]}
 
     def get_order_by_link(self, symbol: str, order_link_id: str) -> dict:
+        symbol = symbol.upper()
+        order_link_id = str(order_link_id)
         try:
             order = self._request(
                 "GET",
                 "/fapi/v3/order",
-                params={"symbol": symbol.upper(), "origClientOrderId": order_link_id},
+                params={"symbol": symbol, "origClientOrderId": order_link_id},
                 auth=True,
             )
         except RuntimeError as exc:
@@ -475,7 +545,13 @@ class AsterFuturesClient:
             if "order does not exist" in message or "unknown order" in message:
                 return {"retCode": 0, "result": {}}
             raise
-        return {"retCode": 0, "result": self._normalize_order(order)}
+        rows = normalize_binance_style_order_rows(
+            [order],
+            expected_symbol=symbol,
+            expected_link_id=order_link_id,
+            require_single=True,
+        )
+        return {"retCode": 0, "result": rows[0]}
 
     def get_positions(self, symbol: str) -> dict:
         positions = self._request(
@@ -487,13 +563,22 @@ class AsterFuturesClient:
         return {"retCode": 0, "result": {"list": [self._normalize_position(item) for item in positions]}}
 
     def get_order_history(self, symbol: str, limit: int = 50) -> dict:
+        symbol = symbol.upper()
         orders = self._request(
             "GET",
             "/fapi/v3/allOrders",
-            params={"symbol": symbol.upper(), "limit": limit},
+            params={"symbol": symbol, "limit": limit},
             auth=True,
         )
-        return {"retCode": 0, "result": {"list": [self._normalize_order(item) for item in orders]}}
+        return {
+            "retCode": 0,
+            "result": {
+                "list": normalize_binance_style_order_rows(
+                    orders,
+                    expected_symbol=symbol,
+                )
+            },
+        }
 
     def _get_user_trades_window(
         self,
