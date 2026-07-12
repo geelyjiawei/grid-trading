@@ -781,6 +781,41 @@ class AsterClientTests(unittest.TestCase):
         self.assertEqual(first["result"]["source"], "exchange")
         self.assertEqual(second["result"]["source"], "exchange_cache")
 
+    def test_nonquote_fee_conversion_uses_execution_minute_open(self):
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        calls = []
+        trade_time = 1714012800123
+        minute_start = trade_time - (trade_time % 60_000)
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append((method, path, params, auth))
+            return [[minute_start, "600", "601", "599", "600"]]
+
+        client._request = fake_request
+        trade = client._normalize_trade(
+            {
+                "orderId": 1,
+                "id": 2,
+                "side": "SELL",
+                "price": "100",
+                "qty": "1",
+                "quoteQty": "100",
+                "commission": "-0.001",
+                "commissionAsset": "BNB",
+                "maker": False,
+                "time": trade_time,
+            }
+        )
+
+        self.assertEqual(trade["feeUsdt"], "0.600")
+        self.assertEqual(trade["feeUsdtSource"], "historical_minute_open")
+        self.assertEqual(calls[0][1], "/fapi/v3/klines")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -972,7 +972,7 @@ function renderGridHistory(runs) {
   }
 
   tbody.innerHTML = runs.map((run) => {
-    const profit = Number(run.net_profit || 0);
+    const profit = Number(run.total_equity_profit ?? run.net_profit ?? 0);
     const initialType = run.initial_order_type === "post_only"
       ? "Post Only"
       : run.initial_order_type === "limit"

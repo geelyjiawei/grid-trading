@@ -3647,8 +3647,10 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(open_fill_qty, 100.0)
         self.assertEqual(reduce_qty, 100.0)
 
-    async def test_filled_order_snapshot_overrides_lagging_partial_trade_page(self):
+    async def test_filled_order_waits_for_trade_page_to_reach_snapshot_quantity(self):
         class FilledSnapshotClient(FakeClient):
+            trade_qty = 0.4
+
             def get_order(self, symbol, order_id):
                 response = super().get_order(symbol, order_id)
                 response["result"].update(
@@ -3662,15 +3664,16 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 return response
 
             def get_order_trades(self, symbol, order_id):
+                qty = self.trade_qty
                 return {
                     "retCode": 0,
                     "result": {
                         "list": [
                             {
                                 "price": "101",
-                                "qty": "0.4",
-                                "volume": "40.4",
-                                "feeUsdt": "0.00808",
+                                "qty": str(qty),
+                                "volume": str(qty * 101),
+                                "feeUsdt": str(qty * 101 * 0.0002),
                                 "feeAsset": "USDT",
                                 "isMaker": True,
                             }
@@ -3705,15 +3708,31 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         await engine._check_fills()
 
-        self.assertNotIn(link_id, engine.active_orders)
-        self.assertAlmostEqual(engine.grid_position_net_qty, -1.0)
+        self.assertIn(link_id, engine.active_orders)
+        self.assertAlmostEqual(engine.grid_position_net_qty, -0.4)
         reduce_orders = [
             order
             for order in engine.active_orders.values()
             if order.get("side") == "Buy" and order.get("reduce_only")
         ]
         self.assertEqual(len(reduce_orders), 1)
-        self.assertEqual(float(reduce_orders[0]["qty"]), 1.0)
+        self.assertEqual(float(reduce_orders[0]["qty"]), 0.4)
+        self.assertAlmostEqual(engine.total_fee, 0.00808)
+
+        client.trade_qty = 1.0
+        await engine._check_fills()
+
+        self.assertNotIn(link_id, engine.active_orders)
+        self.assertAlmostEqual(engine.grid_position_net_qty, -1.0)
+        self.assertAlmostEqual(engine.total_fee, 0.0202)
+        self.assertEqual(
+            sum(
+                float(order["qty"])
+                for order in engine.active_orders.values()
+                if order.get("side") == "Buy" and order.get("reduce_only")
+            ),
+            1.0,
+        )
 
     async def test_unknown_order_with_partial_trade_proof_stays_in_ledger(self):
         class UnknownPartialClient(FakeClient):
@@ -6203,6 +6222,8 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_order_snapshot_replaces_only_unfilled_remainder(self):
         class CancelledPartialSnapshotClient(FakeClient):
+            trades_ready = False
+
             def get_order(self, symbol, order_id):
                 response = super().get_order(symbol, order_id)
                 response["result"].update(
@@ -6216,7 +6237,19 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 return response
 
             def get_order_trades(self, symbol, order_id):
-                return {"retCode": 0, "result": {"list": []}}
+                trades = []
+                if self.trades_ready:
+                    trades = [
+                        {
+                            "price": "101",
+                            "qty": "0.4",
+                            "volume": "40.4",
+                            "feeUsdt": "0.00808",
+                            "feeAsset": "USDT",
+                            "isMaker": True,
+                        }
+                    ]
+                return {"retCode": 0, "result": {"list": trades}}
 
         client = CancelledPartialSnapshotClient(
             "100", tick_size="1", qty_step="0.1", min_qty="0.1"
@@ -6247,6 +6280,17 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         await engine._check_fills()
 
+        self.assertIn(original_link, engine.active_orders)
+        self.assertEqual(
+            engine.active_orders[original_link]["status"],
+            "RECONCILING_EXECUTION",
+        )
+        self.assertEqual(engine.grid_position_net_qty, 0.0)
+        self.assertEqual(len(client.orders), 1)
+
+        client.trades_ready = True
+        await engine._check_fills()
+
         self.assertNotIn(original_link, engine.active_orders)
         replacement_sells = [
             order
@@ -6263,6 +6307,110 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(reduce_buys), 1)
         self.assertEqual(float(reduce_buys[0]["qty"]), 0.4)
         self.assertAlmostEqual(engine.grid_position_net_qty, -0.4)
+
+    async def test_cancelled_order_waits_until_partial_trade_page_matches_snapshot(self):
+        class LaggingCancelledTradesClient(FakeClient):
+            confirmed_trade_qty = 0.4
+
+            def get_order(self, symbol, order_id):
+                response = super().get_order(symbol, order_id)
+                response["result"].update(
+                    {
+                        "orderStatus": "CANCELED",
+                        "executedQty": "0.6",
+                        "cumQuote": "60.6",
+                        "avgPrice": "101",
+                    }
+                )
+                return response
+
+            def get_order_trades(self, symbol, order_id):
+                qty = self.confirmed_trade_qty
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "price": "101",
+                                "qty": str(qty),
+                                "volume": str(qty * 101),
+                                "feeUsdt": str(qty * 101 * 0.0002),
+                                "feeAsset": "USDT",
+                                "isMaker": True,
+                            }
+                        ]
+                    },
+                }
+
+        client = LaggingCancelledTradesClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "qty_per_grid": 1,
+                "leverage": 2,
+                "grid_order_post_only": False,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.reduce_lots_complete = True
+        original_link = engine._place("Sell", 101, 0, reduce_only=False, qty_override=1)
+        original_id = engine.active_orders[original_link]["order_id"]
+        client.open_limit_order_ids.discard(original_id)
+
+        await engine._check_fills()
+
+        self.assertIn(original_link, engine.active_orders)
+        self.assertEqual(
+            engine.active_orders[original_link]["status"],
+            "RECONCILING_EXECUTION",
+        )
+        self.assertAlmostEqual(
+            engine.active_orders[original_link]["processed_fill_qty"],
+            0.4,
+        )
+        self.assertAlmostEqual(engine.grid_position_net_qty, -0.4)
+        self.assertEqual(
+            sum(
+                float(order["qty"])
+                for order in engine.active_orders.values()
+                if order.get("side") == "Sell" and not order.get("reduce_only")
+            ),
+            1.0,
+        )
+
+        client.confirmed_trade_qty = 0.6
+        await engine._check_fills()
+
+        self.assertNotIn(original_link, engine.active_orders)
+        replacement_sells = [
+            order
+            for order in engine.active_orders.values()
+            if order.get("side") == "Sell" and not order.get("reduce_only")
+        ]
+        reduce_buys = [
+            order
+            for order in engine.active_orders.values()
+            if order.get("side") == "Buy" and order.get("reduce_only")
+        ]
+        self.assertEqual(len(replacement_sells), 1)
+        self.assertEqual(float(replacement_sells[0]["qty"]), 0.4)
+        self.assertAlmostEqual(
+            sum(float(order["qty"]) for order in reduce_buys),
+            0.6,
+        )
+        self.assertAlmostEqual(engine.grid_position_net_qty, -0.6)
 
     async def test_restored_grid_continues_tracking_saved_orders_after_restart(self):
         snapshots = []
@@ -9197,6 +9345,482 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(replacement_link_id, engine.active_orders)
         self.assertEqual(engine.active_orders[replacement_link_id]["price"], "110.0")
         self.assertEqual(engine.active_orders[replacement_link_id]["qty"], "1.0")
+
+    async def test_short_profit_and_unrealized_follow_exact_lot_cashflow(self):
+        client = FakeClient("100", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.reduce_lots_complete = True
+
+        engine._record_fill(
+            {
+                "level_idx": 0,
+                "side": "Sell",
+                "price": "101.3",
+                "qty": "1",
+                "order_id": "open",
+                "reduce_only": False,
+            },
+            {
+                "price": 101.3,
+                "qty": 1.0,
+                "volume": 101.3,
+                "fee": 0.0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+        engine._record_fill(
+            {
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "100.2",
+                "qty": "0.4",
+                "order_id": "reduce",
+                "reduce_only": True,
+                # This stale order field must not override the fill lot.
+                "entry_price": 999.0,
+            },
+            {
+                "price": 100.2,
+                "qty": 0.4,
+                "volume": 40.08,
+                "fee": 0.0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+
+        mark = 99.8
+        cashflow_total = Decimal("101.3") - Decimal("40.08") - Decimal("0.6") * Decimal(str(mark))
+        engine_total = Decimal(str(engine.gross_profit)) + Decimal(
+            str(engine.estimate_grid_unrealized_pnl(mark))
+        )
+
+        self.assertAlmostEqual(engine.gross_profit, 0.44)
+        self.assertAlmostEqual(engine.grid_position_net_qty, -0.6)
+        self.assertEqual(engine_total, cashflow_total)
+
+    async def test_long_profit_and_unrealized_follow_exact_lot_cashflow(self):
+        client = FakeClient("100", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.reduce_lots_complete = True
+
+        engine._record_fill(
+            {
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "98.7",
+                "qty": "1",
+                "order_id": "open",
+                "reduce_only": False,
+            },
+            {
+                "price": 98.7,
+                "qty": 1.0,
+                "volume": 98.7,
+                "fee": 0.0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+        engine._record_fill(
+            {
+                "level_idx": 0,
+                "side": "Sell",
+                "price": "99.8",
+                "qty": "0.4",
+                "order_id": "reduce",
+                "reduce_only": True,
+                "entry_price": 1.0,
+            },
+            {
+                "price": 99.8,
+                "qty": 0.4,
+                "volume": 39.92,
+                "fee": 0.0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 1,
+                "taker_count": 0,
+            },
+        )
+
+        mark = 100.2
+        cashflow_total = -Decimal("98.7") + Decimal("39.92") + Decimal("0.6") * Decimal(str(mark))
+        engine_total = Decimal(str(engine.gross_profit)) + Decimal(
+            str(engine.estimate_grid_unrealized_pnl(mark))
+        )
+
+        self.assertAlmostEqual(engine.gross_profit, 0.44)
+        self.assertAlmostEqual(engine.grid_position_net_qty, 0.6)
+        self.assertEqual(engine_total, cashflow_total)
+
+    async def test_market_reduce_uses_grid_lots_instead_of_blended_position_entry(self):
+        client = FakeClient("100", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 100, 110]
+        engine.grid_position_net_qty = -1.0
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 0.4, "entry_value": 40.4},
+            "1": {"qty": 0.6, "entry_value": 61.8},
+        }
+        action = {
+            "side": "Buy",
+            "qty": "0.5",
+            "price": "100",
+            "entry_price": 999.0,
+            "processed_fill_qty": 0.0,
+            "processed_fill_volume": 0.0,
+            "processed_fill_fee": 0.0,
+            "reason": "test",
+            "tag": "market_reduce",
+        }
+
+        recorded = engine._record_market_reduce_execution(
+            action,
+            {
+                "price": 100.0,
+                "qty": 0.5,
+                "volume": 50.0,
+                "fee": 0.0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 0,
+                "taker_count": 1,
+            },
+        )
+
+        self.assertTrue(recorded)
+        self.assertTrue(engine.reduce_lots_complete)
+        self.assertAlmostEqual(engine.grid_position_net_qty, -0.5)
+        self.assertAlmostEqual(engine.gross_profit, 0.7)
+        self.assertEqual(
+            engine.reduce_lots_by_level,
+            {"1": {"qty": 0.5, "entry_value": 51.5}},
+        )
+        cashflow_total = (
+            Decimal("0.4") * Decimal("101")
+            + Decimal("0.6") * Decimal("103")
+            - Decimal("0.5") * Decimal("100")
+            - Decimal("0.5") * Decimal("99")
+        )
+        engine_total = Decimal(str(engine.gross_profit)) + Decimal(
+            str(engine.estimate_grid_unrealized_pnl(99))
+        )
+        self.assertEqual(engine_total, cashflow_total)
+
+    async def test_long_market_reduce_uses_grid_lots(self):
+        client = FakeClient("100", tick_size="0.1", qty_step="0.1", min_qty="0.1")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 2,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 100, 110]
+        engine.grid_position_net_qty = 1.0
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 0.4, "entry_value": 39.6},
+            "1": {"qty": 0.6, "entry_value": 58.2},
+        }
+        action = {
+            "side": "Sell",
+            "qty": "0.5",
+            "price": "100",
+            "entry_price": 1.0,
+            "processed_fill_qty": 0.0,
+            "processed_fill_volume": 0.0,
+            "processed_fill_fee": 0.0,
+            "reason": "test",
+            "tag": "market_reduce",
+        }
+
+        engine._record_market_reduce_execution(
+            action,
+            {
+                "price": 100.0,
+                "qty": 0.5,
+                "volume": 50.0,
+                "fee": 0.0,
+                "fee_asset": "USDT",
+                "fee_source": "exchange",
+                "maker_count": 0,
+                "taker_count": 1,
+            },
+        )
+
+        self.assertTrue(engine.reduce_lots_complete)
+        self.assertAlmostEqual(engine.grid_position_net_qty, 0.5)
+        self.assertAlmostEqual(engine.gross_profit, 0.7)
+        self.assertEqual(
+            engine.reduce_lots_by_level,
+            {"1": {"qty": 0.5, "entry_value": 48.5}},
+        )
+
+    async def test_fill_waits_until_nonquote_fee_conversion_is_exact(self):
+        class DelayedFeeConversionClient(FakeClient):
+            fee_ready = False
+
+            def get_order(self, symbol, order_id):
+                response = super().get_order(symbol, order_id)
+                response["result"].update(
+                    {
+                        "orderStatus": "FILLED",
+                        "executedQty": "1",
+                        "cumQuote": "101",
+                        "avgPrice": "101",
+                    }
+                )
+                return response
+
+            def get_order_trades(self, symbol, order_id):
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "price": "101",
+                                "qty": "1",
+                                "volume": "101",
+                                "feeUsdt": "0.01818" if self.fee_ready else "",
+                                "feeAsset": "BNB",
+                                "feeUsdtSource": (
+                                    "historical_minute_open"
+                                    if self.fee_ready
+                                    else "historical_price_unavailable"
+                                ),
+                                "isMaker": True,
+                            }
+                        ]
+                    },
+                }
+
+        client = DelayedFeeConversionClient(
+            "100", tick_size="1", qty_step="0.1", min_qty="0.1"
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "qty_per_grid": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.reduce_lots_complete = True
+        link_id = engine._place("Sell", 101, 0, reduce_only=False, qty_override=1)
+        client.open_limit_order_ids.clear()
+
+        await engine._check_fills()
+
+        self.assertIn(link_id, engine.active_orders)
+        self.assertEqual(engine.grid_position_net_qty, 0.0)
+        self.assertEqual(engine.total_fee, 0.0)
+        self.assertIn("exact exchange fee conversion", engine.trigger_message)
+
+        client.fee_ready = True
+        await engine._check_fills()
+
+        self.assertNotIn(link_id, engine.active_orders)
+        self.assertAlmostEqual(engine.grid_position_net_qty, -1.0)
+        self.assertAlmostEqual(engine.total_fee, 0.01818)
+        self.assertNotIn("exact exchange fee conversion", engine.trigger_message)
+
+    async def test_total_fill_count_survives_truncated_state_history(self):
+        client = FakeClient("100")
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 1,
+            "leverage": 2,
+        }
+        engine = GridEngine(client, config)
+        engine.filled_orders = [
+            {"side": "Sell", "qty": 1, "price": 100, "reduce_only": False}
+            for _ in range(250)
+        ]
+        engine.filled_count = 250
+
+        state = engine.to_state()
+
+        self.assertEqual(len(state["filled_orders"]), 200)
+        self.assertEqual(state["filled_count"], 250)
+
+        restored = GridEngine(client, config)
+        restored.restore_state({**state, "running": False})
+
+        self.assertEqual(len(restored.filled_orders), 200)
+        self.assertEqual(restored.filled_count, 250)
+        self.assertEqual(restored.get_status()["filled_count"], 250)
+
+    async def test_random_lot_sequences_match_independent_cashflow_every_step(self):
+        import random
+
+        for direction, seed in (("short", 73129), ("long", 91871)):
+            rng = random.Random(seed)
+            client = FakeClient(
+                "100",
+                tick_size="0.01",
+                qty_step="0.1",
+                min_qty="0.1",
+            )
+            engine = GridEngine(
+                client,
+                {
+                    "symbol": "TESTUSDT",
+                    "direction": direction,
+                    "grid_mode": "arithmetic",
+                    "upper_price": 110,
+                    "lower_price": 90,
+                    "grid_count": 5,
+                    "total_investment": 0,
+                    "position_sizing_mode": "fixed_grid_qty",
+                    "grid_order_qty": 1,
+                    "leverage": 2,
+                },
+            )
+            engine._fetch_precision()
+            engine.grid_levels = [90, 94, 98, 102, 106, 110]
+            engine.reduce_lots_complete = True
+            cashflow = Decimal("0")
+
+            for index in range(400):
+                lots = engine._reduce_lot_decimal_map()
+                should_open = not lots or rng.random() < 0.56
+                if should_open:
+                    level_idx = rng.randrange(5)
+                    qty = Decimal(rng.randint(1, 10)) * Decimal("0.1")
+                    side = "Sell" if direction == "short" else "Buy"
+                    reduce_only = False
+                else:
+                    level_idx = rng.choice(sorted(lots))
+                    available_steps = int(lots[level_idx]["qty"] / Decimal("0.1"))
+                    qty = Decimal(rng.randint(1, available_steps)) * Decimal("0.1")
+                    side = "Buy" if direction == "short" else "Sell"
+                    reduce_only = True
+
+                price = (
+                    Decimal("91")
+                    + Decimal(level_idx * 4)
+                    + Decimal(rng.randint(-75, 75)) * Decimal("0.01")
+                )
+                volume = price * qty
+                engine._record_fill(
+                    {
+                        "level_idx": level_idx,
+                        "side": side,
+                        "price": str(price),
+                        "qty": str(qty),
+                        "order_id": f"{direction}-{index}",
+                        "reduce_only": reduce_only,
+                        "entry_price": 999.0 if direction == "short" else 1.0,
+                    },
+                    {
+                        "price": float(price),
+                        "qty": float(qty),
+                        "volume": float(volume),
+                        "fee": 0.0,
+                        "fee_asset": "USDT",
+                        "fee_source": "exchange",
+                        "maker_count": 1,
+                        "taker_count": 0,
+                    },
+                )
+                cashflow += volume if side == "Sell" else -volume
+
+                mark = Decimal("100") + Decimal(rng.randint(-500, 500)) * Decimal("0.01")
+                position_value = Decimal(str(engine.grid_position_net_qty)) * mark
+                independent_total = cashflow + position_value
+                engine_total = Decimal(str(engine.gross_profit)) + Decimal(
+                    str(engine.estimate_grid_unrealized_pnl(float(mark)))
+                )
+                self.assertAlmostEqual(
+                    float(engine_total),
+                    float(independent_total),
+                    places=8,
+                    msg=f"direction={direction} step={index}",
+                )
+                self.assertTrue(engine.reduce_lots_complete)
 
 
 if __name__ == "__main__":

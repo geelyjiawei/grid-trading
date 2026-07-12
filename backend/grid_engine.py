@@ -40,6 +40,7 @@ class GridEngine:
         self.grid_levels: list[float] = []
         self.active_orders: dict[str, dict] = {}
         self.filled_orders: list[dict] = []
+        self.filled_count = 0
         self.completed_pairs = 0
         self.reduce_lots_by_level: dict[str, dict[str, float]] = {}
         self.reduce_lots_complete = False
@@ -103,6 +104,7 @@ class GridEngine:
             "grid_levels": self.grid_levels,
             "active_orders": self.active_orders,
             "filled_orders": self.filled_orders[-200:],
+            "filled_count": self.filled_count,
             "completed_pairs": self.completed_pairs,
             "reduce_lots_by_level": self.reduce_lots_by_level,
             "reduce_lots_complete": self.reduce_lots_complete,
@@ -151,6 +153,10 @@ class GridEngine:
         self.grid_levels = list(state.get("grid_levels") or [])
         self.active_orders = dict(state.get("active_orders") or {})
         self.filled_orders = list(state.get("filled_orders") or [])
+        self.filled_count = max(
+            len(self.filled_orders),
+            int(state.get("filled_count") or 0),
+        )
         self.completed_pairs = int(state.get("completed_pairs") or 0)
         allow_reduce_lot_legacy_bootstrap = "reduce_lots_complete" not in state
         self.reduce_lots_by_level = self._normalize_reduce_lots(state.get("reduce_lots_by_level") or {})
@@ -625,7 +631,7 @@ class GridEngine:
             "paused_replacements": self.paused_replacements,
             "paused_replacements_count": len(self.paused_replacements),
             "completed_pairs": self.completed_pairs,
-            "filled_count": len(self.filled_orders),
+            "filled_count": self.filled_count,
             "filled_orders": self.filled_orders[-50:],
             "reduce_lots_complete": self.reduce_lots_complete,
             "reduce_lots_by_level": self.reduce_lots_by_level,
@@ -839,6 +845,7 @@ class GridEngine:
             "fee": fallback_fee,
             "fee_asset": "USDT estimated",
             "fee_source": "estimated",
+            "fee_conversion_complete": False,
             "maker_count": 1 if liquidity_hint == "maker" else 0,
             "taker_count": 1 if liquidity_hint != "maker" else 0,
         }
@@ -880,6 +887,7 @@ class GridEngine:
         total_volume = Decimal("0")
         total_fee = Decimal("0")
         fee_assets: set[str] = set()
+        fee_conversion_sources: set[str] = set()
         converted_all = True
         maker_count = 0
         taker_count = 0
@@ -902,8 +910,12 @@ class GridEngine:
             total_volume += volume
             if fee_usdt_text != "":
                 total_fee += Decimal(str(fee_usdt_text))
+                fee_conversion_sources.add(
+                    str(trade.get("feeUsdtSource") or "exchange_reported")
+                )
             else:
                 converted_all = False
+                fee_conversion_sources.add("estimated")
                 total_fee += Decimal(
                     str(
                         self._estimate_fee(
@@ -925,6 +937,8 @@ class GridEngine:
             "fee": float(total_fee),
             "fee_asset": ",".join(sorted(fee_assets)) if fee_assets else "USDT",
             "fee_source": "exchange" if converted_all else "mixed",
+            "fee_conversion_source": ",".join(sorted(fee_conversion_sources)),
+            "fee_conversion_complete": converted_all,
             "maker_count": maker_count,
             "taker_count": taker_count,
         }
@@ -2276,17 +2290,43 @@ class GridEngine:
         snapshot: dict | None = None,
     ):
         fallback_qty = float(order["qty"])
+        effective_snapshot = (
+            snapshot if snapshot is not None else self._get_order_snapshot(order)
+        )
         stats = self._authoritative_execution_stats(
             order,
-            snapshot if snapshot is not None else self._get_order_snapshot(order),
+            effective_snapshot,
         )
 
-        filled_qty = 0.0
+        snapshot_qty = Decimal(
+            str(
+                self._float_field(
+                    effective_snapshot,
+                    "executedQty",
+                    "cumExecQty",
+                    "cumQty",
+                    "cum_exec_qty",
+                )
+            )
+        )
         if stats and stats["qty"] > 0:
-            filled_qty = min(float(stats["qty"]), fallback_qty)
-            self._record_execution_delta(order, {**stats, "qty": filled_qty})
-        else:
-            filled_qty = float(order.get("processed_fill_qty", 0) or 0)
+            confirmed_qty = min(float(stats["qty"]), fallback_qty)
+            self._record_execution_delta(order, {**stats, "qty": confirmed_qty})
+
+        processed_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
+        if hasattr(self.client, "get_order_trades") and (
+            snapshot_qty > processed_qty + self._qty_tolerance_decimal()
+        ):
+            order["status"] = "RECONCILING_EXECUTION"
+            self.trigger_message = (
+                "A cancelled order has a confirmed partial fill; waiting for exact "
+                "exchange trades and commission before replacing the remainder."
+            )
+            self._mark_fast_poll()
+            self._persist_state()
+            return
+
+        filled_qty = float(order.get("processed_fill_qty", 0) or 0)
 
         self.active_orders.pop(link_id, None)
 
@@ -2536,9 +2576,16 @@ class GridEngine:
             position += Decimal(str(self._signed_qty(str(side or ""), qty)))
         self._set_grid_position_net_qty(position)
 
-    def _apply_market_reduce_to_grid_position(self, side: str, qty: float):
+    def _apply_market_reduce_to_grid_position(
+        self,
+        side: str,
+        qty: float,
+        *,
+        lot_ledger_updated: bool = False,
+    ):
         self._apply_grid_position_fill({"side": side, "reduce_only": True}, qty)
-        self.reduce_lots_complete = False
+        if not lot_ledger_updated:
+            self.reduce_lots_complete = False
 
     def _sync_grid_position_with_exchange(self) -> bool:
         if self.config["direction"] not in {"long", "short"}:
@@ -2727,9 +2774,14 @@ class GridEngine:
         self._set_reduce_lot_decimal_map(lots)
         self.reduce_lots_complete = True
 
-    def _record_reduce_lot_fill(self, order: dict, qty: float, price: float):
+    def _record_reduce_lot_fill(
+        self,
+        order: dict,
+        qty: float,
+        price: float,
+    ) -> float | None:
         if not self.reduce_lots_complete or self.config["direction"] not in {"long", "short"}:
-            return
+            return None
 
         try:
             level_idx = int(order.get("level_idx", 0) or 0)
@@ -2737,27 +2789,101 @@ class GridEngine:
             price_decimal = Decimal(str(price))
         except Exception:
             self.reduce_lots_complete = False
-            return
+            return None
 
         lots = self._reduce_lot_decimal_map()
         direction = self.config["direction"]
         side = order.get("side")
         reduce_only = bool(order.get("reduce_only"))
+        realized_gross: Decimal | None = None
 
         if direction == "short":
             if side == "Sell" and not reduce_only:
                 self._lot_add(lots, level_idx, qty_decimal, price_decimal)
-            elif side == "Buy" and reduce_only and not self._lot_remove(lots, level_idx, qty_decimal):
-                self.reduce_lots_complete = False
-                return
+            elif side == "Buy" and reduce_only:
+                lot = lots.get(level_idx)
+                if (
+                    not lot
+                    or qty_decimal - lot["qty"] > self._qty_tolerance_decimal()
+                ):
+                    self.reduce_lots_complete = False
+                    return None
+                average_entry = lot["entry_value"] / lot["qty"]
+                realized_gross = (average_entry - price_decimal) * qty_decimal
+                if not self._lot_remove(lots, level_idx, qty_decimal):
+                    self.reduce_lots_complete = False
+                    return None
         elif direction == "long":
             if side == "Buy" and not reduce_only:
                 self._lot_add(lots, level_idx, qty_decimal, price_decimal)
-            elif side == "Sell" and reduce_only and not self._lot_remove(lots, level_idx, qty_decimal):
-                self.reduce_lots_complete = False
-                return
+            elif side == "Sell" and reduce_only:
+                lot = lots.get(level_idx)
+                if (
+                    not lot
+                    or qty_decimal - lot["qty"] > self._qty_tolerance_decimal()
+                ):
+                    self.reduce_lots_complete = False
+                    return None
+                average_entry = lot["entry_value"] / lot["qty"]
+                realized_gross = (price_decimal - average_entry) * qty_decimal
+                if not self._lot_remove(lots, level_idx, qty_decimal):
+                    self.reduce_lots_complete = False
+                    return None
 
         self._set_reduce_lot_decimal_map(lots)
+        return float(realized_gross) if realized_gross is not None else None
+
+    def _record_market_reduce_lot_fill(
+        self,
+        side: str,
+        qty: float,
+        price: float,
+    ) -> float | None:
+        direction = self.config.get("direction")
+        expected_side = "Sell" if direction == "long" else "Buy" if direction == "short" else ""
+        if (
+            not self.reduce_lots_complete
+            or not expected_side
+            or side != expected_side
+        ):
+            return None
+
+        lots = self._reduce_lot_decimal_map()
+        ledger_qty = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
+        grid_qty = Decimal(str(self._grid_position_qty()))
+        if abs(ledger_qty - grid_qty) > self._qty_tolerance_decimal():
+            self.reduce_lots_complete = False
+            return None
+
+        remaining = Decimal(str(qty))
+        exit_price = Decimal(str(price))
+        if remaining - ledger_qty > self._qty_tolerance_decimal():
+            self.reduce_lots_complete = False
+            return None
+
+        realized_gross = Decimal("0")
+        for level_idx in sorted(list(lots)):
+            if remaining <= self._qty_tolerance_decimal():
+                break
+            lot = lots.get(level_idx)
+            if not lot or lot["qty"] <= 0:
+                continue
+            consumed = min(remaining, lot["qty"])
+            average_entry = lot["entry_value"] / lot["qty"]
+            if direction == "long":
+                realized_gross += (exit_price - average_entry) * consumed
+            else:
+                realized_gross += (average_entry - exit_price) * consumed
+            if not self._lot_remove(lots, level_idx, consumed):
+                self.reduce_lots_complete = False
+                return None
+            remaining -= consumed
+
+        if remaining > self._qty_tolerance_decimal():
+            self.reduce_lots_complete = False
+            return None
+        self._set_reduce_lot_decimal_map(lots)
+        return float(realized_gross)
 
     def _reduce_target_for_level(self, level_idx: int) -> tuple[str, float] | None:
         direction = self.config["direction"]
@@ -3497,6 +3623,20 @@ class GridEngine:
         if direction not in {"long", "short"} or not self._qty_reaches_accounting_step(grid_qty):
             return 0.0
 
+        if self.reduce_lots_complete:
+            lots = self._reduce_lot_decimal_map()
+            ledger_qty = sum((lot["qty"] for lot in lots.values()), Decimal("0"))
+            grid_qty_decimal = Decimal(str(grid_qty))
+            if abs(ledger_qty - grid_qty_decimal) <= self._qty_tolerance_decimal():
+                entry_value = sum(
+                    (lot["entry_value"] for lot in lots.values()),
+                    Decimal("0"),
+                )
+                mark_value = Decimal(str(mark_price)) * ledger_qty
+                if direction == "long":
+                    return float(mark_value - entry_value)
+                return float(entry_value - mark_value)
+
         reduce_side = "Sell" if direction == "long" else "Buy"
         remaining = grid_qty
         pnl = 0.0
@@ -3541,6 +3681,19 @@ class GridEngine:
             allow_estimate=allow_estimate,
             liquidity_hint=self._order_liquidity_hint(order),
         )
+        if (
+            trade_stats
+            and hasattr(self.client, "get_order_trades")
+            and not allow_estimate
+            and not bool(trade_stats.get("fee_conversion_complete", True))
+        ):
+            self.trigger_message = (
+                "Waiting for exact exchange fee conversion before finalizing a fill."
+            )
+            self._mark_fast_poll()
+            trade_stats = None
+        elif self.trigger_message.startswith("Waiting for exact exchange fee conversion"):
+            self.trigger_message = ""
 
         snapshot = {**order, **(snapshot or {})}
         executed_qty = self._float_field(
@@ -3559,11 +3712,21 @@ class GridEngine:
                 liquidity_hint=self._order_liquidity_hint(order),
             )
 
-        if snapshot_stats and (
+        snapshot_is_ahead = snapshot_stats and (
             not trade_stats
             or Decimal(str(snapshot_stats.get("qty", 0) or 0))
             > Decimal(str(trade_stats.get("qty", 0) or 0)) + self._qty_tolerance_decimal()
-        ):
+        )
+        if snapshot_is_ahead:
+            # Order snapshots prove quantity but do not contain the final
+            # per-execution commission. When a trade endpoint exists, wait for
+            # that authoritative page instead of permanently booking an
+            # estimate that cannot be corrected after the counter order is
+            # placed and the source order leaves active_orders.
+            if trade_stats:
+                return trade_stats
+            if hasattr(self.client, "get_order_trades") and not allow_estimate:
+                return None
             return snapshot_stats
         return trade_stats
 
@@ -3576,14 +3739,23 @@ class GridEngine:
         qty = float(delta_stats["qty"])
         price = float(delta_stats["price"])
         entry_price = float(action.get("entry_price", 0) or 0)
-        gross_profit = 0.0
-        if entry_price > 0:
+        ledger_gross_profit = self._record_market_reduce_lot_fill(
+            str(action.get("side") or ""),
+            qty,
+            price,
+        )
+        gross_profit = ledger_gross_profit if ledger_gross_profit is not None else 0.0
+        if ledger_gross_profit is None and entry_price > 0:
             if self.config["direction"] == "long" and action.get("side") == "Sell":
                 gross_profit = (price - entry_price) * qty
             elif self.config["direction"] == "short" and action.get("side") == "Buy":
                 gross_profit = (entry_price - price) * qty
 
-        self._apply_market_reduce_to_grid_position(str(action.get("side") or ""), qty)
+        self._apply_market_reduce_to_grid_position(
+            str(action.get("side") or ""),
+            qty,
+            lot_ledger_updated=ledger_gross_profit is not None,
+        )
         recorded = self._record_trade_value(
             price,
             qty,
@@ -3603,6 +3775,10 @@ class GridEngine:
                 "fee": round(recorded["fee"], 4),
                 "fee_asset": recorded["fee_asset"],
                 "fee_source": recorded["fee_source"],
+                "fee_conversion_source": delta_stats.get(
+                    "fee_conversion_source",
+                    "",
+                ),
                 "maker_count": delta_stats.get("maker_count", 0),
                 "taker_count": delta_stats.get("taker_count", 0),
                 "liquidity": self._liquidity_label(delta_stats),
@@ -3614,6 +3790,7 @@ class GridEngine:
                 "tag": action.get("tag", "market_reduce"),
             }
         )
+        self.filled_count += 1
         self._persist_state()
         return True
 
@@ -5648,18 +5825,23 @@ class GridEngine:
         qty = stats["qty"]
         price = stats["price"]
         gross_profit = 0.0
-        self._record_reduce_lot_fill(order, qty, price)
+        ledger_gross_profit = self._record_reduce_lot_fill(order, qty, price)
         self._apply_grid_position_fill(order, qty)
 
         if order["reduce_only"]:
-            entry_price = float(order.get("entry_price") or 0)
-            if entry_price > 0:
-                if self.config["direction"] == "long" and order["side"] == "Sell":
-                    gross_profit = (price - entry_price) * qty
-                elif self.config["direction"] == "short" and order["side"] == "Buy":
-                    gross_profit = (entry_price - price) * qty
-            elif level_idx + 1 < len(self.grid_levels):
-                gross_profit = (self.grid_levels[level_idx + 1] - self.grid_levels[level_idx]) * qty
+            if ledger_gross_profit is not None:
+                gross_profit = ledger_gross_profit
+            else:
+                entry_price = float(order.get("entry_price") or 0)
+                if entry_price > 0:
+                    if self.config["direction"] == "long" and order["side"] == "Sell":
+                        gross_profit = (price - entry_price) * qty
+                    elif self.config["direction"] == "short" and order["side"] == "Buy":
+                        gross_profit = (entry_price - price) * qty
+                elif level_idx + 1 < len(self.grid_levels):
+                    gross_profit = (
+                        self.grid_levels[level_idx + 1] - self.grid_levels[level_idx]
+                    ) * qty
             if count_completed_pair:
                 self.completed_pairs += 1
         recorded = self._record_trade_value(
@@ -5682,6 +5864,7 @@ class GridEngine:
                 "fee": round(recorded["fee"], 4),
                 "fee_asset": recorded["fee_asset"],
                 "fee_source": recorded["fee_source"],
+                "fee_conversion_source": stats.get("fee_conversion_source", ""),
                 "maker_count": stats.get("maker_count", 0),
                 "taker_count": stats.get("taker_count", 0),
                 "liquidity": self._liquidity_label(stats),
@@ -5691,6 +5874,7 @@ class GridEngine:
                 "reduce_only": order["reduce_only"],
             }
         )
+        self.filled_count += 1
         if persist_state:
             self._persist_state()
 

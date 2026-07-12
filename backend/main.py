@@ -725,6 +725,13 @@ def _write_grid_history_file(history: dict):
 
 def _history_record_from_engine(engine: GridEngine, status: str = "running") -> dict:
     config = engine.config
+    realized_net_profit = float(engine.total_profit)
+    valuation_price = float(engine.current_price or 0)
+    unrealised_pnl = (
+        engine.estimate_grid_unrealized_pnl(valuation_price)
+        if valuation_price > 0
+        else 0.0
+    )
     return {
         "run_id": config.get("run_id", ""),
         "symbol": str(config.get("symbol", "")).upper(),
@@ -754,10 +761,15 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
         "baseline_position_qty": round(engine.baseline_position_qty, 8),
         "completed_pairs": engine.completed_pairs,
         "gross_profit": round(engine.gross_profit, 4),
-        "net_profit": round(engine.total_profit, 4),
+        "net_profit": round(realized_net_profit, 4),
+        "realized_net_profit": round(realized_net_profit, 4),
+        "unrealised_pnl": round(unrealised_pnl, 4),
+        "total_equity_profit": round(realized_net_profit + unrealised_pnl, 4),
+        "valuation_price": valuation_price,
+        "grid_position_net_qty": round(engine._grid_position_net_qty(), 8),
         "total_fee": round(engine.total_fee, 4),
         "total_volume": round(engine.total_volume, 4),
-        "filled_count": len(engine.filled_orders),
+        "filled_count": engine.filled_count,
         "last_message": engine.trigger_message,
     }
 
@@ -1088,6 +1100,14 @@ def _upsert_grid_history(engine: GridEngine, status: str = "running"):
         for index, record in enumerate(runs):
             if record.get("run_id") == run_id:
                 new_record["started_at"] = record.get("started_at") or new_record["started_at"]
+                try:
+                    previous_filled_count = int(record.get("filled_count") or 0)
+                except (TypeError, ValueError):
+                    previous_filled_count = 0
+                new_record["filled_count"] = max(
+                    previous_filled_count,
+                    int(new_record.get("filled_count") or 0),
+                )
                 if status not in {"stopped", "closed"}:
                     new_record["stopped_at"] = record.get("stopped_at")
                 runs[index] = {**record, **new_record}
@@ -1165,6 +1185,24 @@ def _restore_saved_engines():
         logger.critical("Grid state restore blocked by ledger integrity failure: %s", exc)
         return
     legacy_exchange = _normalize_exchange(state.get("exchange"))
+    history_fill_counts: dict[str, int] = {}
+    try:
+        for record in _load_grid_history_file().get("runs", []):
+            if not isinstance(record, dict):
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            try:
+                filled_count = int(record.get("filled_count") or 0)
+            except (TypeError, ValueError):
+                continue
+            history_fill_counts[run_id] = max(
+                history_fill_counts.get(run_id, 0),
+                filled_count,
+            )
+    except (GridHistoryIntegrityError, TypeError):
+        pass
 
     for state_key, engine_state in list(state.get("grids", {}).items()):
         config = dict(engine_state.get("config") or {})
@@ -1182,6 +1220,14 @@ def _restore_saved_engines():
 
         config["symbol"] = symbol
         config["exchange"] = exchange
+        run_id = str(config.get("run_id") or "")
+        history_fill_count = history_fill_counts.get(run_id, 0)
+        try:
+            saved_fill_count = int(engine_state.get("filled_count") or 0)
+        except (TypeError, ValueError):
+            saved_fill_count = 0
+        if history_fill_count > saved_fill_count:
+            engine_state = {**engine_state, "filled_count": history_fill_count}
         engine = GridEngine(_client_for_exchange(exchange), config, state_callback=_save_engine_state)
         try:
             engine.restore_state(engine_state)
@@ -2114,6 +2160,7 @@ def recent_trades(symbol: str, limit: int = 100, exchange: str | None = None):
             "fee": item.get("fee", "0"),
             "fee_asset": item.get("feeAsset", ""),
             "fee_usdt": item.get("feeUsdt", ""),
+            "fee_usdt_source": item.get("feeUsdtSource", ""),
             "realized_pnl": item.get("realizedPnl", "0"),
             "is_maker": item.get("isMaker", False),
             "time": item.get("time", ""),

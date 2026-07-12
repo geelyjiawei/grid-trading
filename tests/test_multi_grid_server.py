@@ -1254,6 +1254,69 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(open_orders[0]["orderId"], order_id)
         self.assertEqual(open_orders[0]["qty"], "3.1")
 
+    def test_restore_migrates_legacy_total_fill_count_from_history(self):
+        symbol = "COUNTUSDT"
+        exchange = "binance"
+        run_id = "count-run"
+        key = main._engine_key(exchange, symbol)
+        recent_fills = [
+            {"side": "Sell", "price": 100, "qty": 1, "reduce_only": False}
+            for _ in range(200)
+        ]
+        main._write_grid_state_file(
+            {
+                "version": 1,
+                "grids": {
+                    key: {
+                        "config": {
+                            "run_id": run_id,
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "direction": "short",
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 1,
+                            "total_investment": 0,
+                            "position_sizing_mode": "fixed_grid_qty",
+                            "grid_order_qty": 1,
+                            "leverage": 2,
+                        },
+                        "running": False,
+                        "grid_ready": False,
+                        "grid_levels": [90, 110],
+                        "filled_orders": recent_fills,
+                        "tick_size": "1",
+                        "qty_step": "0.1",
+                        "min_qty": 0.1,
+                    }
+                },
+            }
+        )
+        main._write_grid_history_file(
+            {
+                "version": 1,
+                "runs": [
+                    {
+                        "run_id": run_id,
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "filled_count": 572,
+                        "started_at": 1,
+                    }
+                ],
+            }
+        )
+
+        main._restore_saved_engines()
+
+        engine = main._engines[key]
+        saved = main._load_grid_state_file()["grids"][key]
+        history = main._load_grid_history_file()["runs"][0]
+        self.assertEqual(engine.filled_count, 572)
+        self.assertEqual(saved["filled_count"], 572)
+        self.assertEqual(history["filled_count"], 572)
+
     def test_restore_resumes_incomplete_cleanup_even_when_saved_running_is_false(self):
         symbol = "INTERRUPTUSDT"
         exchange = "binance"
@@ -2743,6 +2806,165 @@ class MultiGridServerTests(unittest.TestCase):
 
         self.assertEqual(fee_usdt, Decimal("0.700"))
         self.assertEqual(len(calls), 1)
+
+    def test_binance_fee_conversion_uses_execution_minute_open_and_cache(self):
+        client = BinanceFuturesClient("", "", True)
+        calls = []
+        trade_time = 1714012800123
+        minute_start = trade_time - (trade_time % 60_000)
+
+        def fake_request(method, path, *, params=None, auth=False, api_key=False):
+            calls.append((method, path, params, auth, api_key))
+            return [[minute_start, "567.00", "568", "566", "567.50"]]
+
+        client._request = fake_request
+        trade = {
+            "orderId": 1,
+            "id": 2,
+            "side": "SELL",
+            "price": "943.33",
+            "qty": "0.2",
+            "quoteQty": "188.666",
+            "commission": "0.00011988",
+            "commissionAsset": "BNB",
+            "maker": False,
+            "time": trade_time,
+        }
+
+        first = client._normalize_trade(trade)
+        second = client._normalize_trade({**trade, "id": 3, "time": trade_time + 1000})
+
+        self.assertEqual(first["feeUsdt"], "0.0679719600")
+        self.assertEqual(first["feeUsdtSource"], "historical_minute_open")
+        self.assertEqual(second["feeUsdt"], "0.0679719600")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "/fapi/v1/klines")
+        self.assertEqual(calls[0][2]["startTime"], minute_start)
+
+    def test_binance_historical_fee_conversion_never_uses_current_price_fallback(self):
+        client = BinanceFuturesClient("", "", True)
+        client._asset_price_cache["BNBUSDT"] = (Decimal("900"), time.time())
+
+        def fake_request(method, path, *, params=None, auth=False, api_key=False):
+            raise RuntimeError("historical market data unavailable")
+
+        client._request = fake_request
+        trade = client._normalize_trade(
+            {
+                "orderId": 1,
+                "id": 2,
+                "side": "SELL",
+                "price": "100",
+                "qty": "1",
+                "quoteQty": "100",
+                "commission": "0.001",
+                "commissionAsset": "BNB",
+                "maker": False,
+                "time": 1714012800123,
+            }
+        )
+
+        self.assertEqual(trade["feeUsdt"], "")
+        self.assertEqual(trade["feeUsdtSource"], "historical_price_unavailable")
+
+    def test_historical_fee_price_caches_are_bounded(self):
+        client = BinanceFuturesClient("", "", True)
+        client.HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS = 2
+
+        def fake_request(method, path, *, params=None, auth=False, api_key=False):
+            minute_start = int(params["startTime"])
+            return [[minute_start, "600", "600", "600", "600"]]
+
+        client._request = fake_request
+        start = 1714012800000
+        for offset in range(3):
+            client._fee_to_usdt(
+                Decimal("0.001"),
+                "BNB",
+                trade_time_ms=start + offset * 60_000,
+            )
+
+        self.assertEqual(len(client._historical_asset_price_cache), 2)
+        self.assertNotIn(
+            ("BNBUSDT", start),
+            client._historical_asset_price_cache,
+        )
+
+    def test_bybit_fee_conversion_uses_execution_minute_open(self):
+        client = BybitClient("", "", True)
+        calls = []
+        trade_time = 1714012800123
+        minute_start = trade_time - (trade_time % 60_000)
+
+        def fake_request(method, path, *, params=None, payload=None, auth=False):
+            calls.append((method, path, params, auth))
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [[str(minute_start), "600", "601", "599", "600"]]
+                },
+            }
+
+        client._request = fake_request
+        trade = client._normalize_trade(
+            {
+                "orderId": "1",
+                "execId": "2",
+                "side": "Sell",
+                "execPrice": "100",
+                "execQty": "1",
+                "execValue": "100",
+                "execFee": "0.001",
+                "feeCurrency": "BNB",
+                "isMaker": False,
+                "execTime": str(trade_time),
+            }
+        )
+
+        self.assertEqual(trade["feeUsdt"], "0.600")
+        self.assertEqual(trade["feeUsdtSource"], "historical_minute_open")
+        self.assertEqual(calls[0][1], "/v5/market/kline")
+
+    def test_history_records_realized_and_unrealized_profit_separately(self):
+        client = FakeClient("99", tick_size="1", qty_step="0.1", min_qty="0.1")
+        engine = main.GridEngine(
+            client,
+            {
+                "run_id": "profit-audit",
+                "exchange": "binance",
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine.current_price = 99
+        engine.grid_position_net_qty = -1
+        engine.reduce_lots_complete = True
+        engine.reduce_lots_by_level = {
+            "0": {"qty": 1.0, "entry_value": 101.0}
+        }
+        engine.gross_profit = 0.6
+        engine.total_fee = 0.1
+        engine.total_profit = 0.5
+        engine.filled_count = 250
+
+        record = main._history_record_from_engine(engine, "stopped")
+
+        self.assertEqual(record["realized_net_profit"], 0.5)
+        self.assertEqual(record["unrealised_pnl"], 2.0)
+        self.assertEqual(record["total_equity_profit"], 2.5)
+        self.assertEqual(record["net_profit"], 0.5)
+        self.assertEqual(record["grid_position_net_qty"], -1.0)
+        self.assertEqual(record["filled_count"], 250)
 
     def test_private_state_files_are_chmod_600_on_unix(self):
         main._write_grid_state_file({"version": 1, "grids": {}})

@@ -14,6 +14,7 @@ from fee_rates import fee_rate_response
 class BybitClient:
     exchange = "bybit"
     ASSET_PRICE_TTL_SECONDS = 60
+    HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS = 2048
     FEE_RATE_TTL_SECONDS = 300
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
@@ -22,6 +23,7 @@ class BybitClient:
         self.base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.recv_window = "5000"
         self._asset_price_cache: dict[str, Decimal | tuple[Decimal, float]] = {}
+        self._historical_asset_price_cache: dict[tuple[str, int], Decimal] = {}
         self._fee_rate_cache: dict[str, tuple[str, str, int, float]] = {}
 
     def _sign(self, payload: str, timestamp: str) -> str:
@@ -335,7 +337,11 @@ class BybitClient:
     def _normalize_trade(self, item: dict[str, Any]) -> dict:
         fee_asset = str(item.get("feeCurrency") or item.get("feeCoin") or "USDT").upper()
         fee_amount = Decimal(str(item.get("execFee", "0")))
-        fee_usdt = self._fee_to_usdt(fee_amount, fee_asset)
+        fee_usdt, fee_usdt_source = self._fee_to_usdt_with_source(
+            fee_amount,
+            fee_asset,
+            trade_time_ms=item.get("execTime"),
+        )
 
         return {
             "orderId": str(item.get("orderId", "")),
@@ -347,38 +353,103 @@ class BybitClient:
             "fee": str(fee_amount),
             "feeAsset": fee_asset,
             "feeUsdt": "" if fee_usdt is None else str(fee_usdt),
+            "feeUsdtSource": fee_usdt_source,
             "realizedPnl": item.get("execPnl", "0"),
             "isMaker": str(item.get("isMaker", "")).lower() == "true",
             "time": item.get("execTime", ""),
         }
 
-    def _fee_to_usdt(self, amount: Decimal, asset: str) -> Decimal | None:
+    def _historical_fee_asset_price(self, symbol: str, trade_time_ms: int) -> Decimal | None:
+        minute_start = trade_time_ms - (trade_time_ms % 60_000)
+        key = (symbol, minute_start)
+        cached = self._historical_asset_price_cache.get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            response = self._request(
+                "GET",
+                "/v5/market/kline",
+                params=(
+                    f"category=linear&symbol={symbol}&interval=1&"
+                    f"start={minute_start}&limit=1"
+                ),
+            )
+            if response.get("retCode") != 0:
+                return None
+            row = response.get("result", {}).get("list", [])[0]
+            if int(row[0]) != minute_start:
+                return None
+            price = Decimal(str(row[1]))
+            if price <= 0:
+                return None
+        except Exception:
+            return None
+
+        self._historical_asset_price_cache[key] = price
+        while len(self._historical_asset_price_cache) > self.HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS:
+            self._historical_asset_price_cache.pop(next(iter(self._historical_asset_price_cache)))
+        return price
+
+    def _fee_to_usdt_with_source(
+        self,
+        amount: Decimal,
+        asset: str,
+        *,
+        trade_time_ms: Any = None,
+    ) -> tuple[Decimal | None, str]:
         if amount == 0:
-            return Decimal("0")
+            return Decimal("0"), "exchange_zero"
         if asset in {"", "USDT", "USDC", "BUSD", "FDUSD", "USD"}:
-            return amount
+            return amount, "quote_asset"
 
         symbol = f"{asset}USDT"
+        try:
+            timestamp = int(trade_time_ms or 0)
+        except (TypeError, ValueError):
+            timestamp = 0
+        if timestamp > 0:
+            price = self._historical_fee_asset_price(symbol, timestamp)
+            if price is None:
+                return None, "historical_price_unavailable"
+            return amount * price, "historical_minute_open"
+
         now = time.time()
         cached = self._asset_price_cache.get(symbol)
         if isinstance(cached, tuple):
             cached_price, cached_at = cached
             if now - cached_at < self.ASSET_PRICE_TTL_SECONDS:
-                return amount * cached_price
+                return amount * cached_price, "current_ticker_cache"
         elif cached is not None:
-            return amount * cached
+            return amount * cached, "current_ticker_cache"
 
         try:
             ticker = self.get_ticker(symbol)
             price = Decimal(str(ticker["result"]["list"][0]["lastPrice"]))
+            if price <= 0:
+                raise ValueError("invalid fee asset price")
             self._asset_price_cache[symbol] = (price, now)
-            return amount * price
+            return amount * price, "current_ticker"
         except Exception:
             if isinstance(cached, tuple):
-                return amount * cached[0]
+                return amount * cached[0], "stale_current_ticker_cache"
             if cached is not None:
-                return amount * cached
-            return None
+                return amount * cached, "stale_current_ticker_cache"
+            return None, "current_price_unavailable"
+
+    def _fee_to_usdt(
+        self,
+        amount: Decimal,
+        asset: str,
+        *,
+        trade_time_ms: Any = None,
+    ) -> Decimal | None:
+        fee_usdt, _ = self._fee_to_usdt_with_source(
+            amount,
+            asset,
+            trade_time_ms=trade_time_ms,
+        )
+        return fee_usdt
 
     @staticmethod
     def round_to_step(value: float, step: str) -> str:
