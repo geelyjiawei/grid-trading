@@ -3306,6 +3306,65 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(coverage["has_risk"])
         self.assertIn("automatic top-up is paused", engine.trigger_message)
 
+        def fill_all_active(side: str, reduce_only: bool):
+            targets = [
+                order
+                for order in engine.active_orders.values()
+                if order["side"] == side and bool(order["reduce_only"]) is reduce_only
+            ]
+            for order in targets:
+                order_id = str(order["order_id"])
+                client.open_limit_order_ids.discard(order_id)
+                exchange_order = next(
+                    item for item in client.orders if str(item["orderId"]) == order_id
+                )
+                exchange_order["orderStatus"] = "FILLED"
+            self.assertTrue(engine._reconcile_exchange_open_orders())
+
+        def active_qty_by_level(side: str, reduce_only: bool) -> dict[int, Decimal]:
+            result: dict[int, Decimal] = {}
+            for order in engine.active_orders.values():
+                if order["side"] != side or bool(order["reduce_only"]) is not reduce_only:
+                    continue
+                level_idx = int(order["level_idx"])
+                remaining = Decimal(str(order["qty"])) - Decimal(
+                    str(order.get("processed_fill_qty", 0) or 0)
+                )
+                result[level_idx] = result.get(level_idx, Decimal("0")) + remaining
+            return result
+
+        # Falling through the lower boundary fills every reduce-only Buy. The
+        # short grid must be flat and all 20 Sell legs must be restored exactly.
+        fill_all_active("Buy", True)
+        open_qty_by_level = active_qty_by_level("Sell", False)
+        self.assertEqual(Decimal(str(engine.grid_position_net_qty)), Decimal("0"))
+        self.assertEqual(engine.reduce_lots_by_level, {})
+        self.assertEqual(set(open_qty_by_level), set(range(20)))
+        self.assertTrue(
+            all(qty == Decimal("0.20") for qty in open_qty_by_level.values())
+        )
+        self.assertEqual(sum(open_qty_by_level.values()), Decimal("4.00"))
+        healed_coverage = engine.grid_coverage_snapshot()
+        self.assertFalse(healed_coverage["has_risk"])
+        self.assertEqual(healed_coverage["missing_by_level"], [])
+        self.assertEqual(healed_coverage["excess_by_level"], [])
+
+        # Rising through the upper boundary fills every Sell. The full short
+        # inventory and every reduce-only Buy must again equal the configured target.
+        fill_all_active("Sell", False)
+        reduce_qty_by_level = active_qty_by_level("Buy", True)
+        self.assertEqual(Decimal(str(engine.grid_position_net_qty)), Decimal("-4.00"))
+        self.assertEqual(set(reduce_qty_by_level), set(range(20)))
+        self.assertTrue(
+            all(qty == Decimal("0.20") for qty in reduce_qty_by_level.values())
+        )
+        self.assertEqual(sum(reduce_qty_by_level.values()), Decimal("4.00"))
+        protection = engine.reduce_protection_snapshot()
+        self.assertFalse(protection["has_risk"])
+        self.assertEqual(protection["missing_by_level"], [])
+        self.assertEqual(protection["excess_by_level"], [])
+        self.assertEqual(engine.paused_replacements, [])
+
     async def test_mu_oversized_same_level_fragments_heal_to_one_exact_target(self):
         for fill_sequence in ((0.20, 0.01), (0.01, 0.20)):
             client = FakeClient("975", tick_size="1", qty_step="0.01", min_qty="0.01")
