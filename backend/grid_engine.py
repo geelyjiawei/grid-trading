@@ -2787,22 +2787,19 @@ class GridEngine:
             self._persist_state()
             return
 
-        filled_qty = float(order.get("processed_fill_qty", 0) or 0)
+        planned_qty = Decimal(str(order.get("qty", 0) or 0))
+        filled_qty = Decimal(str(order.get("processed_fill_qty", 0) or 0))
 
         self.active_orders.pop(link_id, None)
 
-        remaining_qty = max(0.0, fallback_qty - filled_qty)
-        if order.get("reduce_only"):
-            should_replace = self._qty_reaches_accounting_step(remaining_qty)
-        else:
-            should_replace = (
-                Decimal(str(remaining_qty)) + self._qty_tolerance_decimal()
-                >= Decimal(str(self.min_qty))
-            )
-        if should_replace:
+        remaining_qty = self._normalized_qty_decimal(
+            max(Decimal("0"), planned_qty - filled_qty),
+            self.qty_step,
+        )
+        if self._qty_reaches_accounting_step(remaining_qty):
             replacement = {
                 **order,
-                "qty": str(remaining_qty),
+                "qty": self._fq(remaining_qty),
                 "processed_fill_qty": 0.0,
                 "processed_fill_volume": 0.0,
                 "processed_fill_fee": 0.0,
@@ -3112,7 +3109,7 @@ class GridEngine:
             or self.initial_grid_deployment_pending
             or self._stopping
             or self.pending_reduce_action
-            or self.paused_replacements
+            or self._paused_replacements_block_reconciliation()
             or self.risk_shutdown_pending
             or self.manual_stop_pending
             or self.ownership_conflicts
@@ -6515,20 +6512,81 @@ class GridEngine:
         self._record_execution_delta(order, stats)
         return True
 
+    def _queued_replacement_order_plan(self, order: dict) -> dict | None:
+        mode = str(order.get("replacement_mode") or "counter_order")
+        if mode == "same_order":
+            return {
+                "side": str(order.get("side") or ""),
+                "price": float(order.get("price", 0) or 0),
+                "level_idx": int(order.get("level_idx", 0) or 0),
+                "reduce_only": bool(order.get("reduce_only")),
+                "qty": float(order.get("qty", 0) or 0),
+                "entry_price": order.get("entry_price"),
+            }
+        if mode == "planned_order":
+            raw_plan = order.get("replacement_plan") or {}
+            return {
+                "side": str(raw_plan.get("side") or ""),
+                "price": float(raw_plan.get("price", 0) or 0),
+                "level_idx": int(raw_plan.get("level_idx", 0) or 0),
+                "reduce_only": bool(raw_plan.get("reduce_only")),
+                "qty": float(raw_plan.get("qty", 0) or 0),
+                "entry_price": raw_plan.get("entry_price"),
+            }
+        return self._counter_order_plan(order)
+
+    def _bind_fixed_grid_replacement_to_level_coverage(self, order: dict) -> bool:
+        if (
+            order.get("replacement_mode") != "same_order"
+            or order.get("reduce_only")
+            or self._position_sizing_mode() != "fixed_grid_qty"
+            or self.config.get("direction") not in {"long", "short"}
+            or str(order.get("side") or "") != self._open_side_for_direction()
+        ):
+            return False
+
+        order["replacement_mode"] = "planned_order"
+        order["replacement_plan"] = {
+            "side": str(order["side"]),
+            "price": float(order["price"]),
+            "level_idx": int(order["level_idx"]),
+            "reduce_only": False,
+            "qty": str(order["qty"]),
+            "entry_price": order.get("entry_price"),
+        }
+        return True
+
+    def _paused_replacements_block_reconciliation(self) -> bool:
+        for order in self.paused_replacements:
+            try:
+                plan = self._queued_replacement_order_plan(order)
+                side = str((plan or {}).get("side") or "")
+                price = float((plan or {}).get("price", 0) or 0)
+                qty = float((plan or {}).get("qty", 0) or 0)
+            except Exception:
+                return True
+            if not plan or not side or price <= 0 or qty <= 0:
+                return True
+            if bool(plan.get("reduce_only")):
+                return True
+
+            qty_text = self._order_qty_text(qty, reduce_only=False)
+            if qty_text and self._meets_min_notional(self._fp(price), qty_text):
+                return True
+        return False
+
     def _coalesce_nonreduce_counter_replacements(self) -> bool:
         changed = False
         retained: list[dict] = []
         groups: dict[tuple[str, str, int, bool], dict] = {}
 
         for order in self.paused_replacements:
-            if order.get("replacement_mode") != "counter_order":
-                retained.append(order)
-                continue
+            changed = self._bind_fixed_grid_replacement_to_level_coverage(order) or changed
             replacement_link_id = str(order.get("replacement_link_id") or "")
             if replacement_link_id and replacement_link_id in self.active_orders:
                 changed = True
                 continue
-            plan = self._counter_order_plan(order)
+            plan = self._queued_replacement_order_plan(order)
             if not plan or bool(plan.get("reduce_only")):
                 retained.append(order)
                 continue
@@ -6551,10 +6609,21 @@ class GridEngine:
                 retained.append(order)
                 continue
 
-            total_qty = Decimal(str(existing.get("qty", 0) or 0)) + Decimal(
-                str(order.get("qty", 0) or 0)
+            existing_plan = self._queued_replacement_order_plan(existing) or {}
+            total_qty = Decimal(str(existing_plan.get("qty", 0) or 0)) + Decimal(
+                str(plan.get("qty", 0) or 0)
             )
-            existing["qty"] = self._fq(float(total_qty))
+            total_qty_text = self._fq(total_qty)
+            existing["qty"] = total_qty_text
+            existing["replacement_mode"] = "planned_order"
+            existing["replacement_plan"] = {
+                "side": str(plan["side"]),
+                "price": float(plan["price"]),
+                "level_idx": int(plan["level_idx"]),
+                "reduce_only": False,
+                "qty": total_qty_text,
+                "entry_price": plan.get("entry_price"),
+            }
             existing["replacement_retry_after"] = 0.0
             existing["replacement_retry_attempts"] = 0
             existing_sources = list(existing.get("replacement_source_links") or [])
@@ -6848,7 +6917,7 @@ class GridEngine:
             (
                 item
                 for item in self.paused_replacements
-                if item.get("replacement_mode") == "same_order"
+                if item.get("replacement_mode") in {"same_order", "planned_order"}
                 and str(item.get("replacement_source_link_id", "") or "")
                 == source_link_id
             ),
@@ -6862,6 +6931,12 @@ class GridEngine:
 
         side = str(order["side"])
         level_idx = int(order["level_idx"])
+        use_level_coverage_plan = bool(
+            not order.get("reduce_only")
+            and self._position_sizing_mode() == "fixed_grid_qty"
+            and self.config.get("direction") in {"long", "short"}
+            and side == self._open_side_for_direction()
+        )
         queued = dict(order)
         for field in (
             "submission_pending",
@@ -6875,7 +6950,9 @@ class GridEngine:
         queued.update(
             {
                 "status": "QUEUED_REPLACEMENT",
-                "replacement_mode": "same_order",
+                "replacement_mode": (
+                    "planned_order" if use_level_coverage_plan else "same_order"
+                ),
                 "replacement_source_link_id": source_link_id,
                 "replacement_link_id": (
                     f"g_{level_idx}_{side[0]}_"
@@ -6888,6 +6965,15 @@ class GridEngine:
                 "replacement_error": str(reason or "replacement rejected"),
             }
         )
+        if use_level_coverage_plan:
+            queued["replacement_plan"] = {
+                "side": side,
+                "price": float(order["price"]),
+                "level_idx": level_idx,
+                "reduce_only": False,
+                "qty": str(order["qty"]),
+                "entry_price": order.get("entry_price"),
+            }
         self.paused_replacements.append(queued)
         self._mark_fast_poll()
         self._persist_state()
@@ -7034,6 +7120,9 @@ class GridEngine:
         return False
 
     def _counter_order_plan(self, order: dict) -> dict | None:
+        if order.get("replacement_mode") == "planned_order":
+            return self._queued_replacement_order_plan(order)
+
         direction = self.config["direction"]
         side = order["side"]
         level_idx = int(order.get("level_idx", 0) or 0)
@@ -7131,6 +7220,36 @@ class GridEngine:
         plan = self._counter_order_plan(order)
         if not plan:
             return True
+        if order.get("replacement_mode") == "planned_order" and not bool(
+            plan["reduce_only"]
+        ):
+            if (
+                self._position_sizing_mode() == "fixed_grid_qty"
+                and self.config.get("direction") in {"long", "short"}
+                and str(plan["side"]) == self._open_side_for_direction()
+            ):
+                return self._place_counter_leg(
+                    str(plan["side"]),
+                    float(plan["price"]),
+                    int(plan["level_idx"]),
+                    reduce_only=False,
+                    qty=float(plan["qty"]),
+                    entry_price=plan.get("entry_price"),
+                    link_id_override=str(order.get("replacement_link_id") or "") or None,
+                )
+            return (
+                self._place(
+                    str(plan["side"]),
+                    float(plan["price"]),
+                    int(plan["level_idx"]),
+                    reduce_only=False,
+                    qty_override=float(plan["qty"]),
+                    entry_price=plan.get("entry_price"),
+                    allow_duplicate=True,
+                    link_id_override=str(order.get("replacement_link_id") or "") or None,
+                )
+                is not None
+            )
         return self._place_counter_leg(
             str(plan["side"]),
             float(plan["price"]),

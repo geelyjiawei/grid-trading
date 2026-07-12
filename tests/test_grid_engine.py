@@ -12584,6 +12584,239 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(coverage["has_risk"], msg=coverage)
                 self.assertEqual(coverage["coverage_qty"], 0.2)
 
+    async def test_cancelled_partial_open_sub_minimum_remainder_is_durably_coalesced(self):
+        for direction in ("short", "long"):
+            with self.subTest(direction=direction):
+                client, engine = self._directional_sub_minimum_counter_engine(direction)
+                engine.reduce_lots_by_level = {}
+                engine.grid_position_net_qty = 0.0
+
+                open_side = "Sell" if direction == "short" else "Buy"
+                open_price = 110 if direction == "short" else 90
+                link_id = engine._place(
+                    open_side,
+                    open_price,
+                    0,
+                    reduce_only=False,
+                    qty_override=Decimal("0.20"),
+                )
+                order = engine.active_orders[link_id]
+                client.open_limit_order_ids.discard(str(order["order_id"]))
+
+                engine._handle_cancelled_order(
+                    link_id,
+                    order,
+                    snapshot={
+                        "orderId": order["order_id"],
+                        "orderStatus": "CANCELED",
+                        "side": open_side,
+                        "price": str(open_price),
+                        "qty": "0.20",
+                        "executedQty": "0.12",
+                        "avgPrice": str(open_price),
+                        "cumQuote": str(Decimal(str(open_price)) * Decimal("0.12")),
+                        "reduceOnly": False,
+                    },
+                )
+
+                self.assertEqual(len(engine.paused_replacements), 1)
+                queued = engine.paused_replacements[0]
+                self.assertEqual(queued["replacement_mode"], "planned_order")
+                self.assertEqual(Decimal(str(queued["qty"])), Decimal("0.08"))
+                coverage = engine.grid_coverage_snapshot()
+                self.assertEqual(
+                    Decimal(str(coverage["missing_by_level"][0]["missing_qty"])),
+                    Decimal("0.08"),
+                )
+
+                with patch.object(
+                    engine,
+                    "_sync_grid_position_with_exchange",
+                    return_value=True,
+                ) as sync_position:
+                    engine._reconcile_grid_position_protection()
+                sync_position.assert_called_once()
+
+                durable_state = copy.deepcopy(engine.to_state())
+                restored = GridEngine(client, copy.deepcopy(engine.config))
+                restored.restore_state({**durable_state, "running": False})
+                self.assertEqual(len(restored.paused_replacements), 1)
+                self.assertEqual(
+                    Decimal(str(restored.paused_replacements[0]["qty"])),
+                    Decimal("0.08"),
+                )
+                engine = restored
+
+                reduce_order = next(
+                    item for item in engine.active_orders.values() if item.get("reduce_only")
+                )
+                self.assertTrue(
+                    engine._record_execution_delta(
+                        reduce_order,
+                        {
+                            "price": float(reduce_order["price"]),
+                            "qty": "0.02",
+                            "volume": str(
+                                Decimal(str(reduce_order["price"])) * Decimal("0.02")
+                            ),
+                            "fee": 0,
+                            "fee_asset": "USDT",
+                            "fee_source": "exchange",
+                            "maker_count": 1,
+                            "taker_count": 0,
+                        },
+                    )
+                )
+
+                open_orders = [
+                    item
+                    for item in engine.active_orders.values()
+                    if not item.get("reduce_only")
+                ]
+                self.assertEqual(len(open_orders), 1)
+                self.assertEqual(Decimal(str(open_orders[0]["qty"])), Decimal("0.10"))
+                self.assertEqual(engine.paused_replacements, [])
+                coverage = engine.grid_coverage_snapshot()
+                self.assertFalse(coverage["has_risk"], msg=coverage)
+                self.assertEqual(Decimal(str(coverage["coverage_qty"])), Decimal("0.2"))
+
+    async def test_every_partial_cancel_qty_step_remains_accounted(self):
+        for direction in ("short", "long"):
+            for filled_steps in range(20):
+                with self.subTest(direction=direction, filled_steps=filled_steps):
+                    client, engine = self._directional_sub_minimum_counter_engine(direction)
+                    engine.reduce_lots_by_level = {}
+                    engine.grid_position_net_qty = 0.0
+                    open_side = "Sell" if direction == "short" else "Buy"
+                    open_price = 110 if direction == "short" else 90
+                    filled_qty = Decimal("0.01") * filled_steps
+                    remaining_qty = Decimal("0.20") - filled_qty
+                    link_id = engine._place(
+                        open_side,
+                        open_price,
+                        0,
+                        reduce_only=False,
+                        qty_override=Decimal("0.20"),
+                    )
+                    order = engine.active_orders[link_id]
+                    client.open_limit_order_ids.discard(str(order["order_id"]))
+
+                    engine._handle_cancelled_order(
+                        link_id,
+                        order,
+                        snapshot={
+                            "orderId": order["order_id"],
+                            "orderStatus": "CANCELED",
+                            "side": open_side,
+                            "price": str(open_price),
+                            "qty": "0.20",
+                            "executedQty": str(filled_qty),
+                            "avgPrice": str(open_price),
+                            "cumQuote": str(Decimal(str(open_price)) * filled_qty),
+                            "reduceOnly": False,
+                        },
+                    )
+
+                    lot_qty = sum(
+                        (
+                            Decimal(str(lot["qty"]))
+                            for lot in engine.reduce_lots_by_level.values()
+                        ),
+                        Decimal("0"),
+                    )
+                    active_open_qty = sum(
+                        (
+                            Decimal(str(item["qty"]))
+                            - Decimal(str(item.get("processed_fill_qty", 0) or 0))
+                            for item in engine.active_orders.values()
+                            if not item.get("reduce_only")
+                        ),
+                        Decimal("0"),
+                    )
+                    queued_open_qty = sum(
+                        (
+                            Decimal(
+                                str(
+                                    engine._queued_replacement_order_plan(item).get(
+                                        "qty", 0
+                                    )
+                                )
+                            )
+                            for item in engine.paused_replacements
+                            if not engine._queued_replacement_order_plan(item).get(
+                                "reduce_only"
+                            )
+                        ),
+                        Decimal("0"),
+                    )
+
+                    self.assertEqual(lot_qty, filled_qty)
+                    self.assertEqual(lot_qty + active_open_qty + queued_open_qty, Decimal("0.20"))
+                    self.assertLessEqual(lot_qty + active_open_qty, Decimal("0.20"))
+                    self.assertFalse(engine.grid_coverage_snapshot()["excess_by_level"])
+                    self.assertFalse(engine.reduce_protection_snapshot()["has_risk"])
+                    if Decimal("0") < remaining_qty < Decimal("0.10"):
+                        self.assertEqual(queued_open_qty, remaining_qty)
+                    else:
+                        self.assertEqual(queued_open_qty, Decimal("0"))
+
+                    restored = GridEngine(client, copy.deepcopy(engine.config))
+                    restored.restore_state(
+                        {**copy.deepcopy(engine.to_state()), "running": False}
+                    )
+                    restored_queued_qty = sum(
+                        (
+                            Decimal(
+                                str(
+                                    restored._queued_replacement_order_plan(item).get(
+                                        "qty", 0
+                                    )
+                                )
+                            )
+                            for item in restored.paused_replacements
+                            if not restored._queued_replacement_order_plan(item).get(
+                                "reduce_only"
+                            )
+                        ),
+                        Decimal("0"),
+                    )
+                    self.assertEqual(restored_queued_qty, queued_open_qty)
+
+    async def test_stale_sub_minimum_level_replacement_dequeues_when_coverage_is_full(self):
+        client, engine = self._directional_sub_minimum_counter_engine("short")
+        engine.reduce_lots_by_level = {}
+        engine.grid_position_net_qty = 0.0
+        engine._place(
+            "Sell",
+            110,
+            0,
+            reduce_only=False,
+            qty_override=Decimal("0.20"),
+        )
+        order_count = len(client.orders)
+        engine.paused_replacements = [
+            {
+                "link_id": "g_0_S_cancelled_fragment",
+                "order_id": "cancelled-fragment",
+                "level_idx": 0,
+                "side": "Sell",
+                "price": "110",
+                "qty": "0.08",
+                "reduce_only": False,
+                "replacement_mode": "same_order",
+                "replacement_source_link_id": "g_0_S_cancelled_fragment",
+                "replacement_link_id": "g_0_S_deferred_fragment",
+            }
+        ]
+
+        engine._resume_paused_replacements()
+
+        self.assertEqual(engine.paused_replacements, [])
+        self.assertEqual(len(client.orders), order_count)
+        coverage = engine.grid_coverage_snapshot()
+        self.assertFalse(coverage["has_risk"], msg=coverage)
+        self.assertEqual(Decimal(str(coverage["coverage_qty"])), Decimal("0.2"))
+
     async def test_coalesced_counter_survives_restart_and_places_once(self):
         client = FakeClient(
             "0.28",
