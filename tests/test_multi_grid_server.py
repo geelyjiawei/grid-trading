@@ -68,6 +68,7 @@ class MultiGridServerTests(unittest.TestCase):
         self._original_api_config = main._api_config
         self._original_client = main._client
         self._original_grid_state_integrity_error = main._grid_state_integrity_error
+        self._original_grid_history_integrity_error = main._grid_history_integrity_error
         self._state_tmp = tempfile.TemporaryDirectory()
         main.GRID_STATE_FILE = str(Path(self._state_tmp.name) / "grid_state.json")
         main.GRID_HISTORY_FILE = str(Path(self._state_tmp.name) / "grid_history.json")
@@ -89,6 +90,7 @@ class MultiGridServerTests(unittest.TestCase):
         main._api_config = main._api_configs["binance"]
         main._client = fake_client
         main._grid_state_integrity_error = ""
+        main._grid_history_integrity_error = ""
         self.client = TestClient(main.app)
 
     def tearDown(self):
@@ -103,6 +105,7 @@ class MultiGridServerTests(unittest.TestCase):
         main._api_config = self._original_api_config
         main._client = self._original_client
         main._grid_state_integrity_error = self._original_grid_state_integrity_error
+        main._grid_history_integrity_error = self._original_grid_history_integrity_error
         self._state_tmp.cleanup()
         if self._original_grid_config_key is None:
             os.environ.pop("GRID_CONFIG_KEY", None)
@@ -374,6 +377,104 @@ class MultiGridServerTests(unittest.TestCase):
             {record["run_id"] for record in history["runs"]},
             {"run-first", "run-second"},
         )
+
+    def test_corrupt_history_is_preserved_without_blocking_state_persistence(self):
+        corrupt_bytes = b'{"version": 1, "runs": ['
+        Path(main.GRID_HISTORY_FILE).write_bytes(corrupt_bytes)
+        engine = Mock()
+        engine.config = {
+            "run_id": "history-corrupt-run",
+            "symbol": "HISTORYUSDT",
+            "exchange": "binance",
+        }
+        engine.running = True
+        engine.to_state.return_value = {
+            "running": True,
+            "config": dict(engine.config),
+        }
+
+        main._save_engine_state(engine)
+
+        saved_state = main._load_grid_state_file()
+        self.assertIn(
+            main._engine_key("binance", "HISTORYUSDT"),
+            saved_state["grids"],
+        )
+        self.assertEqual(Path(main.GRID_HISTORY_FILE).read_bytes(), corrupt_bytes)
+        self.assertTrue(main._grid_history_integrity_error)
+        response = self.client.get("/api/grid/history")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("preserved", response.json()["detail"])
+        risk = self.client.get("/api/risk/HISTORYUSDT?exchange=binance").json()
+        self.assertTrue(risk["has_risk"])
+        self.assertEqual(
+            risk["history_store_error"],
+            main._grid_history_integrity_error,
+        )
+
+    def test_repaired_history_resumes_updates_and_clears_integrity_error(self):
+        Path(main.GRID_HISTORY_FILE).write_text("not-json", encoding="utf-8")
+        with self.assertRaises(main.GridHistoryIntegrityError):
+            main._load_grid_history_file()
+
+        main._write_grid_history_file({"version": 1, "runs": []})
+        engine = Mock()
+        engine.config = {"run_id": "history-repaired-run"}
+        with patch.object(
+            main,
+            "_history_record_from_engine",
+            return_value={
+                "run_id": "history-repaired-run",
+                "started_at": 1,
+                "status": "running",
+            },
+        ):
+            saved = main._upsert_grid_history(engine, "running")
+
+        self.assertTrue(saved)
+        self.assertEqual(main._grid_history_integrity_error, "")
+        self.assertEqual(
+            main._load_grid_history_file()["runs"][0]["run_id"],
+            "history-repaired-run",
+        )
+
+    def test_history_write_failure_does_not_break_trading_state_save(self):
+        engine = Mock()
+        engine.config = {
+            "run_id": "history-write-failure",
+            "symbol": "WRITEFAILUSDT",
+            "exchange": "binance",
+        }
+        engine.running = True
+        engine.to_state.return_value = {
+            "running": True,
+            "config": dict(engine.config),
+        }
+
+        with (
+            patch.object(
+                main,
+                "_history_record_from_engine",
+                return_value={
+                    "run_id": "history-write-failure",
+                    "started_at": 1,
+                    "status": "running",
+                },
+            ),
+            patch.object(
+                main,
+                "_write_grid_history_file",
+                side_effect=PermissionError("history is read-only"),
+            ),
+        ):
+            main._save_engine_state(engine)
+
+        state = main._load_grid_state_file()
+        self.assertIn(
+            main._engine_key("binance", "WRITEFAILUSDT"),
+            state["grids"],
+        )
+        self.assertIn("cannot be written", main._grid_history_integrity_error)
 
     def test_state_saves_throttle_history_but_persist_status_transitions(self):
         engine = main.GridEngine(

@@ -508,11 +508,15 @@ function renderRiskSnapshot(risk) {
   const queuedReplacementCount = Number(risk.queued_replacement_count || 0);
   const acceptedShapeMismatchCount = Number(risk.accepted_shape_mismatch_count || 0);
   const stateStoreError = String(risk.state_store_error || "");
+  const historyStoreError = String(risk.history_store_error || "");
   if (risk.snapshot_error) {
     messages.push("<div>暂时无法从服务器和交易所核对挂单与持仓。当前状态不能视为安全或无风险，请稍后刷新并检查服务连接。</div>");
   }
   if (stateStoreError) {
     messages.push("<div>交易账本文件无法安全读取。系统已禁止启动新网格，避免把旧订单或旧持仓误认为空账户；请先检查并恢复服务器上的网格状态文件。</div>");
+  }
+  if (historyStoreError) {
+    messages.push("<div>开仓历史文件无法安全读取。程序已保留原文件并暂停覆盖历史记录；现有交易状态仍会正常保存，请检查并恢复服务器上的历史文件。</div>");
   }
   if (risk.initialization_in_progress) {
     messages.push("<div>策略正在完成开仓后的网格部署；在全部挂单确认前不会标记为运行就绪。</div>");

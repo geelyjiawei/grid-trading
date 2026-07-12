@@ -46,7 +46,19 @@ class GridStateIntegrityError(RuntimeError):
     """Raised when the durable trading ledger cannot be read safely."""
 
 
+class GridHistoryIntegrityError(RuntimeError):
+    """Raised when strategy history cannot be read without risking data loss."""
+
+
 _grid_state_integrity_error = ""
+_grid_history_integrity_error = ""
+
+
+def _set_grid_history_integrity_error(message: str):
+    global _grid_history_integrity_error
+    if message and _grid_history_integrity_error != message:
+        logger.error(message)
+    _grid_history_integrity_error = message
 
 BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
@@ -490,18 +502,38 @@ def _assert_grid_state_integrity():
 def _load_grid_history_file() -> dict:
     with _state_files_lock:
         if not os.path.exists(GRID_HISTORY_FILE):
+            _set_grid_history_integrity_error("")
             return {"version": 1, "runs": []}
 
         try:
             with open(GRID_HISTORY_FILE, "r", encoding="utf-8") as file:
                 history = json.load(file)
-        except (OSError, json.JSONDecodeError):
-            return {"version": 1, "runs": []}
+        except (OSError, json.JSONDecodeError) as exc:
+            message = (
+                "The grid history file cannot be read safely. The original file is being "
+                "preserved and history updates are paused until it is repaired."
+            )
+            _set_grid_history_integrity_error(message)
+            raise GridHistoryIntegrityError(message) from exc
 
         if not isinstance(history, dict):
-            return {"version": 1, "runs": []}
+            message = (
+                "The grid history file has an invalid root structure. The original file is "
+                "being preserved and history updates are paused until it is repaired."
+            )
+            _set_grid_history_integrity_error(message)
+            raise GridHistoryIntegrityError(message)
+        runs = history.get("runs")
+        if runs is not None and not isinstance(runs, list):
+            message = (
+                "The grid history file has an invalid runs structure. The original file is "
+                "being preserved and history updates are paused until it is repaired."
+            )
+            _set_grid_history_integrity_error(message)
+            raise GridHistoryIntegrityError(message)
         history.setdefault("version", 1)
         history.setdefault("runs", [])
+        _set_grid_history_integrity_error("")
         return history
 
 
@@ -518,6 +550,7 @@ def _write_grid_history_file(history: dict):
         os.replace(tmp_path, GRID_HISTORY_FILE)
         _fsync_parent_directory(GRID_HISTORY_FILE)
         _private_chmod(GRID_HISTORY_FILE)
+        _set_grid_history_integrity_error("")
 
 
 def _history_record_from_engine(engine: GridEngine, status: str = "running") -> dict:
@@ -819,10 +852,13 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
 def _upsert_grid_history(engine: GridEngine, status: str = "running"):
     run_id = str(engine.config.get("run_id", ""))
     if not run_id:
-        return
+        return False
 
     with _state_files_lock:
-        history = _load_grid_history_file()
+        try:
+            history = _load_grid_history_file()
+        except GridHistoryIntegrityError:
+            return False
         runs = history.setdefault("runs", [])
         new_record = _history_record_from_engine(engine, status)
         for index, record in enumerate(runs):
@@ -841,7 +877,16 @@ def _upsert_grid_history(engine: GridEngine, status: str = "running"):
             reverse=True,
         )[:500]
         history["updated_at"] = time.time()
-        _write_grid_history_file(history)
+        try:
+            _write_grid_history_file(history)
+        except (OSError, TypeError, ValueError) as exc:
+            _set_grid_history_integrity_error(
+                "The grid history file cannot be written safely. Trading state remains "
+                "enabled, but history updates are paused until the file path is repaired."
+            )
+            logger.debug("Grid history write failure", exc_info=exc)
+            return False
+        return True
 
 
 def _save_engine_state(engine: GridEngine):
@@ -1529,7 +1574,10 @@ def _engine_status(engine: GridEngine) -> dict:
 
 @app.get("/api/grid/history")
 def grid_history(limit: int = 100):
-    history = _load_grid_history_file()
+    try:
+        history = _load_grid_history_file()
+    except GridHistoryIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     safe_limit = max(1, min(int(limit or 100), 500))
     runs = sorted(
         history.get("runs", []),
@@ -1731,6 +1779,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "initialization_failed": initialization_failed,
         "initialization_in_progress": initialization_in_progress,
         "state_store_error": _grid_state_integrity_error,
+        "history_store_error": _grid_history_integrity_error,
         "positions": positions,
         "has_risk": bool(
             orphan_orders
@@ -1745,6 +1794,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
             or initialization_failed
             or initialization_in_progress
             or _grid_state_integrity_error
+            or _grid_history_integrity_error
         ),
     }
 
