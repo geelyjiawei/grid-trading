@@ -121,7 +121,13 @@ class FakeClient:
             self.open_limit_order_ids.add(order["orderId"])
         if kwargs.get("order_type") == "Market":
             self._apply_market_position(order)
-        return {"retCode": 0, "result": {"orderId": order["orderId"]}}
+        return {
+            "retCode": 0,
+            "result": {
+                "orderId": order["orderId"],
+                "orderLinkId": str(kwargs.get("order_link_id", "") or ""),
+            },
+        }
 
     def _apply_market_position(self, order):
         side = order.get("side")
@@ -7378,7 +7384,12 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.open_limit_order_ids, set())
 
     async def test_ambiguous_batch_identity_never_falls_back_with_new_client_ids(self):
-        for response_variant in ("reordered", "missing", "duplicate"):
+        for response_variant in (
+            "reordered",
+            "missing",
+            "duplicate",
+            "success_without_identity",
+        ):
             with self.subTest(response_variant=response_variant):
                 class AmbiguousBatchClient(BatchFakeClient):
                     def __init__(self, *args, **kwargs):
@@ -7420,8 +7431,16 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                             result_items = [rejection, success(0), success(2)]
                         elif response_variant == "missing":
                             result_items = [rejection, success(1)]
-                        else:
+                        elif response_variant == "duplicate":
                             result_items = [rejection, success(0), success(0)]
+                        else:
+                            missing_identity = {
+                                "retCode": 0,
+                                "result": {
+                                    "orderId": accepted[0]["result"]["orderId"],
+                                },
+                            }
+                            result_items = [rejection, missing_identity, success(2)]
                         return {"retCode": 0, "result": {"list": result_items}}
 
                 client = AmbiguousBatchClient(
@@ -12106,6 +12125,100 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                     engine.active_orders[link_id]["status"],
                     "SUBMIT_UNKNOWN",
                 )
+
+    async def test_success_ack_without_client_id_stays_pending_until_exchange_lookup(self):
+        class MissingIdentityAckClient(FakeClient):
+            def place_order(self, **kwargs):
+                response = super().place_order(**kwargs)
+                response["result"].pop("orderLinkId", None)
+                return response
+
+        client = MissingIdentityAckClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+
+        link_id = engine._place(
+            "Sell",
+            110,
+            0,
+            reduce_only=False,
+            qty_override=1,
+        )
+
+        self.assertTrue(engine.active_orders[link_id]["submission_pending"])
+        self.assertEqual(engine.active_orders[link_id]["status"], "SUBMIT_UNKNOWN")
+        self.assertEqual(len(client.orders), 1)
+
+        engine._reconcile_exchange_open_orders()
+
+        self.assertFalse(engine.active_orders[link_id].get("submission_pending", False))
+        self.assertEqual(engine.active_orders[link_id]["order_id"], "1")
+        self.assertEqual(len(client.orders), 1)
+
+    async def test_opening_ack_without_client_id_never_resubmits_market_or_limit(self):
+        for order_type in ("market", "limit"):
+            with self.subTest(order_type=order_type):
+                class MissingOpeningIdentityClient(FakeClient):
+                    def place_order(self, **kwargs):
+                        response = super().place_order(**kwargs)
+                        response["result"].pop("orderLinkId", None)
+                        return response
+
+                client = MissingOpeningIdentityClient(
+                    "100",
+                    tick_size="1",
+                    qty_step="1",
+                    min_qty="1",
+                )
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "long",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 1,
+                        "leverage": 2,
+                    },
+                )
+                engine._fetch_precision()
+                engine.grid_levels = [90, 110]
+                engine.current_price = 100
+                engine.current_mark_price = 100
+
+                if order_type == "market":
+                    self.assertFalse(engine._place_market_open("Buy", 1))
+                else:
+                    engine._place_limit_open("Buy", 1, 90, post_only=False)
+
+                self.assertTrue(engine.opening_order["submission_pending"])
+                self.assertEqual(engine.opening_order["status"], "SUBMIT_UNKNOWN")
+                self.assertEqual(len(client.orders), 1)
+
+                self.assertTrue(engine._resolve_opening_submission([]))
+
+                self.assertFalse(engine.opening_order.get("submission_pending", False))
+                self.assertEqual(engine.opening_order["order_id"], "1")
+                self.assertEqual(len(client.orders), 1)
 
     async def test_exchange_unknown_batch_items_do_not_fall_back_to_new_client_ids(self):
         class UnknownBatchClient(FakeClient):

@@ -2068,6 +2068,15 @@ class GridEngine:
 
     def _confirm_pending_submission(self, order: dict, snapshot: dict) -> bool:
         snapshot_link_id = str(snapshot.get("orderLinkId", "") or "")
+        expected_link_id = str(order.get("link_id", "") or "")
+        if expected_link_id and not snapshot_link_id:
+            logger.warning(
+                "Pending submission acknowledgement omitted the client order ID "
+                "symbol=%s expected=%s",
+                self.config.get("symbol"),
+                expected_link_id,
+            )
+            return False
         if snapshot_link_id and snapshot_link_id != str(order.get("link_id", "")):
             logger.error(
                 "Pending submission lookup returned a different client order ID "
@@ -4470,7 +4479,7 @@ class GridEngine:
                 return link_id
             self._mark_submission_unknown(
                 self.pending_reduce_action,
-                "successful reduce-only market response had no order ID",
+                "successful reduce-only market response did not confirm the original client order ID",
             )
             return link_id
         order_id = str(self.pending_reduce_action.get("order_id", "") or "")
@@ -4598,11 +4607,12 @@ class GridEngine:
             if self.opening_order.get("accepted_shape_mismatch"):
                 raise RuntimeError(self.trigger_message)
             self._mark_submission_unknown(
-                self.opening_order, "successful opening response had no order ID"
+                self.opening_order,
+                "successful opening response did not confirm the original client order ID",
             )
             self.trigger_message = (
-                "Initial market order acknowledgement had no order ID; checking the original "
-                "client order ID without opening another position."
+                "Initial market order acknowledgement did not confirm the original client "
+                "order ID; checking that identity without opening another position."
             )
             self._persist_state()
             return False
@@ -4744,11 +4754,12 @@ class GridEngine:
             if self.opening_order.get("accepted_shape_mismatch"):
                 raise RuntimeError(self.trigger_message)
             self._mark_submission_unknown(
-                self.opening_order, "successful opening response had no order ID"
+                self.opening_order,
+                "successful opening response did not confirm the original client order ID",
             )
             self.trigger_message = (
-                f"{order_label.title()} opening order acknowledgement had no order ID; "
-                "checking the original client order ID without opening another position."
+                f"{order_label.title()} opening order acknowledgement did not confirm the "
+                "original client order ID; checking that identity without opening another position."
             )
             self._persist_state()
             return
@@ -4947,9 +4958,13 @@ class GridEngine:
         if not self._confirm_pending_submission(pending_order, result.get("result", {})):
             if pending_order.get("accepted_shape_mismatch"):
                 return link_id
-            self._mark_submission_unknown(pending_order, "successful response had no order ID")
+            self._mark_submission_unknown(
+                pending_order,
+                "successful response did not confirm the original client order ID",
+            )
             logger.warning(
-                "Grid order acknowledgement had no order ID; preserving client order ID "
+                "Grid order acknowledgement did not confirm the original client order ID; "
+                "preserving that identity "
                 "symbol=%s link_id=%s",
                 self.config.get("symbol"),
                 link_id,
@@ -5207,6 +5222,9 @@ class GridEngine:
                         break
                     response_link = str(snapshot.get("orderLinkId", "") or "")
                     expected_link = str(chunk[index]["state"]["link_id"])
+                    if order_result.get("retCode") in (0, "0") and not response_link:
+                        identity_ambiguous = True
+                        break
                     if response_link and (
                         response_link != expected_link
                         or response_link in seen_response_links
