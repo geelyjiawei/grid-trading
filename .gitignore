@@ -1,6 +1,6 @@
-backend/api_config.json
-backend/grid_state.json
-backend/grid_history.json
+api_config.json
+grid_state.json
+grid_history.json
 backend/__pycache__/
 tests/__pycache__/
 .env
@@ -8,6 +8,8 @@ tests/__pycache__/
 .venv/
 data/
 __pycache__/
+.coverage
+htmlcov/
 *.key
 *.pem
 *.p8

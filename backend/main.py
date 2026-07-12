@@ -2,8 +2,12 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from decimal import Decimal
+from itertools import pairwise
+from threading import RLock
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,16 +28,80 @@ from auth import (
 from aster_client import AsterFuturesClient
 from binance_client import BinanceFuturesClient
 from bybit_client import BybitClient
+from exchange_snapshots import (
+    validate_balance_response,
+    validate_instrument_response,
+    validate_position_response,
+    validate_ticker_response,
+)
+from fee_rates import normalize_fee_rate
 from grid_engine import GridEngine
 from secret_store import decrypt_text, encrypt_text, storage_backend
 
 
 logger = logging.getLogger(__name__)
 _engines: dict[str, GridEngine] = {}
+_engines_lock = RLock()
+_state_files_lock = RLock()
+_config_file_lock = RLock()
+_starting_engine_keys: set[str] = set()
+_stopping_engine_keys: set[str] = set()
 SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
 DEFAULT_EXCHANGE = "bybit"
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
 DEFAULT_TAKER_FEE_RATE = float(os.getenv("GRID_TAKER_FEE_RATE", "0.0005"))
+HISTORY_STATE_UPDATE_INTERVAL_SECONDS = 1.0
+
+
+class GridStateIntegrityError(RuntimeError):
+    """Raised when the durable trading ledger cannot be read safely."""
+
+
+class GridHistoryIntegrityError(RuntimeError):
+    """Raised when strategy history cannot be read without risking data loss."""
+
+
+class ApiConfigIntegrityError(RuntimeError):
+    """Raised when encrypted exchange credentials cannot be read safely."""
+
+
+_grid_state_integrity_error = ""
+_grid_history_integrity_error = ""
+_api_config_integrity_error = ""
+_api_config_read_error = ""
+_api_config_write_error = ""
+_api_config_tracked_path = ""
+_api_config_file_was_present = False
+
+
+def _set_grid_history_integrity_error(message: str):
+    global _grid_history_integrity_error
+    if message and _grid_history_integrity_error != message:
+        logger.error(message)
+    _grid_history_integrity_error = message
+
+
+def _sync_api_config_integrity_error():
+    global _api_config_integrity_error
+    _api_config_integrity_error = " ".join(
+        error for error in (_api_config_read_error, _api_config_write_error) if error
+    )
+
+
+def _set_api_config_read_error(message: str):
+    global _api_config_read_error
+    if message and _api_config_read_error != message:
+        logger.error(message)
+    _api_config_read_error = message
+    _sync_api_config_integrity_error()
+
+
+def _set_api_config_write_error(message: str):
+    global _api_config_write_error
+    if message and _api_config_write_error != message:
+        logger.error(message)
+    _api_config_write_error = message
+    _sync_api_config_integrity_error()
 
 BASE_DIR = os.path.dirname(__file__)
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
@@ -53,6 +121,26 @@ def _private_chmod(path: str):
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _fsync_parent_directory(path: str):
+    if os.name == "nt":
+        return
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    descriptor = None
+    try:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        os.fsync(descriptor)
+    except OSError:
+        # The file itself is already durable. Some mounted filesystems do not
+        # allow directory fsync, so treat this final metadata barrier as best effort.
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _cors_allowed_origins() -> list[str]:
@@ -124,7 +212,10 @@ def _load_env_api_config() -> dict | None:
 
 
 def _load_api_configs() -> dict[str, dict]:
-    file_configs = _load_file_api_configs()
+    try:
+        file_configs = _load_file_api_configs()
+    except ApiConfigIntegrityError:
+        file_configs = {}
     env_configs = _load_env_api_configs()
     merged = dict(env_configs)
     for exchange, config in file_configs.items():
@@ -150,111 +241,255 @@ def _select_api_config(configs: dict[str, dict], exchange: str | None = None) ->
 
 
 def _load_api_config() -> dict:
-    file_configs = _load_file_api_configs()
+    try:
+        file_configs = _load_file_api_configs()
+    except ApiConfigIntegrityError:
+        file_configs = {}
     if file_configs:
         return _select_api_config(file_configs) or _default_api_config()
     env_configs = _load_env_api_configs()
     return _select_api_config(env_configs) or _default_api_config()
 
 
-def _load_file_api_configs() -> dict[str, dict]:
-    if not os.path.exists(API_CONFIG_FILE):
-        return {}
+def _track_api_config_path() -> str:
+    global _api_config_tracked_path, _api_config_file_was_present
+    path = os.path.abspath(API_CONFIG_FILE)
+    if path != _api_config_tracked_path:
+        _api_config_tracked_path = path
+        _api_config_file_was_present = os.path.exists(path)
+    return path
 
-    try:
-        with open(API_CONFIG_FILE, "r", encoding="utf-8") as file:
-            config = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {}
 
-    try:
-        if isinstance(config.get("configs"), dict):
-            loaded: dict[str, dict] = {}
-            for exchange_key, item in config.get("configs", {}).items():
-                if not isinstance(item, dict):
-                    continue
-                exchange = _normalize_exchange(item.get("exchange") or exchange_key)
-                if item.get("encrypted"):
-                    loaded[exchange] = {
-                        "api_key": decrypt_text(str(item.get("api_key", ""))),
-                        "api_secret": decrypt_text(str(item.get("api_secret", ""))),
-                        "exchange": exchange,
-                        "testnet": bool(item.get("testnet", False)),
-                        "source": "file",
-                    }
-                else:
-                    loaded[exchange] = {
-                        "api_key": str(item.get("api_key", "")),
-                        "api_secret": str(item.get("api_secret", "")),
-                        "exchange": exchange,
-                        "testnet": bool(item.get("testnet", False)),
-                        "source": "file",
-                    }
-            return loaded
+def _mark_api_config_file_present():
+    global _api_config_file_was_present
+    _api_config_file_was_present = True
 
-        if config.get("encrypted"):
-            legacy = {
-                "api_key": decrypt_text(str(config.get("api_key", ""))),
-                "api_secret": decrypt_text(str(config.get("api_secret", ""))),
-                "exchange": _normalize_exchange(config.get("exchange")),
-                "testnet": bool(config.get("testnet", False)),
-                "source": "file",
-            }
-            return {legacy["exchange"]: legacy}
 
-        # One-time migration for configs saved before encrypted storage existed.
-        migrated = {
-            "api_key": str(config.get("api_key", "")),
-            "api_secret": str(config.get("api_secret", "")),
-            "exchange": _normalize_exchange(config.get("exchange")),
-            "testnet": bool(config.get("testnet", False)),
+def _decode_api_config_entry(item: dict, exchange: str) -> tuple[dict, bool]:
+    encrypted = item.get("encrypted", False)
+    if not isinstance(encrypted, bool):
+        raise ValueError("encrypted must be a boolean")
+
+    api_key = item.get("api_key")
+    api_secret = item.get("api_secret")
+    if not isinstance(api_key, str) or not api_key:
+        raise ValueError("api_key must be a non-empty string")
+    if not isinstance(api_secret, str) or not api_secret:
+        raise ValueError("api_secret must be a non-empty string")
+
+    testnet = item.get("testnet", False)
+    if not isinstance(testnet, bool):
+        raise ValueError("testnet must be a boolean")
+
+    if encrypted:
+        api_key = decrypt_text(api_key)
+        api_secret = decrypt_text(api_secret)
+        if not api_key or not api_secret:
+            raise ValueError("decrypted credentials must not be empty")
+
+    return (
+        {
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "exchange": exchange,
+            "testnet": testnet,
             "source": "file",
-        }
-        if migrated["api_key"] or migrated["api_secret"]:
-            _save_api_config(migrated)
-        return {migrated["exchange"]: migrated}
-    except Exception:
-        return {}
+        },
+        not encrypted,
+    )
+
+
+def _load_file_api_configs() -> dict[str, dict]:
+    with _config_file_lock:
+        config_path = _track_api_config_path()
+        if not os.path.exists(config_path):
+            if _api_config_file_was_present:
+                message = (
+                    "The encrypted API configuration file disappeared after it was loaded. "
+                    "Credential updates are blocked to prevent losing other exchanges."
+                )
+                _set_api_config_read_error(message)
+                raise ApiConfigIntegrityError(message)
+            _set_api_config_read_error("")
+            return {}
+
+        try:
+            _mark_api_config_file_present()
+            with open(config_path, "r", encoding="utf-8") as file:
+                config = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            message = (
+                "The encrypted API configuration file cannot be read safely. The original "
+                "file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message) from exc
+
+        if not isinstance(config, dict):
+            message = (
+                "The encrypted API configuration file has an invalid root structure. The "
+                "original file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message)
+        if not config:
+            message = (
+                "The encrypted API configuration file is unexpectedly empty. The original "
+                "file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message)
+
+        try:
+            if "configs" in config:
+                if config.get("version") != 2:
+                    raise ValueError("unsupported multi-exchange config version")
+                raw_configs = config.get("configs")
+                if not isinstance(raw_configs, dict) or not raw_configs:
+                    raise ValueError("configs must be a non-empty object")
+                loaded: dict[str, dict] = {}
+                needs_migration = False
+                for exchange_key, item in raw_configs.items():
+                    if not isinstance(item, dict):
+                        raise ValueError("each exchange config must be an object")
+                    raw_exchange = str(exchange_key).strip().lower()
+                    if raw_exchange not in SUPPORTED_EXCHANGES:
+                        raise ValueError("unsupported exchange in API config")
+                    declared_exchange = item.get("exchange", raw_exchange)
+                    if not isinstance(declared_exchange, str):
+                        raise ValueError("exchange must be a string")
+                    if declared_exchange.strip().lower() != raw_exchange:
+                        raise ValueError("exchange key and value do not match")
+                    loaded_item, plaintext = _decode_api_config_entry(
+                        item,
+                        raw_exchange,
+                    )
+                    loaded[raw_exchange] = loaded_item
+                    needs_migration = needs_migration or plaintext
+                if needs_migration:
+                    _write_api_configs(loaded)
+                _set_api_config_read_error("")
+                return loaded
+
+            raw_exchange = str(config.get("exchange") or DEFAULT_EXCHANGE).strip().lower()
+            if raw_exchange not in SUPPORTED_EXCHANGES:
+                raise ValueError("unsupported exchange in API config")
+            legacy, plaintext = _decode_api_config_entry(config, raw_exchange)
+            if plaintext:
+                # One-time migration for configs saved before encrypted storage existed.
+                _write_api_configs({raw_exchange: legacy})
+            _set_api_config_read_error("")
+            return {raw_exchange: legacy}
+        except ApiConfigIntegrityError:
+            raise
+        except Exception as exc:
+            # Never log decrypted values. Preserve the source file so a bad key,
+            # malformed entry, or failed migration cannot erase other exchanges.
+            message = (
+                "The encrypted API configuration cannot be decrypted or migrated safely. "
+                "The original file is being preserved and credential updates are blocked."
+            )
+            _set_api_config_read_error(message)
+            raise ApiConfigIntegrityError(message) from exc
 
 
 def _write_api_configs(configs: dict[str, dict]):
-    encrypted_configs = {}
-    for exchange, config in configs.items():
-        exchange = _normalize_exchange(exchange)
-        encrypted_configs[exchange] = {
-            "encrypted": True,
-            "backend": storage_backend(),
-            "exchange": exchange,
-            "api_key": encrypt_text(str(config.get("api_key", ""))),
-            "api_secret": encrypt_text(str(config.get("api_secret", ""))),
-            "testnet": bool(config.get("testnet", False)),
-        }
+    with _config_file_lock:
+        config_path = _track_api_config_path()
+        tmp_path = ""
+        try:
+            if not isinstance(configs, dict) or not configs:
+                raise ValueError("at least one API configuration is required")
 
-    encrypted_config = {
-        "version": 2,
-        "encrypted": True,
-        "backend": storage_backend(),
-        "configs": encrypted_configs,
-    }
-    config_dir = os.path.dirname(API_CONFIG_FILE)
-    if config_dir:
-        os.makedirs(config_dir, exist_ok=True)
-    with open(API_CONFIG_FILE, "w", encoding="utf-8") as file:
-        json.dump(encrypted_config, file, ensure_ascii=False, indent=2)
-    _private_chmod(API_CONFIG_FILE)
+            backend = storage_backend()
+            encrypted_configs = {}
+            for exchange_key, config in configs.items():
+                exchange = str(exchange_key).strip().lower()
+                if exchange not in SUPPORTED_EXCHANGES:
+                    raise ValueError("unsupported exchange in API config")
+                if not isinstance(config, dict):
+                    raise ValueError("each exchange config must be an object")
+                declared_exchange = str(config.get("exchange") or exchange).strip().lower()
+                if declared_exchange != exchange:
+                    raise ValueError("exchange key and value do not match")
+                api_key = config.get("api_key")
+                api_secret = config.get("api_secret")
+                if not isinstance(api_key, str) or not api_key:
+                    raise ValueError("api_key must be a non-empty string")
+                if not isinstance(api_secret, str) or not api_secret:
+                    raise ValueError("api_secret must be a non-empty string")
+                testnet = config.get("testnet", False)
+                if not isinstance(testnet, bool):
+                    raise ValueError("testnet must be a boolean")
+                encrypted_configs[exchange] = {
+                    "encrypted": True,
+                    "backend": backend,
+                    "exchange": exchange,
+                    "api_key": encrypt_text(api_key),
+                    "api_secret": encrypt_text(api_secret),
+                    "testnet": testnet,
+                }
+
+            encrypted_config = {
+                "version": 2,
+                "encrypted": True,
+                "backend": backend,
+                "configs": encrypted_configs,
+            }
+            config_dir = os.path.dirname(config_path)
+            os.makedirs(config_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=config_dir,
+                prefix=f".{os.path.basename(config_path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as file:
+                tmp_path = file.name
+                if os.name != "nt":
+                    os.chmod(tmp_path, 0o600)
+                json.dump(encrypted_config, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(tmp_path, config_path)
+            tmp_path = ""
+            _fsync_parent_directory(config_path)
+            _private_chmod(config_path)
+        except Exception:
+            _set_api_config_write_error(
+                "The encrypted API configuration file cannot be written safely. The "
+                "previous credential file is being preserved."
+            )
+            raise
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning(
+                        "Failed to remove temporary API config file path=%s",
+                        tmp_path,
+                    )
+        _mark_api_config_file_present()
+        _set_api_config_read_error("")
+        _set_api_config_write_error("")
 
 
 def _save_api_config(config: dict):
-    exchange = _normalize_exchange(config.get("exchange"))
-    configs = _load_file_api_configs()
-    configs[exchange] = {
-        "exchange": exchange,
-        "api_key": str(config.get("api_key", "")),
-        "api_secret": str(config.get("api_secret", "")),
-        "testnet": bool(config.get("testnet", False)),
-        "source": "file",
-    }
-    _write_api_configs(configs)
+    with _config_file_lock:
+        exchange = _normalize_exchange(config.get("exchange"))
+        configs = _load_file_api_configs()
+        configs[exchange] = {
+            "exchange": exchange,
+            "api_key": str(config.get("api_key", "")),
+            "api_secret": str(config.get("api_secret", "")),
+            "testnet": bool(config.get("testnet", False)),
+            "source": "file",
+        }
+        _write_api_configs(configs)
 
 
 def _mask_api_key(api_key: str) -> str:
@@ -296,14 +531,49 @@ def _engine_symbol(engine: GridEngine | None) -> str:
     return str(engine.config.get("symbol", "")).upper().strip()
 
 
+def _engine_snapshot() -> list[GridEngine]:
+    with _engines_lock:
+        return list(_engines.values())
+
+
+def _engine_requires_cleanup(engine: GridEngine | None) -> bool:
+    if not engine:
+        return False
+    return bool(
+        engine.running
+        or engine.active_orders
+        or engine.opening_order
+        or engine.pending_reduce_action
+        or engine.paused_replacements
+        or engine.initialization_in_progress
+        or engine.risk_shutdown_pending
+        or engine.manual_stop_pending
+        or engine.stop_finalize_pending
+        or engine.initialization_failed
+        or engine.initial_grid_deployment_ledger
+        or engine._qty_reaches_accounting_step(engine._grid_position_qty())
+    )
+
+
+def _engine_has_exchange_state(engine: GridEngine) -> bool:
+    return bool(
+        engine.active_orders
+        or engine.opening_order
+        or engine.pending_reduce_action
+        or engine.initial_grid_deployment_ledger
+        or engine._qty_reaches_accounting_step(engine._grid_position_qty())
+    )
+
+
 def _get_engine(exchange: str | None, symbol: str) -> GridEngine | None:
     symbol = str(symbol or "").upper().strip()
-    if exchange:
-        return _engines.get(_engine_key(exchange, symbol))
-    matches = [engine for engine in _engines.values() if _engine_symbol(engine) == symbol]
-    if len(matches) == 1:
-        return matches[0]
-    return _engines.get(symbol)
+    with _engines_lock:
+        if exchange:
+            return _engines.get(_engine_key(exchange, symbol))
+        matches = [engine for engine in _engines.values() if _engine_symbol(engine) == symbol]
+        if len(matches) == 1:
+            return matches[0]
+        return _engines.get(symbol)
 
 
 def _configured_exchange(config: dict | None) -> bool:
@@ -357,63 +627,131 @@ _client = _clients.get(_active_exchange)
 
 
 def _load_grid_state_file() -> dict:
-    if not os.path.exists(GRID_STATE_FILE):
-        return {"version": 1, "grids": {}}
+    global _grid_state_integrity_error
+    with _state_files_lock:
+        if not os.path.exists(GRID_STATE_FILE):
+            _grid_state_integrity_error = ""
+            return {"version": 1, "grids": {}}
 
-    try:
-        with open(GRID_STATE_FILE, "r", encoding="utf-8") as file:
-            state = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "grids": {}}
+        try:
+            with open(GRID_STATE_FILE, "r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            message = (
+                "The durable grid state file cannot be read safely. New grid starts are "
+                "blocked so existing exchange work cannot be mistaken for an empty account."
+            )
+            _grid_state_integrity_error = message
+            raise GridStateIntegrityError(message) from exc
 
-    if not isinstance(state, dict):
-        return {"version": 1, "grids": {}}
-    state.setdefault("version", 1)
-    state.setdefault("grids", {})
-    return state
+        if not isinstance(state, dict):
+            message = (
+                "The durable grid state file has an invalid root structure. New grid starts "
+                "are blocked until the ledger is reviewed."
+            )
+            _grid_state_integrity_error = message
+            raise GridStateIntegrityError(message)
+        grids = state.get("grids")
+        if grids is not None and not isinstance(grids, dict):
+            message = (
+                "The durable grid state file has an invalid grids structure. New grid starts "
+                "are blocked until the ledger is reviewed."
+            )
+            _grid_state_integrity_error = message
+            raise GridStateIntegrityError(message)
+        state.setdefault("version", 1)
+        state.setdefault("grids", {})
+        _grid_state_integrity_error = ""
+        return state
 
 
 def _write_grid_state_file(state: dict):
-    state_dir = os.path.dirname(GRID_STATE_FILE)
-    if state_dir:
-        os.makedirs(state_dir, exist_ok=True)
-    tmp_path = f"{GRID_STATE_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, GRID_STATE_FILE)
-    _private_chmod(GRID_STATE_FILE)
+    global _grid_state_integrity_error
+    with _state_files_lock:
+        state_dir = os.path.dirname(GRID_STATE_FILE)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        tmp_path = f"{GRID_STATE_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(state, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, GRID_STATE_FILE)
+        _fsync_parent_directory(GRID_STATE_FILE)
+        _private_chmod(GRID_STATE_FILE)
+        _grid_state_integrity_error = ""
+
+
+def _assert_grid_state_integrity():
+    try:
+        _load_grid_state_file()
+    except GridStateIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _load_grid_history_file() -> dict:
-    if not os.path.exists(GRID_HISTORY_FILE):
-        return {"version": 1, "runs": []}
+    with _state_files_lock:
+        if not os.path.exists(GRID_HISTORY_FILE):
+            _set_grid_history_integrity_error("")
+            return {"version": 1, "runs": []}
 
-    try:
-        with open(GRID_HISTORY_FILE, "r", encoding="utf-8") as file:
-            history = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "runs": []}
+        try:
+            with open(GRID_HISTORY_FILE, "r", encoding="utf-8") as file:
+                history = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            message = (
+                "The grid history file cannot be read safely. The original file is being "
+                "preserved and history updates are paused until it is repaired."
+            )
+            _set_grid_history_integrity_error(message)
+            raise GridHistoryIntegrityError(message) from exc
 
-    if not isinstance(history, dict):
-        return {"version": 1, "runs": []}
-    history.setdefault("version", 1)
-    history.setdefault("runs", [])
-    return history
+        if not isinstance(history, dict):
+            message = (
+                "The grid history file has an invalid root structure. The original file is "
+                "being preserved and history updates are paused until it is repaired."
+            )
+            _set_grid_history_integrity_error(message)
+            raise GridHistoryIntegrityError(message)
+        runs = history.get("runs")
+        if runs is not None and not isinstance(runs, list):
+            message = (
+                "The grid history file has an invalid runs structure. The original file is "
+                "being preserved and history updates are paused until it is repaired."
+            )
+            _set_grid_history_integrity_error(message)
+            raise GridHistoryIntegrityError(message)
+        history.setdefault("version", 1)
+        history.setdefault("runs", [])
+        _set_grid_history_integrity_error("")
+        return history
 
 
 def _write_grid_history_file(history: dict):
-    history_dir = os.path.dirname(GRID_HISTORY_FILE)
-    if history_dir:
-        os.makedirs(history_dir, exist_ok=True)
-    tmp_path = f"{GRID_HISTORY_FILE}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as file:
-        json.dump(history, file, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, GRID_HISTORY_FILE)
-    _private_chmod(GRID_HISTORY_FILE)
+    with _state_files_lock:
+        history_dir = os.path.dirname(GRID_HISTORY_FILE)
+        if history_dir:
+            os.makedirs(history_dir, exist_ok=True)
+        tmp_path = f"{GRID_HISTORY_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(history, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, GRID_HISTORY_FILE)
+        _fsync_parent_directory(GRID_HISTORY_FILE)
+        _private_chmod(GRID_HISTORY_FILE)
+        _set_grid_history_integrity_error("")
 
 
 def _history_record_from_engine(engine: GridEngine, status: str = "running") -> dict:
     config = engine.config
+    realized_net_profit = float(engine.total_profit)
+    valuation_price = float(engine.current_price or 0)
+    unrealised_pnl = (
+        engine.estimate_grid_unrealized_pnl(valuation_price)
+        if valuation_price > 0
+        else 0.0
+    )
     return {
         "run_id": config.get("run_id", ""),
         "symbol": str(config.get("symbol", "")).upper(),
@@ -429,6 +767,10 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
         "grid_order_qty": config.get("grid_order_qty"),
         "initial_order_type": config.get("initial_order_type", "market"),
         "initial_order_price": config.get("initial_order_price"),
+        "maker_fee_rate": engine._maker_fee_rate(),
+        "taker_fee_rate": engine._taker_fee_rate(),
+        "fee_rate_source": config.get("fee_rate_source", "saved_config"),
+        "fee_rate_fetched_at": config.get("fee_rate_fetched_at"),
         "status": status,
         "started_at": engine.start_time or time.time(),
         "updated_at": time.time(),
@@ -439,19 +781,29 @@ def _history_record_from_engine(engine: GridEngine, status: str = "running") -> 
         "baseline_position_qty": round(engine.baseline_position_qty, 8),
         "completed_pairs": engine.completed_pairs,
         "gross_profit": round(engine.gross_profit, 4),
-        "net_profit": round(engine.total_profit, 4),
+        "net_profit": round(realized_net_profit, 4),
+        "realized_net_profit": round(realized_net_profit, 4),
+        "unrealised_pnl": round(unrealised_pnl, 4),
+        "total_equity_profit": round(realized_net_profit + unrealised_pnl, 4),
+        "valuation_price": valuation_price,
+        "grid_position_net_qty": round(engine._grid_position_net_qty(), 8),
         "total_fee": round(engine.total_fee, 4),
         "total_volume": round(engine.total_volume, 4),
-        "filled_count": len(engine.filled_orders),
+        "filled_count": engine.filled_count,
         "last_message": engine.trigger_message,
     }
 
 
 def _round_down_steps(value: float, step: str) -> int:
-    from decimal import Decimal, ROUND_DOWN
+    from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
     value_decimal = Decimal(str(value))
     step_decimal = Decimal(str(step))
+    nearest_steps = (value_decimal / step_decimal).to_integral_value(rounding=ROUND_HALF_UP)
+    nearest_value = nearest_steps * step_decimal
+    tolerance = max(abs(step_decimal) * Decimal("1e-9"), Decimal("1e-18"))
+    if abs(value_decimal - nearest_value) <= tolerance:
+        value_decimal = nearest_value
     return int((value_decimal / step_decimal).quantize(Decimal("1"), rounding=ROUND_DOWN))
 
 
@@ -477,25 +829,142 @@ def _validate_fee_rates(cfg: "GridConfig"):
             raise HTTPException(status_code=400, detail=f"{field} must be between 0 and 0.01")
 
 
+def _exchange_fee_rates(client, symbol: str) -> dict:
+    symbol = str(symbol or "").upper().strip()
+    try:
+        response = client.get_fee_rates(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch account fee rates for {symbol}: {exc}",
+        ) from exc
+    if not isinstance(response, dict):
+        raise HTTPException(status_code=502, detail="Exchange returned an invalid fee rate response")
+    if response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=response.get("retMsg", f"Failed to fetch account fee rates for {symbol}"),
+        )
+
+    result = response.get("result") or {}
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Exchange returned an invalid fee rate response")
+    result_symbol = str(result.get("symbol") or "").upper().strip()
+    if result_symbol != symbol:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Exchange fee rate response symbol mismatch for {symbol}: "
+                f"{result_symbol or 'missing symbol'}"
+            ),
+        )
+    try:
+        maker_fee_rate = normalize_fee_rate(result.get("makerFeeRate"), "maker fee rate")
+        taker_fee_rate = normalize_fee_rate(result.get("takerFeeRate"), "taker fee rate")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try:
+        fetched_at = int(result.get("fetchedAt") or int(time.time() * 1000))
+    except (TypeError, ValueError):
+        fetched_at = int(time.time() * 1000)
+    return {
+        "symbol": symbol,
+        "maker_fee_rate": maker_fee_rate,
+        "taker_fee_rate": taker_fee_rate,
+        "source": str(result.get("source") or "exchange"),
+        "fetched_at": fetched_at,
+    }
+
+
+def _ticker_snapshot_or_http(client, symbol: str) -> dict:
+    try:
+        response = client.get_ticker(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{symbol} ticker snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch current price"),
+        )
+    try:
+        return validate_ticker_response(response, symbol=symbol)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _instrument_snapshot_or_http(client, symbol: str) -> dict:
+    try:
+        response = client.get_instrument_info(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{symbol} instrument snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch instrument info"),
+        )
+    try:
+        return validate_instrument_response(response, symbol=symbol)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _balance_snapshot_or_http(client) -> dict:
+    try:
+        response = client.get_balance()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Balance snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch balance"),
+        )
+    try:
+        return validate_balance_response(response)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _with_exchange_fee_rates(client, cfg: "GridConfig", symbol: str) -> tuple["GridConfig", dict]:
+    rates = _exchange_fee_rates(client, symbol)
+    updated = cfg.model_copy(
+        update={
+            "fee_rate": float(rates["taker_fee_rate"]),
+            "maker_fee_rate": float(rates["maker_fee_rate"]),
+            "taker_fee_rate": float(rates["taker_fee_rate"]),
+        }
+    )
+    _validate_fee_rates(updated)
+    return updated, rates
+
+
 def _position_sizing_mode(cfg: "GridConfig") -> str:
     return str(cfg.position_sizing_mode or "investment").lower().strip()
 
 
 def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> dict:
-    ticker = client.get_ticker(symbol)
-    if ticker.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=ticker.get("retMsg", "Failed to fetch current price"))
-    current_price = float(ticker["result"]["list"][0]["lastPrice"])
+    ticker = _ticker_snapshot_or_http(client, symbol)
+    current_price = float(ticker["last_price"])
     initial_order_type = cfg.initial_order_type.lower().strip()
     sizing_mode = _position_sizing_mode(cfg)
 
-    info_resp = client.get_instrument_info(symbol)
-    if info_resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=info_resp.get("retMsg", "Failed to fetch instrument info"))
-    instrument = info_resp["result"]["list"][0]
-    tick_size = float(instrument["priceFilter"]["tickSize"])
-    qty_step = instrument["lotSizeFilter"]["qtyStep"]
-    min_qty = float(instrument["lotSizeFilter"]["minOrderQty"])
+    instrument = _instrument_snapshot_or_http(client, symbol)
+    tick_size_text = instrument["tick_size"]
+    tick_size = float(tick_size_text)
+    qty_step = instrument["qty_step"]
+    min_qty = float(instrument["min_qty"])
+    min_notional = float(instrument["min_notional"])
+    market_qty_step = instrument["market_qty_step"]
+    market_min_qty = float(instrument["market_min_qty"])
+    max_market_qty = float(instrument["max_market_qty"])
 
     reference_price = current_price
     if direction in {"long", "short"} and initial_order_type in {"limit", "post_only"}:
@@ -515,6 +984,18 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
             reference_price = maker_safe_price
 
     levels = _calculate_grid_levels(cfg.lower_price, cfg.upper_price, cfg.grid_count, grid_mode)
+    rounded_levels = [float(client.round_to_step(level, tick_size_text)) for level in levels]
+    if any(
+        current <= previous
+        for previous, current in pairwise(rounded_levels)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Configured grid levels collapse to duplicate exchange prices; "
+                "reduce the grid count or widen the price range"
+            ),
+        )
     if not (levels[0] < reference_price < levels[-1]):
         raise HTTPException(
             status_code=400,
@@ -568,6 +1049,125 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
 
     total_qty = _steps_to_qty(total_steps, qty_step)
 
+    initial_notional_price = reference_price
+    if direction in {"long", "short"} and initial_order_type == "market":
+        initial_notional_price = float(ticker["mark_price"])
+
+    if direction in {"long", "short"} and initial_order_type == "market":
+        market_steps = _round_down_steps(total_qty, market_qty_step)
+        market_total_qty = _steps_to_qty(market_steps, market_qty_step)
+        if market_total_qty < market_min_qty:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Initial market quantity {market_total_qty} is below the exchange minimum "
+                    f"{market_min_qty}"
+                ),
+            )
+        if max_market_qty > 0 and market_total_qty > max_market_qty:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Initial market quantity {market_total_qty} exceeds the exchange single-order "
+                    f"maximum {max_market_qty}; reduce the per-grid quantity or use a limit opening order"
+                ),
+            )
+        if sizing_mode == "fixed_grid_qty":
+            tolerance = max(float(market_qty_step) * 1e-9, 1e-18)
+            if abs(market_total_qty - total_qty) > tolerance:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The requested fixed per-grid quantity cannot be represented exactly by the "
+                        "exchange market-order quantity step; use a compatible quantity or a limit opening order"
+                    ),
+                )
+
+        # A market fill must be fully representable by subsequent limit-grid orders.
+        coverable_steps = _round_down_steps(market_total_qty, qty_step)
+        coverable_qty = _steps_to_qty(coverable_steps, qty_step)
+        tolerance = max(float(qty_step) * 1e-9, 1e-18)
+        if abs(coverable_qty - market_total_qty) > tolerance:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "The exchange market quantity step is incompatible with its limit-order step; "
+                    "use a limit opening order so every filled unit can be protected"
+                ),
+            )
+        total_steps = coverable_steps
+        total_qty = coverable_qty
+        base_steps = total_steps // active_count
+        remainder_steps = total_steps % active_count
+        per_order_qtys = [
+            _steps_to_qty(base_steps + (1 if index < remainder_steps else 0), qty_step)
+            for index in range(active_count)
+        ]
+
+    if direction in {"long", "short"} and min_notional > 0:
+        if initial_order_type != "market":
+            initial_notional_price = float(
+                client.round_to_step(initial_notional_price, tick_size_text)
+            )
+        initial_notional = Decimal(str(initial_notional_price)) * Decimal(str(total_qty))
+        minimum_notional = Decimal(str(min_notional))
+        tolerance = max(minimum_notional * Decimal("1e-12"), Decimal("1e-18"))
+        if initial_notional + tolerance < minimum_notional:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Initial opening notional {initial_notional} is below the exchange minimum "
+                    f"{minimum_notional}; increase the per-grid quantity or investment"
+                ),
+            )
+
+    limit_qty_tolerance = max(float(qty_step) * 1e-9, 1e-18)
+    if min(per_order_qtys) + limit_qty_tolerance < min_qty:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Per-grid quantity {min(per_order_qtys)} is below the exchange limit-order "
+                f"minimum {min_qty}; increase the per-grid quantity or investment"
+            ),
+        )
+
+    minimum_notional = Decimal(str(min_notional))
+    if minimum_notional > 0:
+        notional_tolerance = max(
+            minimum_notional * Decimal("1e-12"),
+            Decimal("1e-18"),
+        )
+        if direction in {"long", "short"}:
+            allocated_by_level = {
+                int(target[0]): qty
+                for target, qty in zip(active_targets, per_order_qtys, strict=True)
+            }
+            fallback_steps = total_steps // active_count
+            fallback_qty = _steps_to_qty(max(1, fallback_steps), qty_step)
+            notional_checks = [
+                (level_idx, allocated_by_level.get(level_idx, fallback_qty))
+                for level_idx in range(len(rounded_levels) - 1)
+            ]
+        else:
+            notional_checks = [
+                (int(target[0]), qty)
+                for target, qty in zip(active_targets, per_order_qtys, strict=True)
+            ]
+
+        for level_idx, qty in notional_checks:
+            open_price_index = level_idx + 1 if direction == "short" else level_idx
+            open_price = Decimal(str(rounded_levels[open_price_index]))
+            notional = open_price * Decimal(str(qty))
+            if notional + notional_tolerance < minimum_notional:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Per-grid round-trip notional {notional} at level {level_idx} is below "
+                        f"the exchange minimum {minimum_notional}; increase the per-grid "
+                        "quantity or investment"
+                    ),
+                )
+
     if grid_mode == "geometric":
         ratio = (levels[1] / levels[0]) if len(levels) > 1 else 1
         grid_profit_pct = (ratio - 1) * 100
@@ -590,6 +1190,7 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         "symbol": symbol,
         "current_price": current_price,
         "reference_price": reference_price,
+        "initial_notional_price": initial_notional_price,
         "position_sizing_mode": sizing_mode,
         "grid_order_qty": cfg.grid_order_qty,
         "grid_step": grid_step,
@@ -602,6 +1203,10 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
         "qty_per_grid_max": max(per_order_qtys),
         "qty_step": qty_step,
         "min_qty": min_qty,
+        "min_notional": min_notional,
+        "market_qty_step": market_qty_step,
+        "market_min_qty": market_min_qty,
+        "max_market_qty": max_market_qty,
         "per_grid_gross_profit": gross_profit,
         "per_grid_open_fee": open_fee,
         "per_grid_close_fee": close_fee,
@@ -615,24 +1220,98 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
 def _upsert_grid_history(engine: GridEngine, status: str = "running"):
     run_id = str(engine.config.get("run_id", ""))
     if not run_id:
-        return
+        return False
 
-    history = _load_grid_history_file()
-    runs = history.setdefault("runs", [])
-    new_record = _history_record_from_engine(engine, status)
-    for index, record in enumerate(runs):
-        if record.get("run_id") == run_id:
-            new_record["started_at"] = record.get("started_at") or new_record["started_at"]
-            if status not in {"stopped", "closed"}:
-                new_record["stopped_at"] = record.get("stopped_at")
-            runs[index] = {**record, **new_record}
-            break
-    else:
-        runs.append(new_record)
+    with _state_files_lock:
+        try:
+            history = _load_grid_history_file()
+        except GridHistoryIntegrityError:
+            return False
+        runs = history.setdefault("runs", [])
+        new_record = _history_record_from_engine(engine, status)
+        for index, record in enumerate(runs):
+            if record.get("run_id") == run_id:
+                new_record["started_at"] = record.get("started_at") or new_record["started_at"]
+                try:
+                    previous_filled_count = int(record.get("filled_count") or 0)
+                except (TypeError, ValueError):
+                    previous_filled_count = 0
+                new_record["filled_count"] = max(
+                    previous_filled_count,
+                    int(new_record.get("filled_count") or 0),
+                )
+                if status not in {"stopped", "closed"}:
+                    new_record["stopped_at"] = record.get("stopped_at")
+                runs[index] = {**record, **new_record}
+                break
+        else:
+            runs.append(new_record)
 
-    history["runs"] = sorted(runs, key=lambda item: float(item.get("started_at") or 0), reverse=True)[:500]
-    history["updated_at"] = time.time()
-    _write_grid_history_file(history)
+        history["runs"] = sorted(
+            runs,
+            key=lambda item: float(item.get("started_at") or 0),
+            reverse=True,
+        )[:500]
+        history["updated_at"] = time.time()
+        try:
+            _write_grid_history_file(history)
+        except (OSError, TypeError, ValueError) as exc:
+            _set_grid_history_integrity_error(
+                "The grid history file cannot be written safely. Trading state remains "
+                "enabled, but history updates are paused until the file path is repaired."
+            )
+            logger.debug("Grid history write failure", exc_info=exc)
+            return False
+        return True
+
+
+def _stop_finalization_ready(engine: GridEngine) -> bool:
+    return bool(
+        getattr(engine, "stop_finalize_pending", False) is True
+        and not engine.running
+        and not engine.active_orders
+        and not engine.opening_order
+        and not engine.pending_reduce_action
+        and not engine.paused_replacements
+        and not engine.manual_stop_pending
+        and not engine.risk_shutdown_pending
+        and not engine.initialization_in_progress
+        and not engine.initial_grid_deployment_pending
+        and not engine.initial_grid_deployment_ledger
+    )
+
+
+def _durable_stop_intent_present(engine: GridEngine) -> bool:
+    symbol = _engine_symbol(engine)
+    exchange = _engine_exchange(engine)
+    run_id = str(engine.config.get("run_id") or "")
+    if not symbol or not run_id:
+        return False
+
+    try:
+        state = _load_grid_state_file()
+    except Exception as exc:
+        logger.warning(
+            "Could not verify durable stop intent exchange=%s symbol=%s: %s",
+            exchange,
+            symbol,
+            exc,
+        )
+        return False
+
+    record = state.get("grids", {}).get(_engine_key(exchange, symbol))
+    if not isinstance(record, dict):
+        return False
+    config = record.get("config")
+    if not isinstance(config, dict):
+        return False
+    return bool(
+        str(config.get("run_id") or "") == run_id
+        and str(config.get("symbol") or "").upper().strip() == symbol
+        and _normalize_exchange(config.get("exchange")) == exchange
+        and record.get("manual_stop_pending") is True
+        and record.get("stop_finalize_pending") is True
+    )
 
 
 def _save_engine_state(engine: GridEngine):
@@ -642,29 +1321,138 @@ def _save_engine_state(engine: GridEngine):
 
     exchange = _engine_exchange(engine)
     engine.config["exchange"] = exchange
-    state = _load_grid_state_file()
-    state["updated_at"] = time.time()
-    state.setdefault("grids", {})[_engine_key(exchange, symbol)] = engine.to_state()
-    _write_grid_state_file(state)
-    _upsert_grid_history(engine, "running" if engine.running else "saved")
+    engine_key = _engine_key(exchange, symbol)
+    with _engines_lock:
+        registered = _engines.get(engine_key) is engine
+    stop_finalize_pending = (
+        getattr(engine, "stop_finalize_pending", False) is True
+    )
+    finalize_stop = registered and _stop_finalization_ready(engine)
+    requested_history_status = str(
+        getattr(engine, "finalize_history_status", "") or ""
+    ).lower()
+    if requested_history_status not in {"failed", "closed", "stopped"}:
+        requested_history_status = ""
+    history_status = (
+        (
+            requested_history_status
+            or (
+                "failed"
+                if getattr(engine, "initialization_failed", False) is True
+                else "stopped"
+            )
+        )
+        if finalize_stop
+        else ("running" if engine.running else "saved")
+    )
+    finalized = False
+    with _state_files_lock:
+        state = _load_grid_state_file()
+        state["updated_at"] = time.time()
+        state.setdefault("grids", {})[engine_key] = engine.to_state()
+        _write_grid_state_file(state)
+
+        now = time.monotonic()
+        previous_status = getattr(engine, "_last_history_state_status", "")
+        try:
+            previous_write = float(
+                getattr(engine, "_last_history_state_write_at", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            previous_write = 0.0
+        should_write_history = bool(
+            finalize_stop
+            or (
+                not stop_finalize_pending
+                and (
+                    history_status != previous_status
+                    or now - previous_write >= HISTORY_STATE_UPDATE_INTERVAL_SECONDS
+                )
+            )
+        )
+        history_saved = True
+        if should_write_history:
+            history_saved = bool(
+                not engine.config.get("run_id")
+                or _upsert_grid_history(engine, history_status)
+            )
+            if history_saved:
+                engine._last_history_state_status = history_status
+                engine._last_history_state_write_at = now
+
+        if finalize_stop:
+            if not history_saved:
+                finalization_label = (
+                    "failed grid start"
+                    if history_status == "failed"
+                    else (
+                        "closed grid"
+                        if history_status == "closed"
+                        else "stopped grid"
+                    )
+                )
+                engine.trigger_message = (
+                    f"The {finalization_label} history could not "
+                    "be saved. The full ledger is retained and finalization can be retried."
+                )
+                state["updated_at"] = time.time()
+                state.setdefault("grids", {})[engine_key] = engine.to_state()
+                _write_grid_state_file(state)
+            else:
+                state.setdefault("grids", {}).pop(engine_key, None)
+                state["updated_at"] = time.time()
+                _write_grid_state_file(state)
+                finalized = True
+
+    if finalized:
+        engine.stop_finalize_pending = False
+        engine.finalize_history_status = ""
+        engine.trigger_message = ""
+        with _engines_lock:
+            if _engines.get(engine_key) is engine:
+                _engines.pop(engine_key, None)
+    return finalized
 
 
 def _delete_engine_state(symbol: str, exchange: str | None = None):
-    state = _load_grid_state_file()
-    grids = state.setdefault("grids", {})
-    symbol = symbol.upper()
-    if exchange:
-        grids.pop(_engine_key(exchange, symbol), None)
-    else:
-        for key in (symbol, *[item for item in list(grids) if item.endswith(f":{symbol}")]):
-            grids.pop(key, None)
-    state["updated_at"] = time.time()
-    _write_grid_state_file(state)
+    with _state_files_lock:
+        state = _load_grid_state_file()
+        grids = state.setdefault("grids", {})
+        symbol = symbol.upper()
+        if exchange:
+            grids.pop(_engine_key(exchange, symbol), None)
+        else:
+            for key in (symbol, *[item for item in list(grids) if item.endswith(f":{symbol}")]):
+                grids.pop(key, None)
+        state["updated_at"] = time.time()
+        _write_grid_state_file(state)
 
 
 def _restore_saved_engines():
-    state = _load_grid_state_file()
+    try:
+        state = _load_grid_state_file()
+    except GridStateIntegrityError as exc:
+        logger.critical("Grid state restore blocked by ledger integrity failure: %s", exc)
+        return
     legacy_exchange = _normalize_exchange(state.get("exchange"))
+    history_fill_counts: dict[str, int] = {}
+    try:
+        for record in _load_grid_history_file().get("runs", []):
+            if not isinstance(record, dict):
+                continue
+            run_id = str(record.get("run_id") or "")
+            if not run_id:
+                continue
+            try:
+                filled_count = int(record.get("filled_count") or 0)
+            except (TypeError, ValueError):
+                continue
+            history_fill_counts[run_id] = max(
+                history_fill_counts.get(run_id, 0),
+                filled_count,
+            )
+    except (GridHistoryIntegrityError, TypeError):
+        pass
 
     for state_key, engine_state in list(state.get("grids", {}).items()):
         config = dict(engine_state.get("config") or {})
@@ -673,24 +1461,57 @@ def _restore_saved_engines():
         symbol = str(config.get("symbol") or str(state_key).split(":")[-1]).upper()
         exchange = _normalize_exchange(config.get("exchange") or engine_state.get("exchange") or legacy_exchange)
         key = _engine_key(exchange, symbol)
-        if key in _engines:
-            continue
+        with _engines_lock:
+            if key in _engines:
+                continue
         if not _configured_exchange(_api_configs.get(exchange)):
             logger.warning("Saved grid skipped because API is not configured exchange=%s symbol=%s", exchange, symbol)
             continue
 
         config["symbol"] = symbol
         config["exchange"] = exchange
+        run_id = str(config.get("run_id") or "")
+        history_fill_count = history_fill_counts.get(run_id, 0)
+        try:
+            saved_fill_count = int(engine_state.get("filled_count") or 0)
+        except (TypeError, ValueError):
+            saved_fill_count = 0
+        if history_fill_count > saved_fill_count:
+            engine_state = {**engine_state, "filled_count": history_fill_count}
         engine = GridEngine(_client_for_exchange(exchange), config, state_callback=_save_engine_state)
         try:
-            should_restart = bool(engine_state.get("running", False))
             engine.restore_state(engine_state)
             engine.config["exchange"] = exchange
-            _engines[key] = engine
-            can_restart = (
-                should_restart
-                and not engine._stopping
-                and (engine.grid_ready or engine.waiting_trigger or engine.waiting_initial_order)
+            with _engines_lock:
+                _engines[key] = engine
+            if engine.stop_finalize_pending and not _stop_finalization_ready(engine):
+                engine.manual_stop_pending = True
+            if engine.stop_finalize_pending and _stop_finalization_ready(engine):
+                try:
+                    _save_engine_state(engine)
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to finalize restored stopped grid exchange=%s symbol=%s: %s",
+                        exchange,
+                        symbol,
+                        exc,
+                    )
+                if not engine.stop_finalize_pending:
+                    continue
+            cleanup_must_resume = bool(
+                engine.manual_stop_pending
+                or engine.risk_shutdown_pending
+                or engine.pending_reduce_action
+            )
+            strategy_can_resume = bool(
+                engine.grid_ready
+                or engine.waiting_trigger
+                or engine.waiting_initial_order
+                or (engine.restore_refresh_pending and engine._restore_saved_running)
+            )
+            can_restart = not engine._stopping and (
+                cleanup_must_resume
+                or strategy_can_resume
             )
             if can_restart:
                 try:
@@ -704,23 +1525,25 @@ def _restore_saved_engines():
                 engine.running = False
                 engine._persist_state()
             if state_key != key:
-                migrated_state = _load_grid_state_file()
-                grids = migrated_state.setdefault("grids", {})
-                if key in grids and state_key in grids:
-                    grids.pop(state_key, None)
-                    migrated_state["updated_at"] = time.time()
-                    _write_grid_state_file(migrated_state)
+                with _state_files_lock:
+                    migrated_state = _load_grid_state_file()
+                    grids = migrated_state.setdefault("grids", {})
+                    if key in grids and state_key in grids:
+                        grids.pop(state_key, None)
+                        migrated_state["updated_at"] = time.time()
+                        _write_grid_state_file(migrated_state)
         except Exception as exc:
             # Keep the saved state on disk so the UI/risk checks can still show the problem.
             logger.exception("Failed to restore saved grid symbol=%s: %s", config.get("symbol"), exc)
-            _engines.pop(key, None)
+            with _engines_lock:
+                _engines.pop(key, None)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _restore_saved_engines()
     yield
-    for engine in list(_engines.values()):
+    for engine in _engine_snapshot():
         if engine.running:
             await engine.suspend()
 
@@ -864,6 +1687,11 @@ def auth_logout(response: Response):
 
 @app.get("/api/config")
 def get_config():
+    try:
+        _load_file_api_configs()
+    except ApiConfigIntegrityError:
+        # Return the in-memory status together with the durable storage warning.
+        pass
     _refresh_active_exchange()
     api_key = _api_config.get("api_key", "")
     configs = {}
@@ -886,6 +1714,7 @@ def get_config():
         "configured": bool(api_key),
         "source": _api_config.get("source", "none"),
         "storage": storage_backend(),
+        "storage_error": _api_config_integrity_error,
     }
 
 
@@ -894,8 +1723,13 @@ def set_config(cfg: ApiConfig):
     global _api_configs, _clients
 
     exchange = _normalize_exchange(cfg.exchange)
-    if any(engine.running and _engine_exchange(engine) == exchange for engine in _engines.values()):
+    if any(engine.running and _engine_exchange(engine) == exchange for engine in _engine_snapshot()):
         raise HTTPException(status_code=400, detail=f"Stop running {exchange.title()} grids before changing this API config")
+
+    try:
+        _load_file_api_configs()
+    except ApiConfigIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     candidate = _build_client(exchange, cfg.api_key.strip(), cfg.api_secret.strip(), cfg.testnet)
     try:
@@ -903,18 +1737,22 @@ def set_config(cfg: ApiConfig):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to connect to {exchange.title()}: {exc}") from exc
 
-    if balance.get("retCode") != 0:
+    try:
+        validate_balance_response(balance)
+    except RuntimeError as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"API verification failed: {balance.get('retMsg', 'unknown error')}",
-        )
+            detail=f"API verification failed: {exc}",
+        ) from exc
 
     saved_config = cfg.model_dump()
     saved_config["exchange"] = exchange
     try:
         _save_api_config(saved_config)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=f"API verified but not saved securely: {exc}") from exc
+    except ApiConfigIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=f"API verified but not saved securely: {exc}") from exc
 
     _api_configs[exchange] = {**saved_config, "source": "file"}
     _clients[exchange] = candidate
@@ -926,13 +1764,11 @@ def set_config(cfg: ApiConfig):
 def get_price(symbol: str, exchange: str | None = None):
     exchange = _normalize_exchange(exchange or _active_exchange)
     client = _client_for_exchange(exchange, require_config=False)
-    resp = client.get_ticker(symbol.upper())
-    if resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch ticker"))
-
-    data = resp["result"]["list"][0]
+    symbol = symbol.upper()
+    ticker = _ticker_snapshot_or_http(client, symbol)
+    data = ticker["raw"]
     return {
-        "symbol": data["symbol"],
+        "symbol": ticker["symbol"],
         "exchange": exchange,
         "last_price": data["lastPrice"],
         "index_price": data.get("indexPrice", ""),
@@ -945,38 +1781,33 @@ def get_price(symbol: str, exchange: str | None = None):
 @app.get("/api/balance")
 def get_balance(exchange: str | None = None):
     client = _get_client(exchange)
-    resp = client.get_balance()
-    if resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch balance"))
-
-    wallets = resp["result"]["list"][0].get("coin", [])
-    usdt = next((item for item in wallets if item.get("coin") == "USDT"), None)
-    if not usdt:
-        return {"available": "0", "equity": "0", "unrealised_pnl": "0"}
-
+    balance = _balance_snapshot_or_http(client)
     return {
-        "available": usdt.get("availableToWithdraw") or usdt.get("walletBalance", "0"),
-        "equity": usdt.get("equity", "0"),
-        "unrealised_pnl": usdt.get("unrealisedPnl", "0"),
+        "available": str(balance["available"]),
+        "equity": str(balance["equity"]),
+        "unrealised_pnl": str(balance["unrealised_pnl"]),
     }
+
+
+@app.get("/api/fees/{symbol}")
+def get_fee_rates(symbol: str, exchange: str | None = None):
+    exchange = _normalize_exchange(exchange or _active_exchange)
+    client = _get_client(exchange)
+    rates = _exchange_fee_rates(client, symbol.upper().strip())
+    return {"exchange": exchange, **rates}
 
 
 @app.get("/api/positions/{symbol}")
 def get_positions(symbol: str, exchange: str | None = None):
     client = _get_client(exchange)
-    resp = client.get_positions(symbol.upper())
-    if resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch positions"))
+    symbol = symbol.upper()
+    position_rows = _validated_position_rows_or_http(client, symbol)
 
     positions = []
-    for item in resp["result"].get("list", []):
-        try:
-            size = float(item.get("size", 0))
-        except (TypeError, ValueError):
-            size = 0
-
-        if size <= 0:
+    for position in position_rows:
+        if position["qty"] <= 0:
             continue
+        item = position["raw"]
 
         positions.append(
             {
@@ -1014,7 +1845,6 @@ def grid_preview(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="grid_order_qty must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
-    _validate_fee_rates(cfg)
     if direction not in {"long", "short", "neutral"}:
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
@@ -1026,8 +1856,12 @@ def grid_preview(cfg: GridConfig):
     if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
+    cfg, fee_rates = _with_exchange_fee_rates(client, cfg, symbol)
+
     preview = _preview_grid(client, cfg, symbol, direction, grid_mode)
     preview["exchange"] = exchange
+    preview["fee_rate_source"] = fee_rates["source"]
+    preview["fee_rate_fetched_at"] = fee_rates["fetched_at"]
     return preview
 
 
@@ -1040,10 +1874,7 @@ async def start_grid(cfg: GridConfig):
     grid_mode = cfg.grid_mode.lower().strip()
     initial_order_type = cfg.initial_order_type.lower().strip()
     sizing_mode = _position_sizing_mode(cfg)
-    existing_engine = _get_engine(exchange, symbol)
-
-    if existing_engine and existing_engine.running:
-        raise HTTPException(status_code=400, detail=f"A grid is already running for {symbol}")
+    engine_key = _engine_key(exchange, symbol)
     if cfg.upper_price <= cfg.lower_price:
         raise HTTPException(status_code=400, detail="upper_price must be greater than lower_price")
     if cfg.grid_count < 2 or cfg.grid_count > 100:
@@ -1056,7 +1887,6 @@ async def start_grid(cfg: GridConfig):
         raise HTTPException(status_code=400, detail="grid_order_qty must be greater than 0")
     if cfg.leverage < 1 or cfg.leverage > 125:
         raise HTTPException(status_code=400, detail="leverage must be between 1 and 125")
-    _validate_fee_rates(cfg)
     if direction not in {"long", "short", "neutral"}:
         raise HTTPException(status_code=400, detail="direction must be long, short, or neutral")
     if grid_mode not in {"arithmetic", "geometric"}:
@@ -1068,6 +1898,12 @@ async def start_grid(cfg: GridConfig):
     if cfg.initial_order_price is not None and cfg.initial_order_price <= 0:
         raise HTTPException(status_code=400, detail="initial_order_price must be greater than 0")
 
+    cfg, fee_rates = _with_exchange_fee_rates(client, cfg, symbol)
+
+    # Never interpret a damaged durable ledger as an empty account. This check
+    # runs before any exchange order or position-changing request.
+    _assert_grid_state_integrity()
+
     engine_config = cfg.model_dump()
     engine_config["exchange"] = exchange
     engine_config["symbol"] = symbol
@@ -1075,29 +1911,140 @@ async def start_grid(cfg: GridConfig):
     engine_config["grid_mode"] = grid_mode
     engine_config["initial_order_type"] = initial_order_type
     engine_config["position_sizing_mode"] = sizing_mode
+    engine_config["fee_rate_source"] = fee_rates["source"]
+    engine_config["fee_rate_fetched_at"] = fee_rates["fetched_at"]
     engine_config["run_id"] = f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
+    engine_config["strict_order_ownership"] = True
     engine = GridEngine(client, engine_config, state_callback=_save_engine_state)
 
-    try:
-        await engine.initialize()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with _engines_lock:
+        existing_engine = _engines.get(engine_key)
+        if (
+            engine_key in _starting_engine_keys
+            or engine_key in _stopping_engine_keys
+            or _engine_requires_cleanup(existing_engine)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"An existing grid for {symbol} still has running, initializing, or "
+                    "unconfirmed exchange work; stop and reconcile it before starting a new grid"
+                ),
+            )
+        _starting_engine_keys.add(engine_key)
 
-    _engines[_engine_key(exchange, symbol)] = engine
-    engine.start()
-    _save_engine_state(engine)
+    try:
+        open_response = client.get_open_orders(symbol)
+        if open_response.get("retCode") != 0:
+            raise RuntimeError(
+                open_response.get("retMsg", "Failed to verify existing exchange orders")
+            )
+        existing_grid_orders = [
+            item
+            for item in open_response.get("result", {}).get("list", [])
+            if _is_grid_order(item)
+        ]
+        if existing_grid_orders:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Found {len(existing_grid_orders)} existing grid-tagged exchange order(s) "
+                    f"for {symbol}; review or cancel those orders before starting a new run"
+                ),
+            )
+        await engine.initialize()
+        with _engines_lock:
+            _engines[engine_key] = engine
+        engine.start()
+        _save_engine_state(engine)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        has_exchange_state = _engine_has_exchange_state(engine)
+        if has_exchange_state:
+            engine.initialization_in_progress = False
+            engine.initial_grid_deployment_pending = False
+            engine.initialization_failed = True
+            engine.manual_stop_pending = True
+            engine.grid_ready = False
+            engine.trigger_message = (
+                f"Grid initialization failed after exchange work may have started: {exc}. "
+                "Managed orders are being cancelled; review the retained position before retrying."
+            )
+            with _engines_lock:
+                _engines[engine_key] = engine
+            try:
+                if not engine.running:
+                    engine.start()
+                else:
+                    engine._persist_state()
+            except Exception as recovery_exc:
+                logger.exception(
+                    "Failed to start initialization recovery exchange=%s symbol=%s: %s",
+                    exchange,
+                    symbol,
+                    recovery_exc,
+                )
+            raise HTTPException(status_code=409, detail=engine.trigger_message) from exc
+
+        engine.running = False
+        if engine._task:
+            engine._task.cancel()
+            engine._task = None
+        engine.initialization_in_progress = False
+        engine.initial_grid_deployment_pending = False
+        engine.initialization_failed = True
+        engine.manual_stop_pending = False
+        engine.grid_ready = False
+        engine.stop_finalize_pending = True
+        engine.finalize_history_status = "failed"
+        engine.trigger_message = (
+            f"Grid initialization failed before any exchange order or position was created: "
+            f"{exc}. Archiving the failed start without leaving a saved grid."
+        )
+        with _engines_lock:
+            _engines[engine_key] = engine
+        try:
+            finalized = _save_engine_state(engine)
+        except Exception as finalize_exc:
+            logger.exception(
+                "Failed to archive pre-exchange grid start exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                finalize_exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Grid initialization failed before exchange work, but its durable failure "
+                    "record could not be finalized. The retained ledger must be retried."
+                ),
+            ) from finalize_exc
+        if not finalized:
+            raise HTTPException(
+                status_code=503,
+                detail=engine.trigger_message or (
+                    "Grid initialization failed before exchange work, but failure history "
+                    "finalization is still pending."
+                ),
+            )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        with _engines_lock:
+            _starting_engine_keys.discard(engine_key)
+
     return {"ok": True, "message": f"{exchange.title()} {symbol} {direction} grid started"}
 
 
 @app.post("/api/grid/stop")
 async def stop_grid():
-    running = [engine for engine in _engines.values() if engine.running]
-    if not running:
+    pending = [engine for engine in _engine_snapshot() if _engine_requires_cleanup(engine)]
+    if not pending:
         raise HTTPException(status_code=400, detail="No active grid")
-    if len(running) > 1:
+    if len(pending) > 1:
         raise HTTPException(status_code=400, detail="Multiple grids are running; stop by symbol")
 
-    engine = running[0]
+    engine = pending[0]
     return await _stop_grid(_engine_symbol(engine), _engine_exchange(engine))
 
 
@@ -1108,38 +2055,199 @@ async def stop_grid_symbol(symbol: str, exchange: str | None = None):
 
 @app.post("/api/grid/stop-all")
 async def stop_all_grids():
-    running = [engine for engine in _engines.values() if engine.running]
-    if not running:
+    pending = [engine for engine in _engine_snapshot() if _engine_requires_cleanup(engine)]
+    if not pending:
         raise HTTPException(status_code=400, detail="No active grid")
 
-    for engine in running:
-        symbol = str(engine.config.get("symbol", "")).upper()
+    stopped: list[str] = []
+    failures: list[str] = []
+    for engine in pending:
+        symbol = _engine_symbol(engine)
         exchange = _engine_exchange(engine)
-        await engine.stop()
-        _upsert_grid_history(engine, "stopped")
-        if symbol:
-            _delete_engine_state(symbol, exchange)
-            _engines.pop(_engine_key(exchange, symbol), None)
+        label = f"{exchange.title()} {symbol}"
+        try:
+            await _stop_engine_once(engine)
+            stopped.append(label)
+        except HTTPException as exc:
+            reason = (
+                exc.detail
+                if isinstance(exc.detail, str)
+                else "stop request failed; state was retained"
+            )
+            failures.append(f"{label}: {reason[:300]}")
+        except Exception as exc:
+            logger.exception(
+                "Unexpected stop-all failure exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+            failures.append(f"{label}: unexpected stop failure; state was retained")
+
+    if failures:
+        stopped_text = ", ".join(stopped) if stopped else "none"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Stop-all incomplete. Stopped: {stopped_text}. "
+                f"Still pending: {'; '.join(failures)}"
+            ),
+        )
 
     return {"ok": True, "message": "All grids stopped and open orders cancelled"}
 
 
+async def _stop_and_finalize_engine(engine: GridEngine):
+    symbol = _engine_symbol(engine)
+    exchange = _engine_exchange(engine)
+    run_id_was_present = "run_id" in engine.config
+    previous_run_id = engine.config.get("run_id")
+    if not str(previous_run_id or "").strip():
+        engine.config["run_id"] = (
+            f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
+        )
+    previous_stop_finalize_pending = engine.stop_finalize_pending
+    previous_finalize_history_status = engine.finalize_history_status
+    previous_manual_stop_pending = engine.manual_stop_pending
+    previous_trigger_message = engine.trigger_message
+    engine.stop_finalize_pending = True
+    engine.finalize_history_status = "stopped"
+    engine.manual_stop_pending = True
+    engine.trigger_message = (
+        "Stop requested; exchange cleanup and durable history finalization are pending."
+    )
+    try:
+        _save_engine_state(engine)
+    except Exception as exc:
+        if _durable_stop_intent_present(engine):
+            logger.warning(
+                "Stop-intent write reported failure after the intent became durable; "
+                "continuing exchange cleanup exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+        else:
+            if run_id_was_present:
+                engine.config["run_id"] = previous_run_id
+            else:
+                engine.config.pop("run_id", None)
+            engine.stop_finalize_pending = previous_stop_finalize_pending
+            engine.finalize_history_status = previous_finalize_history_status
+            engine.manual_stop_pending = previous_manual_stop_pending
+            engine.trigger_message = previous_trigger_message
+            logger.exception(
+                "Failed to persist stop intent exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The durable stop intent could not be persisted, so no new exchange "
+                    "cleanup was started. Repair the grid state storage and retry."
+                ),
+            ) from exc
+
+    try:
+        await engine.stop()
+    except Exception as exc:
+        if _stop_finalization_ready(engine):
+            engine.trigger_message = (
+                "Exchange cleanup is complete, but durable stop finalization failed. "
+                "The retained ledger can be retried safely."
+            )
+        logger.exception(
+            "Grid stop remains pending exchange=%s symbol=%s: %s",
+            exchange,
+            symbol,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=engine.trigger_message or f"Grid stop remains incomplete: {exc}",
+        ) from exc
+    if engine.stop_finalize_pending:
+        try:
+            _save_engine_state(engine)
+        except Exception as exc:
+            engine.trigger_message = (
+                "Exchange cleanup is complete, but durable stop finalization failed. "
+                "The retained ledger can be retried safely."
+            )
+            logger.exception(
+                "Failed to finalize stopped grid exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+            raise HTTPException(status_code=503, detail=engine.trigger_message) from exc
+    if engine.stop_finalize_pending:
+        detail = engine.trigger_message or (
+            "Exchange cleanup completed, but durable stop finalization is still pending."
+        )
+        raise HTTPException(status_code=503, detail=detail)
+
+    return symbol, exchange
+
+
+async def _stop_engine_once(engine: GridEngine):
+    symbol = _engine_symbol(engine)
+    exchange = _engine_exchange(engine)
+    engine_key = _engine_key(exchange, symbol)
+    with _engines_lock:
+        current_engine = _engines.get(engine_key)
+        stale_stop_completed = bool(
+            current_engine is None
+            and getattr(engine, "_stopping", False) is True
+            and not engine.running
+            and not engine.active_orders
+            and not engine.opening_order
+            and not engine.pending_reduce_action
+            and not engine.paused_replacements
+            and not engine.manual_stop_pending
+            and not engine.risk_shutdown_pending
+            and getattr(engine, "stop_finalize_pending", False) is False
+            and not engine.initialization_in_progress
+            and not engine.initial_grid_deployment_pending
+        )
+        if stale_stop_completed:
+            return symbol, exchange
+        if current_engine is not engine:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{symbol} grid instance changed before stop; the stale stop request "
+                    "was not executed"
+                ),
+            )
+        if engine_key in _stopping_engine_keys:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{symbol} grid is already stopping",
+            )
+        _stopping_engine_keys.add(engine_key)
+    try:
+        return await _stop_and_finalize_engine(engine)
+    finally:
+        with _engines_lock:
+            _stopping_engine_keys.discard(engine_key)
+
+
 async def _stop_grid(symbol: str, exchange: str | None = None):
     engine = _get_engine(exchange, symbol)
-    if not engine or not engine.running:
+    if not _engine_requires_cleanup(engine):
         raise HTTPException(status_code=400, detail="No active grid")
 
     exchange = _engine_exchange(engine)
-    await engine.stop()
-    _upsert_grid_history(engine, "stopped")
-    _delete_engine_state(symbol, exchange)
-    _engines.pop(_engine_key(exchange, symbol), None)
+    await _stop_engine_once(engine)
     return {"ok": True, "message": f"{exchange.title()} {symbol} grid stopped and open orders cancelled"}
 
 
 @app.get("/api/grid/status")
 def grid_status():
-    statuses = [_engine_status(engine) for engine in _engines.values()]
+    statuses = [_engine_status(engine) for engine in _engine_snapshot()]
     return {
         "running": any(status["running"] for status in statuses),
         "engine_count": len(statuses),
@@ -1161,55 +2269,77 @@ def _engine_status(engine: GridEngine) -> dict:
     status = engine.get_status()
     exchange = _engine_exchange(engine)
     status["exchange"] = exchange
-    account_unrealised_pnl = 0.0
-    actual_position_net_qty = 0.0
+    account_unrealised_pnl: Decimal | None = Decimal("0")
+    actual_position_net_qty: Decimal | None = Decimal("0")
     mark_price = None
+    position_snapshot_error = ""
     try:
         client = engine.client
-        resp = client.get_positions(str(status.get("symbol", "")).upper())
-        if resp.get("retCode") == 0:
-            for item in resp.get("result", {}).get("list", []):
-                side = str(item.get("side") or "")
-                try:
-                    size = float(item.get("size", 0) or 0)
-                except (TypeError, ValueError):
-                    size = 0.0
-                if side == "Buy":
-                    actual_position_net_qty += size
-                elif side == "Sell":
-                    actual_position_net_qty -= size
-                try:
-                    account_unrealised_pnl += float(item.get("unrealisedPnl", 0) or 0)
-                except (TypeError, ValueError):
-                    pass
-                if mark_price is None:
-                    try:
-                        mark_price = float(item.get("markPrice", 0) or 0)
-                    except (TypeError, ValueError):
-                        mark_price = None
-    except Exception:
-        account_unrealised_pnl = 0.0
+        symbol = str(status.get("symbol", "")).upper()
+        rows = validate_position_response(client.get_positions(symbol), symbol=symbol)
+        for position in rows:
+            qty = position["qty"]
+            if position["side"] == "Buy":
+                actual_position_net_qty += qty
+            elif position["side"] == "Sell":
+                actual_position_net_qty -= qty
+            account_unrealised_pnl += position["unrealised_pnl"] or Decimal("0")
+            if mark_price is None and position["mark_price"] is not None:
+                mark_price = float(position["mark_price"])
+    except Exception as exc:
+        logger.warning(
+            "Position snapshot unavailable while rendering grid status exchange=%s symbol=%s msg=%s",
+            exchange,
+            status.get("symbol"),
+            exc,
+        )
+        position_snapshot_error = str(exc)
+        account_unrealised_pnl = None
+        actual_position_net_qty = None
 
     realized_net = float(status.get("total_profit", 0) or 0)
     grid_unrealised_pnl = (
         engine.estimate_grid_unrealized_pnl(mark_price)
-        if mark_price is not None and mark_price > 0
-        else 0.0
+        if not position_snapshot_error and mark_price is not None and mark_price > 0
+        else 0.0 if not position_snapshot_error else None
     )
     expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
     status["realized_gross_profit"] = status.get("gross_profit", 0)
     status["realized_net_profit"] = round(realized_net, 4)
-    status["unrealised_pnl"] = round(grid_unrealised_pnl, 4)
-    status["account_unrealised_pnl"] = round(account_unrealised_pnl, 4)
-    status["account_position_net_qty"] = round(actual_position_net_qty, 8)
-    status["position_delta_from_grid"] = round(actual_position_net_qty - expected_position_net_qty, 8)
-    status["total_equity_profit"] = round(realized_net + grid_unrealised_pnl, 4)
+    status["position_snapshot_valid"] = not position_snapshot_error
+    status["position_snapshot_error"] = position_snapshot_error
+    status["unrealised_pnl"] = (
+        round(grid_unrealised_pnl, 4) if grid_unrealised_pnl is not None else None
+    )
+    status["account_unrealised_pnl"] = (
+        round(float(account_unrealised_pnl), 4)
+        if account_unrealised_pnl is not None
+        else None
+    )
+    status["account_position_net_qty"] = (
+        round(float(actual_position_net_qty), 8)
+        if actual_position_net_qty is not None
+        else None
+    )
+    status["position_delta_from_grid"] = (
+        round(float(actual_position_net_qty) - expected_position_net_qty, 8)
+        if actual_position_net_qty is not None
+        else None
+    )
+    status["total_equity_profit"] = (
+        round(realized_net + grid_unrealised_pnl, 4)
+        if grid_unrealised_pnl is not None
+        else None
+    )
     return status
 
 
 @app.get("/api/grid/history")
 def grid_history(limit: int = 100):
-    history = _load_grid_history_file()
+    try:
+        history = _load_grid_history_file()
+    except GridHistoryIntegrityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     safe_limit = max(1, min(int(limit or 100), 500))
     runs = sorted(
         history.get("runs", []),
@@ -1221,7 +2351,26 @@ def grid_history(limit: int = 100):
 
 def _is_grid_order(item: dict) -> bool:
     link_id = str(item.get("orderLinkId") or item.get("order_link_id") or "")
-    return link_id.startswith(("g_", "open_"))
+    return link_id.startswith(("g_", "open_", "init_", "repair_"))
+
+
+def _validated_position_rows_or_http(client, symbol: str) -> list[dict]:
+    try:
+        response = client.get_positions(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{symbol} position snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch positions"),
+        )
+    try:
+        return validate_position_response(response, symbol=symbol)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 def _managed_order_ids(engine: GridEngine | None) -> set[str]:
@@ -1230,7 +2379,25 @@ def _managed_order_ids(engine: GridEngine | None) -> set[str]:
     ids = {str(order.get("order_id", "")) for order in engine.active_orders.values()}
     if engine.opening_order:
         ids.add(str(engine.opening_order.get("order_id", "")))
+    pending_reduce_action = getattr(engine, "pending_reduce_action", None)
+    if pending_reduce_action:
+        ids.add(str(pending_reduce_action.get("order_id", "")))
     return {order_id for order_id in ids if order_id}
+
+
+def _managed_order_links(engine: GridEngine | None) -> set[str]:
+    if not engine:
+        return set()
+    links = {
+        str(order.get("link_id", "") or "")
+        for order in engine.active_orders.values()
+    }
+    if engine.opening_order:
+        links.add(str(engine.opening_order.get("link_id", "") or ""))
+    pending_reduce_action = getattr(engine, "pending_reduce_action", None)
+    if pending_reduce_action:
+        links.add(str(pending_reduce_action.get("link_id", "") or ""))
+    return {link_id for link_id in links if link_id}
 
 
 def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
@@ -1239,6 +2406,7 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
     symbol = symbol.upper().strip()
     engine = _get_engine(exchange, symbol)
     managed_ids = _managed_order_ids(engine)
+    managed_links = _managed_order_links(engine)
 
     open_resp = client.get_open_orders(symbol)
     if open_resp.get("retCode") != 0:
@@ -1258,24 +2426,21 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         }
         for item in grid_orders
         if str(item.get("orderId", "")) not in managed_ids
+        and str(item.get("orderLinkId", "") or "") not in managed_links
     ]
 
-    position_resp = client.get_positions(symbol)
-    if position_resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=position_resp.get("retMsg", "Failed to fetch positions"))
+    position_rows = _validated_position_rows_or_http(client, symbol)
     positions = []
-    actual_position_net_qty = 0.0
-    for item in position_resp["result"].get("list", []):
-        try:
-            size = float(item.get("size", 0))
-        except (TypeError, ValueError):
-            size = 0
+    actual_position_net_qty_decimal = Decimal("0")
+    for position in position_rows:
+        size = position["qty"]
         if size > 0:
-            side = item.get("side", "")
+            side = position["side"]
             if side == "Buy":
-                actual_position_net_qty += size
+                actual_position_net_qty_decimal += size
             elif side == "Sell":
-                actual_position_net_qty -= size
+                actual_position_net_qty_decimal -= size
+            item = position["raw"]
             positions.append(
                 {
                     "side": side,
@@ -1285,23 +2450,102 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
                     "unrealised_pnl": item.get("unrealisedPnl", "0"),
                 }
             )
+    actual_position_net_qty = float(actual_position_net_qty_decimal)
 
-    unmanaged_position = bool(positions and (not engine or not engine.running))
+    unmanaged_position = bool(positions and not engine)
     unmanaged_delta_qty = 0.0
     expected_position_net_qty = 0.0
     reduce_protection = {}
     reduce_protection_risk = False
-    if engine and engine.running:
+    grid_coverage = {}
+    grid_coverage_risk = False
+    pending_submissions = []
+    queued_replacements = []
+    accepted_shape_mismatches = []
+    risk_shutdown_pending = False
+    manual_stop_pending = False
+    initialization_failed = False
+    initialization_in_progress = False
+    initial_grid_deployment_pending = False
+    initial_grid_deployment_submitted_count = 0
+    initial_grid_deployment_total_count = 0
+    if engine:
         status = engine.get_status()
         expected_position_net_qty = float(status.get("expected_position_net_qty", 0) or 0)
         unmanaged_delta_qty = actual_position_net_qty - expected_position_net_qty
-        unmanaged_position = abs(unmanaged_delta_qty) >= max(float(engine.min_qty), 1e-12)
+        unmanaged_position = engine._qty_reaches_accounting_step(unmanaged_delta_qty)
         reduce_protection = status.get("reduce_protection") or {}
-        # Reduce-protection diagnostics are informational only. The live grid
-        # should not surface a risk solely because the optional protection
-        # ledger is incomplete; actual risk is still captured by orphan orders
-        # and expected-vs-actual position deltas.
-        reduce_protection_risk = False
+        reduce_protection_risk = bool(reduce_protection.get("has_risk"))
+        grid_coverage = status.get("grid_coverage") or {}
+        grid_coverage_risk = bool(grid_coverage.get("has_risk"))
+        submission_records = list(engine.active_orders.values())
+        if engine.opening_order:
+            submission_records.append(engine.opening_order)
+        if engine.pending_reduce_action:
+            submission_records.append(engine.pending_reduce_action)
+        risk_shutdown_pending = bool(status.get("risk_shutdown_pending"))
+        manual_stop_pending = bool(status.get("manual_stop_pending"))
+        initialization_failed = bool(status.get("initialization_failed"))
+        initialization_in_progress = bool(status.get("initialization_in_progress"))
+        initial_grid_deployment_pending = bool(
+            status.get("initial_grid_deployment_pending")
+        )
+        initial_grid_deployment_submitted_count = int(
+            status.get("initial_grid_deployment_submitted_count", 0) or 0
+        )
+        initial_grid_deployment_total_count = int(
+            status.get("initial_grid_deployment_total_count", 0) or 0
+        )
+        pending_submissions = [
+            {
+                "order_link_id": order.get("link_id", ""),
+                "side": order.get("side", ""),
+                "price": order.get("price", "0"),
+                "qty": order.get("qty", "0"),
+                "status": order.get("status", "SUBMIT_UNKNOWN"),
+                "reduce_only": bool(order.get("reduce_only", False)),
+                "attempts": int(order.get("submission_attempts", 1) or 1),
+                "error": order.get("submission_error", ""),
+            }
+            for order in submission_records
+            if order.get("submission_pending") or order is engine.pending_reduce_action
+        ]
+        queued_replacements = [
+            {
+                "mode": item.get("replacement_mode", "counter_order"),
+                "side": item.get("side", ""),
+                "price": item.get("price", "0"),
+                "qty": item.get("qty", "0"),
+                "level_idx": item.get("level_idx"),
+                "reduce_only": bool(item.get("reduce_only", False)),
+                "attempts": int(item.get("replacement_retry_attempts", 0) or 0),
+            }
+            for item in engine.paused_replacements
+        ]
+        accepted_shape_mismatches = [
+            {
+                "order_id": order.get("order_id", ""),
+                "order_link_id": order.get("link_id", ""),
+                "reason": order.get("accepted_shape_mismatch", ""),
+                "expected_side": order.get("expected_side", order.get("side", "")),
+                "expected_price": order.get("expected_price", order.get("price", "0")),
+                "expected_qty": order.get("expected_qty", order.get("qty", "0")),
+                "expected_reduce_only": bool(
+                    order.get("expected_reduce_only", order.get("reduce_only", False))
+                ),
+                "actual_side": order.get("exchange_accepted_side", order.get("side", "")),
+                "actual_price": order.get("exchange_accepted_price", order.get("price", "0")),
+                "actual_qty": order.get("exchange_accepted_qty", order.get("qty", "0")),
+                "actual_reduce_only": bool(
+                    order.get(
+                        "exchange_accepted_reduce_only",
+                        order.get("reduce_only", False),
+                    )
+                ),
+            }
+            for order in submission_records
+            if order.get("accepted_shape_mismatch")
+        ]
     return {
         "symbol": symbol,
         "exchange": exchange,
@@ -1313,8 +2557,38 @@ def _risk_snapshot(symbol: str, exchange: str | None = None) -> dict:
         "expected_position_net_qty": round(expected_position_net_qty, 8),
         "actual_position_net_qty": round(actual_position_net_qty, 8),
         "reduce_protection": reduce_protection,
+        "grid_coverage": grid_coverage,
+        "pending_submission_count": len(pending_submissions),
+        "pending_submissions": pending_submissions,
+        "queued_replacement_count": len(queued_replacements),
+        "queued_replacements": queued_replacements,
+        "accepted_shape_mismatch_count": len(accepted_shape_mismatches),
+        "accepted_shape_mismatches": accepted_shape_mismatches,
+        "risk_shutdown_pending": risk_shutdown_pending,
+        "manual_stop_pending": manual_stop_pending,
+        "initialization_failed": initialization_failed,
+        "initialization_in_progress": initialization_in_progress,
+        "initial_grid_deployment_pending": initial_grid_deployment_pending,
+        "initial_grid_deployment_submitted_count": initial_grid_deployment_submitted_count,
+        "initial_grid_deployment_total_count": initial_grid_deployment_total_count,
+        "state_store_error": _grid_state_integrity_error,
+        "history_store_error": _grid_history_integrity_error,
         "positions": positions,
-        "has_risk": bool(orphan_orders or unmanaged_position or reduce_protection_risk),
+        "has_risk": bool(
+            orphan_orders
+            or unmanaged_position
+            or reduce_protection_risk
+            or grid_coverage_risk
+            or pending_submissions
+            or queued_replacements
+            or accepted_shape_mismatches
+            or risk_shutdown_pending
+            or manual_stop_pending
+            or initialization_failed
+            or initialization_in_progress
+            or _grid_state_integrity_error
+            or _grid_history_integrity_error
+        ),
     }
 
 
@@ -1382,6 +2656,7 @@ def recent_trades(symbol: str, limit: int = 100, exchange: str | None = None):
             "fee": item.get("fee", "0"),
             "fee_asset": item.get("feeAsset", ""),
             "fee_usdt": item.get("feeUsdt", ""),
+            "fee_usdt_source": item.get("feeUsdtSource", ""),
             "realized_pnl": item.get("realizedPnl", "0"),
             "is_maker": item.get("isMaker", False),
             "time": item.get("time", ""),
