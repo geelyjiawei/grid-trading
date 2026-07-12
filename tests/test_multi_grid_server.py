@@ -80,6 +80,7 @@ class MultiGridServerTests(unittest.TestCase):
         main.API_CONFIG_FILE = str(Path(self._state_tmp.name) / "api_config.json")
         main._engines.clear()
         main._starting_engine_keys.clear()
+        main._stopping_engine_keys.clear()
         fake_client = FakeClient("100")
         main._api_configs = {
             "binance": {
@@ -106,6 +107,7 @@ class MultiGridServerTests(unittest.TestCase):
     def tearDown(self):
         main._engines.clear()
         main._starting_engine_keys.clear()
+        main._stopping_engine_keys.clear()
         main.GRID_STATE_FILE = self._original_state_file
         main.GRID_HISTORY_FILE = self._original_history_file
         main.API_CONFIG_FILE = self._original_api_config_file
@@ -311,6 +313,52 @@ class MultiGridServerTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_same_grid_concurrent_stop_is_reserved_before_cancellation(self):
+        class BlockingCancelClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.cancel_calls = 0
+                self.cancel_lock = threading.Lock()
+
+            def cancel_order(self, symbol, order_id):
+                with self.cancel_lock:
+                    self.cancel_calls += 1
+                    first_call = self.cancel_calls == 1
+                if first_call:
+                    self.entered.set()
+                    if not self.release.wait(timeout=5):
+                        raise TimeoutError("test cancellation barrier timed out")
+                return super().cancel_order(symbol, order_id)
+
+        blocking_client = BlockingCancelClient("100")
+        main._clients["binance"] = blocking_client
+        main._client = blocking_client
+        start = TestClient(main.app).post(
+            "/api/grid/start",
+            json=self._payload("STOPRACEUSDT"),
+        )
+        self.assertEqual(start.status_code, 200, start.text)
+        expected_cancel_calls = len(blocking_client.open_limit_order_ids)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                TestClient(main.app).post,
+                "/api/grid/stop/STOPRACEUSDT?exchange=binance",
+            )
+            self.assertTrue(blocking_client.entered.wait(timeout=2))
+            second_response = TestClient(main.app).post(
+                "/api/grid/stop/STOPRACEUSDT?exchange=binance"
+            )
+            blocking_client.release.set()
+            first_response = first_future.result(timeout=10)
+
+        self.assertEqual(first_response.status_code, 200, first_response.text)
+        self.assertEqual(second_response.status_code, 409)
+        self.assertIn("already stopping", second_response.json()["detail"].lower())
+        self.assertEqual(blocking_client.cancel_calls, expected_cancel_calls)
 
     def test_concurrent_engine_state_saves_preserve_both_grids(self):
         original_load = main._load_grid_state_file
@@ -856,6 +904,370 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(stop.status_code, 200)
         self.assertEqual(stopped_history["runs"][0]["status"], "stopped")
         self.assertIsNotNone(stopped_history["runs"][0]["stopped_at"])
+
+    def test_stop_history_failure_retains_durable_engine_until_retry(self):
+        start = self.client.post("/api/grid/start", json=self._payload("BILLUSDT"))
+        self.assertEqual(start.status_code, 200)
+        key = main._engine_key("binance", "BILLUSDT")
+        original_upsert = main._upsert_grid_history
+
+        def fail_final_history(engine, status="running"):
+            if status == "stopped":
+                return False
+            return original_upsert(engine, status)
+
+        with patch.object(main, "_upsert_grid_history", side_effect=fail_final_history):
+            stop = self.client.post("/api/grid/stop/BILLUSDT?exchange=binance")
+
+        self.assertEqual(stop.status_code, 503)
+        self.assertIn("history", stop.json()["detail"].lower())
+        self.assertIn(key, main._engines)
+        retained = main._engines[key]
+        self.assertFalse(retained.running)
+        self.assertTrue(retained.stop_finalize_pending)
+        self.assertIn(key, main._load_grid_state_file()["grids"])
+        self.assertEqual(main._client.open_limit_order_ids, set())
+
+        retry = self.client.post("/api/grid/stop/BILLUSDT?exchange=binance")
+        self.assertEqual(retry.status_code, 200)
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        history = main._load_grid_history_file()["runs"]
+        record = next(item for item in history if item["symbol"] == "BILLUSDT")
+        self.assertEqual(record["status"], "stopped")
+        self.assertIsNotNone(record["stopped_at"])
+
+    def test_stop_assigns_run_id_before_archiving_legacy_engine(self):
+        config = self._payload("LEGACYUSDT")
+        config.update({"exchange": "binance", "direction": "short"})
+        engine = main.GridEngine(
+            main._client,
+            config,
+            state_callback=main._save_engine_state,
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine._place("Sell", 105, 0, reduce_only=False, qty_override=1)
+        engine.running = True
+        engine.grid_ready = True
+        engine.start_time = 1234.5
+        key = main._engine_key("binance", "LEGACYUSDT")
+        main._engines[key] = engine
+        main._save_engine_state(engine)
+        self.assertNotIn("run_id", engine.config)
+
+        stop = self.client.post(
+            "/api/grid/stop/LEGACYUSDT?exchange=binance"
+        )
+
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["symbol"] == "LEGACYUSDT"
+        )
+        self.assertTrue(record["run_id"])
+        self.assertEqual(record["status"], "stopped")
+        self.assertIsNotNone(record["stopped_at"])
+
+    def test_legacy_stop_run_id_rolls_back_when_intent_write_fails(self):
+        config = self._payload("LEGACYFAILUSDT")
+        config.update({"exchange": "binance", "direction": "short"})
+        engine = main.GridEngine(
+            main._client,
+            config,
+            state_callback=main._save_engine_state,
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        engine._place("Sell", 105, 0, reduce_only=False, qty_override=1)
+        engine.running = True
+        engine.grid_ready = True
+        key = main._engine_key("binance", "LEGACYFAILUSDT")
+        main._engines[key] = engine
+        main._save_engine_state(engine)
+        open_before = set(main._client.open_limit_order_ids)
+
+        with patch.object(
+            main,
+            "_write_grid_state_file",
+            side_effect=PermissionError("state is read-only"),
+        ):
+            stop = self.client.post(
+                "/api/grid/stop/LEGACYFAILUSDT?exchange=binance"
+            )
+
+        self.assertEqual(stop.status_code, 503)
+        self.assertNotIn("run_id", engine.config)
+        self.assertTrue(engine.running)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertFalse(engine.stop_finalize_pending)
+        self.assertEqual(main._client.open_limit_order_ids, open_before)
+
+    def test_stop_intent_survives_restart_without_resuming_grid_orders(self):
+        config = self._payload("CRASHSTOPUSDT")
+        config.update(
+            {
+                "exchange": "binance",
+                "direction": "short",
+                "run_id": "crash-stop-before-cleanup",
+            }
+        )
+        engine = main.GridEngine(
+            main._client,
+            config,
+            state_callback=main._save_engine_state,
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        link_id = engine._place(
+            "Sell",
+            105,
+            0,
+            reduce_only=False,
+            qty_override=1,
+        )
+        order_id = str(engine.active_orders[link_id]["order_id"])
+        engine.running = True
+        engine.grid_ready = True
+        engine.stop_finalize_pending = True
+        engine.manual_stop_pending = True
+        key = main._engine_key("binance", "CRASHSTOPUSDT")
+        main._engines[key] = engine
+        main._save_engine_state(engine)
+        order_count = len(main._client.orders)
+
+        main._engines.clear()
+        main._restore_saved_engines()
+
+        self.assertIn(key, main._engines)
+        restored = main._engines[key]
+        self.assertFalse(restored.running)
+        self.assertTrue(restored.manual_stop_pending)
+        self.assertTrue(restored.stop_finalize_pending)
+        self.assertIn(link_id, restored.active_orders)
+        self.assertEqual(len(main._client.orders), order_count)
+        self.assertIn(order_id, main._client.open_limit_order_ids)
+
+        stop = self.client.post(
+            "/api/grid/stop/CRASHSTOPUSDT?exchange=binance"
+        )
+
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        self.assertNotIn(order_id, main._client.open_limit_order_ids)
+        self.assertEqual(len(main._client.orders), order_count)
+
+    def test_restore_auto_finalizes_cleanup_completed_before_crash(self):
+        config = self._payload("ARCHIVEUSDT")
+        config.update(
+            {
+                "exchange": "binance",
+                "direction": "short",
+                "run_id": "crash-stop-after-cleanup",
+            }
+        )
+        engine = main.GridEngine(main._client, config)
+        engine.running = False
+        engine.grid_ready = False
+        engine.stop_finalize_pending = True
+        key = main._engine_key("binance", "ARCHIVEUSDT")
+        main._write_grid_state_file(
+            {"version": 1, "grids": {key: engine.to_state()}}
+        )
+        self.assertTrue(main._upsert_grid_history(engine, "saved"))
+
+        main._restore_saved_engines()
+
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["run_id"] == "crash-stop-after-cleanup"
+        )
+        self.assertEqual(record["status"], "stopped")
+        self.assertIsNotNone(record["stopped_at"])
+
+    def test_stop_does_not_cancel_when_durable_intent_write_fails(self):
+        start = self.client.post("/api/grid/start", json=self._payload("INTENTUSDT"))
+        self.assertEqual(start.status_code, 200)
+        key = main._engine_key("binance", "INTENTUSDT")
+        engine = main._engines[key]
+        open_before = set(main._client.open_limit_order_ids)
+
+        with patch.object(
+            main,
+            "_write_grid_state_file",
+            side_effect=PermissionError("state is read-only"),
+        ):
+            stop = self.client.post(
+                "/api/grid/stop/INTENTUSDT?exchange=binance"
+            )
+
+        self.assertEqual(stop.status_code, 503)
+        self.assertIn("persist", stop.json()["detail"].lower())
+        self.assertIn(key, main._engines)
+        self.assertIs(main._engines[key], engine)
+        self.assertTrue(engine.running)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertFalse(engine.stop_finalize_pending)
+        self.assertEqual(main._client.open_limit_order_ids, open_before)
+
+        retry = self.client.post(
+            "/api/grid/stop/INTENTUSDT?exchange=binance"
+        )
+        self.assertEqual(retry.status_code, 200, retry.text)
+
+    def test_stop_does_not_cancel_when_failed_intent_cannot_be_read_back(self):
+        start = self.client.post("/api/grid/start", json=self._payload("READBACKUSDT"))
+        self.assertEqual(start.status_code, 200)
+        key = main._engine_key("binance", "READBACKUSDT")
+        engine = main._engines[key]
+        open_before = set(main._client.open_limit_order_ids)
+        original_load = main._load_grid_state_file
+        loads = 0
+
+        def load_once_then_fail():
+            nonlocal loads
+            loads += 1
+            if loads == 1:
+                return original_load()
+            raise main.GridStateIntegrityError("state cannot be read back")
+
+        with (
+            patch.object(
+                main,
+                "_load_grid_state_file",
+                side_effect=load_once_then_fail,
+            ),
+            patch.object(
+                main,
+                "_write_grid_state_file",
+                side_effect=PermissionError("state write outcome is unknown"),
+            ),
+        ):
+            stop = self.client.post(
+                "/api/grid/stop/READBACKUSDT?exchange=binance"
+            )
+
+        self.assertEqual(stop.status_code, 503)
+        self.assertIn(key, main._engines)
+        self.assertIs(main._engines[key], engine)
+        self.assertTrue(engine.running)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertFalse(engine.stop_finalize_pending)
+        self.assertEqual(main._client.open_limit_order_ids, open_before)
+
+    def test_stop_continues_when_write_error_occurs_after_intent_is_durable(self):
+        start = self.client.post("/api/grid/start", json=self._payload("FSYNCUSDT"))
+        self.assertEqual(start.status_code, 200)
+        key = main._engine_key("binance", "FSYNCUSDT")
+        original_write = main._write_grid_state_file
+        writes = 0
+
+        def persist_then_fail_once(state):
+            nonlocal writes
+            writes += 1
+            original_write(state)
+            if writes == 1:
+                raise OSError("directory fsync failed after atomic replace")
+
+        with patch.object(
+            main,
+            "_write_grid_state_file",
+            side_effect=persist_then_fail_once,
+        ):
+            stop = self.client.post(
+                "/api/grid/stop/FSYNCUSDT?exchange=binance"
+            )
+
+        self.assertEqual(stop.status_code, 200, stop.text)
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
+        self.assertEqual(main._client.open_limit_order_ids, set())
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["symbol"] == "FSYNCUSDT"
+        )
+        self.assertEqual(record["status"], "stopped")
+
+    def test_stop_does_not_trust_durable_intent_from_another_run(self):
+        start = self.client.post("/api/grid/start", json=self._payload("STALERUNUSDT"))
+        self.assertEqual(start.status_code, 200)
+        key = main._engine_key("binance", "STALERUNUSDT")
+        engine = main._engines[key]
+        open_before = set(main._client.open_limit_order_ids)
+
+        state = main._load_grid_state_file()
+        stale = state["grids"][key]
+        stale["config"]["run_id"] = "stale-previous-run"
+        stale["manual_stop_pending"] = True
+        stale["stop_finalize_pending"] = True
+        main._write_grid_state_file(state)
+
+        with patch.object(
+            main,
+            "_write_grid_state_file",
+            side_effect=PermissionError("state is read-only"),
+        ):
+            stop = self.client.post(
+                "/api/grid/stop/STALERUNUSDT?exchange=binance"
+            )
+
+        self.assertEqual(stop.status_code, 503)
+        self.assertIn(key, main._engines)
+        self.assertIs(main._engines[key], engine)
+        self.assertTrue(engine.running)
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertFalse(engine.stop_finalize_pending)
+        self.assertEqual(main._client.open_limit_order_ids, open_before)
+
+    def test_stop_state_delete_failure_retains_finalization_for_retry(self):
+        start = self.client.post("/api/grid/start", json=self._payload("DELETEUSDT"))
+        self.assertEqual(start.status_code, 200)
+        key = main._engine_key("binance", "DELETEUSDT")
+        original_write = main._write_grid_state_file
+
+        def fail_only_final_delete(state):
+            if key not in state.get("grids", {}):
+                raise PermissionError("cannot delete final grid state")
+            return original_write(state)
+
+        with patch.object(
+            main,
+            "_write_grid_state_file",
+            side_effect=fail_only_final_delete,
+        ):
+            stop = self.client.post(
+                "/api/grid/stop/DELETEUSDT?exchange=binance"
+            )
+
+        self.assertEqual(stop.status_code, 503)
+        self.assertIn("final", stop.json()["detail"].lower())
+        self.assertIn(key, main._engines)
+        retained = main._engines[key]
+        self.assertFalse(retained.running)
+        self.assertTrue(retained.stop_finalize_pending)
+        self.assertIn(key, main._load_grid_state_file()["grids"])
+        self.assertEqual(main._client.open_limit_order_ids, set())
+        record = next(
+            item
+            for item in main._load_grid_history_file()["runs"]
+            if item["symbol"] == "DELETEUSDT"
+        )
+        self.assertEqual(record["status"], "stopped")
+
+        retry = self.client.post(
+            "/api/grid/stop/DELETEUSDT?exchange=binance"
+        )
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertNotIn(key, main._engines)
+        self.assertNotIn(key, main._load_grid_state_file()["grids"])
 
     def test_grid_status_reports_total_profit_with_unrealised_pnl(self):
         main._client.positions = [{"side": "Buy", "size": "1", "unrealisedPnl": "2.5"}]

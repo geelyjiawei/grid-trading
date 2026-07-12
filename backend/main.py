@@ -45,6 +45,7 @@ _engines_lock = RLock()
 _state_files_lock = RLock()
 _config_file_lock = RLock()
 _starting_engine_keys: set[str] = set()
+_stopping_engine_keys: set[str] = set()
 SUPPORTED_EXCHANGES = {"bybit", "binance", "aster"}
 DEFAULT_EXCHANGE = "bybit"
 DEFAULT_MAKER_FEE_RATE = float(os.getenv("GRID_MAKER_FEE_RATE", "0.0002"))
@@ -547,6 +548,7 @@ def _engine_requires_cleanup(engine: GridEngine | None) -> bool:
         or engine.initialization_in_progress
         or engine.risk_shutdown_pending
         or engine.manual_stop_pending
+        or engine.stop_finalize_pending
         or engine.initialization_failed
         or engine._qty_reaches_accounting_step(engine._grid_position_qty())
     )
@@ -1252,6 +1254,54 @@ def _upsert_grid_history(engine: GridEngine, status: str = "running"):
         return True
 
 
+def _stop_finalization_ready(engine: GridEngine) -> bool:
+    return bool(
+        getattr(engine, "stop_finalize_pending", False) is True
+        and not engine.running
+        and not engine.active_orders
+        and not engine.opening_order
+        and not engine.pending_reduce_action
+        and not engine.paused_replacements
+        and not engine.manual_stop_pending
+        and not engine.risk_shutdown_pending
+        and not engine.initialization_in_progress
+        and not engine.initial_grid_deployment_pending
+    )
+
+
+def _durable_stop_intent_present(engine: GridEngine) -> bool:
+    symbol = _engine_symbol(engine)
+    exchange = _engine_exchange(engine)
+    run_id = str(engine.config.get("run_id") or "")
+    if not symbol or not run_id:
+        return False
+
+    try:
+        state = _load_grid_state_file()
+    except Exception as exc:
+        logger.warning(
+            "Could not verify durable stop intent exchange=%s symbol=%s: %s",
+            exchange,
+            symbol,
+            exc,
+        )
+        return False
+
+    record = state.get("grids", {}).get(_engine_key(exchange, symbol))
+    if not isinstance(record, dict):
+        return False
+    config = record.get("config")
+    if not isinstance(config, dict):
+        return False
+    return bool(
+        str(config.get("run_id") or "") == run_id
+        and str(config.get("symbol") or "").upper().strip() == symbol
+        and _normalize_exchange(config.get("exchange")) == exchange
+        and record.get("manual_stop_pending") is True
+        and record.get("stop_finalize_pending") is True
+    )
+
+
 def _save_engine_state(engine: GridEngine):
     symbol = str(engine.config.get("symbol", "")).upper()
     if not symbol:
@@ -1259,11 +1309,23 @@ def _save_engine_state(engine: GridEngine):
 
     exchange = _engine_exchange(engine)
     engine.config["exchange"] = exchange
-    history_status = "running" if engine.running else "saved"
+    engine_key = _engine_key(exchange, symbol)
+    with _engines_lock:
+        registered = _engines.get(engine_key) is engine
+    stop_finalize_pending = (
+        getattr(engine, "stop_finalize_pending", False) is True
+    )
+    finalize_stop = registered and _stop_finalization_ready(engine)
+    history_status = (
+        "stopped"
+        if finalize_stop
+        else ("running" if engine.running else "saved")
+    )
+    finalized = False
     with _state_files_lock:
         state = _load_grid_state_file()
         state["updated_at"] = time.time()
-        state.setdefault("grids", {})[_engine_key(exchange, symbol)] = engine.to_state()
+        state.setdefault("grids", {})[engine_key] = engine.to_state()
         _write_grid_state_file(state)
 
         now = time.monotonic()
@@ -1274,13 +1336,48 @@ def _save_engine_state(engine: GridEngine):
             )
         except (TypeError, ValueError):
             previous_write = 0.0
-        if (
-            history_status != previous_status
-            or now - previous_write >= HISTORY_STATE_UPDATE_INTERVAL_SECONDS
-        ):
-            _upsert_grid_history(engine, history_status)
-            engine._last_history_state_status = history_status
-            engine._last_history_state_write_at = now
+        should_write_history = bool(
+            finalize_stop
+            or (
+                not stop_finalize_pending
+                and (
+                    history_status != previous_status
+                    or now - previous_write >= HISTORY_STATE_UPDATE_INTERVAL_SECONDS
+                )
+            )
+        )
+        history_saved = True
+        if should_write_history:
+            history_saved = bool(
+                not engine.config.get("run_id")
+                or _upsert_grid_history(engine, history_status)
+            )
+            if history_saved:
+                engine._last_history_state_status = history_status
+                engine._last_history_state_write_at = now
+
+        if finalize_stop:
+            if not history_saved:
+                engine.trigger_message = (
+                    "Exchange cleanup is complete, but the stopped grid history could not "
+                    "be saved. The full ledger is retained and finalization can be retried."
+                )
+                state["updated_at"] = time.time()
+                state.setdefault("grids", {})[engine_key] = engine.to_state()
+                _write_grid_state_file(state)
+            else:
+                state.setdefault("grids", {}).pop(engine_key, None)
+                state["updated_at"] = time.time()
+                _write_grid_state_file(state)
+                finalized = True
+
+    if finalized:
+        engine.stop_finalize_pending = False
+        engine.trigger_message = ""
+        with _engines_lock:
+            if _engines.get(engine_key) is engine:
+                _engines.pop(engine_key, None)
+    return finalized
 
 
 def _delete_engine_state(symbol: str, exchange: str | None = None):
@@ -1353,6 +1450,20 @@ def _restore_saved_engines():
             engine.config["exchange"] = exchange
             with _engines_lock:
                 _engines[key] = engine
+            if engine.stop_finalize_pending and not _stop_finalization_ready(engine):
+                engine.manual_stop_pending = True
+            if engine.stop_finalize_pending and _stop_finalization_ready(engine):
+                try:
+                    _save_engine_state(engine)
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to finalize restored stopped grid exchange=%s symbol=%s: %s",
+                        exchange,
+                        symbol,
+                        exc,
+                    )
+                if not engine.stop_finalize_pending:
+                    continue
             cleanup_must_resume = bool(
                 engine.manual_stop_pending
                 or engine.risk_shutdown_pending
@@ -1774,7 +1885,11 @@ async def start_grid(cfg: GridConfig):
 
     with _engines_lock:
         existing_engine = _engines.get(engine_key)
-        if engine_key in _starting_engine_keys or _engine_requires_cleanup(existing_engine):
+        if (
+            engine_key in _starting_engine_keys
+            or engine_key in _stopping_engine_keys
+            or _engine_requires_cleanup(existing_engine)
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -1882,16 +1997,117 @@ async def stop_all_grids():
         raise HTTPException(status_code=400, detail="No active grid")
 
     for engine in pending:
-        symbol = str(engine.config.get("symbol", "")).upper()
-        exchange = _engine_exchange(engine)
-        await engine.stop()
-        _upsert_grid_history(engine, "stopped")
-        if symbol:
-            _delete_engine_state(symbol, exchange)
-            with _engines_lock:
-                _engines.pop(_engine_key(exchange, symbol), None)
+        await _stop_engine_once(engine)
 
     return {"ok": True, "message": "All grids stopped and open orders cancelled"}
+
+
+async def _stop_and_finalize_engine(engine: GridEngine):
+    symbol = _engine_symbol(engine)
+    exchange = _engine_exchange(engine)
+    run_id_was_present = "run_id" in engine.config
+    previous_run_id = engine.config.get("run_id")
+    if not str(previous_run_id or "").strip():
+        engine.config["run_id"] = (
+            f"{symbol}_{int(time.time())}_{os.urandom(3).hex()}"
+        )
+    previous_stop_finalize_pending = engine.stop_finalize_pending
+    previous_manual_stop_pending = engine.manual_stop_pending
+    previous_trigger_message = engine.trigger_message
+    engine.stop_finalize_pending = True
+    engine.manual_stop_pending = True
+    engine.trigger_message = (
+        "Stop requested; exchange cleanup and durable history finalization are pending."
+    )
+    try:
+        _save_engine_state(engine)
+    except Exception as exc:
+        if _durable_stop_intent_present(engine):
+            logger.warning(
+                "Stop-intent write reported failure after the intent became durable; "
+                "continuing exchange cleanup exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+        else:
+            if run_id_was_present:
+                engine.config["run_id"] = previous_run_id
+            else:
+                engine.config.pop("run_id", None)
+            engine.stop_finalize_pending = previous_stop_finalize_pending
+            engine.manual_stop_pending = previous_manual_stop_pending
+            engine.trigger_message = previous_trigger_message
+            logger.exception(
+                "Failed to persist stop intent exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The durable stop intent could not be persisted, so no new exchange "
+                    "cleanup was started. Repair the grid state storage and retry."
+                ),
+            ) from exc
+
+    try:
+        await engine.stop()
+    except Exception as exc:
+        if _stop_finalization_ready(engine):
+            engine.trigger_message = (
+                "Exchange cleanup is complete, but durable stop finalization failed. "
+                "The retained ledger can be retried safely."
+            )
+        logger.exception(
+            "Grid stop remains pending exchange=%s symbol=%s: %s",
+            exchange,
+            symbol,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=engine.trigger_message or f"Grid stop remains incomplete: {exc}",
+        ) from exc
+    if engine.stop_finalize_pending:
+        try:
+            _save_engine_state(engine)
+        except Exception as exc:
+            engine.trigger_message = (
+                "Exchange cleanup is complete, but durable stop finalization failed. "
+                "The retained ledger can be retried safely."
+            )
+            logger.exception(
+                "Failed to finalize stopped grid exchange=%s symbol=%s: %s",
+                exchange,
+                symbol,
+                exc,
+            )
+            raise HTTPException(status_code=503, detail=engine.trigger_message) from exc
+    if engine.stop_finalize_pending:
+        detail = engine.trigger_message or (
+            "Exchange cleanup completed, but durable stop finalization is still pending."
+        )
+        raise HTTPException(status_code=503, detail=detail)
+
+    return symbol, exchange
+
+
+async def _stop_engine_once(engine: GridEngine):
+    engine_key = _engine_key(_engine_exchange(engine), _engine_symbol(engine))
+    with _engines_lock:
+        if engine_key in _stopping_engine_keys:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{_engine_symbol(engine)} grid is already stopping",
+            )
+        _stopping_engine_keys.add(engine_key)
+    try:
+        return await _stop_and_finalize_engine(engine)
+    finally:
+        with _engines_lock:
+            _stopping_engine_keys.discard(engine_key)
 
 
 async def _stop_grid(symbol: str, exchange: str | None = None):
@@ -1900,11 +2116,7 @@ async def _stop_grid(symbol: str, exchange: str | None = None):
         raise HTTPException(status_code=400, detail="No active grid")
 
     exchange = _engine_exchange(engine)
-    await engine.stop()
-    _upsert_grid_history(engine, "stopped")
-    _delete_engine_state(symbol, exchange)
-    with _engines_lock:
-        _engines.pop(_engine_key(exchange, symbol), None)
+    await _stop_engine_once(engine)
     return {"ok": True, "message": f"{exchange.title()} {symbol} grid stopped and open orders cancelled"}
 
 

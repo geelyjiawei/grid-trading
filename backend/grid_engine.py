@@ -99,6 +99,7 @@ class GridEngine:
         self.pending_reduce_action: dict | None = None
         self.risk_shutdown_pending = False
         self.manual_stop_pending = False
+        self.stop_finalize_pending = False
         self.initialization_in_progress = False
         self.initialization_failed = False
         self.initial_grid_deployment_pending = False
@@ -179,6 +180,7 @@ class GridEngine:
             "pending_reduce_action": self.pending_reduce_action,
             "risk_shutdown_pending": self.risk_shutdown_pending,
             "manual_stop_pending": self.manual_stop_pending,
+            "stop_finalize_pending": self.stop_finalize_pending,
             "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
             "initial_grid_deployment_pending": self.initial_grid_deployment_pending,
@@ -258,6 +260,7 @@ class GridEngine:
         self.pending_reduce_action = state.get("pending_reduce_action")
         self.risk_shutdown_pending = bool(state.get("risk_shutdown_pending", False))
         self.manual_stop_pending = bool(state.get("manual_stop_pending", False))
+        self.stop_finalize_pending = bool(state.get("stop_finalize_pending", False))
         self.initialization_in_progress = bool(
             state.get("initialization_in_progress", False)
         )
@@ -1016,6 +1019,7 @@ class GridEngine:
             "pending_reduce_action": self.pending_reduce_action,
             "risk_shutdown_pending": self.risk_shutdown_pending,
             "manual_stop_pending": self.manual_stop_pending,
+            "stop_finalize_pending": self.stop_finalize_pending,
             "initialization_in_progress": self.initialization_in_progress,
             "initialization_failed": self.initialization_failed,
             "initial_grid_deployment_pending": self.initial_grid_deployment_pending,
