@@ -8489,6 +8489,169 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(engine.filled_orders, [])
                 self.assertEqual(engine.grid_position_net_qty, 0.0)
 
+    async def test_invalid_open_order_snapshot_is_rejected_atomically(self):
+        for response_variant in (
+            "duplicate_order_id",
+            "duplicate_link_id",
+            "known_order_wrong_link",
+            "known_link_wrong_order",
+            "missing_order_id",
+            "missing_link_id",
+            "invalid_row",
+            "invalid_list",
+        ):
+            with self.subTest(response_variant=response_variant):
+                client = FakeClient(
+                    "100",
+                    tick_size="1",
+                    qty_step="1",
+                    min_qty="1",
+                )
+                engine = GridEngine(
+                    client,
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "short",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 1,
+                        "leverage": 2,
+                    },
+                )
+                engine._fetch_precision()
+                engine.grid_levels = [90, 110]
+                link_id = engine._place(
+                    "Sell",
+                    110,
+                    0,
+                    reduce_only=False,
+                    qty_override=1,
+                )
+                snapshot = client.get_open_orders("TESTUSDT")["result"]["list"][0]
+                bad_snapshot = dict(snapshot)
+
+                if response_variant == "duplicate_order_id":
+                    bad_snapshot["orderLinkId"] = "g_9_S_duplicate"
+                    open_orders = [snapshot, bad_snapshot]
+                elif response_variant == "duplicate_link_id":
+                    bad_snapshot["orderId"] = "another-order-id"
+                    open_orders = [snapshot, bad_snapshot]
+                elif response_variant == "known_order_wrong_link":
+                    bad_snapshot["orderLinkId"] = "g_9_S_wrong"
+                    open_orders = [bad_snapshot]
+                elif response_variant == "known_link_wrong_order":
+                    bad_snapshot["orderId"] = "another-order-id"
+                    open_orders = [bad_snapshot]
+                elif response_variant == "missing_order_id":
+                    bad_snapshot.pop("orderId")
+                    open_orders = [bad_snapshot]
+                elif response_variant == "missing_link_id":
+                    bad_snapshot.pop("orderLinkId")
+                    open_orders = [bad_snapshot]
+                elif response_variant == "invalid_row":
+                    open_orders = [None]
+                else:
+                    open_orders = "not-a-list"
+
+                with self.assertRaisesRegex(RuntimeError, "open-order snapshot"):
+                    engine._reconcile_exchange_open_orders(open_orders)
+
+                self.assertEqual(len(client.orders), 1)
+                self.assertEqual(set(engine.active_orders), {link_id})
+                self.assertFalse(engine.manual_stop_pending)
+                self.assertEqual(engine.ownership_conflicts, [])
+                self.assertEqual(engine.paused_replacements, [])
+                self.assertEqual(engine.filled_orders, [])
+                self.assertEqual(engine.grid_position_net_qty, 0.0)
+
+    async def test_manual_open_order_without_client_id_does_not_invalidate_snapshot(self):
+        client = FakeClient(
+            "100",
+            tick_size="1",
+            qty_step="1",
+            min_qty="1",
+        )
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+        link_id = engine._place(
+            "Sell",
+            110,
+            0,
+            reduce_only=False,
+            qty_override=1,
+        )
+        managed = client.get_open_orders("TESTUSDT")["result"]["list"][0]
+        manual = {
+            "orderId": "manual-order-id",
+            "orderLinkId": "",
+            "side": "Buy",
+            "price": "90",
+            "qty": "1",
+            "orderStatus": "NEW",
+            "reduceOnly": False,
+        }
+
+        engine._reconcile_exchange_open_orders([managed, manual])
+
+        self.assertEqual(set(engine.active_orders), {link_id})
+        self.assertFalse(engine.manual_stop_pending)
+        self.assertEqual(engine.ownership_conflicts, [])
+
+    async def test_fetch_open_orders_rejects_malformed_success_response(self):
+        for response_variant in (
+            "invalid_response",
+            "missing_result",
+            "invalid_result",
+            "missing_list",
+        ):
+            with self.subTest(response_variant=response_variant):
+                class MalformedOpenOrdersClient(FakeClient):
+                    def get_open_orders(self, symbol):
+                        if response_variant == "invalid_response":
+                            return []
+                        if response_variant == "missing_result":
+                            return {"retCode": 0}
+                        if response_variant == "invalid_result":
+                            return {"retCode": 0, "result": []}
+                        return {"retCode": 0, "result": {}}
+
+                engine = GridEngine(
+                    MalformedOpenOrdersClient("100"),
+                    {
+                        "symbol": "TESTUSDT",
+                        "direction": "neutral",
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 100,
+                        "qty_per_grid": 1,
+                        "leverage": 2,
+                    },
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "open-order snapshot"):
+                    engine._fetch_open_orders()
+
     async def test_cancelled_order_snapshot_replaces_only_unfilled_remainder(self):
         class CancelledPartialSnapshotClient(FakeClient):
             trades_ready = False

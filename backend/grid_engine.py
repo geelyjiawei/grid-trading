@@ -1913,11 +1913,92 @@ class GridEngine:
     def _is_grid_managed_link(link_id: str) -> bool:
         return str(link_id or "").startswith(("g_", "open_", "init_", "repair_"))
 
+    def _validate_open_order_snapshot(self, open_orders: Any) -> list[dict]:
+        if not isinstance(open_orders, list):
+            raise RuntimeError("Invalid open-order snapshot: expected a list")
+
+        managed_orders = [
+            order for order in self.active_orders.values() if isinstance(order, dict)
+        ]
+        if isinstance(self.opening_order, dict):
+            managed_orders.append(self.opening_order)
+
+        managed_by_order_id: dict[str, dict] = {}
+        managed_by_link_id: dict[str, dict] = {}
+        for order in managed_orders:
+            order_id = str(order.get("order_id", "") or "")
+            link_id = str(order.get("link_id", "") or "")
+            if order_id:
+                existing = managed_by_order_id.get(order_id)
+                if existing is not None and existing is not order:
+                    raise RuntimeError(
+                        "Invalid open-order snapshot context: duplicate managed order ID"
+                    )
+                managed_by_order_id[order_id] = order
+            if link_id:
+                existing = managed_by_link_id.get(link_id)
+                if existing is not None and existing is not order:
+                    raise RuntimeError(
+                        "Invalid open-order snapshot context: duplicate managed client order ID"
+                    )
+                managed_by_link_id[link_id] = order
+
+        validated: list[dict] = []
+        seen_order_ids: set[str] = set()
+        seen_link_ids: set[str] = set()
+        for index, item in enumerate(open_orders):
+            if not isinstance(item, dict):
+                raise RuntimeError(
+                    f"Invalid open-order snapshot: row {index} is not an object"
+                )
+            order_id = str(item.get("orderId", "") or "")
+            link_id = str(item.get("orderLinkId", "") or "")
+            if not order_id:
+                raise RuntimeError(
+                    f"Invalid open-order snapshot: row {index} has no order ID"
+                )
+            if order_id in seen_order_ids:
+                raise RuntimeError(
+                    "Invalid open-order snapshot: duplicate exchange order ID"
+                )
+            if link_id and link_id in seen_link_ids:
+                raise RuntimeError(
+                    "Invalid open-order snapshot: duplicate client order ID"
+                )
+
+            managed_by_id = managed_by_order_id.get(order_id)
+            if managed_by_id is not None:
+                expected_link = str(managed_by_id.get("link_id", "") or "")
+                if expected_link != link_id:
+                    raise RuntimeError(
+                        "Invalid open-order snapshot: managed order ID maps to a different "
+                        "client order ID"
+                    )
+            managed_by_link = managed_by_link_id.get(link_id) if link_id else None
+            if managed_by_link is not None:
+                expected_order_id = str(managed_by_link.get("order_id", "") or "")
+                if expected_order_id and expected_order_id != order_id:
+                    raise RuntimeError(
+                        "Invalid open-order snapshot: managed client order ID maps to a "
+                        "different exchange order ID"
+                    )
+
+            seen_order_ids.add(order_id)
+            if link_id:
+                seen_link_ids.add(link_id)
+            validated.append(item)
+        return validated
+
     def _fetch_open_orders(self) -> list[dict]:
         resp = self.client.get_open_orders(self.config["symbol"])
+        if not isinstance(resp, dict):
+            raise RuntimeError("Invalid open-order snapshot response: expected an object")
         if resp.get("retCode") != 0:
             raise RuntimeError(resp.get("retMsg", "Failed to fetch open orders"))
-        return list(resp.get("result", {}).get("list", []))
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("Invalid open-order snapshot response: missing result object")
+        return self._validate_open_order_snapshot(result.get("list"))
 
     def _pending_limit_order_state(
         self,
@@ -2762,7 +2843,11 @@ class GridEngine:
         return self._record_execution_delta(order, stats)
 
     def _reconcile_exchange_open_orders(self, open_orders: list[dict] | None = None) -> bool:
-        open_orders = self._fetch_open_orders() if open_orders is None else open_orders
+        open_orders = (
+            self._fetch_open_orders()
+            if open_orders is None
+            else self._validate_open_order_snapshot(open_orders)
+        )
         changed = self._adopt_exchange_grid_orders(open_orders)
         changed = self._resolve_pending_submissions(open_orders) or changed
         open_order_ids = {str(item.get("orderId", "")) for item in open_orders}
@@ -6506,11 +6591,7 @@ class GridEngine:
         if not self.opening_order:
             return
 
-        resp = self.client.get_open_orders(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to fetch open orders"))
-
-        open_orders = list(resp["result"].get("list", []))
+        open_orders = self._fetch_open_orders()
         if self.opening_order.get("submission_pending"):
             if not self._resolve_opening_submission(open_orders):
                 return
