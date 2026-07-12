@@ -8301,6 +8301,205 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertAlmostEqual(engine.grid_position_net_qty, -0.6)
 
+    async def test_lagging_cancelled_sub_minimum_remainder_survives_restart(self):
+        class LaggingSubMinimumCancelledClient(FakeClient):
+            confirmed_trade_qty = Decimal("0.10")
+
+            def __init__(self, *args, snapshot_style, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.snapshot_style = snapshot_style
+
+            def get_order(self, symbol, order_id):
+                response = super().get_order(symbol, order_id)
+                executed_qty = Decimal("0.12")
+                response["result"].update(
+                    {
+                        "orderStatus": (
+                            "Cancelled" if self.snapshot_style == "bybit" else "CANCELED"
+                        ),
+                        "avgPrice": response["result"].get("price", "0"),
+                    }
+                )
+                quote_value = Decimal(str(response["result"]["avgPrice"])) * executed_qty
+                if self.snapshot_style == "bybit":
+                    response["result"].update(
+                        {
+                            "cumExecQty": str(executed_qty),
+                            "cumExecValue": str(quote_value),
+                        }
+                    )
+                else:
+                    response["result"].update(
+                        {
+                            "executedQty": str(executed_qty),
+                            "cumQuote": str(quote_value),
+                        }
+                    )
+                return response
+
+            def get_order_trades(self, symbol, order_id):
+                order = next(
+                    item for item in self.orders if str(item["orderId"]) == str(order_id)
+                )
+                qty = self.confirmed_trade_qty
+                price = Decimal(str(order["price"]))
+                volume = price * qty
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "price": str(price),
+                                "qty": str(qty),
+                                "volume": str(volume),
+                                "feeUsdt": str(volume * Decimal("0.0002")),
+                                "feeAsset": "USDT",
+                                "isMaker": True,
+                            }
+                        ]
+                    },
+                }
+
+        for direction in ("short", "long"):
+            for snapshot_style in ("binance_aster", "bybit"):
+                with self.subTest(direction=direction, snapshot_style=snapshot_style):
+                    client = LaggingSubMinimumCancelledClient(
+                        "100",
+                        tick_size="1",
+                        qty_step="0.01",
+                        min_qty="0.10",
+                        snapshot_style=snapshot_style,
+                    )
+                    config = {
+                        "symbol": "TESTUSDT",
+                        "direction": direction,
+                        "grid_mode": "arithmetic",
+                        "upper_price": 110,
+                        "lower_price": 90,
+                        "grid_count": 1,
+                        "total_investment": 0,
+                        "position_sizing_mode": "fixed_grid_qty",
+                        "grid_order_qty": 0.20,
+                        "qty_per_grid": 0.20,
+                        "leverage": 2,
+                        "grid_order_post_only": False,
+                        "maker_fee_rate": 0.0002,
+                        "taker_fee_rate": 0.0005,
+                    }
+                    engine = GridEngine(client, config)
+                    engine._fetch_precision()
+                    engine.grid_levels = [90, 110]
+                    engine.grid_ready = True
+                    engine.target_qty_by_level = {"0": 0.20}
+                    engine.reduce_lots_complete = True
+                    open_side = "Sell" if direction == "short" else "Buy"
+                    open_price = 101 if direction == "short" else 99
+                    original_link = engine._place(
+                        open_side,
+                        open_price,
+                        0,
+                        reduce_only=False,
+                        qty_override=Decimal("0.20"),
+                    )
+                    original_id = engine.active_orders[original_link]["order_id"]
+                    client.open_limit_order_ids.discard(original_id)
+
+                    await engine._check_fills()
+
+                    self.assertIn(original_link, engine.active_orders)
+                    self.assertEqual(
+                        engine.active_orders[original_link]["status"],
+                        "RECONCILING_EXECUTION",
+                    )
+                    self.assertEqual(
+                        Decimal(
+                            str(
+                                engine.active_orders[original_link][
+                                    "processed_fill_qty"
+                                ]
+                            )
+                        ),
+                        Decimal("0.10"),
+                    )
+                    self.assertEqual(engine.paused_replacements, [])
+
+                    durable_state = copy.deepcopy(engine.to_state())
+                    restored = GridEngine(client, copy.deepcopy(config))
+                    restored.restore_state({**durable_state, "running": False})
+                    client.confirmed_trade_qty = Decimal("0.12")
+
+                    await restored._check_fills()
+
+                    self.assertNotIn(original_link, restored.active_orders)
+                    self.assertEqual(len(restored.paused_replacements), 1)
+                    self.assertEqual(
+                        Decimal(str(restored.paused_replacements[0]["qty"])),
+                        Decimal("0.08"),
+                    )
+                    self.assertEqual(
+                        restored.paused_replacements[0]["replacement_mode"],
+                        "planned_order",
+                    )
+                    self.assertEqual(
+                        Decimal(str(restored.total_volume)),
+                        Decimal(str(open_price)) * Decimal("0.12"),
+                    )
+                    self.assertEqual(
+                        Decimal(str(restored.total_fee)),
+                        Decimal(str(open_price)) * Decimal("0.12") * Decimal("0.0002"),
+                    )
+                    expected_position = (
+                        Decimal("-0.12") if direction == "short" else Decimal("0.12")
+                    )
+                    self.assertEqual(
+                        Decimal(str(restored.grid_position_net_qty)),
+                        expected_position,
+                    )
+                    coverage = restored.grid_coverage_snapshot()
+                    self.assertEqual(
+                        Decimal(str(coverage["missing_by_level"][0]["missing_qty"])),
+                        Decimal("0.08"),
+                    )
+
+                    small_reduce = next(
+                        item
+                        for item in restored.active_orders.values()
+                        if item.get("reduce_only")
+                        and Decimal(str(item["qty"])) == Decimal("0.02")
+                    )
+                    self.assertTrue(
+                        restored._record_execution_delta(
+                            small_reduce,
+                            {
+                                "price": float(small_reduce["price"]),
+                                "qty": "0.02",
+                                "volume": str(
+                                    Decimal(str(small_reduce["price"]))
+                                    * Decimal("0.02")
+                                ),
+                                "fee": 0,
+                                "fee_asset": "USDT",
+                                "fee_source": "exchange",
+                                "maker_count": 1,
+                                "taker_count": 0,
+                            },
+                        )
+                    )
+                    self.assertEqual(restored.paused_replacements, [])
+                    open_orders = [
+                        item
+                        for item in restored.active_orders.values()
+                        if not item.get("reduce_only")
+                    ]
+                    self.assertEqual(len(open_orders), 1)
+                    self.assertEqual(Decimal(str(open_orders[0]["qty"])), Decimal("0.10"))
+                    coverage = restored.grid_coverage_snapshot()
+                    self.assertFalse(coverage["has_risk"], msg=coverage)
+                    self.assertEqual(
+                        Decimal(str(coverage["coverage_qty"])),
+                        Decimal("0.2"),
+                    )
+
     async def test_restored_grid_continues_tracking_saved_orders_after_restart(self):
         snapshots = []
         client = FakeClient("100")
@@ -12377,6 +12576,117 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.orders), 1)
         self.assertEqual(client.orders[0]["side"], "Sell")
+        self.assertEqual(client.orders[0]["qty"], "17")
+        self.assertEqual(engine.paused_replacements, [])
+
+    async def test_coalesced_rejected_counter_uses_new_immutable_client_order_id(self):
+        class RejectFirstCounterClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.reject_first_counter = True
+                self.counter_attempts = []
+
+            def place_order(self, **kwargs):
+                if (
+                    kwargs.get("order_type") == "Limit"
+                    and kwargs.get("side") == "Sell"
+                    and not kwargs.get("reduce_only")
+                ):
+                    self.counter_attempts.append(dict(kwargs))
+                    if self.reject_first_counter:
+                        self.reject_first_counter = False
+                        return {"retCode": 400, "retMsg": "deterministic business rejection"}
+                return super().place_order(**kwargs)
+
+        client = RejectFirstCounterClient(
+            "100",
+            tick_size="1",
+            qty_step="1",
+            min_qty="1",
+        )
+        durable_events = []
+
+        def capture_state(current_engine):
+            durable_events.append(
+                (
+                    len(client.counter_attempts),
+                    copy.deepcopy(current_engine.to_state()),
+                )
+            )
+
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "neutral",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 20,
+                "qty_per_grid": 20,
+                "leverage": 2,
+            },
+            state_callback=capture_state,
+        )
+        engine._fetch_precision()
+        engine.grid_levels = [90, 110]
+
+        for index, qty in enumerate((8, 9), start=1):
+            source = {
+                "link_id": f"g_0_B_rejected_source_{index}",
+                "order_id": f"rejected-source-{index}",
+                "level_idx": 0,
+                "side": "Buy",
+                "price": "90",
+                "qty": str(qty),
+                "status": "FILLED",
+                "order_type": "Limit",
+                "time_in_force": "GTC",
+                "reduce_only": False,
+                "processed_fill_qty": 0,
+                "processed_fill_volume": 0,
+                "processed_fill_fee": 0,
+            }
+            self.assertTrue(
+                engine._record_execution_delta(
+                    source,
+                    {
+                        "price": 90,
+                        "qty": qty,
+                        "volume": 90 * qty,
+                        "fee": 0,
+                        "fee_asset": "USDT",
+                        "fee_source": "exchange",
+                        "maker_count": 1,
+                        "taker_count": 0,
+                    },
+                )
+            )
+
+        self.assertEqual(len(client.counter_attempts), 2)
+        self.assertEqual(client.counter_attempts[0]["qty"], "8")
+        self.assertEqual(client.counter_attempts[1]["qty"], "17")
+        self.assertNotEqual(
+            client.counter_attempts[0]["order_link_id"],
+            client.counter_attempts[1]["order_link_id"],
+        )
+        replacement_link_id = client.counter_attempts[1]["order_link_id"]
+        self.assertTrue(
+            any(
+                attempts == 1
+                and any(
+                    item.get("replacement_link_id") == replacement_link_id
+                    and item.get("qty") == "17"
+                    for item in state["paused_replacements"]
+                )
+                and replacement_link_id not in state["active_orders"]
+                for attempts, state in durable_events
+            )
+        )
+        self.assertEqual(len(client.orders), 1)
         self.assertEqual(client.orders[0]["qty"], "17")
         self.assertEqual(engine.paused_replacements, [])
 

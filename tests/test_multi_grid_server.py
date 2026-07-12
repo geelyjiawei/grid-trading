@@ -2631,7 +2631,10 @@ class MultiGridServerTests(unittest.TestCase):
                 "side": "BUY",
                 "price": "100.5",
                 "origQty": "0.01",
-                "status": "NEW",
+                "avgPrice": "100.25",
+                "executedQty": "0.006",
+                "cumQuote": "0.6015",
+                "status": "CANCELED",
                 "reduceOnly": False,
                 "time": 1714012800000,
             }
@@ -2664,6 +2667,11 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(order["orderId"], "123")
         self.assertEqual(order["orderLinkId"], "g_1_B_abcdef")
         self.assertEqual(order["side"], "Buy")
+        self.assertEqual(order["qty"], "0.01")
+        self.assertEqual(order["avgPrice"], "100.25")
+        self.assertEqual(order["executedQty"], "0.006")
+        self.assertEqual(order["cumQuote"], "0.6015")
+        self.assertEqual(order["orderStatus"], "CANCELED")
         self.assertEqual(position["side"], "Sell")
         self.assertEqual(position["size"], "0.25")
         self.assertEqual(position["avgPrice"], "105")

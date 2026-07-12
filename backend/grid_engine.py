@@ -6624,6 +6624,14 @@ class GridEngine:
                 "qty": total_qty_text,
                 "entry_price": plan.get("entry_price"),
             }
+            # A client order ID is an immutable identity for one exact order
+            # shape. Once fragments change the quantity, retire any ID that
+            # may have been used by a definitive rejection and persist a fresh
+            # identity before the next exchange write.
+            existing["replacement_link_id"] = (
+                f"g_{int(plan['level_idx'])}_{str(plan['side'])[0]}_"
+                f"{uuid.uuid4().hex[:ORDER_LINK_RANDOM_HEX_LENGTH]}"
+            )
             existing["replacement_retry_after"] = 0.0
             existing["replacement_retry_attempts"] = 0
             existing_sources = list(existing.get("replacement_source_links") or [])

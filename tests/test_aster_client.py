@@ -274,7 +274,10 @@ class AsterClientTests(unittest.TestCase):
                 "side": "SELL",
                 "price": "100",
                 "origQty": "0.2",
-                "status": "NEW",
+                "avgPrice": "99.5",
+                "executedQty": "0.12",
+                "cumQuote": "11.94",
+                "status": "CANCELED",
                 "reduceOnly": "true",
                 "time": 123,
             }
@@ -306,6 +309,11 @@ class AsterClientTests(unittest.TestCase):
 
         self.assertEqual(order["side"], "Sell")
         self.assertTrue(order["reduceOnly"])
+        self.assertEqual(order["qty"], "0.2")
+        self.assertEqual(order["avgPrice"], "99.5")
+        self.assertEqual(order["executedQty"], "0.12")
+        self.assertEqual(order["cumQuote"], "11.94")
+        self.assertEqual(order["orderStatus"], "CANCELED")
         self.assertEqual(trade["side"], "Buy")
         self.assertEqual(trade["fee"], "0.01")
         self.assertEqual(trade["feeUsdt"], "0.01")
