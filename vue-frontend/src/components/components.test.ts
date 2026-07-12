@@ -4,6 +4,8 @@ import type { ApiConfigResponse, GridStatus } from "../api/types";
 import AuthDialog from "./AuthDialog.vue";
 import ExchangeSettingsDialog from "./ExchangeSettingsDialog.vue";
 import GridConfigurationPanel from "./GridConfigurationPanel.vue";
+import MarketOverview from "./MarketOverview.vue";
+import StrategyDetailsPanel from "./StrategyDetailsPanel.vue";
 import StrategyList from "./StrategyList.vue";
 
 describe("Vue migration components", () => {
@@ -144,5 +146,56 @@ describe("Vue migration components", () => {
       "limit",
       "post_only",
     ]);
+  });
+
+  it("renders the backend balance field used by the current API", () => {
+    const wrapper = mount(MarketOverview, {
+      props: {
+        exchange: "aster",
+        symbol: "ANSEMUSDT",
+        configured: true,
+        price: null,
+        balance: { available: "123.4567", equity: "140" },
+        fees: null,
+        loading: false,
+      },
+    });
+
+    expect(wrapper.text()).toContain("123.4567");
+  });
+
+  it("shows authoritative open order quantities without normalizing them", async () => {
+    const wrapper = mount(StrategyDetailsPanel, {
+      props: {
+        exchange: "aster",
+        symbol: "ANSEMUSDT",
+        configured: true,
+        loading: false,
+        error: "",
+        positions: [],
+        orders: [
+          {
+            order_id: "123",
+            order_link_id: "g_7_B_exact",
+            side: "Buy",
+            price: "0.3800000",
+            qty: "70",
+            status: "NEW",
+            reduce_only: true,
+          },
+        ],
+        trades: [],
+        history: [],
+      },
+    });
+    const orderTab = wrapper
+      .findAll(".detail-tabs button")
+      .find((button) => button.text().startsWith("挂单"));
+    expect(orderTab).toBeDefined();
+    await orderTab!.trigger("click");
+
+    expect(wrapper.text()).toContain("70");
+    expect(wrapper.text()).toContain("g_7_B_exact");
+    expect(wrapper.text()).toContain("止盈/平仓");
   });
 });

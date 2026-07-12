@@ -9,9 +9,13 @@ import type {
   FeeRates,
   GridConfigRequest,
   GridPreview,
+  GridHistoryRun,
+  GridOrder,
   GridStatus,
+  GridTrade,
   LoginRequest,
   PriceSnapshot,
+  PositionSnapshot,
   RiskSnapshot,
   SaveApiConfigRequest,
 } from "./api/types";
@@ -20,6 +24,7 @@ import ExchangeSettingsDialog from "./components/ExchangeSettingsDialog.vue";
 import GridConfigurationPanel from "./components/GridConfigurationPanel.vue";
 import MarketOverview from "./components/MarketOverview.vue";
 import StrategyList from "./components/StrategyList.vue";
+import StrategyDetailsPanel from "./components/StrategyDetailsPanel.vue";
 import StrategyOverview from "./components/StrategyOverview.vue";
 import { exchangeName } from "./format";
 
@@ -37,6 +42,12 @@ const fees = ref<FeeRates | null>(null);
 const grids = ref<GridStatus[]>([]);
 const selectedStatus = ref<GridStatus | null>(null);
 const risk = ref<RiskSnapshot | null>(null);
+const positions = ref<PositionSnapshot[]>([]);
+const openOrders = ref<GridOrder[]>([]);
+const trades = ref<GridTrade[]>([]);
+const history = ref<GridHistoryRun[]>([]);
+const detailsLoading = ref(false);
+const detailsError = ref("");
 const preview = ref<GridPreview | null>(null);
 const previewContext = ref("");
 const previewBusy = ref(false);
@@ -52,6 +63,7 @@ let marketTimer: number | undefined;
 let statusRefreshRunning = false;
 let marketRefreshRunning = false;
 let previewRequestSequence = 0;
+let detailsRequestSequence = 0;
 
 const configured = computed(
   () => Boolean(config.value?.configs[activeExchange.value]?.configured),
@@ -153,10 +165,53 @@ async function refreshWorkspace(): Promise<void> {
   normalizeSymbol();
   loading.value = true;
   try {
-    await Promise.all([refreshStrategies(), refreshMarket()]);
+    await Promise.all([refreshStrategies(), refreshMarket(), refreshDetails()]);
   } finally {
     loading.value = false;
   }
+}
+
+async function refreshDetails(): Promise<void> {
+  if (!authenticated.value || !configured.value || !symbol.value) {
+    positions.value = [];
+    openOrders.value = [];
+    trades.value = [];
+    return;
+  }
+  const exchange = activeExchange.value;
+  const requestedSymbol = symbol.value;
+  const requestSequence = ++detailsRequestSequence;
+  detailsLoading.value = true;
+  detailsError.value = "";
+  const results = await Promise.allSettled([
+    api.positions(exchange, requestedSymbol),
+    api.openOrders(exchange, requestedSymbol),
+    api.trades(exchange, requestedSymbol),
+    api.history(),
+  ]);
+  if (
+    requestSequence !== detailsRequestSequence
+    || exchange !== activeExchange.value
+    || requestedSymbol !== symbol.value
+  ) {
+    return;
+  }
+
+  const [positionResult, orderResult, tradeResult, historyResult] = results;
+  if (positionResult.status === "fulfilled") positions.value = positionResult.value.positions;
+  if (orderResult.status === "fulfilled") {
+    openOrders.value = orderResult.value.orders ?? orderResult.value.result?.list ?? [];
+  }
+  if (tradeResult.status === "fulfilled") {
+    trades.value = tradeResult.value.trades ?? tradeResult.value.result?.list ?? [];
+  }
+  if (historyResult.status === "fulfilled") history.value = historyResult.value.runs;
+
+  const failures = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => messageFrom(result.reason, "策略明细读取失败"));
+  detailsError.value = [...new Set(failures)].join("；");
+  detailsLoading.value = false;
 }
 
 async function requestPreview(configRequest: GridConfigRequest): Promise<void> {
@@ -229,6 +284,9 @@ async function selectExchange(exchange: Exchange): Promise<void> {
   balance.value = null;
   fees.value = null;
   risk.value = null;
+  positions.value = [];
+  openOrders.value = [];
+  trades.value = [];
   marketError.value = "";
   await refreshWorkspace();
 }
@@ -237,7 +295,7 @@ async function selectStrategy(grid: GridStatus): Promise<void> {
   activeExchange.value = grid.exchange;
   symbol.value = grid.symbol;
   selectedStatus.value = grid;
-  await refreshMarket();
+  await Promise.all([refreshMarket(), refreshDetails()]);
 }
 
 async function saveConfig(payload: SaveApiConfigRequest): Promise<void> {
@@ -336,6 +394,18 @@ onUnmounted(() => {
         @preview="requestPreview"
       />
       <StrategyOverview class="dashboard-span" :status="selectedStatus" :risk="risk" />
+      <StrategyDetailsPanel
+        :exchange="activeExchange"
+        :symbol="symbol"
+        :configured="configured"
+        :loading="detailsLoading"
+        :error="detailsError"
+        :positions="positions"
+        :orders="openOrders"
+        :trades="trades"
+        :history="history"
+        @refresh="refreshDetails"
+      />
     </section>
 
     <AuthDialog

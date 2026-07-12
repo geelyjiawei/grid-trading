@@ -116,6 +116,7 @@ export interface PriceSnapshot {
 }
 
 export interface BalanceSnapshot {
+  available?: string | number;
   available_balance?: string | number;
   wallet_balance?: string | number;
   equity?: string | number;
@@ -133,9 +134,12 @@ export interface GridOrder {
   status?: string;
   reduce_only?: boolean;
   reduceOnly?: boolean;
+  created_time?: string | number;
 }
 
 export interface GridTrade {
+  order_id?: string;
+  trade_id?: string;
   side: "Buy" | "Sell";
   price: string | number;
   qty: string | number;
@@ -189,7 +193,26 @@ export interface RiskSnapshot {
 }
 
 export interface GridHistoryResponse {
-  runs: Array<Record<string, unknown>>;
+  runs: GridHistoryRun[];
+}
+
+export interface GridHistoryRun {
+  started_at?: string | number;
+  symbol?: string;
+  exchange?: Exchange;
+  direction?: Direction;
+  grid_mode?: GridMode;
+  initial_order_type?: InitialOrderType;
+  initial_order_price?: string | number;
+  position_sizing_mode?: PositionSizingMode;
+  grid_order_qty?: string | number;
+  total_investment?: string | number;
+  status?: string;
+  total_equity_profit?: string | number;
+  net_profit?: string | number;
+  total_fee?: string | number;
+  total_volume?: string | number;
+  completed_pairs?: number;
 }
 
 export interface GridPreview {

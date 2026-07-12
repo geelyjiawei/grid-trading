@@ -85,7 +85,7 @@ http
     }
     if (url.pathname === "/api/balance") {
       return send(response, {
-        available_balance: "1842.5521",
+        available: "1842.5521",
         equity: "2018.4409",
         unrealised_pnl: "1.9291",
       });
@@ -102,6 +102,82 @@ http
         has_risk: false,
         unmanaged_position: false,
         unmanaged_delta_qty: 0,
+      });
+    }
+    if (url.pathname.startsWith("/api/positions/")) {
+      return send(response, {
+        positions: [
+          {
+            side: "Buy",
+            size: "3000",
+            entry_price: "0.3772",
+            mark_price: "0.38092",
+            unrealised_pnl: "11.16",
+            leverage: "3",
+            liq_price: "0.201",
+          },
+        ],
+      });
+    }
+    if (url.pathname.startsWith("/api/orders/open/")) {
+      return send(response, {
+        orders: [
+          {
+            order_id: "101",
+            order_link_id: "g_7_B_mock",
+            side: "Buy",
+            price: "0.3800000",
+            qty: "100",
+            status: "NEW",
+            reduce_only: true,
+          },
+          {
+            order_id: "102",
+            order_link_id: "g_8_S_mock",
+            side: "Sell",
+            price: "0.3820000",
+            qty: "100",
+            status: "NEW",
+            reduce_only: false,
+          },
+        ],
+      });
+    }
+    if (url.pathname.startsWith("/api/trades/")) {
+      return send(response, {
+        trades: [
+          {
+            order_id: "99",
+            trade_id: "9901",
+            side: "Buy",
+            price: "0.3800",
+            qty: "100",
+            volume: "38",
+            fee_usdt: "0.0076",
+            fee_asset: "USDT",
+            realized_pnl: "0.2",
+            is_maker: true,
+            time: 1783890000000,
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/api/grid/history") {
+      return send(response, {
+        runs: [
+          {
+            started_at: 1783890000,
+            exchange: "aster",
+            symbol: "ANSEMUSDT",
+            direction: "long",
+            grid_mode: "arithmetic",
+            status: "stopped",
+            total_equity_profit: "4.2",
+            total_fee: "0.8",
+            total_volume: "8200",
+            completed_pairs: 41,
+          },
+        ],
       });
     }
     if (url.pathname === "/api/grid/preview") {

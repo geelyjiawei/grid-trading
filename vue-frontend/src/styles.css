@@ -306,6 +306,50 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
   background: #0a1921;
 }
 
+.detail-header { margin-bottom: 0.75rem; }
+.detail-tabs {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  padding-bottom: 0.75rem;
+}
+.detail-tabs button {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.55rem 0.75rem;
+  color: var(--muted);
+  background: #0b1b24;
+}
+.detail-tabs button.active { border-color: var(--mint); color: var(--mint); }
+.detail-tabs button span {
+  display: grid;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  place-items: center;
+  border-radius: 6px;
+  color: #dcebed;
+  background: #1d3440;
+  font-size: 0.65rem;
+}
+.detail-content { min-height: 8rem; }
+.card-list { display: grid; gap: 0.65rem; }
+.position-item { border: 1px solid var(--line-soft); border-radius: 13px; padding: 0.85rem; background: #0c202a; }
+.position-item header { display: flex; justify-content: space-between; margin-bottom: 0.7rem; }
+.position-item header span { color: var(--muted); }
+.detail-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.55rem; }
+.detail-metrics div { min-width: 0; }
+.detail-metrics span { display: block; margin-bottom: 0.2rem; color: var(--muted); font-size: 0.67rem; }
+.detail-metrics strong { display: block; overflow: hidden; text-overflow: ellipsis; font-size: 0.82rem; }
+.table-scroll { overflow-x: auto; }
+.table-scroll table { width: 100%; min-width: 760px; border-collapse: collapse; }
+.table-scroll th, .table-scroll td { padding: 0.65rem 0.7rem; border-bottom: 1px solid var(--line-soft); text-align: left; white-space: nowrap; font-size: 0.75rem; }
+.table-scroll th { color: var(--muted); font-weight: 500; }
+.table-scroll tbody tr:hover { background: rgba(39, 83, 99, 0.16); }
+.mono-cell { font-family: Consolas, monospace; color: #a9c0ca; }
+
 .callout {
   padding: 0.75rem 0.9rem;
   border: 1px solid rgba(246, 200, 86, 0.35);
@@ -392,4 +436,5 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
   .exchange-config-list article { align-items: flex-start; flex-direction: column; gap: 0.2rem; }
   .form-grid { grid-template-columns: 1fr; }
   .preview-metrics { grid-template-columns: 1fr 1fr; }
+  .detail-metrics { grid-template-columns: 1fr 1fr; }
 }

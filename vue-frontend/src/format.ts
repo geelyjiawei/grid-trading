@@ -33,3 +33,12 @@ export function formatPercent(value: unknown, fractionDigits = 2): string {
   if (number === null) return "--";
   return `${number >= 0 ? "+" : ""}${number.toFixed(fractionDigits)}%`;
 }
+
+export function formatTimestamp(value: unknown): string {
+  const number = finiteNumber(value);
+  if (number === null) return "--";
+  const milliseconds = number < 1_000_000_000_000 ? number * 1000 : number;
+  const date = new Date(milliseconds);
+  if (Number.isNaN(date.getTime())) return "--";
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
