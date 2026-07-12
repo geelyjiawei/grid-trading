@@ -29,6 +29,17 @@ class BinanceFuturesClient:
     RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
     TIME_SYNC_DEDUP_SECONDS = 1.0
     MAX_TIME_OFFSET_MS = 24 * 60 * 60 * 1000
+    LIST_RESPONSE_PATHS = frozenset(
+        {
+            "/fapi/v1/allOrders",
+            "/fapi/v1/batchOrders",
+            "/fapi/v1/klines",
+            "/fapi/v1/openOrders",
+            "/fapi/v1/userTrades",
+            "/fapi/v3/balance",
+            "/fapi/v3/positionRisk",
+        }
+    )
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -188,7 +199,14 @@ class BinanceFuturesClient:
             )
             try:
                 data = response.json()
-            except ValueError:
+            except ValueError as exc:
+                if response.status_code < 400:
+                    message = f"Binance returned invalid JSON for {path}"
+                    if method.upper() != "GET":
+                        raise ExchangeRequestUncertainError(
+                            f"{message}; request status unknown"
+                        ) from exc
+                    raise RuntimeError(message) from exc
                 data = {"code": response.status_code, "msg": response.text}
             if response.status_code >= 400:
                 message = data.get("msg") if isinstance(data, dict) else response.text
@@ -217,6 +235,14 @@ class BinanceFuturesClient:
                 raise RuntimeError(
                     message or f"Binance request failed with {response.status_code}"
                 )
+            expected_type = list if path in self.LIST_RESPONSE_PATHS else dict
+            if not isinstance(data, expected_type):
+                message = f"Binance returned an invalid response structure for {path}"
+                if method.upper() != "GET":
+                    raise ExchangeRequestUncertainError(
+                        f"{message}; request status unknown"
+                    )
+                raise RuntimeError(message)
             return data
         raise RuntimeError("Binance request failed after timestamp synchronization")
 

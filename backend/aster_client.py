@@ -30,6 +30,17 @@ class AsterFuturesClient:
     MAX_TRADE_HISTORY_QUERIES = 64
     FEE_RATE_TTL_SECONDS = 300
     RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
+    LIST_RESPONSE_PATHS = frozenset(
+        {
+            "/fapi/v3/allOrders",
+            "/fapi/v3/balance",
+            "/fapi/v3/batchOrders",
+            "/fapi/v3/klines",
+            "/fapi/v3/openOrders",
+            "/fapi/v3/positionRisk",
+            "/fapi/v3/userTrades",
+        }
+    )
 
     def __init__(
         self,
@@ -162,7 +173,14 @@ class AsterFuturesClient:
         response = self.session.request(method, url, **request_kwargs)
         try:
             data = response.json()
-        except ValueError:
+        except ValueError as exc:
+            if response.status_code < 400:
+                message = f"Aster returned invalid JSON for {path}"
+                if method.upper() != "GET":
+                    raise ExchangeRequestUncertainError(
+                        f"{message}; request status unknown"
+                    ) from exc
+                raise RuntimeError(message) from exc
             data = {"code": response.status_code, "msg": response.text}
         message = data.get("msg") if isinstance(data, dict) else response.text
         error_code = data.get("code") if isinstance(data, dict) else None
@@ -188,6 +206,14 @@ class AsterFuturesClient:
             raise RuntimeError(message or f"Aster request failed with {response.status_code}")
         if isinstance(data, dict) and data.get("code") not in (None, 0, "0", 200, "200"):
             raise RuntimeError(str(data.get("msg") or data))
+        expected_type = list if path in self.LIST_RESPONSE_PATHS else dict
+        if not isinstance(data, expected_type):
+            message = f"Aster returned an invalid response structure for {path}"
+            if method.upper() != "GET":
+                raise ExchangeRequestUncertainError(
+                    f"{message}; request status unknown"
+                )
+            raise RuntimeError(message)
         return data
 
     def get_ticker(self, symbol: str) -> dict:

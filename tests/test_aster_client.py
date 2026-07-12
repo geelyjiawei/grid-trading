@@ -189,6 +189,111 @@ class AsterClientTests(unittest.TestCase):
                 order_link_id="g_1_B_rejected",
             )
 
+    def test_http_200_invalid_single_order_response_is_unknown(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                response = FakeResponse([])
+                if response_kind == "invalid_json":
+                    def invalid_json():
+                        raise ValueError("truncated acknowledgement")
+
+                    response.json = invalid_json
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                client.session = FakeSession(response)
+
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.place_order(
+                        symbol="ASTERUSDT",
+                        side="Buy",
+                        qty="20",
+                        price="0.5",
+                        order_type="Limit",
+                        order_link_id=f"g_1_B_{response_kind}",
+                    )
+
+    def test_http_200_invalid_batch_order_response_is_unknown(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                response = FakeResponse({"unexpected": True})
+                if response_kind == "invalid_json":
+                    def invalid_json():
+                        raise ValueError("truncated batch acknowledgement")
+
+                    response.json = invalid_json
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                client.session = FakeSession(response)
+
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.place_orders(
+                        [
+                            {
+                                "symbol": "ASTERUSDT",
+                                "side": "Buy",
+                                "qty": "20",
+                                "price": "0.5",
+                                "order_type": "Limit",
+                                "reduce_only": False,
+                                "order_link_id": f"g_1_B_batch_{response_kind}",
+                                "time_in_force": None,
+                            }
+                        ]
+                    )
+
+    def test_http_200_invalid_order_lookup_is_read_error(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                response = FakeResponse([])
+                if response_kind == "invalid_json":
+                    def invalid_json():
+                        raise ValueError("truncated order lookup")
+
+                    response.json = invalid_json
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                client.session = FakeSession(response)
+
+                with self.assertRaises(RuntimeError) as error:
+                    client.get_order_by_link("ASTERUSDT", "g_1_B_lookup")
+
+                self.assertNotIsInstance(
+                    error.exception,
+                    ExchangeRequestUncertainError,
+                )
+
+    def test_http_200_invalid_cancel_response_is_unknown(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                response = FakeResponse([])
+                if response_kind == "invalid_json":
+                    def invalid_json():
+                        raise ValueError("truncated cancellation acknowledgement")
+
+                    response.json = invalid_json
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                client.session = FakeSession(response)
+
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.cancel_order("ASTERUSDT", "123")
+
     def test_signature_payload_uses_eip712_message_body(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
 

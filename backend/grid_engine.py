@@ -2153,7 +2153,10 @@ class GridEngine:
             ),
         ):
             return True
-        return GridEngine._is_uncertain_submission_message(str(exc))
+        message = str(exc)
+        return GridEngine._is_uncertain_submission_message(
+            message
+        ) or GridEngine._is_duplicate_client_order_rejection(message)
 
     @staticmethod
     def _is_uncertain_submission_message(message: str) -> bool:

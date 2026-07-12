@@ -3412,6 +3412,99 @@ class MultiGridServerTests(unittest.TestCase):
                     ExchangeRequestUncertainError,
                 )
 
+    def test_binance_http_200_invalid_single_order_response_is_unknown(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                client = BinanceFuturesClient("key", "secret", True)
+                response = Mock()
+                response.status_code = 200
+                response.text = "truncated acknowledgement"
+                response.headers = {}
+                if response_kind == "invalid_json":
+                    response.json.side_effect = ValueError("invalid json")
+                else:
+                    response.json.return_value = []
+                client.session.request = Mock(return_value=response)
+
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.place_order(
+                        symbol="TESTUSDT",
+                        side="Buy",
+                        qty="1",
+                        price="90",
+                        order_type="Limit",
+                        order_link_id=f"g_0_B_{response_kind}",
+                    )
+
+    def test_binance_http_200_invalid_batch_order_response_is_unknown(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                client = BinanceFuturesClient("key", "secret", True)
+                response = Mock()
+                response.status_code = 200
+                response.text = "truncated batch acknowledgement"
+                response.headers = {}
+                if response_kind == "invalid_json":
+                    response.json.side_effect = ValueError("invalid json")
+                else:
+                    response.json.return_value = {"unexpected": True}
+                client.session.request = Mock(return_value=response)
+
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.place_orders(
+                        [
+                            {
+                                "symbol": "TESTUSDT",
+                                "side": "Buy",
+                                "qty": "1",
+                                "price": "90",
+                                "order_type": "Limit",
+                                "reduce_only": False,
+                                "order_link_id": f"g_0_B_batch_{response_kind}",
+                                "time_in_force": None,
+                            }
+                        ]
+                    )
+
+    def test_binance_http_200_invalid_order_lookup_is_read_error(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                client = BinanceFuturesClient("key", "secret", True)
+                response = Mock()
+                response.status_code = 200
+                response.text = "truncated order lookup"
+                response.headers = {}
+                if response_kind == "invalid_json":
+                    response.json.side_effect = ValueError("invalid json")
+                else:
+                    response.json.return_value = []
+                client.session.request = Mock(return_value=response)
+
+                with self.assertRaises(RuntimeError) as error:
+                    client.get_order_by_link("TESTUSDT", "g_0_B_lookup")
+
+                self.assertNotIsInstance(
+                    error.exception,
+                    ExchangeRequestUncertainError,
+                )
+
+    def test_binance_http_200_invalid_cancel_response_is_unknown(self):
+        for response_kind in ("invalid_json", "wrong_json_shape"):
+            with self.subTest(response_kind=response_kind):
+                client = BinanceFuturesClient("key", "secret", True)
+                response = Mock()
+                response.status_code = 200
+                response.text = "truncated cancellation acknowledgement"
+                response.headers = {}
+                if response_kind == "invalid_json":
+                    response.json.side_effect = ValueError("invalid json")
+                else:
+                    response.json.return_value = []
+                client.session.request = Mock(return_value=response)
+
+                with self.assertRaises(ExchangeRequestUncertainError):
+                    client.cancel_order("TESTUSDT", "123")
+
     def test_bybit_order_trades_follows_cursor_and_normalizes_all_executions(self):
         client = BybitClient("key", "secret")
         calls = []
