@@ -57,6 +57,7 @@ class FakeClient:
             "result": {
                 "list": [
                     {
+                        "symbol": symbol,
                         "priceFilter": {"tickSize": self.tick_size},
                         "lotSizeFilter": {
                             "qtyStep": self.qty_step,
@@ -77,7 +78,14 @@ class FakeClient:
         return {"retCode": 0}
 
     def get_ticker(self, symbol):
-        return {"retCode": 0, "result": {"list": [{"lastPrice": str(self.ticker_price)}]}}
+        return {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {"symbol": symbol, "lastPrice": str(self.ticker_price)}
+                ]
+            },
+        }
 
     def get_fee_rates(self, symbol):
         self.fee_rate_calls.append(symbol)
@@ -515,6 +523,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                 "result": {
                     "list": [
                         {
+                            "symbol": symbol,
                             "priceFilter": {"tickSize": "0.1"},
                             "lotSizeFilter": {
                                 "qtyStep": "0.001",
@@ -544,6 +553,266 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         engine._fetch_precision()
 
         self.assertEqual(engine.max_market_qty, 120.0)
+
+    async def test_invalid_ticker_snapshots_are_rejected_before_price_update(self):
+        class TickerResponseClient(FakeClient):
+            def __init__(self, response):
+                super().__init__("100")
+                self.response = response
+
+            def get_ticker(self, symbol):
+                return copy.deepcopy(self.response)
+
+        def ticker_row(**updates):
+            row = {
+                "symbol": "TESTUSDT",
+                "lastPrice": "100",
+                "markPrice": "101",
+            }
+            row.update(updates)
+            return row
+
+        invalid_responses = {
+            "top-level list": [],
+            "exchange rejection": {"retCode": 1001, "retMsg": "ticker unavailable"},
+            "missing result": {"retCode": 0},
+            "invalid result": {"retCode": 0, "result": []},
+            "missing list": {"retCode": 0, "result": {}},
+            "invalid list": {"retCode": 0, "result": {"list": {}}},
+            "empty list": {"retCode": 0, "result": {"list": []}},
+            "multiple rows": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(), ticker_row()]},
+            },
+            "invalid row": {"retCode": 0, "result": {"list": [None]}},
+            "missing symbol": {
+                "retCode": 0,
+                "result": {"list": [{"lastPrice": "100", "markPrice": "101"}]},
+            },
+            "wrong symbol": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(symbol="OTHERUSDT")]},
+            },
+            "missing last price": {
+                "retCode": 0,
+                "result": {"list": [{"symbol": "TESTUSDT", "markPrice": "101"}]},
+            },
+            "blank last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="")]},
+            },
+            "nonnumeric last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="invalid")]},
+            },
+            "zero last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="0")]},
+            },
+            "negative last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="-1")]},
+            },
+            "nan last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="NaN")]},
+            },
+            "infinite last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="Infinity")]},
+            },
+            "overflowing last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="1e1000000")]},
+            },
+            "underflowing last price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(lastPrice="1e-1000000")]},
+            },
+            "invalid mark price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(markPrice="invalid")]},
+            },
+            "zero mark price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(markPrice="0")]},
+            },
+            "nan mark price": {
+                "retCode": 0,
+                "result": {"list": [ticker_row(markPrice="NaN")]},
+            },
+        }
+
+        for label, response in invalid_responses.items():
+            with self.subTest(label=label):
+                engine = GridEngine(
+                    TickerResponseClient(response),
+                    {"symbol": "TESTUSDT", "direction": "short"},
+                )
+                engine.current_mark_price = 777.0
+                with self.assertRaisesRegex(RuntimeError, "ticker snapshot"):
+                    engine._get_current_price()
+                self.assertEqual(engine.current_mark_price, 777.0)
+
+    async def test_valid_blank_mark_price_uses_last_price(self):
+        client = FakeClient("100")
+        client.get_ticker = lambda symbol: {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {"symbol": symbol, "lastPrice": "100.25", "markPrice": ""}
+                ]
+            },
+        }
+        engine = GridEngine(client, {"symbol": "TESTUSDT", "direction": "short"})
+
+        current_price = engine._get_current_price()
+
+        self.assertEqual(current_price, 100.25)
+        self.assertEqual(engine.current_mark_price, 100.25)
+
+    async def test_invalid_instrument_snapshots_do_not_partially_mutate_precision(self):
+        omitted = object()
+
+        def instrument_response(
+            *,
+            symbol="TESTUSDT",
+            price_filter=omitted,
+            tick_size="0.1",
+            lot_filter=omitted,
+            qty_step="0.01",
+            min_qty="0.01",
+            min_notional="5",
+            market_filter=omitted,
+            market_qty_step="0.01",
+            market_min_qty="0.01",
+            market_max_qty="100",
+        ):
+            info = {}
+            if symbol is not omitted:
+                info["symbol"] = symbol
+            if price_filter is omitted:
+                info["priceFilter"] = {} if tick_size is omitted else {"tickSize": tick_size}
+            elif price_filter is not None:
+                info["priceFilter"] = price_filter
+            else:
+                info["priceFilter"] = None
+            if lot_filter is omitted:
+                info["lotSizeFilter"] = {
+                    "qtyStep": qty_step,
+                    "minOrderQty": min_qty,
+                    "minNotionalValue": min_notional,
+                    "maxOrderQty": "1000",
+                }
+            elif lot_filter is not None:
+                info["lotSizeFilter"] = lot_filter
+            else:
+                info["lotSizeFilter"] = None
+            if market_filter is omitted:
+                info["marketLotSizeFilter"] = {
+                    "qtyStep": market_qty_step,
+                    "minOrderQty": market_min_qty,
+                    "maxOrderQty": market_max_qty,
+                }
+            elif market_filter is not None:
+                info["marketLotSizeFilter"] = market_filter
+            else:
+                info["marketLotSizeFilter"] = None
+            return {"retCode": 0, "result": {"list": [info]}}
+
+        invalid_responses = {
+            "top-level list": [],
+            "exchange rejection": {"retCode": 1001, "retMsg": "rules unavailable"},
+            "missing result": {"retCode": 0},
+            "invalid result": {"retCode": 0, "result": []},
+            "missing list": {"retCode": 0, "result": {}},
+            "invalid list": {"retCode": 0, "result": {"list": {}}},
+            "empty list": {"retCode": 0, "result": {"list": []}},
+            "multiple rows": {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        instrument_response()["result"]["list"][0],
+                        instrument_response()["result"]["list"][0],
+                    ]
+                },
+            },
+            "invalid row": {"retCode": 0, "result": {"list": [None]}},
+            "missing symbol": instrument_response(symbol=omitted),
+            "wrong symbol": instrument_response(symbol="OTHERUSDT"),
+            "missing price filter": instrument_response(price_filter={}),
+            "invalid price filter": instrument_response(price_filter=None),
+            "missing tick size": instrument_response(tick_size=omitted),
+            "blank tick size": instrument_response(tick_size=""),
+            "zero tick size": instrument_response(tick_size="0"),
+            "negative tick size": instrument_response(tick_size="-0.1"),
+            "nan tick size": instrument_response(tick_size="NaN"),
+            "overflowing tick size": instrument_response(tick_size="1e1000000"),
+            "underflowing tick size": instrument_response(tick_size="1e-1000000"),
+            "missing lot filter": instrument_response(lot_filter={}),
+            "invalid lot filter": instrument_response(lot_filter=None),
+            "blank quantity step": instrument_response(qty_step=""),
+            "zero quantity step": instrument_response(qty_step="0"),
+            "negative quantity step": instrument_response(qty_step="-0.01"),
+            "nan quantity step": instrument_response(qty_step="NaN"),
+            "blank minimum quantity": instrument_response(min_qty=""),
+            "zero minimum quantity": instrument_response(min_qty="0"),
+            "negative minimum quantity": instrument_response(min_qty="-0.01"),
+            "negative minimum notional": instrument_response(min_notional="-1"),
+            "infinite minimum notional": instrument_response(min_notional="Infinity"),
+            "invalid market filter": instrument_response(market_filter=None),
+            "zero market quantity step": instrument_response(market_qty_step="0"),
+            "zero market minimum quantity": instrument_response(market_min_qty="0"),
+            "negative market maximum": instrument_response(market_max_qty="-1"),
+            "nan market maximum": instrument_response(market_max_qty="NaN"),
+        }
+
+        class InstrumentResponseClient(FakeClient):
+            def __init__(self, response):
+                super().__init__("100")
+                self.response = response
+
+            def get_instrument_info(self, symbol):
+                return copy.deepcopy(self.response)
+
+        for label, response in invalid_responses.items():
+            with self.subTest(label=label):
+                engine = GridEngine(
+                    InstrumentResponseClient(response),
+                    {"symbol": "TESTUSDT", "direction": "short"},
+                )
+                engine.tick_size = "9"
+                engine.qty_step = "8"
+                engine.min_qty = 7.0
+                engine.min_notional = 6.0
+                engine.market_qty_step = "5"
+                engine.market_min_qty = 4.0
+                engine.max_market_qty = 3.0
+                before = (
+                    engine.tick_size,
+                    engine.qty_step,
+                    engine.min_qty,
+                    engine.min_notional,
+                    engine.market_qty_step,
+                    engine.market_min_qty,
+                    engine.max_market_qty,
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "instrument snapshot"):
+                    engine._fetch_precision()
+
+                self.assertEqual(
+                    (
+                        engine.tick_size,
+                        engine.qty_step,
+                        engine.min_qty,
+                        engine.min_notional,
+                        engine.market_qty_step,
+                        engine.market_min_qty,
+                        engine.max_market_qty,
+                    ),
+                    before,
+                )
 
     async def test_quantity_rounding_snaps_only_binary_float_dust_to_grid_step(self):
         client = FakeClient("100", qty_step="0.01", min_qty="0.01")
@@ -15104,6 +15373,7 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
                     "result": {
                         "list": [
                             {
+                                "symbol": symbol,
                                 "lastPrice": "0.241",
                                 "markPrice": "0.26",
                             }

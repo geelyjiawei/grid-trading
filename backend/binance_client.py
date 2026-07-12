@@ -250,13 +250,20 @@ class BinanceFuturesClient:
         symbol = symbol.upper()
         ticker = self._request("GET", "/fapi/v1/ticker/24hr", params={"symbol": symbol})
         premium = self._request("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol})
+        ticker_symbol = str(ticker.get("symbol") or "").upper()
+        premium_symbol = str(premium.get("symbol") or "").upper()
+        if ticker_symbol != symbol or premium_symbol != symbol:
+            raise RuntimeError(
+                f"Binance ticker symbol mismatch for {symbol}: "
+                f"ticker={ticker_symbol or 'missing'} premium={premium_symbol or 'missing'}"
+            )
         price_change_pct = float(ticker.get("priceChangePercent", "0")) / 100
         return {
             "retCode": 0,
             "result": {
                 "list": [
                     {
-                        "symbol": ticker.get("symbol", symbol),
+                        "symbol": ticker_symbol,
                         "lastPrice": ticker.get("lastPrice", "0"),
                         "indexPrice": premium.get("indexPrice", ""),
                         "markPrice": premium.get("markPrice", ""),
@@ -294,19 +301,20 @@ class BinanceFuturesClient:
             "result": {
                 "list": [
                     {
-                        "priceFilter": {"tickSize": price_filter.get("tickSize", "0.1")},
+                        "symbol": symbol,
+                        "priceFilter": {"tickSize": price_filter.get("tickSize")},
                         "lotSizeFilter": {
-                            "qtyStep": lot_filter.get("stepSize", "0.001"),
-                            "minOrderQty": lot_filter.get("minQty", "0.001"),
+                            "qtyStep": lot_filter.get("stepSize"),
+                            "minOrderQty": lot_filter.get("minQty"),
                             "maxOrderQty": lot_filter.get("maxQty", "0"),
                             "minNotionalValue": min_notional,
                         },
                         "marketLotSizeFilter": {
                             "qtyStep": market_lot_filter.get(
-                                "stepSize", lot_filter.get("stepSize", "0.001")
+                                "stepSize", lot_filter.get("stepSize")
                             ),
                             "minOrderQty": market_lot_filter.get(
-                                "minQty", lot_filter.get("minQty", "0.001")
+                                "minQty", lot_filter.get("minQty")
                             ),
                             "maxOrderQty": market_lot_filter.get("maxQty", "0"),
                         },
@@ -358,6 +366,12 @@ class BinanceFuturesClient:
             params={"symbol": symbol},
             auth=True,
         )
+        returned_symbol = str(data.get("symbol") or "").upper()
+        if returned_symbol != symbol:
+            raise RuntimeError(
+                f"Binance fee rate response symbol mismatch for {symbol}: "
+                f"{returned_symbol or 'missing symbol'}"
+            )
         fetched_at = int(time.time() * 1000)
         response = fee_rate_response(
             symbol,

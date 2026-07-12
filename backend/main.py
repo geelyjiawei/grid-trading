@@ -29,7 +29,12 @@ from aster_client import AsterFuturesClient
 from binance_client import BinanceFuturesClient
 from bybit_client import BybitClient
 from fee_rates import normalize_fee_rate
-from grid_engine import GridEngine, validate_position_response
+from grid_engine import (
+    GridEngine,
+    validate_instrument_response,
+    validate_position_response,
+    validate_ticker_response,
+)
 from secret_store import decrypt_text, encrypt_text, storage_backend
 
 
@@ -811,6 +816,7 @@ def _validate_fee_rates(cfg: "GridConfig"):
 
 
 def _exchange_fee_rates(client, symbol: str) -> dict:
+    symbol = str(symbol or "").upper().strip()
     try:
         response = client.get_fee_rates(symbol)
     except Exception as exc:
@@ -829,6 +835,15 @@ def _exchange_fee_rates(client, symbol: str) -> dict:
     result = response.get("result") or {}
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Exchange returned an invalid fee rate response")
+    result_symbol = str(result.get("symbol") or "").upper().strip()
+    if result_symbol != symbol:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Exchange fee rate response symbol mismatch for {symbol}: "
+                f"{result_symbol or 'missing symbol'}"
+            ),
+        )
     try:
         maker_fee_rate = normalize_fee_rate(result.get("makerFeeRate"), "maker fee rate")
         taker_fee_rate = normalize_fee_rate(result.get("takerFeeRate"), "taker fee rate")
@@ -845,6 +860,44 @@ def _exchange_fee_rates(client, symbol: str) -> dict:
         "source": str(result.get("source") or "exchange"),
         "fetched_at": fetched_at,
     }
+
+
+def _ticker_snapshot_or_http(client, symbol: str) -> dict:
+    try:
+        response = client.get_ticker(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{symbol} ticker snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch current price"),
+        )
+    try:
+        return validate_ticker_response(response, symbol=symbol)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _instrument_snapshot_or_http(client, symbol: str) -> dict:
+    try:
+        response = client.get_instrument_info(symbol)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{symbol} instrument snapshot request failed: {exc}",
+        ) from exc
+    if isinstance(response, dict) and "retCode" in response and response.get("retCode") != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=response.get("retMsg", "Failed to fetch instrument info"),
+        )
+    try:
+        return validate_instrument_response(response, symbol=symbol)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 def _with_exchange_fee_rates(client, cfg: "GridConfig", symbol: str) -> tuple["GridConfig", dict]:
@@ -865,41 +918,20 @@ def _position_sizing_mode(cfg: "GridConfig") -> str:
 
 
 def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> dict:
-    ticker = client.get_ticker(symbol)
-    if ticker.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=ticker.get("retMsg", "Failed to fetch current price"))
-    ticker_item = ticker["result"]["list"][0]
-    current_price = float(ticker_item["lastPrice"])
+    ticker = _ticker_snapshot_or_http(client, symbol)
+    current_price = float(ticker["last_price"])
     initial_order_type = cfg.initial_order_type.lower().strip()
     sizing_mode = _position_sizing_mode(cfg)
 
-    info_resp = client.get_instrument_info(symbol)
-    if info_resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=info_resp.get("retMsg", "Failed to fetch instrument info"))
-    instrument = info_resp["result"]["list"][0]
-    tick_size_text = str(instrument["priceFilter"]["tickSize"])
+    instrument = _instrument_snapshot_or_http(client, symbol)
+    tick_size_text = instrument["tick_size"]
     tick_size = float(tick_size_text)
-    lot_filter = instrument["lotSizeFilter"]
-    explicit_market_filter = instrument.get("marketLotSizeFilter")
-    market_filter = explicit_market_filter or lot_filter
-    qty_step = lot_filter["qtyStep"]
-    min_qty = float(lot_filter["minOrderQty"])
-    min_notional = float(
-        lot_filter.get("minNotionalValue")
-        or instrument.get("minNotionalValue")
-        or 0
-    )
-    market_qty_step = str(market_filter.get("qtyStep") or qty_step)
-    market_min_qty = float(market_filter.get("minOrderQty") or min_qty)
-    if explicit_market_filter:
-        raw_max_market_qty = explicit_market_filter.get("maxOrderQty")
-    else:
-        raw_max_market_qty = (
-            lot_filter.get("maxMktOrderQty")
-            or lot_filter.get("maxMarketOrderQty")
-            or lot_filter.get("maxOrderQty")
-        )
-    max_market_qty = float(raw_max_market_qty or 0)
+    qty_step = instrument["qty_step"]
+    min_qty = float(instrument["min_qty"])
+    min_notional = float(instrument["min_notional"])
+    market_qty_step = instrument["market_qty_step"]
+    market_min_qty = float(instrument["market_min_qty"])
+    max_market_qty = float(instrument["max_market_qty"])
 
     reference_price = current_price
     if direction in {"long", "short"} and initial_order_type in {"limit", "post_only"}:
@@ -986,10 +1018,7 @@ def _preview_grid(client, cfg, symbol: str, direction: str, grid_mode: str) -> d
 
     initial_notional_price = reference_price
     if direction in {"long", "short"} and initial_order_type == "market":
-        try:
-            initial_notional_price = float(ticker_item.get("markPrice") or current_price)
-        except (TypeError, ValueError):
-            initial_notional_price = current_price
+        initial_notional_price = float(ticker["mark_price"])
 
     if direction in {"long", "short"} and initial_order_type == "market":
         market_steps = _round_down_steps(total_qty, market_qty_step)
@@ -1568,13 +1597,11 @@ def set_config(cfg: ApiConfig):
 def get_price(symbol: str, exchange: str | None = None):
     exchange = _normalize_exchange(exchange or _active_exchange)
     client = _client_for_exchange(exchange, require_config=False)
-    resp = client.get_ticker(symbol.upper())
-    if resp.get("retCode") != 0:
-        raise HTTPException(status_code=400, detail=resp.get("retMsg", "Failed to fetch ticker"))
-
-    data = resp["result"]["list"][0]
+    symbol = symbol.upper()
+    ticker = _ticker_snapshot_or_http(client, symbol)
+    data = ticker["raw"]
     return {
-        "symbol": data["symbol"],
+        "symbol": ticker["symbol"],
         "exchange": exchange,
         "last_price": data["lastPrice"],
         "index_price": data.get("indexPrice", ""),

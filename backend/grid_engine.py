@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -44,7 +45,7 @@ COMPLETED_REPAIR_MESSAGE_PREFIXES = (
 )
 
 
-def _position_decimal(
+def _snapshot_decimal(
     value: Any,
     *,
     context: str,
@@ -67,7 +68,175 @@ def _position_decimal(
         raise RuntimeError(f"{context} row {row_index} has invalid {field}") from exc
     if not parsed.is_finite():
         raise RuntimeError(f"{context} row {row_index} has non-finite {field}")
+    try:
+        float_value = float(parsed)
+    except (OverflowError, ValueError) as exc:
+        raise RuntimeError(
+            f"{context} row {row_index} has out-of-range {field}"
+        ) from exc
+    if not math.isfinite(float_value) or (parsed != 0 and float_value == 0):
+        raise RuntimeError(f"{context} row {row_index} has out-of-range {field}")
     return parsed
+
+
+def _single_snapshot_row(response: Any, *, symbol: str, kind: str) -> tuple[str, dict]:
+    label = str(symbol or "").upper().strip()
+    context = f"{label} {kind} snapshot" if label else f"{kind} snapshot"
+    if not isinstance(response, dict):
+        raise RuntimeError(f"{context} response must be an object")
+    if response.get("retCode") != 0:
+        message = str(response.get("retMsg") or "exchange rejected the request")
+        raise RuntimeError(f"{context} request failed: {message}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{context} result must be an object")
+    rows = result.get("list")
+    if not isinstance(rows, list):
+        raise RuntimeError(f"{context} list must be an array")
+    if len(rows) != 1:
+        raise RuntimeError(f"{context} must contain exactly one row")
+    row = rows[0]
+    if not isinstance(row, dict):
+        raise RuntimeError(f"{context} row must be an object")
+    if "symbol" not in row:
+        raise RuntimeError(f"{context} row is missing symbol")
+    row_symbol = str(row.get("symbol") or "").upper().strip()
+    if row_symbol != label:
+        raise RuntimeError(f"{context} row belongs to {row_symbol or 'an empty symbol'}")
+    return context, row
+
+
+def validate_ticker_response(response: Any, *, symbol: str) -> dict:
+    context, row = _single_snapshot_row(response, symbol=symbol, kind="ticker")
+    last_price = _snapshot_decimal(
+        row.get("lastPrice"),
+        context=context,
+        row_index=0,
+        field="lastPrice",
+    )
+    assert last_price is not None
+    if last_price <= 0:
+        raise RuntimeError(f"{context} row has non-positive lastPrice")
+    mark_price = _snapshot_decimal(
+        row.get("markPrice"),
+        context=context,
+        row_index=0,
+        field="markPrice",
+        allow_blank=True,
+    )
+    if mark_price is None:
+        mark_price = last_price
+    elif mark_price <= 0:
+        raise RuntimeError(f"{context} row has non-positive markPrice")
+    return {
+        "raw": row,
+        "symbol": str(symbol).upper().strip(),
+        "last_price": last_price,
+        "mark_price": mark_price,
+    }
+
+
+def validate_instrument_response(response: Any, *, symbol: str) -> dict:
+    context, row = _single_snapshot_row(response, symbol=symbol, kind="instrument")
+    price_filter = row.get("priceFilter")
+    lot_filter = row.get("lotSizeFilter")
+    if not isinstance(price_filter, dict):
+        raise RuntimeError(f"{context} priceFilter must be an object")
+    if not isinstance(lot_filter, dict):
+        raise RuntimeError(f"{context} lotSizeFilter must be an object")
+
+    tick_size = _snapshot_decimal(
+        price_filter.get("tickSize"),
+        context=context,
+        row_index=0,
+        field="tickSize",
+    )
+    qty_step = _snapshot_decimal(
+        lot_filter.get("qtyStep"),
+        context=context,
+        row_index=0,
+        field="qtyStep",
+    )
+    min_qty = _snapshot_decimal(
+        lot_filter.get("minOrderQty"),
+        context=context,
+        row_index=0,
+        field="minOrderQty",
+    )
+    assert tick_size is not None and qty_step is not None and min_qty is not None
+    if tick_size <= 0:
+        raise RuntimeError(f"{context} has non-positive tickSize")
+    if qty_step <= 0:
+        raise RuntimeError(f"{context} has non-positive qtyStep")
+    if min_qty <= 0:
+        raise RuntimeError(f"{context} has non-positive minOrderQty")
+
+    min_notional = _snapshot_decimal(
+        lot_filter.get("minNotionalValue", row.get("minNotionalValue")),
+        context=context,
+        row_index=0,
+        field="minNotionalValue",
+        allow_blank=True,
+    )
+    if min_notional is None:
+        min_notional = Decimal("0")
+    elif min_notional < 0:
+        raise RuntimeError(f"{context} has negative minNotionalValue")
+
+    if "marketLotSizeFilter" in row:
+        market_filter = row.get("marketLotSizeFilter")
+        if not isinstance(market_filter, dict):
+            raise RuntimeError(f"{context} marketLotSizeFilter must be an object")
+        market_qty_step = _snapshot_decimal(
+            market_filter.get("qtyStep"),
+            context=context,
+            row_index=0,
+            field="market qtyStep",
+        )
+        market_min_qty = _snapshot_decimal(
+            market_filter.get("minOrderQty"),
+            context=context,
+            row_index=0,
+            field="market minOrderQty",
+        )
+        max_market_value = market_filter.get("maxOrderQty")
+    else:
+        market_filter = lot_filter
+        market_qty_step = qty_step
+        market_min_qty = min_qty
+        max_market_value = (
+            lot_filter.get("maxMktOrderQty")
+            or lot_filter.get("maxMarketOrderQty")
+            or lot_filter.get("maxOrderQty")
+        )
+    assert market_qty_step is not None and market_min_qty is not None
+    if market_qty_step <= 0:
+        raise RuntimeError(f"{context} has non-positive market qtyStep")
+    if market_min_qty <= 0:
+        raise RuntimeError(f"{context} has non-positive market minOrderQty")
+    max_market_qty = _snapshot_decimal(
+        max_market_value,
+        context=context,
+        row_index=0,
+        field="market maxOrderQty",
+        allow_blank=True,
+    )
+    if max_market_qty is None:
+        max_market_qty = Decimal("0")
+    elif max_market_qty < 0:
+        raise RuntimeError(f"{context} has negative market maxOrderQty")
+
+    return {
+        "raw": row,
+        "symbol": str(symbol).upper().strip(),
+        "tick_size": str(price_filter.get("tickSize")).strip(),
+        "qty_step": str(lot_filter.get("qtyStep")).strip(),
+        "min_qty": min_qty,
+        "min_notional": min_notional,
+        "market_qty_step": str(market_filter.get("qtyStep")).strip(),
+        "market_min_qty": market_min_qty,
+        "max_market_qty": max_market_qty,
+    }
 
 
 def validate_position_response(response: Any, *, symbol: str = "") -> list[dict]:
@@ -102,7 +271,7 @@ def validate_position_response(response: Any, *, symbol: str = "") -> list[dict]
         if "size" not in raw_position:
             raise RuntimeError(f"{context} row {row_index} is missing size")
 
-        qty = _position_decimal(
+        qty = _snapshot_decimal(
             raw_position.get("size"),
             context=context,
             row_index=row_index,
@@ -127,7 +296,7 @@ def validate_position_response(response: Any, *, symbol: str = "") -> list[dict]
         for field in ("avgPrice", "entryPrice", "entry_price"):
             if field not in raw_position:
                 continue
-            candidate = _position_decimal(
+            candidate = _snapshot_decimal(
                 raw_position.get(field),
                 context=context,
                 row_index=row_index,
@@ -144,7 +313,7 @@ def validate_position_response(response: Any, *, symbol: str = "") -> list[dict]
 
         mark_price = None
         if "markPrice" in raw_position:
-            mark_price = _position_decimal(
+            mark_price = _snapshot_decimal(
                 raw_position.get("markPrice"),
                 context=context,
                 row_index=row_index,
@@ -156,7 +325,7 @@ def validate_position_response(response: Any, *, symbol: str = "") -> list[dict]
 
         unrealised_pnl = None
         if "unrealisedPnl" in raw_position:
-            unrealised_pnl = _position_decimal(
+            unrealised_pnl = _snapshot_decimal(
                 raw_position.get("unrealisedPnl"),
                 context=context,
                 row_index=row_index,
@@ -1169,48 +1338,23 @@ class GridEngine:
         }
 
     def _fetch_precision(self):
-        resp = self.client.get_instrument_info(self.config["symbol"])
-        if resp.get("retCode") != 0:
-            raise RuntimeError(resp.get("retMsg", "Failed to fetch instrument info"))
-
-        info = resp["result"]["list"][0]
-        self.tick_size = info["priceFilter"]["tickSize"]
-        lot_filter = info["lotSizeFilter"]
-        explicit_market_filter = info.get("marketLotSizeFilter")
-        market_filter = explicit_market_filter or lot_filter
-        self.qty_step = lot_filter["qtyStep"]
-        self.min_qty = float(lot_filter["minOrderQty"])
-        self.min_notional = float(
-            lot_filter.get("minNotionalValue")
-            or info.get("minNotionalValue")
-            or 0
-        )
-        self.market_qty_step = str(market_filter.get("qtyStep") or self.qty_step)
-        self.market_min_qty = float(
-            market_filter.get("minOrderQty") or self.min_qty
-        )
-        if explicit_market_filter:
-            max_market_qty = explicit_market_filter.get("maxOrderQty")
-        else:
-            # Bybit exposes market and limit maxima in the same lot-size object.
-            # The market-specific field must win over the larger limit maximum.
-            max_market_qty = (
-                lot_filter.get("maxMktOrderQty")
-                or lot_filter.get("maxMarketOrderQty")
-                or lot_filter.get("maxOrderQty")
-            )
-        self.max_market_qty = float(max_market_qty or 0)
+        symbol = str(self.config.get("symbol") or "").upper()
+        response = self.client.get_instrument_info(symbol)
+        rules = validate_instrument_response(response, symbol=symbol)
+        self.tick_size = rules["tick_size"]
+        self.qty_step = rules["qty_step"]
+        self.min_qty = float(rules["min_qty"])
+        self.min_notional = float(rules["min_notional"])
+        self.market_qty_step = rules["market_qty_step"]
+        self.market_min_qty = float(rules["market_min_qty"])
+        self.max_market_qty = float(rules["max_market_qty"])
 
     def _get_current_price(self) -> float:
-        ticker = self.client.get_ticker(self.config["symbol"])
-        if ticker.get("retCode") != 0:
-            raise RuntimeError(ticker.get("retMsg", "Failed to fetch current price"))
-        item = ticker["result"]["list"][0]
-        last_price = float(item["lastPrice"])
-        try:
-            self.current_mark_price = float(item.get("markPrice") or last_price)
-        except (TypeError, ValueError):
-            self.current_mark_price = last_price
+        symbol = str(self.config.get("symbol") or "").upper()
+        response = self.client.get_ticker(symbol)
+        ticker = validate_ticker_response(response, symbol=symbol)
+        last_price = float(ticker["last_price"])
+        self.current_mark_price = float(ticker["mark_price"])
         return last_price
 
     def _calculate_levels(self) -> list[float]:

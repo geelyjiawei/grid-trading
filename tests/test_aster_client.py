@@ -10,6 +10,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from aster_client import AsterFuturesClient  # noqa: E402
 from exchange_errors import ExchangeRateLimitError, ExchangeRequestUncertainError  # noqa: E402
+from grid_engine import validate_instrument_response  # noqa: E402
 
 
 PRIVATE_KEY = "0x" + "1" * 64
@@ -131,6 +132,22 @@ class AsterClientTests(unittest.TestCase):
         self.assertEqual(info["marketLotSizeFilter"]["qtyStep"], "1")
         self.assertEqual(info["marketLotSizeFilter"]["minOrderQty"], "1")
         self.assertEqual(info["marketLotSizeFilter"]["maxOrderQty"], "5000")
+
+    def test_missing_required_filters_never_become_default_rules(self):
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client.session = FakeSession(
+            FakeResponse({"symbols": [{"symbol": "ASTERUSDT", "filters": []}]})
+        )
+
+        response = client.get_instrument_info("ASTERUSDT")
+
+        with self.assertRaisesRegex(RuntimeError, "instrument snapshot"):
+            validate_instrument_response(response, symbol="ASTERUSDT")
 
     def test_http_503_is_reported_as_unknown_submission_outcome(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
@@ -896,6 +913,54 @@ class AsterClientTests(unittest.TestCase):
         self.assertEqual(first["result"]["takerFeeRate"], "0.000400")
         self.assertEqual(first["result"]["source"], "exchange")
         self.assertEqual(second["result"]["source"], "exchange_cache")
+
+    def test_fee_rates_reject_wrong_or_missing_symbol_without_cache(self):
+        for label, returned_symbol in (("wrong", "OTHERUSDT"), ("missing", None)):
+            with self.subTest(label=label):
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+                response = {
+                    "makerCommissionRate": "0",
+                    "takerCommissionRate": "0.0004",
+                }
+                if returned_symbol is not None:
+                    response["symbol"] = returned_symbol
+                client._request = lambda *args, **kwargs: response
+
+                with self.assertRaisesRegex(RuntimeError, "fee rate.*symbol"):
+                    client.get_fee_rates("ANSEMUSDT")
+
+                self.assertEqual(client._fee_rate_cache, {})
+
+    def test_ticker_rejects_wrong_premium_symbol(self):
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+
+        def fake_request(method, path, *, params=None, auth=False):
+            if path == "/fapi/v3/ticker/24hr":
+                return {
+                    "symbol": "ANSEMUSDT",
+                    "lastPrice": "0.4",
+                    "priceChangePercent": "1",
+                }
+            return {
+                "symbol": "OTHERUSDT",
+                "indexPrice": "0.39",
+                "markPrice": "0.4",
+            }
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "ticker.*symbol"):
+            client.get_ticker("ANSEMUSDT")
 
     def test_nonquote_fee_conversion_uses_execution_minute_open(self):
         client = AsterFuturesClient(

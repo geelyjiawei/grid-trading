@@ -278,6 +278,12 @@ class BybitClient:
         items = data.get("result", {}).get("list") or []
         if not items:
             raise RuntimeError(f"Bybit returned no fee rate for {symbol}")
+        if (
+            len(items) != 1
+            or not isinstance(items[0], dict)
+            or str(items[0].get("symbol") or "").upper() != symbol
+        ):
+            raise RuntimeError(f"Bybit fee rate response symbol is ambiguous for {symbol}")
         fetched_at = int(time.time() * 1000)
         response = fee_rate_response(
             symbol,

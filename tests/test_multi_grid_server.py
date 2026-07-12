@@ -27,6 +27,7 @@ from aster_client import AsterFuturesClient  # noqa: E402
 from binance_client import BinanceFuturesClient  # noqa: E402
 from bybit_client import BybitClient  # noqa: E402
 from exchange_errors import ExchangeRateLimitError, ExchangeRequestUncertainError  # noqa: E402
+from grid_engine import validate_instrument_response  # noqa: E402
 from auth import hash_password  # noqa: E402
 from test_grid_engine import FakeClient  # noqa: E402
 
@@ -963,6 +964,77 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertIn("invalid maker fee rate", response.json()["detail"])
         self.assertEqual(main._client.orders, [])
         self.assertIsNone(main._get_engine("binance", "BADFEEUSDT"))
+
+    def test_fee_endpoint_rejects_wrong_symbol_response(self):
+        main._client = FakeClient("100")
+        main._clients["binance"] = main._client
+        main._client.get_fee_rates = lambda symbol: {
+            "retCode": 0,
+            "result": {
+                "symbol": "OTHERUSDT",
+                "makerFeeRate": "0.0002",
+                "takerFeeRate": "0.0005",
+                "source": "exchange",
+                "fetchedAt": 1714012800000,
+            },
+        }
+
+        response = self.client.get("/api/fees/TESTUSDT?exchange=binance")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("fee rate", response.json()["detail"])
+        self.assertIn("symbol", response.json()["detail"])
+
+    def test_price_and_preview_reject_wrong_symbol_ticker(self):
+        client = FakeClient("100")
+        client.get_ticker = lambda symbol: {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "symbol": "OTHERUSDT",
+                        "lastPrice": "1",
+                        "markPrice": "1",
+                    }
+                ]
+            },
+        }
+        main._client = client
+        main._clients["binance"] = client
+
+        price_response = self.client.get("/api/price/TESTUSDT?exchange=binance")
+        preview_response = self.client.post(
+            "/api/grid/preview",
+            json=self._payload("TESTUSDT"),
+        )
+
+        self.assertEqual(price_response.status_code, 502)
+        self.assertIn("ticker snapshot", price_response.json()["detail"])
+        self.assertEqual(preview_response.status_code, 502)
+        self.assertIn("ticker snapshot", preview_response.json()["detail"])
+        self.assertEqual(client.orders, [])
+
+    def test_preview_rejects_wrong_symbol_instrument_snapshot(self):
+        client = FakeClient("100")
+        original_get_instrument_info = client.get_instrument_info
+
+        def wrong_symbol_instrument(symbol):
+            response = original_get_instrument_info(symbol)
+            response["result"]["list"][0]["symbol"] = "OTHERUSDT"
+            return response
+
+        client.get_instrument_info = wrong_symbol_instrument
+        main._client = client
+        main._clients["binance"] = client
+
+        response = self.client.post(
+            "/api/grid/preview",
+            json=self._payload("TESTUSDT"),
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("instrument snapshot", response.json()["detail"])
+        self.assertEqual(client.orders, [])
 
     def test_grid_preview_uses_active_grid_count_and_exchange_qty_step(self):
         main._client = FakeClient("100")
@@ -2810,6 +2882,17 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(info["marketLotSizeFilter"]["minOrderQty"], "0.1")
         self.assertEqual(info["marketLotSizeFilter"]["maxOrderQty"], "120")
 
+    def test_binance_missing_required_filters_never_become_default_rules(self):
+        client = BinanceFuturesClient("", "", True)
+        client._request = Mock(
+            return_value={"symbols": [{"symbol": "TESTUSDT", "filters": []}]}
+        )
+
+        response = client.get_instrument_info("TESTUSDT")
+
+        with self.assertRaisesRegex(RuntimeError, "instrument snapshot"):
+            validate_instrument_response(response, symbol="TESTUSDT")
+
     def test_binance_fee_rates_use_signed_endpoint_and_short_cache(self):
         client = BinanceFuturesClient("key", "secret", True)
         calls = []
@@ -2835,11 +2918,50 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(first["result"]["takerFeeRate"], "0.000500")
         self.assertEqual(second["result"]["source"], "exchange_cache")
 
+    def test_binance_fee_rates_reject_wrong_or_missing_symbol_without_cache(self):
+        for label, returned_symbol in (("wrong", "OTHERUSDT"), ("missing", None)):
+            with self.subTest(label=label):
+                client = BinanceFuturesClient("key", "secret", True)
+                response = {
+                    "makerCommissionRate": "0.0002",
+                    "takerCommissionRate": "0.0005",
+                }
+                if returned_symbol is not None:
+                    response["symbol"] = returned_symbol
+                client._request = Mock(return_value=response)
+
+                with self.assertRaisesRegex(RuntimeError, "fee rate.*symbol"):
+                    client.get_fee_rates("BTCUSDT")
+
+                self.assertEqual(client._fee_rate_cache, {})
+
+    def test_binance_ticker_rejects_wrong_premium_symbol(self):
+        client = BinanceFuturesClient("key", "secret", True)
+
+        def fake_request(method, path, *, params=None, auth=False, api_key=False):
+            if path == "/fapi/v1/ticker/24hr":
+                return {
+                    "symbol": "BTCUSDT",
+                    "lastPrice": "100",
+                    "priceChangePercent": "1",
+                }
+            return {
+                "symbol": "OTHERUSDT",
+                "indexPrice": "99",
+                "markPrice": "100",
+            }
+
+        client._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "ticker.*symbol"):
+            client.get_ticker("BTCUSDT")
+
     def test_binance_fee_rate_cache_expiry_requeries_exchange(self):
         client = BinanceFuturesClient("key", "secret", True)
         client.FEE_RATE_TTL_SECONDS = 0
         client._request = Mock(
             return_value={
+                "symbol": "BTCUSDT",
                 "makerCommissionRate": "0.0002",
                 "takerCommissionRate": "0.0005",
             }
@@ -3354,6 +3476,43 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(first["result"]["makerFeeRate"], "0.0001")
         self.assertEqual(first["result"]["takerFeeRate"], "0.0006")
         self.assertEqual(second["result"]["source"], "exchange_cache")
+
+    def test_bybit_fee_rates_reject_ambiguous_symbol_rows_without_cache(self):
+        cases = {
+            "wrong symbol": [
+                {
+                    "symbol": "OTHERUSDT",
+                    "makerFeeRate": "0.0001",
+                    "takerFeeRate": "0.0006",
+                }
+            ],
+            "missing symbol": [
+                {"makerFeeRate": "0.0001", "takerFeeRate": "0.0006"}
+            ],
+            "multiple rows": [
+                {
+                    "symbol": "BTCUSDT",
+                    "makerFeeRate": "0.0001",
+                    "takerFeeRate": "0.0006",
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "makerFeeRate": "0.0001",
+                    "takerFeeRate": "0.0006",
+                },
+            ],
+        }
+        for label, rows in cases.items():
+            with self.subTest(label=label):
+                client = BybitClient("key", "secret", True)
+                client._request = Mock(
+                    return_value={"retCode": 0, "result": {"list": rows}}
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "fee rate.*symbol"):
+                    client.get_fee_rates("BTCUSDT")
+
+                self.assertEqual(client._fee_rate_cache, {})
 
     def test_bybit_fee_rate_error_response_is_never_cached_as_success(self):
         client = BybitClient("key", "secret", True)
