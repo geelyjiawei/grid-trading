@@ -3200,54 +3200,59 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
             "grid_order_post_only": False,
         }
         levels = [float(price) for price in range(935, 956)]
+        fragments_by_level = [
+            [0.20, 0.01],
+            [0.20],
+            [0.20],
+            [0.20],
+            [0.19],
+            [0.19],
+            [0.14],
+            [0.20],
+            [0.19],
+            [0.20],
+            [0.02],
+            [0.20],
+            [0.20],
+            [0.20],
+            [0.19, 0.01],
+            [0.20],
+            [0.19, 0.01],
+            [0.20],
+            [0.20],
+            [0.20],
+        ]
         quantities = [
-            0.21,
-            0.20,
-            0.20,
-            0.20,
-            0.19,
-            0.19,
-            0.14,
-            0.20,
-            0.19,
-            0.20,
-            0.02,
-            0.20,
-            0.20,
-            0.20,
-            0.20,
-            0.20,
-            0.20,
-            0.20,
-            0.20,
-            0.20,
+            float(sum((Decimal(str(fragment)) for fragment in fragments), Decimal("0")))
+            for fragments in fragments_by_level
         ]
         active_orders = {}
-        for level_idx, qty in enumerate(quantities):
-            link_id = f"g_{level_idx}_B_mu_restore"
-            response = client.place_order(
-                symbol="MUUSDT",
-                side="Buy",
-                qty=str(qty),
-                price=str(levels[level_idx]),
-                order_type="Limit",
-                time_in_force="GTC",
-                reduce_only=True,
-                order_link_id=link_id,
-            )
-            active_orders[link_id] = {
-                "link_id": link_id,
-                "order_id": response["result"]["orderId"],
-                "level_idx": level_idx,
-                "side": "Buy",
-                "price": str(levels[level_idx]),
-                "qty": str(qty),
-                "status": "open",
-                "order_type": "Limit",
-                "time_in_force": "GTC",
-                "reduce_only": True,
-                "entry_price": 949.7754,
-            }
+        for level_idx, fragments in enumerate(fragments_by_level):
+            for fragment_idx, qty in enumerate(fragments):
+                link_id = f"g_{level_idx}_B_mu_restore_{fragment_idx}"
+                response = client.place_order(
+                    symbol="MUUSDT",
+                    side="Buy",
+                    qty=str(qty),
+                    price=str(levels[level_idx]),
+                    order_type="Limit",
+                    time_in_force="GTC",
+                    reduce_only=True,
+                    order_link_id=link_id,
+                )
+                active_orders[link_id] = {
+                    "link_id": link_id,
+                    "order_id": response["result"]["orderId"],
+                    "level_idx": level_idx,
+                    "side": "Buy",
+                    "price": str(levels[level_idx]),
+                    "qty": str(qty),
+                    "status": "open",
+                    "order_type": "Limit",
+                    "time_in_force": "GTC",
+                    "reduce_only": True,
+                    "entry_price": 949.7754,
+                }
 
         state = {
             "running": True,
@@ -3274,8 +3279,22 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         coverage = engine.grid_coverage_snapshot()
         self.assertEqual(len(client.orders), seed_order_count)
+        self.assertEqual(seed_order_count, 23)
         self.assertEqual(client.cancelled_orders, [])
         self.assertEqual(client.open_limit_order_ids, seed_open_ids)
+        self.assertEqual(len(engine.active_orders), 23)
+        self.assertEqual(
+            sum(1 for order in engine.active_orders.values() if order["level_idx"] == 0),
+            2,
+        )
+        self.assertEqual(
+            sum(1 for order in engine.active_orders.values() if order["level_idx"] == 14),
+            2,
+        )
+        self.assertEqual(
+            sum(1 for order in engine.active_orders.values() if order["level_idx"] == 16),
+            2,
+        )
         self.assertAlmostEqual(coverage["target_qty"], 4.0)
         self.assertAlmostEqual(coverage["coverage_qty"], 3.74)
         self.assertAlmostEqual(
@@ -3286,6 +3305,78 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(coverage["net_delta_qty"], -0.26)
         self.assertTrue(coverage["has_risk"])
         self.assertIn("automatic top-up is paused", engine.trigger_message)
+
+    async def test_mu_oversized_same_level_fragments_heal_to_one_exact_target(self):
+        for fill_sequence in ((0.20, 0.01), (0.01, 0.20)):
+            client = FakeClient("975", tick_size="1", qty_step="0.01", min_qty="0.01")
+            engine = GridEngine(
+                client,
+                {
+                    "symbol": "MUUSDT",
+                    "direction": "short",
+                    "grid_mode": "arithmetic",
+                    "upper_price": 955,
+                    "lower_price": 935,
+                    "grid_count": 1,
+                    "total_investment": 0,
+                    "position_sizing_mode": "fixed_grid_qty",
+                    "grid_order_qty": 0.2,
+                    "qty_per_grid": 0.2,
+                    "leverage": 5,
+                    "grid_order_post_only": False,
+                },
+            )
+            engine._fetch_precision()
+            engine.grid_ready = True
+            engine.grid_levels = [935, 936]
+            engine.target_qty_by_level = {"0": 0.2}
+            engine.reduce_lots_complete = True
+            engine.reduce_lots_by_level = {
+                "0": {"qty": 0.21, "entry_value": 0.21 * 949.7754}
+            }
+            engine.grid_position_net_qty = -0.21
+
+            for order_index, qty in enumerate(fill_sequence):
+                order = {
+                    "link_id": f"g_0_B_mu_fragment_{order_index}",
+                    "order_id": f"reduce-{order_index}",
+                    "level_idx": 0,
+                    "side": "Buy",
+                    "price": "935",
+                    "qty": str(qty),
+                    "status": "FILLED",
+                    "order_type": "Limit",
+                    "time_in_force": "GTC",
+                    "reduce_only": True,
+                    "entry_price": 949.7754,
+                    "processed_fill_qty": 0.0,
+                    "processed_fill_volume": 0.0,
+                    "processed_fill_fee": 0.0,
+                }
+                handled = engine._record_execution_delta(
+                    order,
+                    {
+                        "price": 935.0,
+                        "qty": qty,
+                        "volume": 935.0 * qty,
+                        "fee": 0.0,
+                        "fee_asset": "USDT",
+                        "fee_source": "exchange",
+                        "maker_count": 1,
+                        "taker_count": 0,
+                    },
+                )
+                self.assertTrue(handled, msg=fill_sequence)
+
+            reopened = [order for order in client.orders if not order["reduce_only"]]
+            self.assertEqual(
+                sum(Decimal(order["qty"]) for order in reopened),
+                Decimal("0.20"),
+                msg=fill_sequence,
+            )
+            self.assertEqual(engine.paused_replacements, [], msg=fill_sequence)
+            self.assertEqual(engine.reduce_lots_by_level, {}, msg=fill_sequence)
+            self.assertEqual(Decimal(str(engine.grid_position_net_qty)), Decimal("0"))
 
     async def test_baseline_loss_of_one_qty_step_halts_even_when_below_min_order_quantity(self):
         client = FakeClient("100", qty_step="0.01", min_qty="1")
