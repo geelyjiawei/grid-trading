@@ -56,6 +56,293 @@ def validate_positive_decimal(
     return parsed
 
 
+def snapshot_text(
+    value: Any,
+    *,
+    context: str,
+    row_index: int,
+    field: str,
+) -> str:
+    if value is None or isinstance(value, bool):
+        raise RuntimeError(f"{context} row {row_index} has invalid {field}")
+    text = str(value).strip()
+    if not text:
+        raise RuntimeError(f"{context} row {row_index} has invalid {field}")
+    return text
+
+
+def snapshot_boolean(
+    value: Any,
+    *,
+    context: str,
+    row_index: int,
+    field: str,
+    allow_strings: bool = False,
+) -> bool:
+    if isinstance(value, bool):
+        return value
+    if allow_strings and isinstance(value, str):
+        text = value.strip().lower()
+        if text == "true":
+            return True
+        if text == "false":
+            return False
+    raise RuntimeError(f"{context} row {row_index} has invalid {field}")
+
+
+def validate_positive_integer(
+    value: Any,
+    *,
+    context: str,
+    field: str,
+    row_index: int = 0,
+) -> int:
+    parsed = validate_positive_decimal(
+        value,
+        context=context,
+        field=field,
+        row_index=row_index,
+    )
+    if parsed != parsed.to_integral_value():
+        raise RuntimeError(f"{context} row {row_index} has non-integer {field}")
+    return int(parsed)
+
+
+def _execution_context(symbol: str, context: str | None) -> str:
+    if context:
+        return context
+    label = str(symbol or "").upper().strip()
+    return f"{label} execution snapshot" if label else "execution snapshot"
+
+
+def validate_execution_row(
+    row: Any,
+    *,
+    expected_symbol: str = "",
+    expected_order_id: str = "",
+    require_identity: bool = True,
+    row_index: int = 0,
+    context: str | None = None,
+) -> dict:
+    label = str(expected_symbol or "").upper().strip()
+    order_label = str(expected_order_id or "").strip()
+    snapshot_context = _execution_context(label, context)
+    if not isinstance(row, dict):
+        raise RuntimeError(
+            f"{snapshot_context} row {row_index} must be an object"
+        )
+
+    def identity_text(field: str, *, upper: bool = False) -> str:
+        value = row.get(field)
+        if not require_identity and (value is None or not str(value).strip()):
+            return ""
+        text = snapshot_text(
+            value,
+            context=snapshot_context,
+            row_index=row_index,
+            field=field,
+        )
+        return text.upper() if upper else text
+
+    symbol = identity_text("symbol", upper=True)
+    order_id = identity_text("orderId")
+    trade_id = identity_text("tradeId")
+    side = identity_text("side")
+    if symbol and label and symbol != label:
+        raise RuntimeError(
+            f"{snapshot_context} row {row_index} belongs to {symbol}"
+        )
+    if order_id and order_label and order_id != order_label:
+        raise RuntimeError(
+            f"{snapshot_context} row {row_index} belongs to order {order_id}"
+        )
+    if side and side not in {"Buy", "Sell"}:
+        raise RuntimeError(f"{snapshot_context} row {row_index} has invalid side")
+
+    price = validate_positive_decimal(
+        row.get("price"),
+        context=snapshot_context,
+        field="price",
+        row_index=row_index,
+    )
+    qty = validate_positive_decimal(
+        row.get("qty"),
+        context=snapshot_context,
+        field="qty",
+        row_index=row_index,
+    )
+    volume_value = row.get("volume")
+    if require_identity:
+        volume = validate_positive_decimal(
+            volume_value,
+            context=snapshot_context,
+            field="volume",
+            row_index=row_index,
+        )
+    else:
+        volume = snapshot_decimal(
+            volume_value,
+            context=snapshot_context,
+            row_index=row_index,
+            field="volume",
+            allow_blank=True,
+        )
+        if volume is None:
+            volume = price * qty
+        if volume <= 0:
+            raise RuntimeError(
+                f"{snapshot_context} row {row_index} has non-positive volume"
+            )
+
+    fee_value = row.get("fee")
+    if not require_identity and (fee_value is None or not str(fee_value).strip()):
+        fee = Decimal("0")
+    else:
+        fee = snapshot_decimal(
+            fee_value,
+            context=snapshot_context,
+            row_index=row_index,
+            field="fee",
+        )
+        assert fee is not None
+
+    fee_usdt = snapshot_decimal(
+        row.get("feeUsdt"),
+        context=snapshot_context,
+        row_index=row_index,
+        field="feeUsdt",
+        allow_blank=True,
+    )
+    realized_pnl = snapshot_decimal(
+        row.get("realizedPnl", "0"),
+        context=snapshot_context,
+        row_index=row_index,
+        field="realizedPnl",
+        allow_blank=True,
+    )
+    if realized_pnl is None:
+        realized_pnl = Decimal("0")
+
+    fee_asset_value = row.get("feeAsset")
+    if not require_identity and (
+        fee_asset_value is None or not str(fee_asset_value).strip()
+    ):
+        fee_asset = "USDT"
+    else:
+        fee_asset = snapshot_text(
+            fee_asset_value,
+            context=snapshot_context,
+            row_index=row_index,
+            field="feeAsset",
+        ).upper()
+
+    maker_value = row.get("isMaker")
+    if not require_identity and maker_value is None:
+        is_maker = False
+    else:
+        is_maker = snapshot_boolean(
+            maker_value,
+            context=snapshot_context,
+            row_index=row_index,
+            field="isMaker",
+        )
+
+    time_value = row.get("time")
+    if not require_identity and (time_value is None or not str(time_value).strip()):
+        execution_time = None
+    else:
+        execution_time = validate_positive_integer(
+            time_value,
+            context=snapshot_context,
+            field="time",
+            row_index=row_index,
+        )
+
+    fee_source = str(row.get("feeUsdtSource") or "").strip()
+    fingerprint = (
+        symbol,
+        order_id,
+        trade_id,
+        side,
+        price,
+        qty,
+        volume,
+        fee,
+        fee_asset,
+        fee_usdt,
+        fee_source,
+        realized_pnl,
+        is_maker,
+        execution_time,
+    )
+    return {
+        "raw": row,
+        "symbol": symbol,
+        "order_id": order_id,
+        "trade_id": trade_id,
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "volume": volume,
+        "fee": fee,
+        "fee_asset": fee_asset,
+        "fee_usdt": fee_usdt,
+        "fee_usdt_source": fee_source,
+        "realized_pnl": realized_pnl,
+        "is_maker": is_maker,
+        "time": execution_time,
+        "fingerprint": fingerprint,
+    }
+
+
+def validate_execution_response(
+    response: Any,
+    *,
+    expected_symbol: str = "",
+    expected_order_id: str = "",
+    require_identity: bool = True,
+) -> list[dict]:
+    context = _execution_context(expected_symbol, None)
+    if not isinstance(response, dict):
+        raise RuntimeError(f"{context} response must be an object")
+    if response.get("retCode") != 0:
+        message = str(response.get("retMsg") or "exchange rejected the request")
+        raise RuntimeError(f"{context} request failed: {message}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{context} result must be an object")
+    rows = result.get("list")
+    if not isinstance(rows, list):
+        raise RuntimeError(f"{context} list must be an array")
+
+    validated: list[dict] = []
+    by_trade_id: dict[tuple[str, str], dict] = {}
+    for row_index, row in enumerate(rows):
+        item = validate_execution_row(
+            row,
+            expected_symbol=expected_symbol,
+            expected_order_id=expected_order_id,
+            require_identity=require_identity,
+            row_index=row_index,
+            context=context,
+        )
+        trade_id = item["trade_id"]
+        if not trade_id:
+            validated.append(item)
+            continue
+        key = (item["symbol"], trade_id)
+        previous = by_trade_id.get(key)
+        if previous is None:
+            by_trade_id[key] = item
+            validated.append(item)
+            continue
+        if previous["fingerprint"] != item["fingerprint"]:
+            raise RuntimeError(
+                f"{context} contains conflicting duplicate tradeId {trade_id}"
+            )
+    return validated
+
+
 def _single_snapshot_row(response: Any, *, symbol: str, kind: str) -> tuple[str, dict]:
     label = str(symbol or "").upper().strip()
     context = f"{label} {kind} snapshot" if label else f"{kind} snapshot"

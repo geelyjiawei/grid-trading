@@ -17,6 +17,7 @@ from exchange_errors import (
     is_exchange_rate_limit_message,
 )
 from exchange_snapshots import (
+    validate_execution_response,
     validate_instrument_response,
     validate_position_response,
     validate_ticker_response,
@@ -1217,6 +1218,15 @@ class GridEngine:
                 return None
             return stats
 
+        if not isinstance(resp, dict):
+            logger.warning(
+                "Fetch trade details returned malformed response order_id=%s",
+                order_id,
+            )
+            if not allow_estimate:
+                return None
+            return stats
+
         if resp.get("retCode") != 0:
             logger.warning(
                 "Fetch trade details rejected order_id=%s msg=%s",
@@ -1227,7 +1237,22 @@ class GridEngine:
                 return None
             return stats
 
-        trades = resp.get("result", {}).get("list", [])
+        try:
+            trades = validate_execution_response(
+                resp,
+                expected_symbol=self.config["symbol"],
+                expected_order_id=order_id,
+                require_identity=False,
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                "Fetch trade details failed validation order_id=%s msg=%s",
+                order_id,
+                exc,
+            )
+            if not allow_estimate:
+                return None
+            return stats
         if not trades:
             if not allow_estimate:
                 return None
@@ -1246,24 +1271,22 @@ class GridEngine:
         maker_count = 0
         taker_count = 0
 
-        for trade in trades:
-            qty = Decimal(str(trade.get("qty", 0) or 0))
-            price = Decimal(
-                str(trade.get("price", fallback_price) or fallback_price)
-            )
-            volume = Decimal(str(trade.get("volume", 0) or (price * qty)))
-            fee_usdt_text = trade.get("feeUsdt", "")
-            fee_asset = str(trade.get("feeAsset", "USDT") or "USDT")
+        for validated_trade in trades:
+            trade = validated_trade["raw"]
+            qty = validated_trade["qty"]
+            volume = validated_trade["volume"]
+            fee_usdt = validated_trade["fee_usdt"]
+            fee_asset = validated_trade["fee_asset"]
             fee_assets.add(fee_asset)
-            if trade.get("isMaker"):
+            if validated_trade["is_maker"]:
                 maker_count += 1
             else:
                 taker_count += 1
 
             total_qty += qty
             total_volume += volume
-            if fee_usdt_text != "":
-                total_fee += Decimal(str(fee_usdt_text))
+            if fee_usdt is not None:
+                total_fee += fee_usdt
                 fee_conversion_sources.add(
                     str(trade.get("feeUsdtSource") or "exchange_reported")
                 )
@@ -1274,7 +1297,7 @@ class GridEngine:
                     str(
                         self._estimate_fee(
                             float(volume),
-                            "maker" if trade.get("isMaker") else "taker",
+                            "maker" if validated_trade["is_maker"] else "taker",
                         )
                     )
                 )

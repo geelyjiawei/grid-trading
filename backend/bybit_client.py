@@ -14,8 +14,14 @@ from exchange_errors import (
     is_exchange_rate_limit_message,
 )
 from exchange_snapshots import (
+    snapshot_boolean,
+    snapshot_decimal,
+    snapshot_text,
     validate_balance_response,
+    validate_execution_response,
+    validate_execution_row,
     validate_positive_decimal,
+    validate_positive_integer,
     validate_price_cache_entry,
     validate_ticker_response,
 )
@@ -424,74 +430,183 @@ class BybitClient:
         )
 
     def get_order_trades(self, symbol: str, order_id: str) -> dict:
+        symbol = symbol.upper()
+        order_id = str(order_id)
         resp = self._get_paginated(
             "/v5/execution/list",
             base_params=f"category=linear&symbol={symbol}&orderId={order_id}",
             page_size=100,
         )
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"{symbol} execution snapshot response must be an object")
         if resp.get("retCode") != 0:
             return resp
-        matching: dict[tuple[str, ...], dict[str, Any]] = {}
-        for item in resp.get("result", {}).get("list", []):
+        result = resp.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError(f"{symbol} execution snapshot has an invalid result")
+        matching: list[dict[str, Any]] = []
+        for item in result["list"]:
             if not isinstance(item, dict):
-                raise RuntimeError("Bybit order execution history contains an invalid row")
+                raise RuntimeError(f"{symbol} execution snapshot row must be an object")
             if str(item.get("orderId", "")) != str(order_id):
                 continue
-            matching[self._execution_identity(item)] = item
-        resp["result"]["list"] = [self._normalize_trade(item) for item in matching.values()]
+            matching.append(
+                self._normalize_trade(
+                    item,
+                    expected_symbol=symbol,
+                    expected_order_id=order_id,
+                )
+            )
+        normalized_response = {"retCode": 0, "result": {"list": matching}}
+        validated = validate_execution_response(
+            normalized_response,
+            expected_symbol=symbol,
+            expected_order_id=order_id,
+        )
+        resp["result"]["list"] = [item["raw"] for item in validated]
         return resp
 
     def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
+        symbol = symbol.upper()
         resp = self._request(
             "GET",
             "/v5/execution/list",
             params=f"category=linear&symbol={symbol}&limit={limit}",
             auth=True,
         )
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"{symbol} execution snapshot response must be an object")
         if resp.get("retCode") != 0:
             return resp
-        resp["result"]["list"] = [self._normalize_trade(item) for item in resp["result"].get("list", [])]
+        result = resp.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+            raise RuntimeError(f"{symbol} execution snapshot has an invalid result")
+        normalized_response = {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    self._normalize_trade(item, expected_symbol=symbol)
+                    for item in result["list"]
+                ]
+            },
+        }
+        validated = validate_execution_response(
+            normalized_response,
+            expected_symbol=symbol,
+        )
+        resp["result"]["list"] = [item["raw"] for item in validated]
         return resp
 
-    def _normalize_trade(self, item: dict[str, Any]) -> dict:
-        fee_asset = str(item.get("feeCurrency") or item.get("feeCoin") or "USDT").upper()
-        fee_amount = Decimal(str(item.get("execFee", "0")))
+    def _normalize_trade(
+        self,
+        item: dict[str, Any],
+        *,
+        expected_symbol: str = "",
+        expected_order_id: str = "",
+    ) -> dict:
+        context = f"{str(expected_symbol or '').upper()} execution snapshot".strip()
+        if not isinstance(item, dict):
+            raise RuntimeError(f"{context} row 0 must be an object")
+
+        symbol = snapshot_text(
+            item.get("symbol"),
+            context=context,
+            row_index=0,
+            field="symbol",
+        ).upper()
+        order_id = snapshot_text(
+            item.get("orderId"),
+            context=context,
+            row_index=0,
+            field="orderId",
+        )
+        trade_id = snapshot_text(
+            item.get("execId"),
+            context=context,
+            row_index=0,
+            field="tradeId",
+        )
+        side = snapshot_text(
+            item.get("side"),
+            context=context,
+            row_index=0,
+            field="side",
+        )
+        if side not in {"Buy", "Sell"}:
+            raise RuntimeError(f"{context} row 0 has invalid side")
+        price = validate_positive_decimal(
+            item.get("execPrice"), context=context, field="price"
+        )
+        qty = validate_positive_decimal(
+            item.get("execQty"), context=context, field="qty"
+        )
+        volume = validate_positive_decimal(
+            item.get("execValue"), context=context, field="volume"
+        )
+        fee_amount = snapshot_decimal(
+            item.get("execFee"),
+            context=context,
+            row_index=0,
+            field="fee",
+        )
+        assert fee_amount is not None
+        fee_asset_value = item.get("feeCurrency") or item.get("feeCoin")
+        if fee_asset_value is None or not str(fee_asset_value).strip():
+            fee_asset = "USDT"
+        else:
+            fee_asset = snapshot_text(
+                fee_asset_value,
+                context=context,
+                row_index=0,
+                field="feeAsset",
+            ).upper()
+        realized_pnl = snapshot_decimal(
+            item.get("execPnl", "0"),
+            context=context,
+            row_index=0,
+            field="realizedPnl",
+            allow_blank=True,
+        )
+        if realized_pnl is None:
+            realized_pnl = Decimal("0")
+        is_maker = snapshot_boolean(
+            item.get("isMaker"),
+            context=context,
+            row_index=0,
+            field="isMaker",
+            allow_strings=True,
+        )
+        trade_time = validate_positive_integer(
+            item.get("execTime"), context=context, field="time"
+        )
         fee_usdt, fee_usdt_source = self._fee_to_usdt_with_source(
             fee_amount,
             fee_asset,
-            trade_time_ms=item.get("execTime"),
+            trade_time_ms=trade_time,
         )
 
-        return {
-            "orderId": str(item.get("orderId", "")),
-            "tradeId": str(item.get("execId", "")),
-            "side": item.get("side", ""),
-            "price": item.get("execPrice", "0"),
-            "qty": item.get("execQty", "0"),
-            "volume": item.get("execValue", "0"),
+        normalized = {
+            "symbol": symbol,
+            "orderId": order_id,
+            "tradeId": trade_id,
+            "side": side,
+            "price": str(price),
+            "qty": str(qty),
+            "volume": str(volume),
             "fee": str(fee_amount),
             "feeAsset": fee_asset,
             "feeUsdt": "" if fee_usdt is None else str(fee_usdt),
             "feeUsdtSource": fee_usdt_source,
-            "realizedPnl": item.get("execPnl", "0"),
-            "isMaker": str(item.get("isMaker", "")).lower() == "true",
-            "time": item.get("execTime", ""),
+            "realizedPnl": str(realized_pnl),
+            "isMaker": is_maker,
+            "time": str(trade_time),
         }
-
-    @staticmethod
-    def _execution_identity(item: dict[str, Any]) -> tuple[str, ...]:
-        execution_id = str(item.get("execId", "") or "")
-        if execution_id:
-            return ("id", execution_id)
-        return (
-            "shape",
-            str(item.get("orderId", "") or ""),
-            str(item.get("execTime", "") or ""),
-            str(item.get("side", "") or ""),
-            str(item.get("execPrice", "") or ""),
-            str(item.get("execQty", "") or ""),
-            str(item.get("execFee", "") or ""),
+        validate_execution_row(
+            normalized,
+            expected_symbol=expected_symbol,
+            expected_order_id=expected_order_id,
         )
+        return normalized
 
     def _historical_fee_asset_price(self, symbol: str, trade_time_ms: int) -> Decimal | None:
         minute_start = trade_time_ms - (trade_time_ms % 60_000)

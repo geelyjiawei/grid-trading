@@ -17,8 +17,14 @@ from exchange_errors import (
 )
 from exchange_snapshots import (
     normalize_futures_balance_rows,
+    snapshot_boolean,
+    snapshot_decimal,
+    snapshot_text,
+    validate_execution_response,
+    validate_execution_row,
     validate_instrument_response,
     validate_positive_decimal,
+    validate_positive_integer,
     validate_price_cache_entry,
     validate_symbol_price_row,
 )
@@ -32,6 +38,7 @@ class BinanceFuturesClient:
     exchange = "binance"
     ASSET_PRICE_TTL_SECONDS = 60
     HISTORICAL_ASSET_PRICE_CACHE_MAX_ITEMS = 2048
+    MAX_TRADE_HISTORY_PAGES = 100
     FEE_RATE_TTL_SECONDS = 300
     RATE_LIMIT_DEFAULT_RETRY_SECONDS = 60.0
     TIME_SYNC_DEDUP_SECONDS = 1.0
@@ -578,54 +585,120 @@ class BinanceFuturesClient:
         }
 
     def get_order_trades(self, symbol: str, order_id: str) -> dict:
+        symbol = symbol.upper()
+        order_id = str(order_id)
+        page_limit = 1000
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "orderId": order_id,
+            "limit": page_limit,
+        }
+        trades: list[Any] = []
+        requested_from_id: int | None = None
+        for _ in range(self.MAX_TRADE_HISTORY_PAGES):
+            page = self._request(
+                "GET",
+                "/fapi/v1/userTrades",
+                params=dict(params),
+                auth=True,
+            )
+            if not isinstance(page, list):
+                raise RuntimeError(
+                    f"{symbol} execution snapshot response must be an array"
+                )
+            if len(page) > page_limit:
+                raise RuntimeError(
+                    f"{symbol} execution snapshot page exceeds the requested limit"
+                )
+            trades.extend(page)
+            if len(page) < page_limit:
+                break
+
+            page_ids: list[int] = []
+            for row_index, item in enumerate(page):
+                if not isinstance(item, dict):
+                    raise RuntimeError(
+                        f"{symbol} execution snapshot row {row_index} must be an object"
+                    )
+                parsed_id = snapshot_decimal(
+                    item.get("id"),
+                    context=f"{symbol} execution snapshot",
+                    row_index=row_index,
+                    field="tradeId",
+                )
+                assert parsed_id is not None
+                if parsed_id < 0 or parsed_id != parsed_id.to_integral_value():
+                    raise RuntimeError(
+                        f"{symbol} execution snapshot row {row_index} has invalid tradeId"
+                    )
+                page_ids.append(int(parsed_id))
+            if not page_ids:
+                raise RuntimeError(
+                    f"{symbol} execution snapshot cannot advance without trade ids"
+                )
+            next_from_id = max(page_ids) + 1
+            if requested_from_id is not None and next_from_id <= requested_from_id:
+                raise RuntimeError(
+                    f"{symbol} execution snapshot pagination did not advance"
+                )
+            requested_from_id = next_from_id
+            params["fromId"] = next_from_id
+        else:
+            raise RuntimeError(
+                f"{symbol} execution snapshot pagination exceeded "
+                f"{self.MAX_TRADE_HISTORY_PAGES} pages"
+            )
+
+        matching: list[dict[str, Any]] = []
+        for item in trades:
+            if not isinstance(item, dict):
+                raise RuntimeError(f"{symbol} execution snapshot row must be an object")
+            if str(item.get("orderId", "")) != str(order_id):
+                continue
+            matching.append(
+                self._normalize_trade(
+                    item,
+                    expected_symbol=symbol,
+                    expected_order_id=order_id,
+                )
+            )
+        response = {
+            "retCode": 0,
+            "result": {"list": matching},
+        }
+        validated = validate_execution_response(
+            response,
+            expected_symbol=symbol,
+            expected_order_id=order_id,
+        )
+        response["result"]["list"] = [item["raw"] for item in validated]
+        return response
+
+    def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
+        symbol = symbol.upper()
         trades = self._request(
             "GET",
             "/fapi/v1/userTrades",
-            params={"symbol": symbol.upper(), "orderId": order_id, "limit": 1000},
+            params={"symbol": symbol, "limit": limit},
             auth=True,
         )
         if not isinstance(trades, list):
-            raise RuntimeError("Binance order trade history returned an invalid response")
-
-        matching: dict[tuple[str, ...], dict[str, Any]] = {}
-        for item in trades:
-            if not isinstance(item, dict):
-                raise RuntimeError("Binance order trade history contains an invalid row")
-            if str(item.get("orderId", "")) != str(order_id):
-                continue
-            matching[self._trade_identity(item)] = item
-        return {
+            raise RuntimeError(f"{symbol} execution snapshot response must be an array")
+        response = {
             "retCode": 0,
-            "result": {"list": [self._normalize_trade(item) for item in matching.values()]},
+            "result": {
+                "list": [
+                    self._normalize_trade(item, expected_symbol=symbol)
+                    for item in trades
+                ]
+            },
         }
-
-    def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
-        trades = self._request(
-            "GET",
-            "/fapi/v1/userTrades",
-            params={"symbol": symbol.upper(), "limit": limit},
-            auth=True,
+        validated = validate_execution_response(
+            response,
+            expected_symbol=symbol,
         )
-        return {
-            "retCode": 0,
-            "result": {"list": [self._normalize_trade(item) for item in trades]},
-        }
-
-    @staticmethod
-    def _trade_identity(item: dict[str, Any]) -> tuple[str, ...]:
-        trade_id = str(item.get("id", "") or "")
-        if trade_id:
-            return ("id", trade_id)
-        return (
-            "shape",
-            str(item.get("orderId", "") or ""),
-            str(item.get("time", "") or ""),
-            str(item.get("side", "") or ""),
-            str(item.get("price", "") or ""),
-            str(item.get("qty", "") or ""),
-            str(item.get("commission", "") or ""),
-            str(item.get("commissionAsset", "") or ""),
-        )
+        response["result"]["list"] = [item["raw"] for item in validated]
+        return response
 
     @staticmethod
     def _to_binance_side(side: str) -> str:
@@ -651,22 +724,105 @@ class BinanceFuturesClient:
             "createdTime": str(item.get("time", "")),
         }
 
-    def _normalize_trade(self, item: dict[str, Any]) -> dict:
-        price = Decimal(str(item.get("price", "0")))
-        qty = Decimal(str(item.get("qty", "0")))
-        volume = Decimal(str(item.get("quoteQty") or (price * qty)))
-        fee_amount = Decimal(str(item.get("commission", "0")))
-        fee_asset = str(item.get("commissionAsset", "USDT")).upper()
+    def _normalize_trade(
+        self,
+        item: dict[str, Any],
+        *,
+        expected_symbol: str = "",
+        expected_order_id: str = "",
+    ) -> dict:
+        context = f"{str(expected_symbol or '').upper()} execution snapshot".strip()
+        if context == "execution snapshot":
+            context = "execution snapshot"
+        if not isinstance(item, dict):
+            raise RuntimeError(f"{context} row 0 must be an object")
+
+        symbol = snapshot_text(
+            item.get("symbol"),
+            context=context,
+            row_index=0,
+            field="symbol",
+        ).upper()
+        order_id = snapshot_text(
+            item.get("orderId"),
+            context=context,
+            row_index=0,
+            field="orderId",
+        )
+        trade_id = snapshot_text(
+            item.get("id"),
+            context=context,
+            row_index=0,
+            field="tradeId",
+        )
+        raw_side = snapshot_text(
+            item.get("side"),
+            context=context,
+            row_index=0,
+            field="side",
+        ).upper()
+        if raw_side not in {"BUY", "SELL"}:
+            raise RuntimeError(f"{context} row 0 has invalid side")
+
+        price = validate_positive_decimal(
+            item.get("price"), context=context, field="price"
+        )
+        qty = validate_positive_decimal(
+            item.get("qty"), context=context, field="qty"
+        )
+        volume = snapshot_decimal(
+            item.get("quoteQty"),
+            context=context,
+            row_index=0,
+            field="volume",
+            allow_blank=True,
+        )
+        if volume is None:
+            volume = price * qty
+        if volume <= 0:
+            raise RuntimeError(f"{context} row 0 has non-positive volume")
+        fee_amount = snapshot_decimal(
+            item.get("commission"),
+            context=context,
+            row_index=0,
+            field="fee",
+        )
+        assert fee_amount is not None
+        fee_asset = snapshot_text(
+            item.get("commissionAsset"),
+            context=context,
+            row_index=0,
+            field="feeAsset",
+        ).upper()
+        realized_pnl = snapshot_decimal(
+            item.get("realizedPnl", "0"),
+            context=context,
+            row_index=0,
+            field="realizedPnl",
+            allow_blank=True,
+        )
+        if realized_pnl is None:
+            realized_pnl = Decimal("0")
+        is_maker = snapshot_boolean(
+            item.get("maker"),
+            context=context,
+            row_index=0,
+            field="isMaker",
+        )
+        trade_time = validate_positive_integer(
+            item.get("time"), context=context, field="time"
+        )
         fee_usdt, fee_usdt_source = self._fee_to_usdt_with_source(
             fee_amount,
             fee_asset,
-            trade_time_ms=item.get("time"),
+            trade_time_ms=trade_time,
         )
 
-        return {
-            "orderId": str(item.get("orderId", "")),
-            "tradeId": str(item.get("id", "")),
-            "side": self._from_binance_side(str(item.get("side", ""))),
+        normalized = {
+            "symbol": symbol,
+            "orderId": order_id,
+            "tradeId": trade_id,
+            "side": self._from_binance_side(raw_side),
             "price": str(price),
             "qty": str(qty),
             "volume": str(volume),
@@ -674,10 +830,16 @@ class BinanceFuturesClient:
             "feeAsset": fee_asset,
             "feeUsdt": "" if fee_usdt is None else str(fee_usdt),
             "feeUsdtSource": fee_usdt_source,
-            "realizedPnl": item.get("realizedPnl", "0"),
-            "isMaker": bool(item.get("maker", False)),
-            "time": str(item.get("time", "")),
+            "realizedPnl": str(realized_pnl),
+            "isMaker": is_maker,
+            "time": str(trade_time),
         }
+        validate_execution_row(
+            normalized,
+            expected_symbol=expected_symbol,
+            expected_order_id=expected_order_id,
+        )
+        return normalized
 
     def _historical_fee_asset_price(self, symbol: str, trade_time_ms: int) -> Decimal | None:
         minute_start = trade_time_ms - (trade_time_ms % 60_000)

@@ -2938,9 +2938,13 @@ class MultiGridServerTests(unittest.TestCase):
                 "liquidationPrice": "140",
             }
         )
-        client._asset_price_cache["BNBUSDT"] = (Decimal("600"), time.time())
+        trade_time = 1714012800000
+        client._historical_asset_price_cache[("BNBUSDT", trade_time)] = Decimal(
+            "600"
+        )
         trade = client._normalize_trade(
             {
+                "symbol": "TESTUSDT",
                 "orderId": 123,
                 "id": 456,
                 "side": "BUY",
@@ -2950,6 +2954,7 @@ class MultiGridServerTests(unittest.TestCase):
                 "commission": "0.001",
                 "commissionAsset": "BNB",
                 "maker": True,
+                "time": trade_time,
             }
         )
 
@@ -3223,9 +3228,61 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["orderId"], "99")
         self.assertEqual(calls[0][2]["limit"], 1000)
 
+    def test_binance_order_trades_paginate_without_losing_partial_fills(self):
+        client = BinanceFuturesClient("", "", True)
+        calls = []
+
+        def trade(index):
+            return {
+                "symbol": "TESTUSDT",
+                "orderId": 99,
+                "id": index,
+                "side": "BUY",
+                "price": "100",
+                "qty": "0.001",
+                "quoteQty": "0.1",
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "realizedPnl": "0",
+                "maker": True,
+                "time": 1714012800000 + index,
+            }
+
+        def fake_request(method, path, *, params=None, auth=False):
+            calls.append(dict(params or {}))
+            if "fromId" not in (params or {}):
+                return [trade(index) for index in range(1, 1001)]
+            return [trade(1000), *[trade(index) for index in range(1001, 1031)]]
+
+        client._request = fake_request
+
+        response = client.get_order_trades("TESTUSDT", "99")
+
+        self.assertEqual(len(response["result"]["list"]), 1030)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["fromId"], 1001)
+        self.assertEqual(calls[1]["orderId"], "99")
+
+    def test_binance_trade_pagination_fails_closed_when_it_cannot_finish(self):
+        full_page = [{"id": index} for index in range(1000)]
+        cases = {
+            "cursor did not advance": (3, "did not advance"),
+            "page cap reached": (1, "pagination exceeded"),
+        }
+
+        for label, (max_pages, message) in cases.items():
+            with self.subTest(label=label):
+                client = BinanceFuturesClient("", "", True)
+                client.MAX_TRADE_HISTORY_PAGES = max_pages
+                client._request = Mock(return_value=full_page)
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    client.get_order_trades("TESTUSDT", "99")
+
     def test_binance_order_trades_filters_other_orders_and_duplicate_trade_ids(self):
         client = BinanceFuturesClient("", "", True)
         requested = {
+            "symbol": "TESTUSDT",
             "orderId": 99,
             "id": 1,
             "side": "BUY",
@@ -3235,12 +3292,19 @@ class MultiGridServerTests(unittest.TestCase):
             "commission": "0.01",
             "commissionAsset": "USDT",
             "maker": True,
+            "time": 1714012800000,
         }
         client._request = Mock(
             return_value=[
                 requested,
                 {**requested, "orderId": 100, "id": 2},
-                dict(requested),
+                {
+                    **requested,
+                    "price": "100.0",
+                    "qty": "0.20",
+                    "quoteQty": "20.0",
+                    "commission": "0.010",
+                },
             ]
         )
 
@@ -3249,6 +3313,82 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(len(response["result"]["list"]), 1)
         self.assertEqual(response["result"]["list"][0]["orderId"], "99")
         self.assertEqual(response["result"]["list"][0]["tradeId"], "1")
+
+    def test_binance_trade_history_rejects_wrong_symbols_and_conflicting_ids(self):
+        base = {
+            "symbol": "TESTUSDT",
+            "orderId": 99,
+            "id": 1,
+            "side": "BUY",
+            "price": "100",
+            "qty": "0.2",
+            "quoteQty": "20",
+            "commission": "0.01",
+            "commissionAsset": "USDT",
+            "realizedPnl": "0",
+            "maker": True,
+            "time": 1714012800000,
+        }
+        cases = {
+            "wrong symbol": [{**base, "symbol": "OTHERUSDT"}],
+            "conflicting duplicate id": [base, {**base, "qty": "0.3", "quoteQty": "30"}],
+        }
+
+        for label, rows in cases.items():
+            with self.subTest(label=label):
+                client = BinanceFuturesClient("", "", True)
+                client._request = Mock(return_value=rows)
+
+                with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+                    client.get_order_trades("TESTUSDT", "99")
+
+    def test_binance_trade_normalizer_rejects_invalid_accounting_rows(self):
+        base = {
+            "symbol": "TESTUSDT",
+            "orderId": 99,
+            "id": 1,
+            "side": "BUY",
+            "price": "100",
+            "qty": "0.2",
+            "quoteQty": "20",
+            "commission": "0.01",
+            "commissionAsset": "USDT",
+            "realizedPnl": "0",
+            "maker": True,
+            "time": 1714012800000,
+        }
+        mutations = {
+            "missing symbol": lambda row: row.pop("symbol"),
+            "missing order id": lambda row: row.pop("orderId"),
+            "missing trade id": lambda row: row.pop("id"),
+            "invalid side": lambda row: row.__setitem__("side", "HOLD"),
+            "infinite price": lambda row: row.__setitem__("price", "Infinity"),
+            "nan quantity": lambda row: row.__setitem__("qty", "NaN"),
+            "zero volume": lambda row: row.__setitem__("quoteQty", "0"),
+            "infinite fee": lambda row: row.__setitem__("commission", "Infinity"),
+            "infinite pnl": lambda row: row.__setitem__("realizedPnl", "Infinity"),
+            "missing fee asset": lambda row: row.pop("commissionAsset"),
+            "invalid maker flag": lambda row: row.__setitem__("maker", "false"),
+            "missing time": lambda row: row.pop("time"),
+            "fractional time": lambda row: row.__setitem__("time", "1.5"),
+            "invalid time": lambda row: row.__setitem__("time", "not-a-time"),
+        }
+
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                row = dict(base)
+                mutate(row)
+                client = BinanceFuturesClient("", "", True)
+
+                with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+                    client._normalize_trade(row)
+
+    def test_binance_recent_trades_reject_malformed_rows(self):
+        client = BinanceFuturesClient("", "", True)
+        client._request = Mock(return_value=[None])
+
+        with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+            client.get_recent_trades("TESTUSDT")
 
     def test_binance_batch_orders_preserve_each_client_id_and_item_result(self):
         client = BinanceFuturesClient("", "", True)
@@ -3962,6 +4102,8 @@ class MultiGridServerTests(unittest.TestCase):
 
         def trade(index):
             return {
+                "symbol": "MUUSDT",
+                "side": "Buy",
                 "execQty": "0.1",
                 "execPrice": "100",
                 "execValue": "10",
@@ -3970,6 +4112,7 @@ class MultiGridServerTests(unittest.TestCase):
                 "isMaker": False,
                 "orderId": "order-1",
                 "execId": str(index),
+                "execTime": str(1714012800000 + index),
             }
 
         def fake_request(method, path, *, params=None, payload=None, auth=False):
@@ -4001,6 +4144,86 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(len(response["result"]["list"]), 130)
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(item["qty"] == "0.1" for item in response["result"]["list"]))
+
+    def test_bybit_trade_history_rejects_wrong_symbols_and_conflicting_ids(self):
+        base = {
+            "symbol": "MUUSDT",
+            "orderId": "order-1",
+            "execId": "exec-1",
+            "side": "Buy",
+            "execPrice": "100",
+            "execQty": "0.2",
+            "execValue": "20",
+            "execFee": "0.01",
+            "feeCurrency": "USDT",
+            "execPnl": "0",
+            "isMaker": False,
+            "execTime": "1714012800000",
+        }
+        cases = {
+            "wrong symbol": [{**base, "symbol": "OTHERUSDT"}],
+            "conflicting duplicate id": [base, {**base, "execQty": "0.3", "execValue": "30"}],
+        }
+
+        for label, rows in cases.items():
+            with self.subTest(label=label):
+                client = BybitClient("", "", True)
+                client._get_paginated = Mock(
+                    return_value={"retCode": 0, "result": {"list": rows}}
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+                    client.get_order_trades("MUUSDT", "order-1")
+
+    def test_bybit_trade_normalizer_rejects_invalid_accounting_rows(self):
+        base = {
+            "symbol": "MUUSDT",
+            "orderId": "order-1",
+            "execId": "exec-1",
+            "side": "Buy",
+            "execPrice": "100",
+            "execQty": "0.2",
+            "execValue": "20",
+            "execFee": "0.01",
+            "feeCurrency": "USDT",
+            "execPnl": "0",
+            "isMaker": False,
+            "execTime": "1714012800000",
+        }
+        mutations = {
+            "missing symbol": lambda row: row.pop("symbol"),
+            "missing order id": lambda row: row.pop("orderId"),
+            "missing trade id": lambda row: row.pop("execId"),
+            "invalid side": lambda row: row.__setitem__("side", "HOLD"),
+            "infinite price": lambda row: row.__setitem__("execPrice", "Infinity"),
+            "nan quantity": lambda row: row.__setitem__("execQty", "NaN"),
+            "zero volume": lambda row: row.__setitem__("execValue", "0"),
+            "infinite fee": lambda row: row.__setitem__("execFee", "Infinity"),
+            "infinite pnl": lambda row: row.__setitem__("execPnl", "Infinity"),
+            "invalid fee asset": lambda row: row.__setitem__("feeCurrency", True),
+            "invalid maker flag": lambda row: row.__setitem__("isMaker", "maybe"),
+            "missing time": lambda row: row.pop("execTime"),
+            "fractional time": lambda row: row.__setitem__("execTime", "1.5"),
+            "invalid time": lambda row: row.__setitem__("execTime", "not-a-time"),
+        }
+
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                row = dict(base)
+                mutate(row)
+                client = BybitClient("", "", True)
+
+                with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+                    client._normalize_trade(row)
+
+    def test_bybit_recent_trades_reject_malformed_rows(self):
+        client = BybitClient("", "", True)
+        client._request = Mock(
+            return_value={"retCode": 0, "result": {"list": [None]}}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+            client.get_recent_trades("MUUSDT")
 
     def test_bybit_repeated_pagination_cursor_fails_closed(self):
         client = BybitClient("key", "secret")
@@ -4110,6 +4333,7 @@ class MultiGridServerTests(unittest.TestCase):
 
         client._request = fake_request
         trade = {
+            "symbol": "TESTUSDT",
             "orderId": 1,
             "id": 2,
             "side": "SELL",
@@ -4142,6 +4366,7 @@ class MultiGridServerTests(unittest.TestCase):
         client._request = fake_request
         trade = client._normalize_trade(
             {
+                "symbol": "TESTUSDT",
                 "orderId": 1,
                 "id": 2,
                 "side": "SELL",
@@ -4199,6 +4424,7 @@ class MultiGridServerTests(unittest.TestCase):
         client._request = fake_request
         trade = client._normalize_trade(
             {
+                "symbol": "MUUSDT",
                 "orderId": "1",
                 "execId": "2",
                 "side": "Sell",

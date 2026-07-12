@@ -8,6 +8,8 @@ tests/__pycache__/
 .venv/
 data/
 __pycache__/
+.coverage
+htmlcov/
 *.key
 *.pem
 *.p8

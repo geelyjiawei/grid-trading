@@ -18,8 +18,14 @@ from exchange_errors import (
 )
 from exchange_snapshots import (
     normalize_futures_balance_rows,
+    snapshot_boolean,
+    snapshot_decimal,
+    snapshot_text,
+    validate_execution_response,
+    validate_execution_row,
     validate_instrument_response,
     validate_positive_decimal,
+    validate_positive_integer,
     validate_price_cache_entry,
     validate_symbol_price_row,
 )
@@ -489,20 +495,6 @@ class AsterFuturesClient:
         )
         return {"retCode": 0, "result": {"list": [self._normalize_order(item) for item in orders]}}
 
-    @staticmethod
-    def _trade_identity(item: dict[str, Any]) -> tuple[str, ...]:
-        trade_id = str(item.get("id", "") or "")
-        if trade_id:
-            return ("id", trade_id)
-        return (
-            "shape",
-            str(item.get("orderId", "") or ""),
-            str(item.get("time", "") or ""),
-            str(item.get("side", "") or ""),
-            str(item.get("price", "") or ""),
-            str(item.get("qty", "") or ""),
-        )
-
     def _get_user_trades_window(
         self,
         symbol: str,
@@ -520,7 +512,7 @@ class AsterFuturesClient:
             windows.append((window_start, window_end))
             window_start = window_end + 1
 
-        rows: dict[tuple[str, ...], dict[str, Any]] = {}
+        rows: list[dict[str, Any]] = []
         query_count = 0
         for current_start, current_end in windows:
             query_count += 1
@@ -561,7 +553,7 @@ class AsterFuturesClient:
                         reached_window_end = True
                         continue
                     if trade_time >= current_start:
-                        rows[self._trade_identity(item)] = item
+                        rows.append(item)
 
                 if len(page) < self.TRADE_PAGE_LIMIT or reached_window_end:
                     break
@@ -604,25 +596,40 @@ class AsterFuturesClient:
                 page = next_page
 
         return sorted(
-            rows.values(),
+            rows,
             key=lambda item: (
                 int(item.get("time", 0) or 0),
                 int(item.get("id", 0) or 0),
             ),
         )
 
-    @staticmethod
     def _matching_order_trades(
+        self,
         rows: list[dict[str, Any]],
+        symbol: str,
         order_id: str,
     ) -> list[dict[str, Any]]:
-        matching: dict[tuple[str, ...], dict[str, Any]] = {}
+        matching: list[dict[str, Any]] = []
         for item in rows:
+            if not isinstance(item, dict):
+                raise RuntimeError(f"{symbol} execution snapshot row must be an object")
             if str(item.get("orderId", "")) != str(order_id):
                 continue
-            matching[AsterFuturesClient._trade_identity(item)] = item
+            matching.append(
+                self._normalize_trade(
+                    item,
+                    expected_symbol=symbol,
+                    expected_order_id=order_id,
+                )
+            )
+        response = {"retCode": 0, "result": {"list": matching}}
+        validated = validate_execution_response(
+            response,
+            expected_symbol=symbol,
+            expected_order_id=order_id,
+        )
         return sorted(
-            matching.values(),
+            (item["raw"] for item in validated),
             key=lambda item: (
                 int(item.get("time", 0) or 0),
                 int(item.get("id", 0) or 0),
@@ -657,22 +664,75 @@ class AsterFuturesClient:
 
         expected_qty: Decimal | None = None
         if detail is not None:
-            expected_qty = Decimal(str(detail.get("executedQty", "0") or "0"))
-            if expected_qty <= 0:
+            context = f"{symbol} execution snapshot"
+            detail_order_id = snapshot_text(
+                detail.get("orderId"),
+                context=context,
+                row_index=0,
+                field="orderId",
+            )
+            if detail_order_id != order_id:
+                raise RuntimeError(
+                    f"{context} order detail belongs to order {detail_order_id}"
+                )
+            if "symbol" in detail:
+                detail_symbol = snapshot_text(
+                    detail.get("symbol"),
+                    context=context,
+                    row_index=0,
+                    field="symbol",
+                ).upper()
+                if detail_symbol != symbol:
+                    raise RuntimeError(
+                        f"{context} order detail belongs to {detail_symbol}"
+                    )
+
+            expected_qty = snapshot_decimal(
+                detail.get("executedQty"),
+                context=context,
+                row_index=0,
+                field="executedQty",
+            )
+            assert expected_qty is not None
+            if expected_qty < 0:
+                raise RuntimeError(f"{context} order detail has negative executedQty")
+            if expected_qty == 0:
                 return {"retCode": 0, "result": {"list": []}}
 
-            created_time = int(detail.get("time", detail.get("updateTime", 0)) or 0)
-            updated_time = int(detail.get("updateTime", created_time) or created_time)
+            def detail_time(value: Any, field: str) -> int:
+                if value is None or not str(value).strip():
+                    return 0
+                parsed = snapshot_decimal(
+                    value,
+                    context=context,
+                    row_index=0,
+                    field=field,
+                )
+                assert parsed is not None
+                if parsed < 0 or parsed != parsed.to_integral_value():
+                    raise RuntimeError(
+                        f"{context} order detail has invalid {field}"
+                    )
+                return int(parsed)
+
+            created_value = detail.get("time")
+            if created_value is None or not str(created_value).strip():
+                created_value = detail.get("updateTime")
+            created_time = detail_time(created_value, "time")
+            updated_value = detail.get("updateTime")
+            if updated_value is None or not str(updated_value).strip():
+                updated_value = created_time
+            updated_time = detail_time(updated_value, "updateTime")
             if updated_time > 0:
                 probe_start = max(0, updated_time - self.TRADE_PROBE_PADDING_MS)
                 probe_end = updated_time + self.TRADE_PROBE_PADDING_MS
                 probe_rows = self._get_user_trades_window(symbol, probe_start, probe_end)
-                matches = self._matching_order_trades(probe_rows, order_id)
+                matches = self._matching_order_trades(probe_rows, symbol, order_id)
                 matched_qty = self._trade_qty(matches)
                 if matched_qty == expected_qty:
                     return {
                         "retCode": 0,
-                        "result": {"list": [self._normalize_trade(item) for item in matches]},
+                        "result": {"list": matches},
                     }
                 if matched_qty > expected_qty:
                     raise RuntimeError(
@@ -686,14 +746,12 @@ class AsterFuturesClient:
                     )
                     full_end = max(created_time, updated_time) + self.TRADE_PROBE_PADDING_MS
                     full_rows = self._get_user_trades_window(symbol, full_start, full_end)
-                    matches = self._matching_order_trades(full_rows, order_id)
+                    matches = self._matching_order_trades(full_rows, symbol, order_id)
                     matched_qty = self._trade_qty(matches)
                     if matched_qty == expected_qty:
                         return {
                             "retCode": 0,
-                            "result": {
-                                "list": [self._normalize_trade(item) for item in matches]
-                            },
+                            "result": {"list": matches},
                         }
                     if matched_qty > expected_qty:
                         raise RuntimeError(
@@ -712,7 +770,7 @@ class AsterFuturesClient:
         )
         if not isinstance(recent, list):
             raise RuntimeError("Aster trade history returned an invalid response")
-        matches = self._matching_order_trades(recent, order_id)
+        matches = self._matching_order_trades(recent, symbol, order_id)
         if expected_qty is not None and self._trade_qty(matches) != expected_qty:
             raise RuntimeError(
                 "Aster recent trade history is incomplete for the order executed quantity"
@@ -723,7 +781,7 @@ class AsterFuturesClient:
             )
         return {
             "retCode": 0,
-            "result": {"list": [self._normalize_trade(item) for item in matches]},
+            "result": {"list": matches},
         }
 
     def get_fee_rates(self, symbol: str) -> dict:
@@ -769,13 +827,30 @@ class AsterFuturesClient:
         return response
 
     def get_recent_trades(self, symbol: str, limit: int = 100) -> dict:
+        symbol = symbol.upper()
         trades = self._request(
             "GET",
             "/fapi/v3/userTrades",
-            params={"symbol": symbol.upper(), "limit": limit},
+            params={"symbol": symbol, "limit": limit},
             auth=True,
         )
-        return {"retCode": 0, "result": {"list": [self._normalize_trade(item) for item in trades]}}
+        if not isinstance(trades, list):
+            raise RuntimeError(f"{symbol} execution snapshot response must be an array")
+        response = {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    self._normalize_trade(item, expected_symbol=symbol)
+                    for item in trades
+                ]
+            },
+        }
+        validated = validate_execution_response(
+            response,
+            expected_symbol=symbol,
+        )
+        response["result"]["list"] = [item["raw"] for item in validated]
+        return response
 
     @staticmethod
     def _to_aster_side(side: str) -> str:
@@ -801,24 +876,106 @@ class AsterFuturesClient:
             "createdTime": str(item.get("time", item.get("updateTime", ""))),
         }
 
-    def _normalize_trade(self, item: dict[str, Any]) -> dict:
-        price = Decimal(str(item.get("price", "0")))
-        qty = Decimal(str(item.get("qty", "0")))
-        volume = Decimal(str(item.get("quoteQty") or (price * qty)))
+    def _normalize_trade(
+        self,
+        item: dict[str, Any],
+        *,
+        expected_symbol: str = "",
+        expected_order_id: str = "",
+    ) -> dict:
+        context = f"{str(expected_symbol or '').upper()} execution snapshot".strip()
+        if not isinstance(item, dict):
+            raise RuntimeError(f"{context} row 0 must be an object")
+
+        symbol = snapshot_text(
+            item.get("symbol"),
+            context=context,
+            row_index=0,
+            field="symbol",
+        ).upper()
+        order_id = snapshot_text(
+            item.get("orderId"),
+            context=context,
+            row_index=0,
+            field="orderId",
+        )
+        trade_id = snapshot_text(
+            item.get("id"),
+            context=context,
+            row_index=0,
+            field="tradeId",
+        )
+        raw_side = snapshot_text(
+            item.get("side"),
+            context=context,
+            row_index=0,
+            field="side",
+        ).upper()
+        if raw_side not in {"BUY", "SELL"}:
+            raise RuntimeError(f"{context} row 0 has invalid side")
+
+        price = validate_positive_decimal(
+            item.get("price"), context=context, field="price"
+        )
+        qty = validate_positive_decimal(
+            item.get("qty"), context=context, field="qty"
+        )
+        volume = snapshot_decimal(
+            item.get("quoteQty"),
+            context=context,
+            row_index=0,
+            field="volume",
+            allow_blank=True,
+        )
+        if volume is None:
+            volume = price * qty
+        if volume <= 0:
+            raise RuntimeError(f"{context} row 0 has non-positive volume")
         # Production V3 currently reports paid commission as positive, while
         # the official V3 response example uses a negative balance delta.
         # The normalized client contract represents fee cost as positive.
-        fee_amount = abs(Decimal(str(item.get("commission", "0"))))
-        fee_asset = str(item.get("commissionAsset", "USDT")).upper()
+        raw_fee = snapshot_decimal(
+            item.get("commission"),
+            context=context,
+            row_index=0,
+            field="fee",
+        )
+        assert raw_fee is not None
+        fee_amount = abs(raw_fee)
+        fee_asset = snapshot_text(
+            item.get("commissionAsset"),
+            context=context,
+            row_index=0,
+            field="feeAsset",
+        ).upper()
+        realized_pnl = snapshot_decimal(
+            item.get("realizedPnl", "0"),
+            context=context,
+            row_index=0,
+            field="realizedPnl",
+            allow_blank=True,
+        )
+        if realized_pnl is None:
+            realized_pnl = Decimal("0")
+        is_maker = snapshot_boolean(
+            item.get("maker"),
+            context=context,
+            row_index=0,
+            field="isMaker",
+        )
+        trade_time = validate_positive_integer(
+            item.get("time"), context=context, field="time"
+        )
         fee_usdt, fee_usdt_source = self._fee_to_usdt_with_source(
             fee_amount,
             fee_asset,
-            trade_time_ms=item.get("time"),
+            trade_time_ms=trade_time,
         )
-        return {
-            "orderId": str(item.get("orderId", "")),
-            "tradeId": str(item.get("id", "")),
-            "side": self._from_aster_side(str(item.get("side", ""))),
+        normalized = {
+            "symbol": symbol,
+            "orderId": order_id,
+            "tradeId": trade_id,
+            "side": self._from_aster_side(raw_side),
             "price": str(price),
             "qty": str(qty),
             "volume": str(volume),
@@ -826,10 +983,16 @@ class AsterFuturesClient:
             "feeAsset": fee_asset,
             "feeUsdt": "" if fee_usdt is None else str(fee_usdt),
             "feeUsdtSource": fee_usdt_source,
-            "realizedPnl": item.get("realizedPnl", "0"),
-            "isMaker": bool(item.get("maker", False)),
-            "time": str(item.get("time", "")),
+            "realizedPnl": str(realized_pnl),
+            "isMaker": is_maker,
+            "time": str(trade_time),
         }
+        validate_execution_row(
+            normalized,
+            expected_symbol=expected_symbol,
+            expected_order_id=expected_order_id,
+        )
+        return normalized
 
     def _historical_fee_asset_price(self, symbol: str, trade_time_ms: int) -> Decimal | None:
         minute_start = trade_time_ms - (trade_time_ms % 60_000)

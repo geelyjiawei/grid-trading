@@ -461,6 +461,7 @@ class AsterClientTests(unittest.TestCase):
         )
         trade = client._normalize_trade(
             {
+                "symbol": "ASTERUSDT",
                 "orderId": 1,
                 "id": 2,
                 "side": "BUY",
@@ -504,6 +505,7 @@ class AsterClientTests(unittest.TestCase):
             with self.subTest(commission=commission):
                 trade = client._normalize_trade(
                     {
+                        "symbol": "ASTERUSDT",
                         "orderId": 1,
                         "id": 2,
                         "side": "BUY",
@@ -512,11 +514,115 @@ class AsterClientTests(unittest.TestCase):
                         "quoteQty": "10",
                         "commission": commission,
                         "commissionAsset": "USDT",
+                        "maker": False,
+                        "time": 456,
                     }
                 )
 
                 self.assertEqual(trade["fee"], "0.01")
                 self.assertEqual(trade["feeUsdt"], "0.01")
+
+    def test_trade_normalizer_rejects_invalid_accounting_rows(self):
+        base = {
+            "symbol": "ASTERUSDT",
+            "orderId": 99,
+            "id": 1,
+            "side": "BUY",
+            "price": "100",
+            "qty": "0.2",
+            "quoteQty": "20",
+            "commission": "-0.01",
+            "commissionAsset": "USDT",
+            "realizedPnl": "0",
+            "maker": True,
+            "time": 1714012800000,
+        }
+        mutations = {
+            "missing symbol": lambda row: row.pop("symbol"),
+            "missing order id": lambda row: row.pop("orderId"),
+            "missing trade id": lambda row: row.pop("id"),
+            "invalid side": lambda row: row.__setitem__("side", "HOLD"),
+            "infinite price": lambda row: row.__setitem__("price", "Infinity"),
+            "nan quantity": lambda row: row.__setitem__("qty", "NaN"),
+            "zero volume": lambda row: row.__setitem__("quoteQty", "0"),
+            "infinite fee": lambda row: row.__setitem__("commission", "Infinity"),
+            "infinite pnl": lambda row: row.__setitem__("realizedPnl", "Infinity"),
+            "missing fee asset": lambda row: row.pop("commissionAsset"),
+            "invalid maker flag": lambda row: row.__setitem__("maker", "false"),
+            "missing time": lambda row: row.pop("time"),
+            "fractional time": lambda row: row.__setitem__("time", "1.5"),
+            "invalid time": lambda row: row.__setitem__("time", "not-a-time"),
+        }
+
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                row = dict(base)
+                mutate(row)
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+                    client._normalize_trade(row)
+
+    def test_trade_history_rejects_wrong_symbols_and_conflicting_ids(self):
+        base = {
+            "symbol": "ASTERUSDT",
+            "orderId": 99,
+            "id": 1,
+            "side": "BUY",
+            "price": "100",
+            "qty": "0.2",
+            "quoteQty": "20",
+            "commission": "-0.01",
+            "commissionAsset": "USDT",
+            "realizedPnl": "0",
+            "maker": True,
+            "time": 1714012800000,
+        }
+        cases = {
+            "wrong symbol": [{**base, "symbol": "OTHERUSDT", "qty": "0.3", "quoteQty": "30"}],
+            "conflicting duplicate id": [base, {**base, "qty": "0.3", "quoteQty": "30"}],
+        }
+
+        for label, rows in cases.items():
+            with self.subTest(label=label):
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+
+                def fake_request(method, path, *, params=None, auth=False, rows=rows):
+                    if path == "/fapi/v3/order":
+                        return {
+                            "orderId": 99,
+                            "executedQty": "0.3",
+                            "time": 1714012800000,
+                            "updateTime": 1714012800000,
+                        }
+                    return rows
+
+                client._request = fake_request
+
+                with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+                    client.get_order_trades("ASTERUSDT", "99")
+
+    def test_recent_trades_reject_malformed_rows(self):
+        client = AsterFuturesClient(
+            USER,
+            PRIVATE_KEY,
+            signer=SIGNER,
+            base_url="https://example.test",
+        )
+        client._request = lambda *args, **kwargs: [None]
+
+        with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+            client.get_recent_trades("ASTERUSDT")
 
     def test_get_order_trades_filters_order_id_client_side(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
@@ -533,6 +639,7 @@ class AsterClientTests(unittest.TestCase):
                 }
             return [
                 {
+                    "symbol": "ASTERUSDT",
                     "orderId": 1,
                     "id": 10,
                     "side": "BUY",
@@ -541,9 +648,11 @@ class AsterClientTests(unittest.TestCase):
                     "quoteQty": "19.8",
                     "commission": "-0.01",
                     "commissionAsset": "USDT",
+                    "maker": False,
                     "time": 1_500,
                 },
                 {
+                    "symbol": "ASTERUSDT",
                     "orderId": 2,
                     "id": 11,
                     "side": "BUY",
@@ -552,6 +661,7 @@ class AsterClientTests(unittest.TestCase):
                     "quoteQty": "19.6",
                     "commission": "-0.01",
                     "commissionAsset": "USDT",
+                    "maker": False,
                     "time": 2_000,
                 },
             ]
@@ -574,6 +684,7 @@ class AsterClientTests(unittest.TestCase):
 
         def trade(trade_id, qty, timestamp):
             return {
+                "symbol": "ASTERUSDT",
                 "orderId": 42,
                 "id": trade_id,
                 "side": "BUY",
@@ -582,6 +693,7 @@ class AsterClientTests(unittest.TestCase):
                 "quoteQty": str(float(qty) * 10),
                 "commission": "0",
                 "commissionAsset": "USDT",
+                "maker": False,
                 "time": timestamp,
             }
 
@@ -616,6 +728,7 @@ class AsterClientTests(unittest.TestCase):
 
         def target_trade():
             return {
+                "symbol": "ASTERUSDT",
                 "orderId": 77,
                 "id": 2_001,
                 "side": "SELL",
@@ -624,6 +737,7 @@ class AsterClientTests(unittest.TestCase):
                 "quoteQty": "1",
                 "commission": "0",
                 "commissionAsset": "USDT",
+                "maker": False,
                 "time": 1_000_000,
             }
 
@@ -671,6 +785,7 @@ class AsterClientTests(unittest.TestCase):
 
         def trade(trade_id, timestamp):
             return {
+                "symbol": "ASTERUSDT",
                 "orderId": 78,
                 "id": trade_id,
                 "side": "SELL",
@@ -679,6 +794,7 @@ class AsterClientTests(unittest.TestCase):
                 "quoteQty": "0.5",
                 "commission": "0",
                 "commissionAsset": "USDT",
+                "maker": False,
                 "time": timestamp,
             }
 
@@ -838,6 +954,7 @@ class AsterClientTests(unittest.TestCase):
                 }
             return [
                 {
+                    "symbol": "ASTERUSDT",
                     "orderId": 88,
                     "id": 1,
                     "side": "BUY",
@@ -846,6 +963,7 @@ class AsterClientTests(unittest.TestCase):
                     "quoteQty": "1",
                     "commission": "0",
                     "commissionAsset": "USDT",
+                    "maker": False,
                     "time": 1_000_000,
                 }
             ]
@@ -854,6 +972,44 @@ class AsterClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
             client.get_order_trades("ASTERUSDT", "88")
+
+    def test_order_trade_lookup_rejects_invalid_order_detail_accounting(self):
+        base = {
+            "symbol": "ASTERUSDT",
+            "orderId": 99,
+            "executedQty": "0.1",
+            "time": 1_000_000,
+            "updateTime": 1_000_000,
+        }
+        cases = {
+            "missing quantity": {key: value for key, value in base.items() if key != "executedQty"},
+            "negative quantity": {**base, "executedQty": "-0.1"},
+            "nan quantity": {**base, "executedQty": "NaN"},
+            "infinite quantity": {**base, "executedQty": "Infinity"},
+            "wrong order": {**base, "orderId": 100},
+            "wrong symbol": {**base, "symbol": "OTHERUSDT"},
+            "invalid created time": {**base, "time": "bad"},
+            "fractional updated time": {**base, "updateTime": "1.5"},
+        }
+
+        for label, detail in cases.items():
+            with self.subTest(label=label):
+                client = AsterFuturesClient(
+                    USER,
+                    PRIVATE_KEY,
+                    signer=SIGNER,
+                    base_url="https://example.test",
+                )
+
+                def fake_request(method, path, *, params=None, auth=False, detail=detail):
+                    if path == "/fapi/v3/order":
+                        return detail
+                    return []
+
+                client._request = fake_request
+
+                with self.assertRaisesRegex(RuntimeError, "execution snapshot"):
+                    client.get_order_trades("ASTERUSDT", "99")
 
     def test_order_trade_lookup_falls_back_when_order_is_definitively_missing(self):
         client = AsterFuturesClient(USER, PRIVATE_KEY, signer=SIGNER, base_url="https://example.test")
@@ -865,6 +1021,7 @@ class AsterClientTests(unittest.TestCase):
                 raise RuntimeError("Order does not exist")
             return [
                 {
+                    "symbol": "ASTERUSDT",
                     "orderId": 99,
                     "id": 4,
                     "side": "SELL",
@@ -873,6 +1030,7 @@ class AsterClientTests(unittest.TestCase):
                     "quoteQty": "2",
                     "commission": "0",
                     "commissionAsset": "USDT",
+                    "maker": False,
                     "time": 1_000_000,
                 }
             ]
@@ -1035,6 +1193,7 @@ class AsterClientTests(unittest.TestCase):
         client._request = fake_request
         trade = client._normalize_trade(
             {
+                "symbol": "ASTERUSDT",
                 "orderId": 1,
                 "id": 2,
                 "side": "SELL",

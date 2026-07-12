@@ -8201,6 +8201,117 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine._order_liquidity_hint(order), "taker")
         self.assertAlmostEqual(stats["fee"], 0.5)
 
+    async def test_trade_stats_fail_closed_on_malformed_execution_snapshots(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "maker_fee_rate": 0.0002,
+                "taker_fee_rate": 0.0005,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        valid = {
+            "orderId": "1",
+            "tradeId": "trade-1",
+            "side": "Buy",
+            "price": "100",
+            "qty": "1",
+            "volume": "100",
+            "fee": "0.01",
+            "feeAsset": "USDT",
+            "feeUsdt": "0.01",
+            "feeUsdtSource": "quote_asset",
+            "realizedPnl": "0",
+            "isMaker": True,
+            "time": "1714012800000",
+        }
+        cases = {
+            "top-level list": [],
+            "invalid row": {"retCode": 0, "result": {"list": [None]}},
+            "wrong order": {
+                "retCode": 0,
+                "result": {"list": [{**valid, "orderId": "2"}]},
+            },
+            "infinite quantity": {
+                "retCode": 0,
+                "result": {"list": [{**valid, "qty": "Infinity"}]},
+            },
+            "zero volume": {
+                "retCode": 0,
+                "result": {"list": [{**valid, "volume": "0"}]},
+            },
+            "conflicting duplicate id": {
+                "retCode": 0,
+                "result": {
+                    "list": [valid, {**valid, "qty": "1.5", "volume": "150"}]
+                },
+            },
+        }
+
+        for label, response in cases.items():
+            with self.subTest(label=label):
+                client.get_order_trades = lambda symbol, order_id, response=response: response
+
+                stats = engine._get_trade_stats(
+                    "1",
+                    fallback_price=100,
+                    fallback_qty=1,
+                    allow_estimate=False,
+                )
+
+                self.assertIsNone(stats)
+
+    async def test_trade_stats_accepts_legacy_identityless_execution_rows(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "long",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 4,
+                "total_investment": 100,
+                "leverage": 2,
+                "maker_fee_rate": 0.0002,
+                "taker_fee_rate": 0.0005,
+                "trigger_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+            },
+        )
+        client.get_order_trades = lambda symbol, order_id: {
+            "retCode": 0,
+            "result": {"list": [{"price": "100", "qty": "1"}]},
+        }
+
+        stats = engine._get_trade_stats(
+            "1",
+            fallback_price=100,
+            fallback_qty=1,
+            allow_estimate=False,
+        )
+
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["qty"], 1.0)
+        self.assertEqual(stats["volume"], 100.0)
+        self.assertAlmostEqual(stats["fee"], 0.05)
+        self.assertEqual(stats["fee_asset"], "USDT")
+        self.assertEqual(stats["maker_count"], 0)
+        self.assertEqual(stats["taker_count"], 1)
+
     async def test_pending_targets_are_cleared_after_grid_deployment(self):
         client = FakeClient("100")
         engine = GridEngine(
