@@ -1392,6 +1392,120 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertEqual(engine.active_orders, {})
         self.assertNotIn(order_id, main._client.open_limit_order_ids)
 
+    def test_restore_registers_rule_refresh_failure_without_normal_order_placement(self):
+        class FailingRulesClient(FakeClient):
+            def get_instrument_info(self, symbol):
+                raise RuntimeError("exchangeInfo unavailable at process startup")
+
+        symbol = "RULEWAITUSDT"
+        exchange = "binance"
+        key = main._engine_key(exchange, symbol)
+        client = FailingRulesClient("100")
+        main._client = client
+        main._clients[exchange] = client
+        main._write_grid_state_file(
+            {
+                "version": 1,
+                "grids": {
+                    key: {
+                        "config": {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "direction": "short",
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 1,
+                            "total_investment": 0,
+                            "position_sizing_mode": "fixed_grid_qty",
+                            "grid_order_qty": 1,
+                            "qty_per_grid": 1,
+                            "leverage": 2,
+                        },
+                        "running": True,
+                        "grid_ready": True,
+                        "grid_levels": [90, 110],
+                        "target_qty_by_level": {"0": 1},
+                        "tick_size": "1",
+                        "qty_step": "1",
+                        "min_qty": 1,
+                    }
+                },
+            }
+        )
+
+        async def restore_observe_and_stop():
+            main._restore_saved_engines()
+            engine = main._engines[key]
+            await asyncio.sleep(0)
+            observed = {
+                "running": engine.running,
+                "pending": engine.restore_refresh_pending,
+                "error": engine.restore_refresh_error,
+                "orders": list(client.orders),
+            }
+            engine.running = False
+            await engine.suspend()
+            return observed
+
+        observed = asyncio.run(restore_observe_and_stop())
+
+        self.assertTrue(observed["running"])
+        self.assertTrue(observed["pending"])
+        self.assertIn("exchangeInfo unavailable", observed["error"])
+        self.assertEqual(observed["orders"], [])
+
+    def test_stopped_grid_rule_refresh_failure_does_not_reactivate_strategy(self):
+        class FailingRulesClient(FakeClient):
+            def get_instrument_info(self, symbol):
+                raise RuntimeError("exchangeInfo unavailable for stopped grid")
+
+        symbol = "STOPPEDUSDT"
+        exchange = "binance"
+        key = main._engine_key(exchange, symbol)
+        client = FailingRulesClient("100")
+        main._client = client
+        main._clients[exchange] = client
+        main._write_grid_state_file(
+            {
+                "version": 1,
+                "grids": {
+                    key: {
+                        "config": {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "direction": "short",
+                            "grid_mode": "arithmetic",
+                            "upper_price": 110,
+                            "lower_price": 90,
+                            "grid_count": 1,
+                            "total_investment": 0,
+                            "position_sizing_mode": "fixed_grid_qty",
+                            "grid_order_qty": 1,
+                            "qty_per_grid": 1,
+                            "leverage": 2,
+                        },
+                        "running": False,
+                        "grid_ready": False,
+                        "grid_levels": [90, 110],
+                        "restore_refresh_pending": False,
+                        "restore_saved_running": False,
+                    }
+                },
+            }
+        )
+
+        main._restore_saved_engines()
+
+        engine = main._engines[key]
+        durable = engine.to_state()
+        self.assertFalse(engine.running)
+        self.assertIsNone(engine._task)
+        self.assertTrue(engine.restore_refresh_pending)
+        self.assertFalse(engine._restore_saved_running)
+        self.assertFalse(durable["restore_saved_running"])
+        self.assertEqual(client.orders, [])
+
     def test_restore_resumes_waiting_opening_order_when_saved_running_is_false(self):
         symbol = "WAITOPENUSDT"
         exchange = "binance"

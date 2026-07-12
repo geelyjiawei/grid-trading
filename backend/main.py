@@ -1313,6 +1313,7 @@ def _restore_saved_engines():
                 engine.grid_ready
                 or engine.waiting_trigger
                 or engine.waiting_initial_order
+                or (engine.restore_refresh_pending and engine._restore_saved_running)
             )
             can_restart = not engine._stopping and (
                 cleanup_must_resume

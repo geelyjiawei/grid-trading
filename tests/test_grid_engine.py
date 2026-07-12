@@ -3,6 +3,7 @@ import copy
 import logging
 import random
 import sys
+import time
 import unittest
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -8509,6 +8510,47 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(grid_id, client.open_limit_order_ids)
         self.assertIn(manual_id, client.open_limit_order_ids)
 
+    async def test_terminal_stop_clears_restore_refresh_retry_state(self):
+        client = FakeClient("100")
+        engine = GridEngine(
+            client,
+            {
+                "symbol": "TESTUSDT",
+                "direction": "short",
+                "grid_mode": "arithmetic",
+                "upper_price": 110,
+                "lower_price": 90,
+                "grid_count": 1,
+                "total_investment": 0,
+                "position_sizing_mode": "fixed_grid_qty",
+                "grid_order_qty": 1,
+                "leverage": 2,
+            },
+        )
+        engine.running = True
+        engine.grid_ready = True
+        engine.restore_refresh_pending = True
+        engine.restore_refresh_error = "exchangeInfo unavailable"
+        engine.restore_refresh_retry_after = time.time() + 60
+        engine.restore_refresh_attempts = 4
+        engine._restore_saved_running = True
+        engine._restore_legacy_bootstrap_pending = True
+        engine._restore_previous_trigger_message = "previous status"
+        engine.trigger_message = "Restore refresh paused: exchangeInfo unavailable"
+
+        await engine.stop()
+
+        durable = engine.to_state()
+        self.assertFalse(durable["running"])
+        self.assertFalse(durable["restore_refresh_pending"])
+        self.assertEqual(durable["restore_refresh_error"], "")
+        self.assertEqual(durable["restore_refresh_retry_after"], 0.0)
+        self.assertEqual(durable["restore_refresh_attempts"], 0)
+        self.assertFalse(durable["restore_saved_running"])
+        self.assertFalse(durable["restore_legacy_bootstrap_pending"])
+        self.assertEqual(durable["restore_previous_trigger_message"], "")
+        self.assertEqual(durable["trigger_message"], "")
+
     async def test_stop_records_cancel_race_fill_without_placing_counter_order(self):
         class FillWhileCancellingClient(FakeClient):
             def __init__(self, *args, **kwargs):
@@ -9336,6 +9378,58 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(restored.running)
         self.assertFalse(restored.manual_stop_pending)
+        self.assertEqual(restored.active_orders, {})
+        self.assertEqual(len(client.orders), 1)
+
+    async def test_manual_stop_cleanup_finishes_while_restore_rules_are_unavailable(self):
+        class RecoveringCancelClient(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fail_rules = False
+
+            def get_instrument_info(self, symbol):
+                if self.fail_rules:
+                    raise RuntimeError("exchangeInfo unavailable during stop recovery")
+                return super().get_instrument_info(symbol)
+
+        client = RecoveringCancelClient("100")
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 1,
+            "leverage": 2,
+        }
+        source = GridEngine(client, config)
+        source._fetch_precision()
+        source.grid_levels = [90, 110]
+        source._place("Sell", 110, 0, reduce_only=False, qty_override=1)
+        source.grid_ready = False
+        source.manual_stop_pending = True
+        source.running = True
+        state = source.to_state()
+
+        client.fail_rules = True
+        restored = GridEngine(client, config)
+        restored.restore_state(state)
+
+        self.assertTrue(restored.restore_refresh_pending)
+        self.assertTrue(restored.manual_stop_pending)
+        self.assertEqual(len(client.orders), 1)
+
+        restored.start()
+        await asyncio.wait_for(restored._task, timeout=1)
+
+        durable = restored.to_state()
+        self.assertFalse(restored.running)
+        self.assertFalse(restored.manual_stop_pending)
+        self.assertFalse(restored.restore_refresh_pending)
+        self.assertFalse(durable["restore_saved_running"])
         self.assertEqual(restored.active_orders, {})
         self.assertEqual(len(client.orders), 1)
 
@@ -10802,6 +10896,186 @@ class GridEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.current_mark_price, 0.26)
         self.assertEqual(len(market_orders), 1)
         self.assertEqual(market_orders[0]["qty"], "20")
+
+    async def test_restore_rule_refresh_failure_blocks_orders_until_rules_recover(self):
+        class RuleRefreshClient(FakeClient):
+            def __init__(self):
+                super().__init__(
+                    "100",
+                    tick_size="1",
+                    qty_step="1",
+                    min_qty="1",
+                    min_notional="5",
+                )
+                self.fail_rules = True
+                self.rule_calls = 0
+                self.open_order_reads = 0
+
+            def get_instrument_info(self, symbol):
+                self.rule_calls += 1
+                if self.fail_rules:
+                    raise RuntimeError("exchangeInfo temporarily unavailable")
+                return super().get_instrument_info(symbol)
+
+            def get_open_orders(self, symbol):
+                self.open_order_reads += 1
+                return super().get_open_orders(symbol)
+
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "short",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 0,
+            "position_sizing_mode": "fixed_grid_qty",
+            "grid_order_qty": 1,
+            "qty_per_grid": 1,
+            "leverage": 2,
+        }
+        source_client = FakeClient(
+            "100",
+            tick_size="1",
+            qty_step="1",
+            min_qty="1",
+            min_notional="5",
+        )
+        source = GridEngine(source_client, config)
+        source._fetch_precision()
+        source.grid_levels = [90, 110]
+        source.target_qty_by_level = {"0": 1.0}
+        source.grid_ready = True
+        source.running = True
+        legacy_state = source.to_state()
+        for key in (
+            "min_notional",
+            "restore_refresh_pending",
+            "restore_refresh_error",
+            "restore_refresh_retry_after",
+            "restore_refresh_attempts",
+            "restore_saved_running",
+            "restore_legacy_bootstrap_pending",
+            "restore_previous_trigger_message",
+        ):
+            legacy_state.pop(key, None)
+
+        client = RuleRefreshClient()
+        restored = GridEngine(client, config)
+        restored.restore_state(legacy_state)
+
+        self.assertTrue(restored.restore_refresh_pending)
+        self.assertIn("exchangeInfo temporarily unavailable", restored.restore_refresh_error)
+        self.assertIn("normal grid placement is disabled", restored.trigger_message)
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.open_order_reads, 0)
+
+        async def stop_after_poll():
+            restored.running = False
+
+        restored._sleep_until_next_poll = stop_after_poll
+        restored.restore_refresh_retry_after = 0
+        restored.running = True
+        await restored._run_loop()
+
+        self.assertTrue(restored.restore_refresh_pending)
+        self.assertEqual(client.orders, [])
+        self.assertEqual(client.open_order_reads, 0)
+
+        client.fail_rules = False
+        restored.restore_refresh_retry_after = 0
+        restored.running = True
+        await restored._run_loop()
+
+        self.assertFalse(restored.restore_refresh_pending)
+        self.assertEqual(restored.restore_refresh_error, "")
+        self.assertEqual(restored.min_notional, 5.0)
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.orders[0]["side"], "Sell")
+        self.assertEqual(client.orders[0]["price"], "110")
+        self.assertEqual(client.orders[0]["qty"], "1")
+
+    async def test_restore_rule_rate_limit_stays_registered_for_retry(self):
+        class RateLimitedRulesClient(FakeClient):
+            def get_instrument_info(self, symbol):
+                raise ExchangeRateLimitError(
+                    "Too many requests while loading exchangeInfo",
+                    retry_after=12,
+                )
+
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "neutral",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 100,
+            "qty_per_grid": 1,
+            "leverage": 2,
+        }
+        source = GridEngine(FakeClient("100"), config)
+        source.grid_levels = [90, 110]
+        source.grid_ready = True
+        source.running = True
+        state = source.to_state()
+
+        restored = GridEngine(RateLimitedRulesClient("100"), config)
+        restored.restore_state(state)
+
+        self.assertTrue(restored.restore_refresh_pending)
+        self.assertTrue(restored._restore_saved_running)
+        self.assertGreater(restored._rate_limit_remaining(), 11)
+        self.assertGreater(restored.restore_refresh_retry_after, time.time() + 11)
+        self.assertEqual(restored.active_orders, {})
+
+    async def test_legacy_lot_bootstrap_intent_survives_failed_restore_refresh(self):
+        class FailingRulesClient(FakeClient):
+            def get_instrument_info(self, symbol):
+                raise RuntimeError("exchangeInfo unavailable during migration")
+
+        class TrackingEngine(GridEngine):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.bootstrap_calls = 0
+
+            def _bootstrap_reduce_lots_from_legacy_state(self):
+                self.bootstrap_calls += 1
+                return super()._bootstrap_reduce_lots_from_legacy_state()
+
+        config = {
+            "symbol": "TESTUSDT",
+            "direction": "neutral",
+            "grid_mode": "arithmetic",
+            "upper_price": 110,
+            "lower_price": 90,
+            "grid_count": 1,
+            "total_investment": 100,
+            "qty_per_grid": 1,
+            "leverage": 2,
+        }
+        source = GridEngine(FakeClient("100"), config)
+        source.grid_levels = [90, 110]
+        source.grid_ready = True
+        source.running = True
+        legacy_state = source.to_state()
+        legacy_state.pop("reduce_lots_complete", None)
+        legacy_state.pop("reduce_lots_by_level", None)
+        legacy_state.pop("restore_legacy_bootstrap_pending", None)
+
+        failed = GridEngine(FailingRulesClient("100"), config)
+        failed.restore_state(legacy_state)
+        durable = failed.to_state()
+
+        self.assertTrue(durable["restore_refresh_pending"])
+        self.assertTrue(durable["restore_legacy_bootstrap_pending"])
+
+        recovered = TrackingEngine(FakeClient("100"), config)
+        recovered.restore_state(durable)
+
+        self.assertEqual(recovered.bootstrap_calls, 1)
+        self.assertFalse(recovered.restore_refresh_pending)
+        self.assertFalse(recovered._restore_legacy_bootstrap_pending)
 
 
 if __name__ == "__main__":

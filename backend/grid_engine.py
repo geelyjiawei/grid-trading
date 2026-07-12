@@ -35,6 +35,7 @@ MANAGED_CANCEL_RETRY_SECONDS = 0.25
 ORDER_LINK_RANDOM_HEX_LENGTH = 16
 ORDER_REJECTION_BACKOFF_BASE_SECONDS = 3.0
 ORDER_REJECTION_BACKOFF_MAX_SECONDS = 60.0
+RESTORE_REFRESH_MESSAGE_PREFIX = "Restore refresh paused:"
 COMPLETED_REPAIR_MESSAGE_PREFIXES = (
     "Repaired ",
     "Restored ",
@@ -106,6 +107,13 @@ class GridEngine:
         self._reduce_warning_at_by_signature: dict[tuple, float] = {}
         self._exchange_rate_limit_until = 0.0
         self._order_rejection_backoff: dict[str, dict[str, float | int | str]] = {}
+        self.restore_refresh_pending = False
+        self.restore_refresh_error = ""
+        self.restore_refresh_retry_after = 0.0
+        self.restore_refresh_attempts = 0
+        self._restore_saved_running = False
+        self._restore_legacy_bootstrap_pending = False
+        self._restore_previous_trigger_message = ""
 
     def _persist_state(self):
         if self.state_callback:
@@ -163,11 +171,22 @@ class GridEngine:
             "paused_replacements": list(self.paused_replacements),
             "exchange_rate_limit_until": self._exchange_rate_limit_until,
             "order_rejection_backoff": self._order_rejection_backoff,
+            "restore_refresh_pending": self.restore_refresh_pending,
+            "restore_refresh_error": self.restore_refresh_error,
+            "restore_refresh_retry_after": self.restore_refresh_retry_after,
+            "restore_refresh_attempts": self.restore_refresh_attempts,
+            "restore_saved_running": (
+                self._restore_saved_running if self.restore_refresh_pending else False
+            ),
+            "restore_legacy_bootstrap_pending": self._restore_legacy_bootstrap_pending,
+            "restore_previous_trigger_message": self._restore_previous_trigger_message,
             "saved_at": time.time(),
         }
 
     def restore_state(self, state: dict[str, Any]):
-        saved_running = bool(state.get("running", False))
+        saved_running = bool(
+            state.get("running", False) or state.get("restore_saved_running", False)
+        )
         self.config = dict(state.get("config") or self.config)
         self.grid_levels = list(state.get("grid_levels") or [])
         self.active_orders = dict(state.get("active_orders") or {})
@@ -233,6 +252,20 @@ class GridEngine:
             for key, value in raw_backoff.items()
             if isinstance(value, dict)
         }
+        self.restore_refresh_pending = True
+        self.restore_refresh_error = ""
+        self.restore_refresh_retry_after = 0.0
+        self.restore_refresh_attempts = 0
+        self._restore_saved_running = saved_running
+        self._restore_legacy_bootstrap_pending = bool(
+            state.get(
+                "restore_legacy_bootstrap_pending",
+                allow_reduce_lot_legacy_bootstrap,
+            )
+        )
+        self._restore_previous_trigger_message = str(
+            state.get("restore_previous_trigger_message") or ""
+        )
 
         if self.initialization_in_progress and not self.grid_ready:
             self.initialization_in_progress = False
@@ -246,10 +279,15 @@ class GridEngine:
 
         if not self.grid_levels:
             self.grid_levels = self._calculate_levels()
+        self._complete_restore_refresh()
+        self._persist_state()
+
+    def _complete_restore_refresh(self) -> bool:
+        saved_running = self._restore_saved_running
         try:
             self._fetch_precision()
             self.current_price = self._get_current_price()
-            if allow_reduce_lot_legacy_bootstrap:
+            if self._restore_legacy_bootstrap_pending:
                 self._bootstrap_reduce_lots_from_legacy_state()
             if saved_running:
                 self._migrate_baseline_position_from_exchange()
@@ -258,8 +296,52 @@ class GridEngine:
                     if not self.risk_shutdown_pending and not self.manual_stop_pending:
                         self._reconcile_grid_position_protection()
         except Exception as exc:
+            self.restore_refresh_pending = True
+            self.restore_refresh_error = str(exc)
+            self.restore_refresh_attempts += 1
+            delay = min(
+                ORDER_REJECTION_BACKOFF_MAX_SECONDS,
+                NORMAL_POLL_SECONDS * (2 ** min(self.restore_refresh_attempts - 1, 5)),
+            )
+            if isinstance(exc, ExchangeRateLimitError):
+                delay = max(delay, float(exc.retry_after))
+                self._exchange_rate_limit_until = max(
+                    self._exchange_rate_limit_until,
+                    time.time() + float(exc.retry_after),
+                )
+            self.restore_refresh_retry_after = time.time() + delay
+            if not self.trigger_message.startswith(RESTORE_REFRESH_MESSAGE_PREFIX):
+                self._restore_previous_trigger_message = self.trigger_message
+            self.trigger_message = (
+                f"{RESTORE_REFRESH_MESSAGE_PREFIX} exchange rules or authoritative state "
+                f"are unavailable ({exc}); normal grid placement is disabled and recovery "
+                "will retry without discarding the saved ledger."
+            )
             logger.warning("Restore refresh failed symbol=%s msg=%s", self.config.get("symbol"), exc)
-        self._persist_state()
+            return False
+
+        self.restore_refresh_pending = False
+        self.restore_refresh_error = ""
+        self.restore_refresh_retry_after = 0.0
+        self.restore_refresh_attempts = 0
+        self._restore_saved_running = False
+        self._restore_legacy_bootstrap_pending = False
+        if self.trigger_message.startswith(RESTORE_REFRESH_MESSAGE_PREFIX):
+            self.trigger_message = self._restore_previous_trigger_message
+        self._restore_previous_trigger_message = ""
+        return True
+
+    def _clear_restore_refresh_state(self):
+        """Discard retry metadata once the strategy has reached a terminal stop."""
+        self.restore_refresh_pending = False
+        self.restore_refresh_error = ""
+        self.restore_refresh_retry_after = 0.0
+        self.restore_refresh_attempts = 0
+        self._restore_saved_running = False
+        self._restore_legacy_bootstrap_pending = False
+        self._restore_previous_trigger_message = ""
+        if self.trigger_message.startswith(RESTORE_REFRESH_MESSAGE_PREFIX):
+            self.trigger_message = ""
 
     async def initialize(self):
         symbol = self.config["symbol"]
@@ -503,6 +585,7 @@ class GridEngine:
         self.initialization_in_progress = False
         self.paused_replacements.clear()
         self.grid_ready = False
+        self._clear_restore_refresh_state()
         self._persist_state()
 
     async def suspend(self):
@@ -747,6 +830,12 @@ class GridEngine:
             "max_market_qty": self.max_market_qty,
             "min_notional": self.min_notional,
             "exchange_rate_limit_retry_after": round(self._rate_limit_remaining(), 3),
+            "restore_refresh_pending": self.restore_refresh_pending,
+            "restore_refresh_error": self.restore_refresh_error,
+            "restore_refresh_retry_after": round(
+                max(0.0, self.restore_refresh_retry_after - time.time()),
+                3,
+            ),
             "initial_side": self.initial_side,
             "initial_qty": round(self.initial_qty, 8),
             "initial_entry_price": round(self.initial_entry_price, 10),
@@ -1611,6 +1700,7 @@ class GridEngine:
         if all_terminal and not self.pending_reduce_action:
             self.running = False
             self.manual_stop_pending = False
+            self._clear_restore_refresh_state()
         else:
             # A one-shot cancellation failure must not leave live orders orphaned.
             # Keep only the cleanup state machine running; normal grid placement
@@ -2201,6 +2291,7 @@ class GridEngine:
                     "Opening order was definitively rejected after submission recovery checks; "
                     "the grid was not deployed."
                 )
+                self._clear_restore_refresh_state()
                 self._persist_state()
                 return False
 
@@ -5365,6 +5456,7 @@ class GridEngine:
             self.grid_ready = False
             self.risk_shutdown_pending = False
             self.paused_replacements.clear()
+            self._clear_restore_refresh_state()
             self._persist_state()
             return True
         except Exception as exc:
@@ -5387,6 +5479,7 @@ class GridEngine:
                         self.manual_stop_pending = False
                         self.risk_shutdown_pending = False
                         self.paused_replacements.clear()
+                        self._clear_restore_refresh_state()
                         self._persist_state()
                         break
                     self.trigger_message = (
@@ -5419,6 +5512,16 @@ class GridEngine:
                     continue
                 if self.trigger_message.startswith("Exchange rate limit reached;"):
                     self.trigger_message = ""
+                    self._persist_state()
+
+                if self.restore_refresh_pending:
+                    if time.time() < self.restore_refresh_retry_after:
+                        await self._sleep_until_next_poll()
+                        continue
+                    if not self._complete_restore_refresh():
+                        self._persist_state()
+                        await self._sleep_until_next_poll()
+                        continue
                     self._persist_state()
 
                 self.current_price = self._get_current_price()
@@ -5547,6 +5650,7 @@ class GridEngine:
             self.opening_order = None
             self.running = False
             self.trigger_message = "Opening order closed without fills and retry quantity is too small."
+            self._clear_restore_refresh_state()
             self._persist_state()
             return
 
@@ -5560,6 +5664,7 @@ class GridEngine:
                 "Opening order closed without fills and price is outside grid range; "
                 "please review before restarting."
             )
+            self._clear_restore_refresh_state()
             self._persist_state()
             return
 
@@ -5590,6 +5695,7 @@ class GridEngine:
                 f"Opening order replacement failed before any confirmed fill: {exc}. "
                 "The grid was stopped without submitting another opening order."
             )
+            self._clear_restore_refresh_state()
             self._persist_state()
             return
         order_label = "Post-only" if post_only else "Limit"
@@ -5641,6 +5747,7 @@ class GridEngine:
                         f"Initial market order ended as {status} without a confirmed fill; "
                         "the grid was not deployed."
                     )
+                    self._clear_restore_refresh_state()
                     self._persist_state()
                     return
             if self._is_filled_status(status):
@@ -5691,6 +5798,7 @@ class GridEngine:
             self.waiting_initial_order = False
             self.running = False
             self.trigger_message = "Opening order fill quantity is too small; please restart the grid."
+            self._clear_restore_refresh_state()
             self._persist_state()
             return
 
