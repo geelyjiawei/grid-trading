@@ -9,6 +9,10 @@ passes deterministic replay and fault-injection tests against the Rust engine.
 - `openapi-v1.json`: deterministic FastAPI request and route schema.
 - `frontend-api-v1.json`: endpoints used by the current browser application.
 - `INVARIANTS.md`: state, ownership, and persistence rules that OpenAPI cannot express.
+- `replay/grid-plan-v1.json`: credential-free market, rule, and strategy inputs shared by
+  the Python oracle and Rust planner.
+- `replay/grid-plan-v1.expected.json`: the reviewed full order-shape output for every
+  shared replay case. Both runtimes must match it exactly in CI.
 
 Regenerate the machine-readable files with:
 
