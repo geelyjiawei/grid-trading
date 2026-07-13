@@ -9,10 +9,10 @@ pub use grid_plan::{
 };
 pub use reconciliation::{ReconciliationError, ReconciliationResult, ReconciliationService};
 pub use strategy_machine::{
-    ExecutionReport, LevelLot, MemoryStrategyStateStore, PositionBaseline, ReplacementObligation,
-    ReplacementObligationKind, RiskExitReason, StrategyLifecycle, StrategyMachine,
-    StrategyMachineError, StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking,
-    StrategyRunId, StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
-    StrategyTransition,
+    ExecutionReport, LevelLot, MemoryStrategyStateStore, NeutralLot, PositionBaseline,
+    ReplacementObligation, ReplacementObligationKind, RiskExitReason, StrategyLifecycle,
+    StrategyMachine, StrategyMachineError, StrategyOrderPurpose, StrategyOrderRecord,
+    StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError, StrategyStateStore,
+    StrategyStoreError, StrategyTransition,
 };
 pub use submission::{SubmissionError, SubmissionResult, SubmissionService};

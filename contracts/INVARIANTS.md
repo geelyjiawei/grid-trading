@@ -37,6 +37,10 @@ the OpenAPI schema.
   isolated. That configuration is rejected instead of netting through the old position.
 - A neutral grid requires a flat baseline unless the exchange adapter later provides an
   explicit hedge-position identity.
+- Neutral fills maintain durable FIFO directional cost lots. Opposite fills close those
+  lots first, realize exact PnL, and only an excess quantity opens a new direction.
+- Neutral inventory may never retain long and short lots at the same time; its signed lot
+  sum must exactly equal the exchange-facing grid-owned net quantity.
 - Grid-owned position equals confirmed opening fills minus confirmed reducing fills.
 - Manual or unexplained exchange position changes fail closed and never rewrite the
   local ledger.

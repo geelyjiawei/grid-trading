@@ -11,6 +11,10 @@ use crate::domain::{
 
 use super::{GridOrderRole, GridPlan};
 
+fn one_u64() -> u64 {
+    1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StrategyRunId(String);
@@ -155,6 +159,13 @@ pub struct LevelLot {
     pub entry_value: Decimal,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeutralLot {
+    pub id: u64,
+    pub signed_quantity: Decimal,
+    pub entry_value: Decimal,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplacementObligationKind {
@@ -191,9 +202,13 @@ pub struct StrategyState {
     pub opening_filled_value: Decimal,
     pub orders: BTreeMap<ClientOrderId, StrategyOrderRecord>,
     pub lots_by_level: BTreeMap<u16, LevelLot>,
+    #[serde(default)]
+    pub neutral_lots: BTreeMap<u64, NeutralLot>,
     pub replacement_obligations: BTreeMap<u64, ReplacementObligation>,
     pub next_order_sequence: u64,
     pub next_obligation_sequence: u64,
+    #[serde(default = "one_u64")]
+    pub next_neutral_lot_sequence: u64,
     pub initial_deployment_complete: bool,
     #[serde(default)]
     pub risk_exit_reason: Option<RiskExitReason>,
@@ -256,9 +271,11 @@ impl StrategyState {
             opening_filled_value: Decimal::ZERO,
             orders: BTreeMap::new(),
             lots_by_level: BTreeMap::new(),
+            neutral_lots: BTreeMap::new(),
             replacement_obligations: BTreeMap::new(),
             next_order_sequence: 1,
             next_obligation_sequence: 1,
+            next_neutral_lot_sequence: 1,
             initial_deployment_complete: false,
             risk_exit_reason: None,
             risk_trigger_mark_price: None,
@@ -345,6 +362,7 @@ impl StrategyState {
         if self.lifecycle == StrategyLifecycle::Closed
             && (!self.grid_position_net_quantity.is_zero()
                 || !self.lots_by_level.is_empty()
+                || !self.neutral_lots.is_empty()
                 || self.orders.values().any(order_may_still_be_live))
         {
             return Err(StrategyStateError::CannotCloseStrategy);
@@ -457,12 +475,40 @@ impl StrategyState {
                 return Err(StrategyStateError::InvalidLevelLot);
             }
         }
-        if self.direction != Direction::Neutral
-            && !matches!(
-                self.lifecycle,
-                StrategyLifecycle::AwaitingOpening | StrategyLifecycle::Failed
-            )
-        {
+        for (id, lot) in &self.neutral_lots {
+            if id != &lot.id
+                || lot.signed_quantity.is_zero()
+                || lot.entry_value <= Decimal::ZERO
+                || *id >= self.next_neutral_lot_sequence
+            {
+                return Err(StrategyStateError::InvalidNeutralLot);
+            }
+        }
+        if self.direction == Direction::Neutral {
+            if !self.lots_by_level.is_empty() {
+                return Err(StrategyStateError::NeutralLotCoverageMismatch);
+            }
+            if self.lifecycle != StrategyLifecycle::Failed {
+                let signed_quantity = self
+                    .neutral_lots
+                    .values()
+                    .map(|lot| lot.signed_quantity)
+                    .try_fold(Decimal::ZERO, |total, quantity| total.checked_add(quantity))
+                    .ok_or(StrategyStateError::NumericOverflow("neutral lot quantity"))?;
+                if signed_quantity != self.grid_position_net_quantity
+                    || self.neutral_lots.values().any(|lot| {
+                        (self.grid_position_net_quantity > Decimal::ZERO
+                            && lot.signed_quantity <= Decimal::ZERO)
+                            || (self.grid_position_net_quantity < Decimal::ZERO
+                                && lot.signed_quantity >= Decimal::ZERO)
+                    })
+                {
+                    return Err(StrategyStateError::NeutralLotCoverageMismatch);
+                }
+            }
+        } else if !self.neutral_lots.is_empty() {
+            return Err(StrategyStateError::NeutralLotCoverageMismatch);
+        } else if self.lifecycle != StrategyLifecycle::Failed {
             let lot_quantity = self
                 .lots_by_level
                 .values()
@@ -980,14 +1026,6 @@ where
                 },
             );
         }
-        if next.direction == Direction::Neutral {
-            let transition = fail_transition(
-                &mut next,
-                "neutral risk close requires a directional cost-basis ledger",
-            );
-            return finalize_and_store(&mut self.store, next, now_ms, transition);
-        }
-
         let total_quantity = next.grid_position_net_quantity.abs();
         let close_quantity = if let Some(maximum) = fresh_rules.market_quantity.max
             && total_quantity > maximum
@@ -1127,6 +1165,7 @@ where
             StrategyLifecycle::StopRequested | StrategyLifecycle::Stopped
         ) || !next.grid_position_net_quantity.is_zero()
             || !next.lots_by_level.is_empty()
+            || !next.neutral_lots.is_empty()
             || next.orders.values().any(order_may_still_be_live)
         {
             return Err(StrategyStateError::CannotCloseStrategy.into());
@@ -1458,7 +1497,8 @@ fn apply_execution_delta(
 
     if matches!(delta.purpose, StrategyOrderPurpose::RiskClose) {
         validate_directional_position(state, delta.shape)?;
-        let realized = consume_risk_close_lots(state, delta.quantity, delta.quote)?;
+        let realized =
+            consume_risk_close_lots(state, delta.shape.side, delta.quantity, delta.quote)?;
         state.gross_realized_profit = state
             .gross_realized_profit
             .checked_add(realized)
@@ -1481,6 +1521,12 @@ fn apply_execution_delta(
         } else {
             add_level_lot(state, level_index, delta.quantity, delta.quote)?;
         }
+    } else {
+        let realized = apply_neutral_fill(state, delta.shape.side, delta.quantity, delta.quote)?;
+        state.gross_realized_profit = state
+            .gross_realized_profit
+            .checked_add(realized)
+            .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
     }
     let counter = counter_shape(state, level_index, delta.shape, delta.quantity)?;
     let id = add_obligation(
@@ -1583,13 +1629,114 @@ fn consume_level_lot(
     }
 }
 
+fn apply_neutral_fill(
+    state: &mut StrategyState,
+    side: OrderSide,
+    quantity: Decimal,
+    trade_value: Decimal,
+) -> Result<Decimal, String> {
+    if quantity <= Decimal::ZERO || trade_value <= Decimal::ZERO {
+        return Err("neutral execution is invalid".into());
+    }
+    let opposing_ids = state
+        .neutral_lots
+        .iter()
+        .filter_map(|(id, lot)| {
+            ((lot.signed_quantity > Decimal::ZERO && side == OrderSide::Sell)
+                || (lot.signed_quantity < Decimal::ZERO && side == OrderSide::Buy))
+                .then_some(*id)
+        })
+        .collect::<Vec<_>>();
+    let mut remaining_quantity = quantity;
+    let mut remaining_trade_value = trade_value;
+    let mut realized = Decimal::ZERO;
+
+    for id in opposing_ids {
+        if remaining_quantity.is_zero() {
+            break;
+        }
+        let lot = state
+            .neutral_lots
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "neutral lot disappeared during matching".to_owned())?;
+        let available = lot.signed_quantity.abs();
+        let consumed = available.min(remaining_quantity);
+        let consumed_trade_value = if consumed == remaining_quantity {
+            remaining_trade_value
+        } else {
+            trade_value
+                .checked_mul(consumed)
+                .and_then(|value| value.checked_div(quantity))
+                .ok_or_else(|| "neutral trade value allocation overflowed".to_owned())?
+        };
+        let consumed_entry_value = lot
+            .entry_value
+            .checked_mul(consumed)
+            .and_then(|value| value.checked_div(available))
+            .ok_or_else(|| "neutral entry allocation overflowed".to_owned())?;
+        let lot_profit = if lot.signed_quantity > Decimal::ZERO {
+            consumed_trade_value
+                .checked_sub(consumed_entry_value)
+                .ok_or_else(|| "neutral long profit overflowed".to_owned())?
+        } else {
+            consumed_entry_value
+                .checked_sub(consumed_trade_value)
+                .ok_or_else(|| "neutral short profit overflowed".to_owned())?
+        };
+        realized = realized
+            .checked_add(lot_profit)
+            .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
+
+        if consumed == available {
+            state.neutral_lots.remove(&id);
+        } else {
+            let current = state
+                .neutral_lots
+                .get_mut(&id)
+                .ok_or_else(|| "neutral lot disappeared during update".to_owned())?;
+            current.signed_quantity = match side {
+                OrderSide::Buy => current.signed_quantity.checked_add(consumed),
+                OrderSide::Sell => current.signed_quantity.checked_sub(consumed),
+            }
+            .ok_or_else(|| "neutral lot quantity overflowed".to_owned())?;
+            current.entry_value -= consumed_entry_value;
+        }
+        remaining_quantity -= consumed;
+        remaining_trade_value -= consumed_trade_value;
+    }
+
+    if remaining_quantity > Decimal::ZERO {
+        let id = state.next_neutral_lot_sequence;
+        state.next_neutral_lot_sequence = state
+            .next_neutral_lot_sequence
+            .checked_add(1)
+            .ok_or_else(|| "neutral lot sequence overflowed".to_owned())?;
+        state.neutral_lots.insert(
+            id,
+            NeutralLot {
+                id,
+                signed_quantity: match side {
+                    OrderSide::Buy => remaining_quantity,
+                    OrderSide::Sell => -remaining_quantity,
+                },
+                entry_value: remaining_trade_value,
+            },
+        );
+    } else if !remaining_trade_value.is_zero() {
+        return Err("neutral trade value allocation is incomplete".into());
+    }
+    Ok(realized)
+}
+
 fn consume_risk_close_lots(
     state: &mut StrategyState,
+    side: OrderSide,
     quantity: Decimal,
     exit_value: Decimal,
 ) -> Result<Decimal, String> {
     if state.direction == Direction::Neutral {
-        return Err("neutral risk close has no directional lot ledger".into());
+        return apply_neutral_fill(state, side, quantity, exit_value);
     }
     let level_indices = state.lots_by_level.keys().copied().collect::<Vec<_>>();
     let mut remaining_quantity = quantity;
@@ -2127,8 +2274,12 @@ pub enum StrategyStateError {
     TerminalProcessingMismatch,
     #[error("strategy level lot is invalid")]
     InvalidLevelLot,
+    #[error("strategy neutral inventory lot is invalid")]
+    InvalidNeutralLot,
     #[error("strategy level lots do not cover the grid-owned position")]
     LevelLotCoverageMismatch,
+    #[error("strategy neutral inventory lots do not cover the grid-owned position")]
+    NeutralLotCoverageMismatch,
     #[error("replacement obligation identity is invalid")]
     ObligationIdentityMismatch,
     #[error("replacement obligation references a missing assigned order")]
@@ -2425,6 +2576,66 @@ mod tests {
         .unwrap();
         let state = StrategyState::from_plan(
             StrategyRunId::parse("ANSEM001").unwrap(),
+            config,
+            instrument,
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        StrategyMachine::new(MemoryStrategyStateStore::new(state))
+    }
+
+    fn small_neutral_risk_machine() -> StrategyMachine<MemoryStrategyStateStore> {
+        let mut config = GridConfig {
+            exchange: Some(Exchange::Aster),
+            symbol: "ANSEMUSDT".into(),
+            direction: Direction::Neutral,
+            upper_price: Decimal::new(30, 2),
+            lower_price: Decimal::new(26, 2),
+            grid_count: 2,
+            total_investment: Decimal::ZERO,
+            leverage: 2,
+            position_sizing_mode: PositionSizingMode::FixedGridQty,
+            grid_order_qty: Some(decimal(20)),
+            fee_rate: Some(Decimal::new(5, 4)),
+            maker_fee_rate: Some(Decimal::new(2, 4)),
+            taker_fee_rate: Some(Decimal::new(5, 4)),
+            initial_order_type: InitialOrderType::Market,
+            initial_order_price: None,
+            grid_order_post_only: false,
+            grid_mode: GridMode::Arithmetic,
+            trigger_price: None,
+            stop_loss_price: None,
+            take_profit_price: None,
+        };
+        config.stop_loss_price = Some(Decimal::new(25, 2));
+        config.take_profit_price = Some(Decimal::new(31, 2));
+        let instrument = InstrumentRules {
+            tick_size: Decimal::new(1, 2),
+            limit_quantity: QuantityRules {
+                step: Decimal::ONE,
+                min: Decimal::ONE,
+                max: None,
+            },
+            market_quantity: QuantityRules {
+                step: Decimal::ONE,
+                min: Decimal::ONE,
+                max: None,
+            },
+            min_notional: decimal(5),
+        };
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: Decimal::new(29, 2),
+                mark_price: Decimal::new(29, 2),
+            },
+            &instrument,
+        )
+        .unwrap();
+        let state = StrategyState::from_plan(
+            StrategyRunId::parse("ANSEMR01").unwrap(),
             config,
             instrument,
             plan,
@@ -3163,6 +3374,8 @@ mod tests {
         let state = machine.store().snapshot();
         assert_eq!(state.grid_position_net_quantity, Decimal::ZERO);
         assert!(state.lots_by_level.is_empty());
+        assert!(state.neutral_lots.is_empty());
+        assert_eq!(state.gross_realized_profit, Decimal::new(4, 1));
         assert_eq!(state.replacement_obligations.len(), 2);
         assert!(
             state
@@ -3170,6 +3383,163 @@ mod tests {
                 .values()
                 .all(|obligation| !obligation.shape.reduce_only)
         );
+    }
+
+    #[test]
+    fn neutral_fill_that_crosses_zero_closes_then_opens_only_the_remainder() {
+        let mut machine = small_neutral_machine();
+        let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        let sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
+        machine
+            .apply_execution(
+                &report(
+                    buy,
+                    "neutral-long",
+                    decimal(10),
+                    Decimal::new(28, 1),
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+        machine
+            .apply_execution(
+                &report(
+                    sell,
+                    "neutral-flip",
+                    decimal(20),
+                    decimal(6),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                102,
+            )
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.grid_position_net_quantity, decimal(-10));
+        assert_eq!(state.gross_realized_profit, Decimal::new(2, 1));
+        assert_eq!(state.neutral_lots.len(), 1);
+        let lot = state.neutral_lots.values().next().unwrap();
+        assert_eq!(lot.signed_quantity, decimal(-10));
+        assert_eq!(lot.entry_value, decimal(3));
+    }
+
+    #[test]
+    fn neutral_risk_close_uses_its_cost_basis_and_closes_exact_net_quantity() {
+        let mut machine = small_neutral_risk_machine();
+        let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        machine
+            .apply_execution(
+                &report(
+                    buy,
+                    "neutral-risk-long",
+                    decimal(20),
+                    Decimal::new(56, 1),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                101,
+            )
+            .unwrap();
+        machine
+            .evaluate_risk_price(Decimal::new(31, 2), 102)
+            .unwrap();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        let close_id = match machine
+            .prepare_risk_close(decimal(20), &rules, 103)
+            .unwrap()
+        {
+            StrategyTransition::RiskCloseOrderReady {
+                client_order_id,
+                quantity,
+            } => {
+                assert_eq!(quantity, decimal(20));
+                client_order_id
+            }
+            other => panic!("unexpected transition: {other:?}"),
+        };
+        let intent = machine
+            .store()
+            .snapshot()
+            .ready_intents(104)
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.client_order_id == close_id)
+            .unwrap();
+        assert_eq!(intent.shape.side, OrderSide::Sell);
+        assert!(intent.shape.reduce_only);
+        machine
+            .apply_execution(
+                &report(
+                    close_id,
+                    "neutral-risk-close",
+                    decimal(20),
+                    Decimal::new(62, 1),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                105,
+            )
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.grid_position_net_quantity, Decimal::ZERO);
+        assert!(state.neutral_lots.is_empty());
+        assert_eq!(state.gross_realized_profit, Decimal::new(6, 1));
+        assert_eq!(
+            machine
+                .prepare_risk_close(Decimal::ZERO, &rules, 106)
+                .unwrap(),
+            StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::Closed
+            }
+        );
+    }
+
+    #[test]
+    fn neutral_inventory_invariants_hold_across_one_thousand_deterministic_fills() {
+        let machine = small_neutral_machine();
+        let mut state = machine.store().snapshot().clone();
+        let mut seed = 0x5eed_u64;
+        let mut realized = Decimal::ZERO;
+
+        for _ in 0..1_000 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let side = if seed & 1 == 0 {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            };
+            let quantity = Decimal::from((seed % 20) + 1);
+            let price = Decimal::new(i64::try_from((seed % 7) + 26).unwrap(), 2);
+            let value = price.checked_mul(quantity).unwrap();
+            let signed = match side {
+                OrderSide::Buy => quantity,
+                OrderSide::Sell => -quantity,
+            };
+            state.grid_position_net_quantity = state
+                .grid_position_net_quantity
+                .checked_add(signed)
+                .unwrap();
+            realized = realized
+                .checked_add(apply_neutral_fill(&mut state, side, quantity, value).unwrap())
+                .unwrap();
+
+            state.validate().unwrap();
+            assert_eq!(
+                state
+                    .neutral_lots
+                    .values()
+                    .map(|lot| lot.signed_quantity)
+                    .sum::<Decimal>(),
+                state.grid_position_net_quantity
+            );
+            assert!(state.neutral_lots.values().all(|lot| {
+                (state.grid_position_net_quantity > Decimal::ZERO
+                    && lot.signed_quantity > Decimal::ZERO)
+                    || (state.grid_position_net_quantity < Decimal::ZERO
+                        && lot.signed_quantity < Decimal::ZERO)
+            }));
+        }
+        assert!(!realized.is_zero());
     }
 
     #[test]
