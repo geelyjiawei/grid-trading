@@ -16,8 +16,10 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("failed to bind Rust migration server to {address}"))?;
+    let app = grid_trading_server::app_from_environment()
+        .context("invalid Rust migration server configuration")?;
     tracing::info!(%address, "Rust migration server listening in non-trading mode");
-    axum::serve(listener, grid_trading_server::app())
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("Rust migration server stopped unexpectedly")?;

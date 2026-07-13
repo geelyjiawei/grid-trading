@@ -1,8 +1,13 @@
+mod idempotency;
 mod order_ledger;
 mod runtime_files;
 mod runtime_lease;
 mod strategy_state;
 
+pub use idempotency::{
+    BeginIdempotency, CompleteIdempotency, FileIdempotencyStore, IdempotencyError, IdempotencyKey,
+    IdempotencyStore, RequestFingerprint, StoredCommandResponse,
+};
 pub use order_ledger::{
     FileOrderIntentStore, IntentStore, LedgerError, LedgerSnapshot, MemoryOrderIntentStore,
 };

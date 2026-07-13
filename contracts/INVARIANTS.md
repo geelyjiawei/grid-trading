@@ -230,3 +230,26 @@ the OpenAPI schema.
 - A restart cannot resume normal placement before fresh exchange rules and
   authoritative state are validated.
 - Corrupt or incomplete storage fails closed and is retained for audit.
+
+## Write control plane
+
+- Every Rust write endpoint authenticates one strong administrator bearer token before
+  inspecting an idempotency key or consuming the request body. The process retains only
+  the token's SHA-256 digest and compares candidate digests in constant time; tokens are
+  never serialized, logged, or exposed through `Debug` output.
+- Rust exchange writes are disabled by default. During migration, a production process
+  refuses to start if an operator attempts to enable them before the command service has
+  passed the cutover gates. A disabled request cannot invoke a command or create an
+  idempotency record.
+- Every authenticated write requires exactly one bounded, path-safe `Idempotency-Key`.
+  The request method, exact target, canonical content type, and raw body digest form one
+  immutable fingerprint. Reusing a key with a different fingerprint is a conflict.
+- A durable in-progress reservation is committed before a command can execute. Exactly
+  one concurrent request obtains execution ownership; all other matching requests are
+  blocked until a definitive response has been committed.
+- A crash, incomplete reservation, command timeout, unknown command result, or response
+  persistence failure remains an unknown outcome and is never authorized for automatic
+  re-execution. A completed request replays the exact stored status and JSON response.
+- Idempotency files contain request hashes, timestamps, and bounded command responses,
+  never raw request bodies or exchange credentials. Symbolic links, malformed records,
+  oversized records, timestamp regression, and completion mutation fail closed.
