@@ -6,11 +6,67 @@ use crate::{
     domain::{ClientOrderId, IntentState},
     exchange::{
         AuthoritativeOrder, OpenOrderSnapshotGateway, OrderLifecycle, OrderLookup,
-        OrderLookupGateway, PositionSnapshotGateway,
+        OrderLookupGateway, PositionSnapshot, PositionSnapshotGateway,
     },
 };
 
 use super::{ShadowAuditReport, StrategyOrderTracking, StrategyState, audit_strategy_shadow};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StableExchangeView {
+    pub open_orders: Vec<AuthoritativeOrder>,
+    pub position: PositionSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectedStrategyShadow {
+    pub report: ShadowAuditReport,
+    pub open_orders: Vec<AuthoritativeOrder>,
+    pub position: PositionSnapshot,
+}
+
+/// Collects an exchange-only view without assuming that a strategy state exists.
+/// Open orders must remain identical around the position read, otherwise the
+/// result is inconclusive rather than a stale combination of two moments.
+pub async fn collect_stable_exchange_view<G>(
+    gateway: &G,
+    exchange: crate::domain::Exchange,
+    symbol: &str,
+) -> Result<StableExchangeView, ShadowCollectionError>
+where
+    G: OpenOrderSnapshotGateway + PositionSnapshotGateway + ?Sized,
+{
+    let first_open_orders = gateway
+        .open_orders_snapshot(exchange, symbol)
+        .await
+        .map_err(|error| ShadowCollectionError::OpenOrderSnapshot {
+            pass: 1,
+            message: error.to_string(),
+        })?;
+    let first_open_orders = normalize_open_orders(exchange, symbol, first_open_orders)?;
+    let position = gateway
+        .position_snapshot(exchange, symbol)
+        .await
+        .map_err(|error| ShadowCollectionError::PositionSnapshot {
+            message: error.to_string(),
+        })?;
+    validate_position_identity(exchange, symbol, &position)?;
+    let second_open_orders = gateway
+        .open_orders_snapshot(exchange, symbol)
+        .await
+        .map_err(|error| ShadowCollectionError::OpenOrderSnapshot {
+            pass: 2,
+            message: error.to_string(),
+        })?;
+    let second_open_orders = normalize_open_orders(exchange, symbol, second_open_orders)?;
+    if first_open_orders != second_open_orders {
+        return Err(ShadowCollectionError::OpenOrdersChangedDuringCollection);
+    }
+    Ok(StableExchangeView {
+        open_orders: first_open_orders,
+        position,
+    })
+}
 
 /// Collects a stable read-only exchange view and runs the pure shadow audit.
 /// The trait bounds deliberately contain no placement, cancellation, or leverage
@@ -20,7 +76,19 @@ pub async fn collect_strategy_shadow<G>(
     strategy: &StrategyState,
 ) -> Result<ShadowAuditReport, ShadowCollectionError>
 where
-    G: OpenOrderSnapshotGateway + OrderLookupGateway + PositionSnapshotGateway,
+    G: OpenOrderSnapshotGateway + OrderLookupGateway + PositionSnapshotGateway + ?Sized,
+{
+    Ok(collect_strategy_shadow_view(gateway, strategy)
+        .await?
+        .report)
+}
+
+pub async fn collect_strategy_shadow_view<G>(
+    gateway: &G,
+    strategy: &StrategyState,
+) -> Result<CollectedStrategyShadow, ShadowCollectionError>
+where
+    G: OpenOrderSnapshotGateway + OrderLookupGateway + PositionSnapshotGateway + ?Sized,
 {
     strategy
         .validate()
@@ -35,8 +103,10 @@ where
             pass: 1,
             message: error.to_string(),
         })?;
-    let first_open_orders = normalize_owned_open_orders(strategy, first_open_orders)?;
-    let open_client_order_ids = first_open_orders
+    let first_open_orders =
+        normalize_open_orders(strategy.exchange, &strategy.symbol, first_open_orders)?;
+    let owned_open_orders = owned_open_orders(strategy, &first_open_orders);
+    let open_client_order_ids = owned_open_orders
         .iter()
         .map(|order| order.client_order_id.clone())
         .collect::<BTreeSet<_>>();
@@ -71,6 +141,7 @@ where
         .map_err(|error| ShadowCollectionError::PositionSnapshot {
             message: error.to_string(),
         })?;
+    validate_position_identity(strategy.exchange, &strategy.symbol, &position)?;
     let second_open_orders = gateway
         .open_orders_snapshot(strategy.exchange, &strategy.symbol)
         .await
@@ -78,16 +149,22 @@ where
             pass: 2,
             message: error.to_string(),
         })?;
-    let second_open_orders = normalize_owned_open_orders(strategy, second_open_orders)?;
+    let second_open_orders =
+        normalize_open_orders(strategy.exchange, &strategy.symbol, second_open_orders)?;
     if first_open_orders != second_open_orders {
         return Err(ShadowCollectionError::OpenOrdersChangedDuringCollection);
     }
 
-    let mut observed_orders = first_open_orders;
+    let mut observed_orders = owned_open_orders;
     observed_orders.extend(terminal_observations);
     validate_combined_observations(&observed_orders)?;
     observed_orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
-    Ok(audit_strategy_shadow(strategy, &position, &observed_orders))
+    let report = audit_strategy_shadow(strategy, &position, &observed_orders);
+    Ok(CollectedStrategyShadow {
+        report,
+        open_orders: first_open_orders,
+        position,
+    })
 }
 
 fn should_lookup_missing_order(order: &super::StrategyOrderRecord) -> bool {
@@ -105,19 +182,17 @@ fn should_lookup_missing_order(order: &super::StrategyOrderRecord) -> bool {
     }
 }
 
-fn normalize_owned_open_orders(
-    strategy: &StrategyState,
+fn normalize_open_orders(
+    exchange: crate::domain::Exchange,
+    symbol: &str,
     orders: Vec<AuthoritativeOrder>,
 ) -> Result<Vec<AuthoritativeOrder>, ShadowCollectionError> {
     let mut client_order_ids = BTreeSet::new();
     let mut exchange_order_ids = BTreeSet::new();
-    let mut owned = Vec::new();
-    for order in orders.into_iter().filter(|order| {
-        strategy.orders.contains_key(&order.client_order_id)
-            || belongs_to_run(&order.client_order_id, strategy.run_id.as_str())
-    }) {
-        if order.exchange != strategy.exchange
-            || order.shape.symbol != strategy.symbol
+    let mut normalized = Vec::with_capacity(orders.len());
+    for order in orders {
+        if order.exchange != exchange
+            || order.shape.symbol != symbol
             || !matches!(order.lifecycle, OrderLifecycle::Active(_))
             || order.shape.validate().is_err()
             || order.exchange_order_id.trim().is_empty()
@@ -131,10 +206,35 @@ fn normalize_owned_open_orders(
         {
             return Err(ShadowCollectionError::DuplicateOpenOrderIdentity);
         }
-        owned.push(order);
+        normalized.push(order);
     }
-    owned.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
-    Ok(owned)
+    normalized.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
+    Ok(normalized)
+}
+
+fn owned_open_orders(
+    strategy: &StrategyState,
+    orders: &[AuthoritativeOrder],
+) -> Vec<AuthoritativeOrder> {
+    orders
+        .iter()
+        .filter(|order| {
+            strategy.orders.contains_key(&order.client_order_id)
+                || belongs_to_run(&order.client_order_id, strategy.run_id.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+fn validate_position_identity(
+    exchange: crate::domain::Exchange,
+    symbol: &str,
+    position: &PositionSnapshot,
+) -> Result<(), ShadowCollectionError> {
+    if position.exchange != exchange || position.symbol != symbol {
+        return Err(ShadowCollectionError::InvalidPositionIdentity);
+    }
+    Ok(())
 }
 
 fn validate_lookup_identity(
@@ -191,6 +291,8 @@ pub enum ShadowCollectionError {
     OpenOrderSnapshot { pass: u8, message: String },
     #[error("position snapshot failed: {message}")]
     PositionSnapshot { message: String },
+    #[error("position snapshot belongs to another exchange or symbol")]
+    InvalidPositionIdentity,
     #[error("order lookup failed for {client_order_id:?}: {message}")]
     OrderLookup {
         client_order_id: ClientOrderId,
@@ -424,6 +526,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exchange_only_collection_keeps_the_complete_stable_strategy_order_set() {
+        let state = strategy();
+        let mut opens = open_orders(&state);
+        let mut other_run = opens[0].clone();
+        other_run.client_order_id = ClientOrderId::parse("g_OTHER001_1_B_1").unwrap();
+        other_run.exchange_order_id = "other-run".into();
+        opens.push(other_run.clone());
+        let gateway = ReadOnlyGateway::stable(opens, flat_position(&state));
+
+        let view = collect_stable_exchange_view(&gateway, state.exchange, &state.symbol)
+            .await
+            .unwrap();
+
+        assert!(
+            view.open_orders
+                .iter()
+                .any(|order| order.client_order_id == other_run.client_order_id)
+        );
+        assert_eq!(gateway.calls(), vec!["open", "position", "open"]);
+    }
+
+    #[tokio::test]
+    async fn exchange_only_collection_rejects_orders_that_change_around_position_read() {
+        let state = strategy();
+        let first = open_orders(&state);
+        let mut second = first.clone();
+        second.pop();
+        let gateway = ReadOnlyGateway {
+            open_orders: Arc::new(Mutex::new(VecDeque::from([Ok(first), Ok(second)]))),
+            position: Ok(flat_position(&state)),
+            lookups: Arc::new(Mutex::new(BTreeMap::new())),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        assert_eq!(
+            collect_stable_exchange_view(&gateway, state.exchange, &state.symbol).await,
+            Err(ShadowCollectionError::OpenOrdersChangedDuringCollection)
+        );
+    }
+
+    #[tokio::test]
     async fn changed_second_open_order_pass_never_produces_a_stale_report() {
         let state = strategy();
         let first = open_orders(&state);
@@ -512,11 +655,20 @@ mod tests {
         opens.push(other_run);
         let gateway = ReadOnlyGateway::stable(opens, flat_position(&state));
 
-        let report = collect_strategy_shadow(&gateway, &state).await.unwrap();
+        let collected = collect_strategy_shadow_view(&gateway, &state)
+            .await
+            .unwrap();
+        let report = collected.report;
 
         assert!(!report.clean);
         assert_eq!(report.orders.unexpected_order_count, 1);
         assert_eq!(report.orders.observed_owned_order_count, 22);
+        assert!(
+            collected
+                .open_orders
+                .iter()
+                .any(|order| order.exchange_order_id == "other-run")
+        );
     }
 
     #[tokio::test]
@@ -552,7 +704,7 @@ mod tests {
             ..orders[0].shape.clone()
         };
         assert!(matches!(
-            normalize_owned_open_orders(&state, orders),
+            normalize_open_orders(state.exchange, &state.symbol, orders),
             Err(ShadowCollectionError::InvalidOpenOrder { .. })
         ));
     }

@@ -976,7 +976,7 @@ where
     }
 }
 
-fn validate_cross_ledger_ownership(
+pub(crate) fn validate_cross_ledger_ownership(
     strategy: &StrategyState,
     ledger: &LedgerSnapshot,
 ) -> Result<(), RuntimeTickError> {

@@ -189,7 +189,9 @@ export interface TradesResponse {
 export interface RiskSnapshot {
   has_risk?: boolean;
   unmanaged_position?: boolean;
-  unmanaged_delta_qty?: number;
+  unmanaged_delta_qty?: string | number | null;
+  expected_position_net_qty?: string | number | null;
+  actual_position_net_qty?: string | number | null;
   orphan_order_count?: number;
   queued_replacement_count?: number;
   [key: string]: unknown;

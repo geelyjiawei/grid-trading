@@ -41,6 +41,7 @@ pub use leverage::{LeveragePreflightError, LeveragePreflightResult, ensure_symbo
 pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };
+pub(crate) use runtime::validate_cross_ledger_ownership;
 pub use runtime::{
     FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, FileStrategyRecoveryError,
     FileStrategyStartError, LeasedFileArmedStrategy, LeasedFileStrategyRecovery,
@@ -54,7 +55,10 @@ pub use shadow_audit::{
     ShadowAuditIssue, ShadowAuditReport, ShadowExpectedLifecycle, ShadowLevelCoverage,
     ShadowOrderAuditSummary, ShadowPositionAudit, audit_strategy_shadow,
 };
-pub use shadow_collector::{ShadowCollectionError, collect_strategy_shadow};
+pub use shadow_collector::{
+    CollectedStrategyShadow, ShadowCollectionError, StableExchangeView,
+    collect_stable_exchange_view, collect_strategy_shadow, collect_strategy_shadow_view,
+};
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{
     ExecutionReport, LevelLot, MemoryStrategyStateStore, NeutralLot, PositionBaseline,

@@ -19,19 +19,25 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::{
     domain::{Exchange, OrderSide},
+    engine::{
+        ArmedStrategyLifecycle, ShadowCollectionError, StrategyLifecycle,
+        collect_stable_exchange_view, collect_strategy_shadow_view,
+    },
     exchange::{
-        ActiveOrderStatus, OrderLifecycle, PositionLeg, SnapshotError,
+        ActiveOrderStatus, AuthoritativeOrder, OrderLifecycle, PositionLeg, PositionSnapshot,
+        SnapshotError,
         registry::{ExchangeGatewayRegistry, ReadOnlyExchangeGateway, RegistryError},
     },
     persistence::{
         BeginIdempotency, FileIdempotencyStore, IdempotencyError, IdempotencyKey, IdempotencyStore,
-        RequestFingerprint, StoredCommandResponse,
+        RequestFingerprint, StoredCommandResponse, StrategyCatalogSnapshot, load_strategy_catalog,
     },
     security::AdminTokenVerifier,
     web_auth::{
@@ -75,6 +81,7 @@ struct ApiState {
     idempotency: Arc<dyn IdempotencyStore>,
     start_command: Arc<dyn StartGridCommand>,
     exchange_gateways: ExchangeGatewayRegistry,
+    strategy_root: PathBuf,
 }
 
 impl ApiState {
@@ -83,6 +90,7 @@ impl ApiState {
         web_authentication: WebAuthService,
         exchange_gateways: ExchangeGatewayRegistry,
         idempotency_root: PathBuf,
+        strategy_root: PathBuf,
     ) -> Self {
         Self {
             authentication: admin_token.map_or(
@@ -94,6 +102,7 @@ impl ApiState {
             idempotency: Arc::new(FileIdempotencyStore::new(idempotency_root)),
             start_command: Arc::new(DisabledStartGridCommand),
             exchange_gateways,
+            strategy_root,
         }
     }
 
@@ -104,6 +113,7 @@ impl ApiState {
         idempotency: Arc<dyn IdempotencyStore>,
         start_command: Arc<dyn StartGridCommand>,
     ) -> Self {
+        let strategy_root = std::env::temp_dir().join("grid-trading-api-test-strategies");
         Self {
             authentication: AdminAuthentication::Configured(admin_token),
             web_authentication: WebAuthService::disabled(),
@@ -111,6 +121,7 @@ impl ApiState {
             idempotency,
             start_command,
             exchange_gateways: ExchangeGatewayRegistry::default(),
+            strategy_root,
         }
     }
 
@@ -123,6 +134,12 @@ impl ApiState {
     #[cfg(test)]
     fn with_exchange_gateways(mut self, exchange_gateways: ExchangeGatewayRegistry) -> Self {
         self.exchange_gateways = exchange_gateways;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_strategy_root(mut self, strategy_root: PathBuf) -> Self {
+        self.strategy_root = strategy_root;
         self
     }
 }
@@ -844,6 +861,340 @@ async fn exchange_open_orders(
     }
 }
 
+async fn exchange_risk(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let gateway = match read_gateway(&state, exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+
+    let strategy_root = state.strategy_root.clone();
+    let catalog = tokio::task::spawn_blocking(move || load_strategy_catalog(strategy_root)).await;
+    let (selected, catalog_anomaly_count, catalog_problem) = match catalog {
+        Ok(Ok(catalog)) => {
+            let anomaly_count = catalog.anomalies().len();
+            match catalog.select_live(exchange, &symbol) {
+                Ok(selected) => (
+                    selected,
+                    anomaly_count,
+                    (anomaly_count > 0).then_some("strategy_catalog_anomaly"),
+                ),
+                Err(error) => {
+                    tracing::warn!(?exchange, symbol, error = %error, "multiple live strategy states prevent deterministic risk attribution");
+                    (None, anomaly_count, Some("multiple_live_strategies"))
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(?exchange, symbol, error = %error, "strategy catalog could not be read");
+            (None, 0, Some("strategy_catalog_unavailable"))
+        }
+        Err(error) => {
+            tracing::error!(?exchange, symbol, error = %error, "strategy catalog task failed");
+            (None, 0, Some("strategy_catalog_unavailable"))
+        }
+    };
+    let catalog_has_risk = catalog_problem.is_some();
+
+    match selected {
+        Some(StrategyCatalogSnapshot::Active(strategy)) => {
+            let collected = match collect_strategy_shadow_view(gateway.as_ref(), &strategy).await {
+                Ok(collected) => collected,
+                Err(error) => return risk_collection_failure(exchange, &symbol, error),
+            };
+            let report = &collected.report;
+            let orphan_orders = collected
+                .open_orders
+                .iter()
+                .filter(|order| !strategy.orders.contains_key(&order.client_order_id))
+                .map(risk_order_response)
+                .collect::<Vec<_>>();
+            let orphan_order_count = orphan_orders.len();
+            let unmanaged_position = report
+                .position
+                .quantity_delta
+                .is_none_or(|delta| !delta.is_zero());
+            let grid_coverage_risk = !report.level_coverage.missing_levels.is_empty();
+            let order_protection_risk = report.orders.missing_order_count > 0
+                || report.orders.mismatched_order_count > 0
+                || report.orders.partial_execution_pending_count > 0
+                || report.orders.terminal_accounting_pending_count > 0;
+            let has_risk = !report.clean || orphan_order_count > 0 || catalog_has_risk;
+            let positions = collected
+                .position
+                .legs
+                .iter()
+                .filter_map(position_response)
+                .collect::<Vec<_>>();
+            let initialization_in_progress = matches!(
+                strategy.lifecycle,
+                StrategyLifecycle::AwaitingOpening | StrategyLifecycle::DeployingGrid
+            );
+            no_store_json(
+                StatusCode::OK,
+                json!({
+                    "version": 1,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "strategy_present": true,
+                    "strategy_kind": "active",
+                    "run_id": strategy.run_id.as_str(),
+                    "strategy_revision": strategy.revision,
+                    "lifecycle": strategy.lifecycle,
+                    "engine_running": false,
+                    "observation_complete": true,
+                    "baseline_pending": false,
+                    "baseline_position": report.position.baseline_quantity.to_string(),
+                    "grid_position_net_qty": report.position.grid_owned_quantity.to_string(),
+                    "expected_position_net_qty": report.position.expected_quantity.map(|value| value.to_string()),
+                    "actual_position_net_qty": report.position.actual_quantity.map(|value| value.to_string()),
+                    "unmanaged_delta_qty": report.position.quantity_delta.map(|value| value.to_string()),
+                    "unmanaged_position": unmanaged_position,
+                    "orphan_order_count": orphan_order_count,
+                    "orphan_orders": orphan_orders,
+                    "pending_submission_count": report.orders.pending_submission_count,
+                    "queued_replacement_count": report.pending_replacement_obligation_ids.len(),
+                    "accepted_shape_mismatch_count": report.orders.mismatched_order_count,
+                    "reduce_protection": {
+                        "has_risk": order_protection_risk,
+                    },
+                    "grid_coverage": {
+                        "has_risk": grid_coverage_risk,
+                        "required": report.level_coverage.required,
+                        "configured_level_count": report.level_coverage.configured_level_count,
+                        "expected_active_levels": report.level_coverage.expected_active_levels,
+                        "observed_exact_active_levels": report.level_coverage.observed_exact_active_levels,
+                        "missing_levels": report.level_coverage.missing_levels,
+                    },
+                    "waiting_trigger": false,
+                    "waiting_initial_order": strategy.lifecycle == StrategyLifecycle::AwaitingOpening,
+                    "risk_shutdown_pending": strategy.lifecycle == StrategyLifecycle::RiskExitRequested,
+                    "manual_stop_pending": strategy.lifecycle == StrategyLifecycle::StopRequested,
+                    "initialization_failed": strategy.lifecycle == StrategyLifecycle::Failed,
+                    "initialization_in_progress": initialization_in_progress,
+                    "initial_grid_deployment_pending": strategy.lifecycle == StrategyLifecycle::DeployingGrid && !strategy.initial_deployment_complete,
+                    "grid_ready": strategy.initial_deployment_complete,
+                    "catalog_anomaly_count": catalog_anomaly_count,
+                    "state_store_error": catalog_problem,
+                    "positions": positions,
+                    "shadow_audit": report,
+                    "has_risk": has_risk,
+                }),
+            )
+        }
+        Some(StrategyCatalogSnapshot::Armed(strategy)) => {
+            let collected =
+                match collect_stable_exchange_view(gateway.as_ref(), exchange, &symbol).await {
+                    Ok(collected) => collected,
+                    Err(error) => return risk_collection_failure(exchange, &symbol, error),
+                };
+            let actual_quantity =
+                match validated_one_way_quantity(&collected.position, exchange, &symbol) {
+                    Ok(quantity) => quantity,
+                    Err(error) => return snapshot_failure("risk position", exchange, error),
+                };
+            let orphan_orders = collected
+                .open_orders
+                .iter()
+                .map(risk_order_response)
+                .collect::<Vec<_>>();
+            let orphan_order_count = orphan_orders.len();
+            let positions = collected
+                .position
+                .legs
+                .iter()
+                .filter_map(position_response)
+                .collect::<Vec<_>>();
+            no_store_json(
+                StatusCode::OK,
+                json!({
+                    "version": 1,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "strategy_present": true,
+                    "strategy_kind": "armed",
+                    "run_id": strategy.run_id.as_str(),
+                    "strategy_revision": strategy.revision,
+                    "lifecycle": strategy.lifecycle,
+                    "engine_running": false,
+                    "observation_complete": true,
+                    "baseline_pending": true,
+                    "baseline_position": null,
+                    "grid_position_net_qty": "0",
+                    "expected_position_net_qty": null,
+                    "actual_position_net_qty": actual_quantity.to_string(),
+                    "unmanaged_delta_qty": null,
+                    "unmanaged_position": false,
+                    "orphan_order_count": orphan_order_count,
+                    "orphan_orders": orphan_orders,
+                    "pending_submission_count": 0,
+                    "queued_replacement_count": 0,
+                    "accepted_shape_mismatch_count": 0,
+                    "reduce_protection": { "has_risk": false },
+                    "grid_coverage": {
+                        "has_risk": false,
+                        "required": false,
+                        "configured_level_count": strategy.config.grid_count,
+                        "expected_active_levels": [],
+                        "observed_exact_active_levels": [],
+                        "missing_levels": [],
+                    },
+                    "waiting_trigger": strategy.lifecycle == ArmedStrategyLifecycle::WaitingTrigger,
+                    "waiting_initial_order": false,
+                    "risk_shutdown_pending": false,
+                    "manual_stop_pending": false,
+                    "initialization_failed": false,
+                    "initialization_in_progress": false,
+                    "initial_grid_deployment_pending": false,
+                    "grid_ready": false,
+                    "catalog_anomaly_count": catalog_anomaly_count,
+                    "state_store_error": catalog_problem,
+                    "positions": positions,
+                    "shadow_audit": null,
+                    "has_risk": orphan_order_count > 0 || catalog_has_risk,
+                }),
+            )
+        }
+        None => {
+            let collected =
+                match collect_stable_exchange_view(gateway.as_ref(), exchange, &symbol).await {
+                    Ok(collected) => collected,
+                    Err(error) => return risk_collection_failure(exchange, &symbol, error),
+                };
+            let actual_quantity =
+                match validated_one_way_quantity(&collected.position, exchange, &symbol) {
+                    Ok(quantity) => quantity,
+                    Err(error) => return snapshot_failure("risk position", exchange, error),
+                };
+            let orphan_orders = collected
+                .open_orders
+                .iter()
+                .map(risk_order_response)
+                .collect::<Vec<_>>();
+            let orphan_order_count = orphan_orders.len();
+            let unmanaged_position = !actual_quantity.is_zero();
+            let positions = collected
+                .position
+                .legs
+                .iter()
+                .filter_map(position_response)
+                .collect::<Vec<_>>();
+            no_store_json(
+                StatusCode::OK,
+                json!({
+                    "version": 1,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "strategy_present": false,
+                    "strategy_kind": null,
+                    "run_id": null,
+                    "strategy_revision": null,
+                    "lifecycle": null,
+                    "engine_running": false,
+                    "observation_complete": true,
+                    "baseline_pending": false,
+                    "baseline_position": null,
+                    "grid_position_net_qty": null,
+                    "expected_position_net_qty": null,
+                    "actual_position_net_qty": actual_quantity.to_string(),
+                    "unmanaged_delta_qty": actual_quantity.to_string(),
+                    "unmanaged_position": unmanaged_position,
+                    "orphan_order_count": orphan_order_count,
+                    "orphan_orders": orphan_orders,
+                    "pending_submission_count": 0,
+                    "queued_replacement_count": 0,
+                    "accepted_shape_mismatch_count": 0,
+                    "reduce_protection": { "has_risk": false },
+                    "grid_coverage": {
+                        "has_risk": false,
+                        "required": false,
+                        "configured_level_count": 0,
+                        "expected_active_levels": [],
+                        "observed_exact_active_levels": [],
+                        "missing_levels": [],
+                    },
+                    "waiting_trigger": false,
+                    "waiting_initial_order": false,
+                    "risk_shutdown_pending": false,
+                    "manual_stop_pending": false,
+                    "initialization_failed": false,
+                    "initialization_in_progress": false,
+                    "initial_grid_deployment_pending": false,
+                    "grid_ready": false,
+                    "catalog_anomaly_count": catalog_anomaly_count,
+                    "state_store_error": catalog_problem,
+                    "positions": positions,
+                    "shadow_audit": null,
+                    "has_risk": unmanaged_position || orphan_order_count > 0 || catalog_has_risk,
+                }),
+            )
+        }
+    }
+}
+
+fn validated_one_way_quantity(
+    position: &PositionSnapshot,
+    exchange: Exchange,
+    symbol: &str,
+) -> Result<Decimal, SnapshotError> {
+    if position.exchange != exchange || position.symbol != symbol {
+        return Err(SnapshotError::new(
+            "position snapshot belongs to another exchange or symbol",
+        ));
+    }
+    let (quantity, entry_price) = position.one_way_position()?;
+    let leg = &position.legs[0];
+    if leg.mark_price <= Decimal::ZERO
+        || leg.leverage.is_some_and(|leverage| leverage == 0)
+        || (quantity.is_zero() && entry_price.is_some_and(|price| price <= Decimal::ZERO))
+        || (!quantity.is_zero() && entry_price.is_none_or(|price| price <= Decimal::ZERO))
+    {
+        return Err(SnapshotError::new(
+            "one-way position contains an invalid mark price, entry price, or leverage",
+        ));
+    }
+    Ok(quantity)
+}
+
+fn risk_order_response(order: &AuthoritativeOrder) -> Value {
+    let status = match order.lifecycle {
+        OrderLifecycle::Active(ActiveOrderStatus::New) => "NEW",
+        OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled) => "PARTIALLY_FILLED",
+        OrderLifecycle::Terminal(_) => "TERMINAL",
+    };
+    json!({
+        "order_id": order.exchange_order_id,
+        "order_link_id": order.client_order_id.as_str(),
+        "side": order_side_name(order.shape.side),
+        "price": order.shape.price.map(|price| price.to_string()).unwrap_or_else(|| "0".into()),
+        "qty": order.shape.quantity.to_string(),
+        "status": status,
+        "reduce_only": order.shape.reduce_only,
+    })
+}
+
+fn risk_collection_failure(
+    exchange: Exchange,
+    symbol: &str,
+    error: ShadowCollectionError,
+) -> Response {
+    tracing::warn!(?exchange, symbol, error = %error, "risk shadow collection was inconclusive");
+    api_error(
+        StatusCode::BAD_GATEWAY,
+        "risk_snapshot_unavailable",
+        "The risk snapshot changed during collection or is invalid",
+    )
+}
+
 fn selected_exchange(state: &ApiState, selection: ExchangeSelection) -> Exchange {
     selection
         .exchange
@@ -963,12 +1314,14 @@ pub(crate) fn router(
     web_authentication: WebAuthService,
     exchange_gateways: ExchangeGatewayRegistry,
     idempotency_root: PathBuf,
+    strategy_root: PathBuf,
 ) -> Router {
     router_with_state(ApiState::disabled(
         admin_token,
         web_authentication,
         exchange_gateways,
         idempotency_root,
+        strategy_root,
     ))
 }
 
@@ -984,6 +1337,7 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/fees/{symbol}", get(exchange_fee_rates))
         .route("/api/positions/{symbol}", get(exchange_positions))
         .route("/api/orders/open/{symbol}", get(exchange_open_orders))
+        .route("/api/risk/{symbol}", get(exchange_risk))
         .route("/api/v1/grid/start", post(start_grid))
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
@@ -993,9 +1347,12 @@ fn router_with_state(state: ApiState) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        fs,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{
@@ -1014,13 +1371,25 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{ClientOrderId, OrderKind, OrderShape, TimeInForce},
+        domain::{
+            ClientOrderId, Direction, GridConfig, GridMode, InitialOrderType, InstrumentRules,
+            IntentState, OrderIntent, OrderKind, OrderShape, PositionSizingMode, QuantityRules,
+            TimeInForce,
+        },
+        engine::{
+            ArmedStrategyState, MarketSnapshot, PositionBaseline, StrategyLifecycle,
+            StrategyOrderTracking, StrategyRunId, StrategyState, build_grid_plan,
+        },
         exchange::{
             AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
-            AuthoritativeOrder, ExchangeIdentityGateway, ExchangeMarketSnapshot,
-            MarketSnapshotGateway, OpenOrderSnapshotGateway, PositionSide, PositionSnapshot,
-            PositionSnapshotGateway, TradingFeeRateGateway, TradingFeeRates,
-            configured::ExchangeEnvironment,
+            AuthoritativeOrder, ExchangeIdentityGateway, ExchangeMarketSnapshot, LookupError,
+            MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderLookup, OrderLookupGateway,
+            PositionSide, PositionSnapshot, PositionSnapshotGateway, TradingFeeRateGateway,
+            TradingFeeRates, configured::ExchangeEnvironment,
+        },
+        persistence::{
+            FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
+            StrategyFilePaths,
         },
         web_auth::{
             WebAuthConfiguration,
@@ -1293,7 +1662,252 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl OrderLookupGateway for ExactReadGateway {
+        async fn lookup_order_by_client_id(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            client_order_id: &ClientOrderId,
+        ) -> Result<OrderLookup, LookupError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            if client_order_id.as_str() != "g_9_B_exact01" {
+                return Ok(OrderLookup::NotFound);
+            }
+            Ok(OrderLookup::Found(AuthoritativeOrder {
+                client_order_id: client_order_id.clone(),
+                exchange_order_id: "90071992547409931234".into(),
+                exchange,
+                shape: OrderShape {
+                    symbol: symbol.into(),
+                    side: OrderSide::Buy,
+                    price: Some(Decimal::from_str_exact("0.38000").unwrap()),
+                    quantity: Decimal::from_str_exact("100.000").unwrap(),
+                    reduce_only: true,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
+                lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct StrategyRiskGateway {
+        open_orders: Vec<AuthoritativeOrder>,
+        position: PositionSnapshot,
+    }
+
+    impl ExchangeIdentityGateway for StrategyRiskGateway {
+        fn exchange(&self) -> Exchange {
+            Exchange::Aster
+        }
+    }
+
+    #[async_trait]
+    impl AccountBalanceSnapshotGateway for StrategyRiskGateway {
+        async fn account_balance_snapshot(
+            &self,
+            _exchange: Exchange,
+        ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+            Err(SnapshotError::new("not used by strategy risk test"))
+        }
+    }
+
+    #[async_trait]
+    impl MarketSnapshotGateway for StrategyRiskGateway {
+        async fn market_snapshot(
+            &self,
+            _exchange: Exchange,
+            _symbol: &str,
+        ) -> Result<ExchangeMarketSnapshot, SnapshotError> {
+            Err(SnapshotError::new("not used by strategy risk test"))
+        }
+    }
+
+    #[async_trait]
+    impl TradingFeeRateGateway for StrategyRiskGateway {
+        async fn trading_fee_rates(
+            &self,
+            _exchange: Exchange,
+            _symbol: &str,
+        ) -> Result<TradingFeeRates, SnapshotError> {
+            Err(SnapshotError::new("not used by strategy risk test"))
+        }
+    }
+
+    #[async_trait]
+    impl PositionSnapshotGateway for StrategyRiskGateway {
+        async fn position_snapshot(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+        ) -> Result<PositionSnapshot, SnapshotError> {
+            assert_eq!(exchange, self.position.exchange);
+            assert_eq!(symbol, self.position.symbol);
+            Ok(self.position.clone())
+        }
+    }
+
+    #[async_trait]
+    impl OpenOrderSnapshotGateway for StrategyRiskGateway {
+        async fn open_orders_snapshot(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+        ) -> Result<Vec<AuthoritativeOrder>, SnapshotError> {
+            assert_eq!(exchange, self.position.exchange);
+            assert_eq!(symbol, self.position.symbol);
+            Ok(self.open_orders.clone())
+        }
+    }
+
+    #[async_trait]
+    impl OrderLookupGateway for StrategyRiskGateway {
+        async fn lookup_order_by_client_id(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            client_order_id: &ClientOrderId,
+        ) -> Result<OrderLookup, LookupError> {
+            assert_eq!(exchange, self.position.exchange);
+            assert_eq!(symbol, self.position.symbol);
+            Ok(self
+                .open_orders
+                .iter()
+                .find(|order| &order.client_order_id == client_order_id)
+                .cloned()
+                .map(OrderLookup::Found)
+                .unwrap_or(OrderLookup::NotFound))
+        }
+    }
+
+    fn persist_clean_running_strategy(
+        root: &std::path::Path,
+    ) -> (StrategyState, StrategyRiskGateway) {
+        let config = GridConfig {
+            exchange: Some(Exchange::Aster),
+            symbol: "ANSEMUSDT".into(),
+            direction: Direction::Neutral,
+            upper_price: Decimal::from_str_exact("0.42000").unwrap(),
+            lower_price: Decimal::from_str_exact("0.38000").unwrap(),
+            grid_count: 20,
+            total_investment: Decimal::ZERO,
+            leverage: 3,
+            position_sizing_mode: PositionSizingMode::FixedGridQty,
+            grid_order_qty: Some(Decimal::from_str_exact("100.000").unwrap()),
+            fee_rate: Some(Decimal::from_str_exact("0.00050").unwrap()),
+            maker_fee_rate: Some(Decimal::from_str_exact("0.00020").unwrap()),
+            taker_fee_rate: Some(Decimal::from_str_exact("0.00050").unwrap()),
+            initial_order_type: InitialOrderType::Market,
+            initial_order_price: None,
+            grid_order_post_only: false,
+            grid_mode: GridMode::Arithmetic,
+            trigger_price: None,
+            stop_loss_price: None,
+            take_profit_price: None,
+        };
+        let rules = InstrumentRules {
+            tick_size: Decimal::from_str_exact("0.00010").unwrap(),
+            limit_quantity: QuantityRules {
+                step: Decimal::from_str_exact("1.000").unwrap(),
+                min: Decimal::from_str_exact("1.000").unwrap(),
+                max: None,
+            },
+            market_quantity: QuantityRules {
+                step: Decimal::from_str_exact("1.000").unwrap(),
+                min: Decimal::from_str_exact("1.000").unwrap(),
+                max: None,
+            },
+            min_notional: Decimal::ZERO,
+        };
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: Decimal::from_str_exact("0.40000").unwrap(),
+                mark_price: Decimal::from_str_exact("0.40000").unwrap(),
+            },
+            &rules,
+        )
+        .unwrap();
+        let mut state = StrategyState::from_plan(
+            StrategyRunId::parse("RISKAPI1").unwrap(),
+            config,
+            rules,
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        let paths = StrategyFilePaths::new(root, state.run_id.clone()).unwrap();
+        let mut ledger = FileOrderIntentStore::load(paths.intents()).unwrap();
+        let mut open_orders = Vec::new();
+        for (index, order) in state.orders.values_mut().enumerate() {
+            let exchange_order_id = format!("risk-exchange-{index:02}");
+            let intent = OrderIntent::prepare(
+                order.client_order_id.clone(),
+                state.exchange,
+                order.shape.clone(),
+                100,
+            )
+            .unwrap();
+            ledger.insert_prepared(intent).unwrap();
+            ledger
+                .transition(
+                    &order.client_order_id,
+                    IntentState::Accepted {
+                        exchange_order_id: exchange_order_id.clone(),
+                    },
+                    101,
+                )
+                .unwrap();
+            order.tracking = StrategyOrderTracking::Intent {
+                state: IntentState::Accepted {
+                    exchange_order_id: exchange_order_id.clone(),
+                },
+            };
+            order.exchange_order_id = Some(exchange_order_id.clone());
+            open_orders.push(AuthoritativeOrder {
+                client_order_id: order.client_order_id.clone(),
+                exchange_order_id,
+                exchange: state.exchange,
+                shape: order.shape.clone(),
+                lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            });
+        }
+        state.lifecycle = StrategyLifecycle::Running;
+        state.initial_deployment_complete = true;
+        state.validate().unwrap();
+        FileStrategyStateStore::create(paths.state(), state.clone()).unwrap();
+        let position = PositionSnapshot {
+            exchange: state.exchange,
+            symbol: state.symbol.clone(),
+            legs: vec![PositionLeg {
+                side: PositionSide::Both,
+                signed_quantity: Decimal::ZERO,
+                entry_price: None,
+                mark_price: Decimal::from_str_exact("0.40000").unwrap(),
+                unrealized_profit: Decimal::ZERO,
+                leverage: Some(3),
+            }],
+        };
+        (
+            state,
+            StrategyRiskGateway {
+                open_orders,
+                position,
+            },
+        )
+    }
+
     fn exact_read_app() -> Router {
+        static STRATEGY_ROOT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let strategy_root = std::env::temp_dir().join(format!(
+            "grid-trading-api-read-no-strategy-{}-{}",
+            std::process::id(),
+            STRATEGY_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
         gateways
             .register_gateway(
@@ -1312,7 +1926,8 @@ mod tests {
                 )),
                 Arc::new(DisabledStartGridCommand),
             )
-            .with_exchange_gateways(gateways),
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
         )
     }
 
@@ -1404,6 +2019,29 @@ mod tests {
         assert_eq!(positions["positions"][0]["entry_price"], "0.40010");
         assert_eq!(positions["positions"][0]["unrealised_pnl"], "26.78660");
 
+        let risk = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(risk.status(), StatusCode::OK);
+        assert_eq!(risk.headers()[CACHE_CONTROL], "no-store");
+        let risk = response_json(risk).await;
+        assert_eq!(risk["strategy_present"], false);
+        assert_eq!(risk["observation_complete"], true);
+        assert_eq!(risk["actual_position_net_qty"], "-1326.000");
+        assert_eq!(risk["expected_position_net_qty"], Value::Null);
+        assert_eq!(risk["unmanaged_delta_qty"], "-1326.000");
+        assert_eq!(risk["unmanaged_position"], true);
+        assert_eq!(risk["orphan_order_count"], 1);
+        assert_eq!(risk["orphan_orders"][0]["qty"], "100.000");
+        assert_eq!(risk["has_risk"], true);
+
         let orders = app
             .oneshot(
                 Request::builder()
@@ -1419,6 +2057,370 @@ mod tests {
         assert_eq!(orders["orders"][0]["price"], "0.38000");
         assert_eq!(orders["orders"][0]["qty"], "100.000");
         assert_eq!(orders["orders"][0]["reduce_only"], true);
+    }
+
+    #[tokio::test]
+    async fn active_strategy_risk_endpoint_requires_exact_state_ledger_and_exchange_agreement() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (strategy, gateway) = persist_clean_running_strategy(&strategy_root);
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["strategy_present"], true);
+        assert_eq!(risk["strategy_kind"], "active");
+        assert_eq!(risk["run_id"], strategy.run_id.as_str());
+        assert_eq!(risk["baseline_position"], "0");
+        assert_eq!(risk["grid_position_net_qty"], "0");
+        assert_eq!(risk["expected_position_net_qty"], "0");
+        assert_eq!(risk["actual_position_net_qty"], "0");
+        assert_eq!(risk["unmanaged_delta_qty"], "0");
+        assert_eq!(risk["orphan_order_count"], 0);
+        assert_eq!(risk["grid_coverage"]["missing_levels"], json!([]));
+        assert_eq!(risk["shadow_audit"]["clean"], true);
+        assert_eq!(risk["has_risk"], false);
+    }
+
+    #[tokio::test]
+    async fn active_strategy_risk_endpoint_reports_a_missing_grid_order_without_repairing_it() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (_strategy, mut gateway) = persist_clean_running_strategy(&strategy_root);
+        gateway.open_orders.pop();
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["shadow_audit"]["orders"]["missing_order_count"], 1);
+        assert_eq!(
+            risk["grid_coverage"]["missing_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(risk["has_risk"], true);
+    }
+
+    #[tokio::test]
+    async fn active_strategy_risk_endpoint_reports_an_order_owned_by_another_run() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (_strategy, mut gateway) = persist_clean_running_strategy(&strategy_root);
+        let mut other_run_order = gateway.open_orders[0].clone();
+        other_run_order.client_order_id = ClientOrderId::parse("g_OTHER001_1_B_1").unwrap();
+        other_run_order.exchange_order_id = "other-run-exchange-order".into();
+        gateway.open_orders.push(other_run_order);
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["orphan_order_count"], 1);
+        assert_eq!(
+            risk["orphan_orders"][0]["order_id"],
+            "other-run-exchange-order"
+        );
+        assert_eq!(risk["shadow_audit"]["clean"], true);
+        assert_eq!(risk["has_risk"], true);
+    }
+
+    #[tokio::test]
+    async fn strategy_catalog_damage_can_never_produce_a_safe_risk_snapshot() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let paths =
+            StrategyFilePaths::new(&strategy_root, StrategyRunId::parse("BROKENAPI").unwrap())
+                .unwrap();
+        fs::create_dir_all(paths.directory()).unwrap();
+        fs::write(paths.state(), b"{").unwrap();
+        let gateway = StrategyRiskGateway {
+            open_orders: Vec::new(),
+            position: PositionSnapshot {
+                exchange: Exchange::Aster,
+                symbol: "ANSEMUSDT".into(),
+                legs: vec![PositionLeg {
+                    side: PositionSide::Both,
+                    signed_quantity: Decimal::ZERO,
+                    entry_price: None,
+                    mark_price: Decimal::from_str_exact("0.40000").unwrap(),
+                    unrealized_profit: Decimal::ZERO,
+                    leverage: Some(3),
+                }],
+            },
+        };
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["strategy_present"], false);
+        assert_eq!(risk["catalog_anomaly_count"], 1);
+        assert_eq!(risk["state_store_error"], "strategy_catalog_anomaly");
+        assert_eq!(risk["has_risk"], true);
+    }
+
+    #[tokio::test]
+    async fn active_strategy_risk_endpoint_reports_exact_position_delta() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (_strategy, mut gateway) = persist_clean_running_strategy(&strategy_root);
+        gateway.position.legs[0].signed_quantity = Decimal::from(-100);
+        gateway.position.legs[0].entry_price = Some(Decimal::from_str_exact("0.40100").unwrap());
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["expected_position_net_qty"], "0");
+        assert_eq!(risk["actual_position_net_qty"], "-100");
+        assert_eq!(risk["unmanaged_delta_qty"], "-100");
+        assert_eq!(risk["unmanaged_position"], true);
+        assert_eq!(risk["has_risk"], true);
+    }
+
+    #[tokio::test]
+    async fn armed_strategy_keeps_existing_position_as_a_future_baseline() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let config = GridConfig {
+            exchange: Some(Exchange::Aster),
+            symbol: "ANSEMUSDT".into(),
+            direction: Direction::Short,
+            upper_price: Decimal::from_str_exact("0.42000").unwrap(),
+            lower_price: Decimal::from_str_exact("0.38000").unwrap(),
+            grid_count: 20,
+            total_investment: Decimal::ZERO,
+            leverage: 3,
+            position_sizing_mode: PositionSizingMode::FixedGridQty,
+            grid_order_qty: Some(Decimal::from(100)),
+            fee_rate: Some(Decimal::from_str_exact("0.00050").unwrap()),
+            maker_fee_rate: Some(Decimal::from_str_exact("0.00020").unwrap()),
+            taker_fee_rate: Some(Decimal::from_str_exact("0.00050").unwrap()),
+            initial_order_type: InitialOrderType::Market,
+            initial_order_price: None,
+            grid_order_post_only: false,
+            grid_mode: GridMode::Arithmetic,
+            trigger_price: Some(Decimal::from_str_exact("0.40500").unwrap()),
+            stop_loss_price: None,
+            take_profit_price: None,
+        };
+        let armed = ArmedStrategyState::new(
+            StrategyRunId::parse("ARMEDAPI").unwrap(),
+            config.clone(),
+            &MarketSnapshot {
+                last_price: Decimal::from_str_exact("0.40000").unwrap(),
+                mark_price: Decimal::from_str_exact("0.40000").unwrap(),
+            },
+            100,
+        )
+        .unwrap();
+        let paths = StrategyFilePaths::new(&strategy_root, armed.run_id.clone()).unwrap();
+        FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
+        let gateway = StrategyRiskGateway {
+            open_orders: Vec::new(),
+            position: PositionSnapshot {
+                exchange: Exchange::Aster,
+                symbol: "ANSEMUSDT".into(),
+                legs: vec![PositionLeg {
+                    side: PositionSide::Both,
+                    signed_quantity: Decimal::from(-300),
+                    entry_price: Some(Decimal::from_str_exact("0.41000").unwrap()),
+                    mark_price: Decimal::from_str_exact("0.40000").unwrap(),
+                    unrealized_profit: Decimal::from(3),
+                    leverage: Some(3),
+                }],
+            },
+        };
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["strategy_kind"], "armed");
+        assert_eq!(risk["baseline_pending"], true);
+        assert_eq!(risk["actual_position_net_qty"], "-300");
+        assert_eq!(risk["expected_position_net_qty"], Value::Null);
+        assert_eq!(risk["unmanaged_delta_qty"], Value::Null);
+        assert_eq!(risk["unmanaged_position"], false);
+        assert_eq!(risk["has_risk"], false);
     }
 
     #[tokio::test]

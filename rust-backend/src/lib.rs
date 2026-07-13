@@ -27,6 +27,7 @@ use crate::{
 };
 
 const DEFAULT_CONTROL_ROOT: &str = "/app/data/rust-control/idempotency";
+const DEFAULT_STRATEGY_ROOT: &str = "/app/data/rust-control/strategies";
 const DEFAULT_WEB_ROOT: &str = "/app/web";
 
 pub fn app() -> Router {
@@ -35,6 +36,7 @@ pub fn app() -> Router {
         WebAuthService::disabled(),
         ExchangeGatewayRegistry::default(),
         PathBuf::from(DEFAULT_CONTROL_ROOT),
+        PathBuf::from(DEFAULT_STRATEGY_ROOT),
         PathBuf::from(DEFAULT_WEB_ROOT),
     )
 }
@@ -71,6 +73,19 @@ pub fn app_from_environment() -> Result<Router, AppConfigurationError> {
     if !control_root.is_absolute() {
         return Err(AppConfigurationError::RelativeControlRoot);
     }
+    let strategy_root = match env::var("GRID_RUST_STRATEGY_ROOT") {
+        Ok(value) if value.trim().is_empty() => {
+            return Err(AppConfigurationError::EmptyStrategyRoot);
+        }
+        Ok(value) => PathBuf::from(value),
+        Err(env::VarError::NotPresent) => PathBuf::from(DEFAULT_STRATEGY_ROOT),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(AppConfigurationError::NonUnicodeStrategyRoot);
+        }
+    };
+    if !strategy_root.is_absolute() {
+        return Err(AppConfigurationError::RelativeStrategyRoot);
+    }
     let web_root = match env::var("GRID_WEB_ROOT") {
         Ok(value) if value.trim().is_empty() => return Err(AppConfigurationError::EmptyWebRoot),
         Ok(value) => PathBuf::from(value),
@@ -88,6 +103,7 @@ pub fn app_from_environment() -> Result<Router, AppConfigurationError> {
         web_authentication,
         exchange_gateways,
         control_root,
+        strategy_root,
         web_root,
     ))
 }
@@ -97,6 +113,7 @@ fn build_app(
     web_authentication: WebAuthService,
     exchange_gateways: ExchangeGatewayRegistry,
     control_root: PathBuf,
+    strategy_root: PathBuf,
     web_root: PathBuf,
 ) -> Router {
     Router::new()
@@ -105,6 +122,7 @@ fn build_app(
             web_authentication,
             exchange_gateways,
             control_root,
+            strategy_root,
         ))
         .fallback_service(ServeDir::new(web_root))
         .layer(TraceLayer::new_for_http())
@@ -290,6 +308,12 @@ pub enum AppConfigurationError {
     NonUnicodeControlRoot,
     #[error("GRID_RUST_CONTROL_ROOT must be an absolute path")]
     RelativeControlRoot,
+    #[error("GRID_RUST_STRATEGY_ROOT must not be empty")]
+    EmptyStrategyRoot,
+    #[error("GRID_RUST_STRATEGY_ROOT is not valid Unicode")]
+    NonUnicodeStrategyRoot,
+    #[error("GRID_RUST_STRATEGY_ROOT must be an absolute path")]
+    RelativeStrategyRoot,
     #[error("GRID_WEB_ROOT must not be empty")]
     EmptyWebRoot,
     #[error("GRID_WEB_ROOT is not valid Unicode")]
@@ -338,6 +362,7 @@ mod tests {
             WebAuthService::disabled(),
             ExchangeGatewayRegistry::default(),
             PathBuf::from(DEFAULT_CONTROL_ROOT),
+            PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
         )
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -361,6 +386,7 @@ mod tests {
             WebAuthService::disabled(),
             ExchangeGatewayRegistry::default(),
             PathBuf::from(DEFAULT_CONTROL_ROOT),
+            PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
         )
         .oneshot(
@@ -384,6 +410,7 @@ mod tests {
             WebAuthService::disabled(),
             ExchangeGatewayRegistry::default(),
             PathBuf::from(DEFAULT_CONTROL_ROOT),
+            PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
         )
         .oneshot(
