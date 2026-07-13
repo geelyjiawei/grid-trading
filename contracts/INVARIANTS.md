@@ -171,8 +171,13 @@ the OpenAPI schema.
 - Fresh exchange instrument rules must exactly match the rules that produced the durable
   plan. Any change fails the strategy before a new order is placed; an existing plan is
   never silently requantized under new rules.
-- A waiting trigger has no grid plan, baseline, or order intent. Trigger activation uses
-  fresh market data, fresh exchange rules, and the authoritative position at trigger time.
+- A waiting trigger has no grid plan, baseline, order intent, private account read, or
+  leverage write. Trigger activation first confirms the condition from fresh public market
+  data, then uses fresh account fee rates, verified leverage, exchange rules, and the
+  authoritative position at trigger time.
+- A non-triggered strategy can produce its first durable state only after authoritative
+  fee replacement, leverage verification, fresh market/rules, and baseline validation all
+  succeed. Failure in any stage produces no order intent.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
   rule, or baseline failure leaves the armed bytes unchanged and creates no order.
 - Trigger direction is derived from the trigger price relative to the arming market, not

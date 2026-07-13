@@ -1,4 +1,5 @@
 mod armed_strategy;
+mod bootstrap;
 mod cancellation;
 mod exchange_inputs;
 mod execution_accounting;
@@ -13,6 +14,9 @@ mod submission;
 
 pub use armed_strategy::{
     ArmedStrategyError, ArmedStrategyLifecycle, ArmedStrategyState, TriggerCondition,
+};
+pub use bootstrap::{
+    PreparedStrategy, StrategyBootstrapError, activate_armed_strategy, prepare_new_strategy,
 };
 pub use cancellation::{
     CancellationResult, CancellationServiceError, cancel_with, resolve_cancellation_with,

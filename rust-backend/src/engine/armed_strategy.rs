@@ -123,7 +123,24 @@ impl ArmedStrategyState {
         baseline: PositionBaseline,
         now_ms: u64,
     ) -> Result<StrategyState, ArmedStrategyError> {
+        self.activate_with_config(self.config.clone(), market, fresh_rules, baseline, now_ms)
+    }
+
+    pub fn activate_with_config(
+        &self,
+        effective_config: GridConfig,
+        market: &MarketSnapshot,
+        fresh_rules: InstrumentRules,
+        baseline: PositionBaseline,
+        now_ms: u64,
+    ) -> Result<StrategyState, ArmedStrategyError> {
         self.validate()?;
+        effective_config
+            .validate()
+            .map_err(ArmedStrategyError::InvalidConfig)?;
+        if !same_strategy_except_fee_rates(&self.config, &effective_config) {
+            return Err(ArmedStrategyError::ActivationConfigMismatch);
+        }
         if self.lifecycle != ArmedStrategyLifecycle::WaitingTrigger {
             return Err(ArmedStrategyError::NotWaiting);
         }
@@ -133,10 +150,10 @@ impl ArmedStrategyState {
         if !self.is_triggered(market)? {
             return Err(ArmedStrategyError::NotTriggered);
         }
-        let plan = build_grid_plan(&self.config, market, &fresh_rules)?;
+        let plan = build_grid_plan(&effective_config, market, &fresh_rules)?;
         let mut active = StrategyState::from_triggered_plan(
             self.run_id.clone(),
-            self.config.clone(),
+            effective_config,
             fresh_rules,
             plan,
             baseline,
@@ -175,6 +192,18 @@ impl ArmedStrategyState {
     }
 }
 
+fn same_strategy_except_fee_rates(left: &GridConfig, right: &GridConfig) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.fee_rate = None;
+    left.maker_fee_rate = None;
+    left.taker_fee_rate = None;
+    right.fee_rate = None;
+    right.maker_fee_rate = None;
+    right.taker_fee_rate = None;
+    left == right
+}
+
 fn validate_market(market: &MarketSnapshot) -> Result<(), ArmedStrategyError> {
     if market.last_price <= Decimal::ZERO || market.mark_price <= Decimal::ZERO {
         return Err(ArmedStrategyError::InvalidMarketPrice);
@@ -202,6 +231,8 @@ pub enum ArmedStrategyError {
     TimestampRegression,
     #[error("armed strategy is not waiting for a trigger")]
     NotWaiting,
+    #[error("trigger activation changed a strategy field other than authoritative fee rates")]
+    ActivationConfigMismatch,
     #[error("trigger price has not been reached")]
     NotTriggered,
     #[error("armed strategy revision overflowed")]
@@ -359,6 +390,46 @@ mod tests {
         assert!(matches!(
             armed.activate(&market(1014), rules(), PositionBaseline::flat(), 102),
             Err(ArmedStrategyError::NotWaiting)
+        ));
+    }
+
+    #[test]
+    fn trigger_activation_allows_only_authoritative_fee_refresh() {
+        let armed = ArmedStrategyState::new(
+            StrategyRunId::parse("ARMED006").unwrap(),
+            config(Direction::Short, Some(Decimal::new(1014, 0))),
+            &market(1010),
+            100,
+        )
+        .unwrap();
+        let mut effective = armed.config.clone();
+        effective.fee_rate = Some(Decimal::new(4, 4));
+        effective.maker_fee_rate = Some(Decimal::new(1, 4));
+        effective.taker_fee_rate = Some(Decimal::new(4, 4));
+
+        let active = armed
+            .activate_with_config(
+                effective,
+                &market(1014),
+                rules(),
+                PositionBaseline::flat(),
+                101,
+            )
+            .unwrap();
+        assert_eq!(active.config.maker_fee_rate, Some(Decimal::new(1, 4)));
+        assert_eq!(active.config.taker_fee_rate, Some(Decimal::new(4, 4)));
+
+        let mut drifted = armed.config.clone();
+        drifted.grid_order_qty = Some(Decimal::new(3, 1));
+        assert!(matches!(
+            armed.activate_with_config(
+                drifted,
+                &market(1014),
+                rules(),
+                PositionBaseline::flat(),
+                101,
+            ),
+            Err(ArmedStrategyError::ActivationConfigMismatch)
         ));
     }
 }
