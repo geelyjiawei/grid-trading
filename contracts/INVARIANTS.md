@@ -194,6 +194,14 @@ the OpenAPI schema.
   acquiring its run lease. Under that lease it rejects an existing state or orphan intent ledger
   before reading exchange data. Concurrent starts for one run have exactly one durable winner;
   persistence alone never submits an order.
+- Recovery acquires the run lease before reading the state discriminator, validates persisted run
+  identity, gateway exchange identity, and cross-ledger ownership, and performs no exchange call.
+  An armed strategy with any order or cancellation intent is never admitted into memory. Temporary
+  trigger or preflight failures retain the same armed instance and lease without changing its file;
+  activation itself revalidates gateway identity before its first exchange call.
+- The runtime registry owns one independent asynchronous mutex per run ID. A second tick for the
+  same run is rejected rather than queued with stale time, while unrelated runs can advance in
+  parallel. Registration never replaces an existing owner and returns the rejected leased handle.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
   rule, baseline, runtime-setting, or intent-ledger failure leaves the armed bytes unchanged
   and creates no order. Successful activation transfers the same held runtime lease without

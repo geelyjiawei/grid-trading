@@ -96,6 +96,30 @@ impl FilePreparedStrategyStore {
         }
     }
 
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self, StrategyStoreError> {
+        let path = path.into();
+        match read_persisted(&path)? {
+            PersistedStrategyState::Armed(snapshot) => {
+                let snapshot = *snapshot;
+                snapshot.validate()?;
+                Ok(Self::Armed(Box::new(FileArmedStrategyStateStore {
+                    path,
+                    snapshot,
+                })))
+            }
+            PersistedStrategyState::Active(snapshot) => {
+                let snapshot = *snapshot;
+                snapshot
+                    .validate()
+                    .map_err(StrategyStoreError::InvalidState)?;
+                Ok(Self::Active(Box::new(FileStrategyStateStore {
+                    path,
+                    snapshot,
+                })))
+            }
+        }
+    }
+
     pub fn path(&self) -> &Path {
         match self {
             Self::Armed(store) => store.path(),
@@ -206,14 +230,22 @@ impl FileArmedStrategyStateStore {
         self,
         active: StrategyState,
     ) -> Result<FileStrategyStateStore, StrategyStoreError> {
-        self.snapshot.validate_active_successor(&active)?;
+        let mut store = self;
+        store.try_activate_prepared(&active)
+    }
+
+    pub fn try_activate_prepared(
+        &mut self,
+        active: &StrategyState,
+    ) -> Result<FileStrategyStateStore, StrategyStoreError> {
+        self.snapshot.validate_active_successor(active)?;
         commit_persisted(
             &self.path,
             &PersistedStrategyState::Active(Box::new(active.clone())),
         )?;
         Ok(FileStrategyStateStore {
-            path: self.path,
-            snapshot: active,
+            path: self.path.clone(),
+            snapshot: active.clone(),
         })
     }
 
@@ -434,6 +466,10 @@ mod tests {
         assert!(matches!(&active, FilePreparedStrategyStore::Active(_)));
         assert_eq!(active.path(), active_path);
         assert!(FileStrategyStateStore::load(&active_path).is_ok());
+        assert!(matches!(
+            FilePreparedStrategyStore::load(&active_path),
+            Ok(FilePreparedStrategyStore::Active(_))
+        ));
 
         let armed_path = directory.path().join("armed.json");
         let armed = FilePreparedStrategyStore::create(
@@ -444,6 +480,10 @@ mod tests {
         assert!(matches!(&armed, FilePreparedStrategyStore::Armed(_)));
         assert_eq!(armed.path(), armed_path);
         assert!(FileArmedStrategyStateStore::load(&armed_path).is_ok());
+        assert!(matches!(
+            FilePreparedStrategyStore::load(&armed_path),
+            Ok(FilePreparedStrategyStore::Armed(_))
+        ));
     }
 
     #[cfg(unix)]
@@ -602,7 +642,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("armed.json");
         let armed = armed_state();
-        let store = FileArmedStrategyStateStore::create(&path, armed.clone()).unwrap();
+        let mut store = FileArmedStrategyStateStore::create(&path, armed.clone()).unwrap();
         let bytes_before = fs::read(&path).unwrap();
         let mut active = armed
             .activate(
@@ -618,13 +658,27 @@ mod tests {
         active.trigger_observed_price = Some(Decimal::new(404, 3));
 
         assert!(matches!(
-            store.activate_prepared(active),
+            store.try_activate_prepared(&active),
             Err(StrategyStoreError::ArmedStrategy(
                 crate::engine::ArmedStrategyError::ActiveSuccessorMismatch
             ))
         ));
         assert_eq!(fs::read(&path).unwrap(), bytes_before);
-        assert!(FileArmedStrategyStateStore::load(path).is_ok());
+        assert_eq!(store.snapshot(), &armed);
+
+        let valid = armed
+            .activate(
+                &MarketSnapshot {
+                    last_price: Decimal::new(406, 3),
+                    mark_price: Decimal::new(406, 3),
+                },
+                instrument_rules(),
+                PositionBaseline::flat(),
+                102,
+            )
+            .unwrap();
+        assert!(store.try_activate_prepared(&valid).is_ok());
+        assert!(FileStrategyStateStore::load(path).is_ok());
     }
 
     #[test]

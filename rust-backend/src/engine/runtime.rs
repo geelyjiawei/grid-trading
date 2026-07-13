@@ -4,15 +4,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    domain::{CancellationIntent, CancellationState, ClientOrderId, GridConfig, IntentState},
+    domain::{
+        CancellationIntent, CancellationState, ClientOrderId, Exchange, GridConfig, IntentState,
+    },
     engine::{
         ArmedStrategyState, CancellationResult, CancellationServiceError, ExecutionAccountingError,
         ExecutionSyncService, ReconciliationError, ReconciliationResult, StrategyBootstrapError,
         StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
-        StrategyOrderTracking, StrategyRunId, StrategyStateError, StrategyStateStore,
-        StrategyStoreError, StrategyTransition, SubmissionError, SubmissionResult,
-        activate_armed_strategy, cancel_with, load_strategy_inputs, prepare_new_strategy,
-        reconcile_with, resolve_cancellation_with, submit_with,
+        StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError,
+        StrategyStateStore, StrategyStoreError, StrategyTransition, SubmissionError,
+        SubmissionResult, activate_armed_strategy, cancel_with, load_strategy_inputs,
+        prepare_new_strategy, reconcile_with, resolve_cancellation_with, submit_with,
     },
     exchange::{
         ExchangeIdentityGateway, ExecutionSnapshotGateway, HistoricalPriceGateway,
@@ -175,7 +177,7 @@ pub struct LeasedFileStrategyRuntime<G> {
     runtime: StrategyRuntime<G, FileOrderIntentStore, FileStrategyStateStore>,
 }
 
-pub enum PreparedLeasedFileStrategy<G> {
+enum PreparedLeasedFileStrategyInner<G> {
     Armed {
         strategy: Box<LeasedFileArmedStrategy>,
         gateway: Box<G>,
@@ -183,11 +185,138 @@ pub enum PreparedLeasedFileStrategy<G> {
     Active(Box<LeasedFileStrategyRuntime<G>>),
 }
 
+pub struct PreparedLeasedFileStrategy<G> {
+    inner: Option<PreparedLeasedFileStrategyInner<G>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedStrategyKind {
+    Armed,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedStrategyStep {
+    WaitingForTrigger,
+    Activated,
+    Active(RuntimeTickReport),
+}
+
+#[derive(Debug, Error)]
+pub enum PreparedStrategyStepError {
+    #[error(transparent)]
+    Activation(#[from] FileArmedActivationError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeTickError),
+}
+
 impl<G> PreparedLeasedFileStrategy<G> {
+    fn armed(strategy: LeasedFileArmedStrategy, gateway: G) -> Self {
+        Self {
+            inner: Some(PreparedLeasedFileStrategyInner::Armed {
+                strategy: Box::new(strategy),
+                gateway: Box::new(gateway),
+            }),
+        }
+    }
+
+    fn active(runtime: LeasedFileStrategyRuntime<G>) -> Self {
+        Self {
+            inner: Some(PreparedLeasedFileStrategyInner::Active(Box::new(runtime))),
+        }
+    }
+
     pub fn paths(&self) -> &StrategyFilePaths {
-        match self {
-            Self::Armed { strategy, .. } => strategy.paths(),
-            Self::Active(runtime) => runtime.paths(),
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, .. }) => strategy.paths(),
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => runtime.paths(),
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub fn run_id(&self) -> &StrategyRunId {
+        self.paths().run_id()
+    }
+
+    pub fn kind(&self) -> PreparedStrategyKind {
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Armed { .. }) => PreparedStrategyKind::Armed,
+            Some(PreparedLeasedFileStrategyInner::Active(_)) => PreparedStrategyKind::Active,
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub fn armed_strategy(&self) -> Option<&LeasedFileArmedStrategy> {
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, .. }) => Some(strategy),
+            Some(PreparedLeasedFileStrategyInner::Active(_)) | None => None,
+        }
+    }
+
+    pub fn active_runtime(&self) -> Option<&LeasedFileStrategyRuntime<G>> {
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => Some(runtime),
+            Some(PreparedLeasedFileStrategyInner::Armed { .. }) | None => None,
+        }
+    }
+
+    pub async fn advance(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<PreparedStrategyStep, PreparedStrategyStepError>
+    where
+        G: ExchangeIdentityGateway
+            + TradingFeeRateGateway
+            + LeverageGateway
+            + PositionSnapshotGateway
+            + MarketSnapshotGateway
+            + InstrumentRulesGateway
+            + OrderPlacementGateway
+            + OrderCancellationGateway
+            + OrderLookupGateway
+            + ExecutionSnapshotGateway
+            + HistoricalPriceGateway,
+    {
+        let prepared = match self.inner.as_mut() {
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => {
+                return runtime
+                    .runtime_mut()
+                    .tick(now_ms)
+                    .await
+                    .map(PreparedStrategyStep::Active)
+                    .map_err(PreparedStrategyStepError::from);
+            }
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, gateway }) => {
+                match strategy.prepare_activation(gateway.as_ref(), now_ms).await {
+                    Ok(prepared) => prepared,
+                    Err(FileArmedActivationError::Bootstrap(
+                        StrategyBootstrapError::TriggerNotReached,
+                    )) => return Ok(PreparedStrategyStep::WaitingForTrigger),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            None => unreachable!("strategy transition is synchronous"),
+        };
+
+        let Some(PreparedLeasedFileStrategyInner::Armed { strategy, gateway }) = self.inner.take()
+        else {
+            unreachable!("only an armed strategy can finish activation")
+        };
+        match strategy.commit_activation(*gateway, prepared) {
+            Ok(runtime) => {
+                let ownership = runtime.runtime().verify_ledger_ownership();
+                self.inner = Some(PreparedLeasedFileStrategyInner::Active(Box::new(runtime)));
+                ownership
+                    .map(|()| PreparedStrategyStep::Activated)
+                    .map_err(|_| FileArmedActivationError::IntentLedgerMismatch.into())
+            }
+            Err(failure) => {
+                self.inner = Some(PreparedLeasedFileStrategyInner::Armed {
+                    strategy: Box::new(failure.strategy),
+                    gateway: Box::new(failure.gateway),
+                });
+                Err(failure.error.into())
+            }
         }
     }
 }
@@ -256,10 +385,7 @@ where
                 store: *store,
                 settings,
             };
-            Ok(PreparedLeasedFileStrategy::Armed {
-                strategy: Box::new(strategy),
-                gateway: Box::new(gateway),
-            })
+            Ok(PreparedLeasedFileStrategy::armed(strategy, gateway))
         }
         FilePreparedStrategyStore::Active(store) => {
             let intent_store = FileOrderIntentStore::load(paths.intents())?;
@@ -275,15 +401,115 @@ where
             runtime
                 .verify_ledger_ownership()
                 .map_err(|_| FileStrategyStartError::IntentLedgerMismatch)?;
-            Ok(PreparedLeasedFileStrategy::Active(Box::new(
+            Ok(PreparedLeasedFileStrategy::active(
                 LeasedFileStrategyRuntime {
                     paths,
                     _lease: lease,
                     runtime,
                 },
-            )))
+            ))
         }
     }
+}
+
+pub fn recover_leased_file_strategy<G>(
+    gateway: G,
+    paths: StrategyFilePaths,
+    settings: RuntimeSettings,
+) -> Result<PreparedLeasedFileStrategy<G>, FileStrategyRecoveryError>
+where
+    G: ExchangeIdentityGateway,
+{
+    let lease = StrategyRuntimeLease::acquire(paths.lease())?;
+    let persisted = FilePreparedStrategyStore::load(paths.state())?;
+    match persisted {
+        FilePreparedStrategyStore::Armed(store) => {
+            if &store.snapshot().run_id != paths.run_id() {
+                return Err(FileStrategyRecoveryError::RunIdentityMismatch);
+            }
+            verify_gateway_identity(&gateway, store.snapshot().exchange)?;
+            match load_empty_intent_store(paths.intents()) {
+                Ok(_) => {}
+                Err(EmptyIntentLedgerError::Ledger(error)) => {
+                    return Err(FileStrategyRecoveryError::IntentLedger(error));
+                }
+                Err(EmptyIntentLedgerError::NotEmpty) => {
+                    return Err(FileStrategyRecoveryError::IntentLedgerMismatch);
+                }
+            }
+            Ok(PreparedLeasedFileStrategy::armed(
+                LeasedFileArmedStrategy {
+                    paths,
+                    lease,
+                    store: *store,
+                    settings,
+                },
+                gateway,
+            ))
+        }
+        FilePreparedStrategyStore::Active(store) => {
+            if &store.snapshot().run_id != paths.run_id() {
+                return Err(FileStrategyRecoveryError::RunIdentityMismatch);
+            }
+            verify_gateway_identity(&gateway, store.snapshot().exchange)?;
+            let intent_store = FileOrderIntentStore::load(paths.intents())?;
+            let runtime = StrategyRuntime::new(
+                gateway,
+                intent_store,
+                StrategyMachine::new(*store),
+                &settings.quote_asset,
+                settings.maximum_market_age_ms,
+                settings.maximum_future_skew_ms,
+                settings.maximum_submissions_per_tick,
+            )?;
+            runtime
+                .verify_ledger_ownership()
+                .map_err(|_| FileStrategyRecoveryError::IntentLedgerMismatch)?;
+            Ok(PreparedLeasedFileStrategy::active(
+                LeasedFileStrategyRuntime {
+                    paths,
+                    _lease: lease,
+                    runtime,
+                },
+            ))
+        }
+    }
+}
+
+fn verify_gateway_identity<G>(
+    gateway: &G,
+    expected: Exchange,
+) -> Result<(), FileStrategyRecoveryError>
+where
+    G: ExchangeIdentityGateway,
+{
+    let actual = gateway.exchange();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(FileStrategyRecoveryError::GatewayMismatch { expected, actual })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FileStrategyRecoveryError {
+    #[error("configured gateway is for {actual:?}, but persisted strategy requires {expected:?}")]
+    GatewayMismatch {
+        expected: Exchange,
+        actual: Exchange,
+    },
+    #[error("persisted strategy run identity does not match its file directory")]
+    RunIdentityMismatch,
+    #[error("strategy and order-intent ledgers disagree during recovery")]
+    IntentLedgerMismatch,
+    #[error(transparent)]
+    Lease(#[from] RuntimeLeaseError),
+    #[error(transparent)]
+    StrategyState(#[from] StrategyStoreError),
+    #[error(transparent)]
+    IntentLedger(#[from] LedgerError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeBuildError),
 }
 
 #[derive(Debug, Error)]
@@ -326,6 +552,37 @@ pub struct LeasedFileArmedStrategy {
     settings: RuntimeSettings,
 }
 
+struct PreparedArmedActivation {
+    active: StrategyState,
+    intent_store: FileOrderIntentStore,
+    execution_sync: ExecutionSyncService,
+}
+
+struct ActivationCommitFailure<G> {
+    strategy: LeasedFileArmedStrategy,
+    gateway: G,
+    error: FileArmedActivationError,
+}
+
+#[derive(Debug, Error)]
+enum EmptyIntentLedgerError {
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+    #[error("armed strategy intent ledger is not empty")]
+    NotEmpty,
+}
+
+fn load_empty_intent_store(
+    path: impl Into<PathBuf>,
+) -> Result<FileOrderIntentStore, EmptyIntentLedgerError> {
+    let store = FileOrderIntentStore::load(path)?;
+    if store.snapshot().intents.is_empty() && store.snapshot().cancellations.is_empty() {
+        Ok(store)
+    } else {
+        Err(EmptyIntentLedgerError::NotEmpty)
+    }
+}
+
 impl LeasedFileArmedStrategy {
     pub fn load(
         paths: StrategyFilePaths,
@@ -335,6 +592,15 @@ impl LeasedFileArmedStrategy {
         let store = FileArmedStrategyStateStore::load(paths.state())?;
         if &store.snapshot().run_id != paths.run_id() {
             return Err(FileArmedLoadError::RunIdentityMismatch);
+        }
+        match load_empty_intent_store(paths.intents()) {
+            Ok(_) => {}
+            Err(EmptyIntentLedgerError::Ledger(error)) => {
+                return Err(FileArmedLoadError::IntentLedger(error));
+            }
+            Err(EmptyIntentLedgerError::NotEmpty) => {
+                return Err(FileArmedLoadError::IntentLedgerMismatch);
+            }
         }
         Ok(Self {
             paths,
@@ -366,45 +632,109 @@ impl LeasedFileArmedStrategy {
         now_ms: u64,
     ) -> Result<LeasedFileStrategyRuntime<G>, FileArmedActivationError>
     where
-        G: TradingFeeRateGateway
+        G: ExchangeIdentityGateway
+            + TradingFeeRateGateway
             + LeverageGateway
             + PositionSnapshotGateway
             + MarketSnapshotGateway
             + InstrumentRulesGateway,
     {
-        let intent_store = FileOrderIntentStore::load(self.paths.intents())?;
-        if !intent_store.snapshot().intents.is_empty()
-            || !intent_store.snapshot().cancellations.is_empty()
-        {
-            return Err(FileArmedActivationError::IntentLedgerMismatch);
+        let prepared = self.prepare_activation(&gateway, now_ms).await?;
+        match self.commit_activation(gateway, prepared) {
+            Ok(runtime) => {
+                runtime
+                    .runtime()
+                    .verify_ledger_ownership()
+                    .map_err(|_| FileArmedActivationError::IntentLedgerMismatch)?;
+                Ok(runtime)
+            }
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    async fn prepare_activation<G>(
+        &self,
+        gateway: &G,
+        now_ms: u64,
+    ) -> Result<PreparedArmedActivation, FileArmedActivationError>
+    where
+        G: ExchangeIdentityGateway
+            + TradingFeeRateGateway
+            + LeverageGateway
+            + PositionSnapshotGateway
+            + MarketSnapshotGateway
+            + InstrumentRulesGateway,
+    {
+        let expected = self.store.snapshot().exchange;
+        let actual = gateway.exchange();
+        if expected != actual {
+            return Err(FileArmedActivationError::GatewayMismatch { expected, actual });
+        }
+        match load_empty_intent_store(self.paths.intents()) {
+            Ok(_) => {}
+            Err(EmptyIntentLedgerError::Ledger(error)) => {
+                return Err(FileArmedActivationError::IntentLedger(error));
+            }
+            Err(EmptyIntentLedgerError::NotEmpty) => {
+                return Err(FileArmedActivationError::IntentLedgerMismatch);
+            }
         }
         let active = activate_armed_strategy(
-            &gateway,
+            gateway,
             self.store.snapshot(),
             now_ms,
             self.settings.maximum_market_age_ms,
             self.settings.maximum_future_skew_ms,
         )
         .await?;
+        let intent_store = match load_empty_intent_store(self.paths.intents()) {
+            Ok(store) => store,
+            Err(EmptyIntentLedgerError::Ledger(error)) => {
+                return Err(FileArmedActivationError::IntentLedger(error));
+            }
+            Err(EmptyIntentLedgerError::NotEmpty) => {
+                return Err(FileArmedActivationError::IntentLedgerMismatch);
+            }
+        };
+        let execution_sync = ExecutionSyncService::new(&self.settings.quote_asset)
+            .map_err(RuntimeBuildError::from)?;
+        Ok(PreparedArmedActivation {
+            active,
+            intent_store,
+            execution_sync,
+        })
+    }
+
+    fn commit_activation<G>(
+        mut self,
+        gateway: G,
+        prepared: PreparedArmedActivation,
+    ) -> Result<LeasedFileStrategyRuntime<G>, Box<ActivationCommitFailure<G>>> {
+        let state_store = match self.store.try_activate_prepared(&prepared.active) {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(Box::new(ActivationCommitFailure {
+                    strategy: self,
+                    gateway,
+                    error: FileArmedActivationError::StrategyState(error),
+                }));
+            }
+        };
         let Self {
             paths,
             lease,
-            store,
+            store: _,
             settings,
         } = self;
-        let state_store = store.activate_prepared(active)?;
-        let runtime = StrategyRuntime::new(
+        let runtime = StrategyRuntime {
             gateway,
-            intent_store,
-            StrategyMachine::new(state_store),
-            &settings.quote_asset,
-            settings.maximum_market_age_ms,
-            settings.maximum_future_skew_ms,
-            settings.maximum_submissions_per_tick,
-        )?;
-        runtime
-            .verify_ledger_ownership()
-            .map_err(|_| FileArmedActivationError::IntentLedgerMismatch)?;
+            intent_store: prepared.intent_store,
+            machine: StrategyMachine::new(state_store),
+            execution_sync: prepared.execution_sync,
+            maximum_market_age_ms: settings.maximum_market_age_ms,
+            maximum_future_skew_ms: settings.maximum_future_skew_ms,
+            maximum_submissions_per_tick: settings.maximum_submissions_per_tick,
+        };
         Ok(LeasedFileStrategyRuntime {
             paths,
             _lease: lease,
@@ -419,12 +749,21 @@ pub enum FileArmedLoadError {
     Lease(#[from] RuntimeLeaseError),
     #[error(transparent)]
     StrategyState(#[from] StrategyStoreError),
+    #[error(transparent)]
+    IntentLedger(#[from] LedgerError),
     #[error("armed strategy run identity does not match its file directory")]
     RunIdentityMismatch,
+    #[error("armed strategy cannot load with a non-empty or foreign intent ledger")]
+    IntentLedgerMismatch,
 }
 
 #[derive(Debug, Error)]
 pub enum FileArmedActivationError {
+    #[error("configured gateway is for {actual:?}, but armed strategy requires {expected:?}")]
+    GatewayMismatch {
+        expected: Exchange,
+        actual: Exchange,
+    },
     #[error(transparent)]
     Bootstrap(#[from] StrategyBootstrapError),
     #[error(transparent)]
@@ -442,11 +781,19 @@ impl<G> LeasedFileStrategyRuntime<G> {
         gateway: G,
         paths: StrategyFilePaths,
         settings: RuntimeSettings,
-    ) -> Result<Self, FileRuntimeLoadError> {
+    ) -> Result<Self, FileRuntimeLoadError>
+    where
+        G: ExchangeIdentityGateway,
+    {
         let lease = StrategyRuntimeLease::acquire(paths.lease())?;
         let state_store = FileStrategyStateStore::load(paths.state())?;
         if &state_store.snapshot().run_id != paths.run_id() {
             return Err(FileRuntimeLoadError::RunIdentityMismatch);
+        }
+        let expected = state_store.snapshot().exchange;
+        let actual = gateway.exchange();
+        if expected != actual {
+            return Err(FileRuntimeLoadError::GatewayMismatch { expected, actual });
         }
         let intent_store = FileOrderIntentStore::load(paths.intents())?;
         let runtime = StrategyRuntime::new(
@@ -495,6 +842,11 @@ pub enum FileRuntimeLoadError {
     Runtime(#[from] RuntimeBuildError),
     #[error("strategy state run identity does not match its file directory")]
     RunIdentityMismatch,
+    #[error("configured gateway is for {actual:?}, but persisted strategy requires {expected:?}")]
+    GatewayMismatch {
+        expected: Exchange,
+        actual: Exchange,
+    },
     #[error("strategy and order-intent ledgers disagree")]
     IntentLedgerMismatch,
 }
@@ -1106,6 +1458,7 @@ mod tests {
     use async_trait::async_trait;
     use rust_decimal::Decimal;
     use tempfile::tempdir;
+    use tokio::sync::{Barrier as AsyncBarrier, Semaphore};
 
     use super::*;
     use crate::{
@@ -1116,8 +1469,9 @@ mod tests {
         },
         engine::{
             GridOrderRole, MarketSnapshot, MemoryStrategyStateStore, PositionBaseline,
-            StrategyLifecycle, StrategyOrderPurpose, StrategyRunId, StrategyState,
-            StrategyStateStore, build_grid_plan,
+            RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError, StrategyLifecycle,
+            StrategyOrderPurpose, StrategyRunId, StrategyState, StrategyStateStore,
+            build_grid_plan,
         },
         exchange::{
             ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
@@ -1155,6 +1509,29 @@ mod tests {
         position_snapshot_calls: usize,
         fee_rate_calls: usize,
         leverage_write_calls: usize,
+        market_gate: Option<Arc<MarketGate>>,
+    }
+
+    struct MarketGate {
+        entered: AsyncBarrier,
+        release: Semaphore,
+    }
+
+    impl MarketGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: AsyncBarrier::new(2),
+                release: Semaphore::new(0),
+            })
+        }
+
+        async fn wait_until_entered(&self) {
+            self.entered.wait().await;
+        }
+
+        fn release(&self) {
+            self.release.add_permits(1);
+        }
     }
 
     impl MockGateway {
@@ -1184,6 +1561,7 @@ mod tests {
                     position_snapshot_calls: 0,
                     fee_rate_calls: 0,
                     leverage_write_calls: 0,
+                    market_gate: None,
                 })),
             }
         }
@@ -1280,6 +1658,12 @@ mod tests {
             state.market.last_price = price;
             state.market.mark_price = price;
             state.market.observed_at_ms = observed_at_ms;
+        }
+
+        fn block_market_snapshot(&self) -> Arc<MarketGate> {
+            let gate = MarketGate::new();
+            self.state.lock().unwrap().market_gate = Some(Arc::clone(&gate));
+            gate
         }
 
         fn set_position(&self, quantity: Decimal, entry_price: Option<Decimal>) {
@@ -1537,9 +1921,20 @@ mod tests {
             _exchange: Exchange,
             _symbol: &str,
         ) -> Result<ExchangeMarketSnapshot, SnapshotError> {
-            let mut state = self.state.lock().unwrap();
-            state.market_snapshot_calls += 1;
-            Ok(state.market.clone())
+            let (market, gate) = {
+                let mut state = self.state.lock().unwrap();
+                state.market_snapshot_calls += 1;
+                (state.market.clone(), state.market_gate.clone())
+            };
+            if let Some(gate) = gate {
+                gate.entered.wait().await;
+                gate.release
+                    .acquire()
+                    .await
+                    .expect("test market gate must remain open")
+                    .forget();
+            }
+            Ok(market)
         }
     }
 
@@ -1746,9 +2141,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let PreparedLeasedFileStrategy::Active(runtime) = prepared else {
-            panic!("immediate strategy should be active");
-        };
+        let runtime = prepared
+            .active_runtime()
+            .expect("immediate strategy should be active");
 
         assert_eq!(gateway.placement_call_count(), 0);
         assert!(runtime.paths().state().is_file());
@@ -1783,9 +2178,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let PreparedLeasedFileStrategy::Armed { strategy, .. } = prepared else {
-            panic!("triggered strategy should be armed");
-        };
+        let strategy = prepared
+            .armed_strategy()
+            .expect("triggered strategy should be armed");
 
         assert_eq!(gateway.market_snapshot_call_count(), 1);
         assert_eq!(gateway.account_preflight_call_count(), 0);
@@ -1933,6 +2328,239 @@ mod tests {
         assert!(FileArmedStrategyStateStore::load(paths.state()).is_ok());
     }
 
+    #[tokio::test]
+    async fn armed_advance_keeps_lease_while_waiting_and_activates_without_placing() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        gateway.set_market_price(Decimal::new(1010, 0), 1_100);
+        let mut prepared = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            StrategyRunId::parse("advance1").unwrap(),
+            triggered_config(),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let paths = prepared.paths().clone();
+
+        assert_eq!(
+            prepared.advance(1_100).await.unwrap(),
+            PreparedStrategyStep::WaitingForTrigger
+        );
+        assert_eq!(prepared.kind(), PreparedStrategyKind::Armed);
+        assert_eq!(gateway.account_preflight_call_count(), 0);
+        assert!(matches!(
+            LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()),
+            Err(FileArmedLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
+        ));
+
+        gateway.set_market_price(Decimal::new(1014, 0), 1_200);
+        assert_eq!(
+            prepared.advance(1_200).await.unwrap(),
+            PreparedStrategyStep::Activated
+        );
+        assert_eq!(prepared.kind(), PreparedStrategyKind::Active);
+        assert_eq!(gateway.placement_call_count(), 0);
+
+        let PreparedStrategyStep::Active(report) = prepared.advance(1_300).await.unwrap() else {
+            panic!("the first active tick must return an active report");
+        };
+        assert_eq!(report.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[test]
+    fn recovery_loads_under_one_lease_without_calling_the_exchange() {
+        let directory = tempdir().unwrap();
+        let state = file_state();
+        let paths = StrategyFilePaths::new(directory.path(), state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(paths.state(), state).unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+
+        let recovered =
+            recover_leased_file_strategy(gateway.clone(), paths.clone(), runtime_settings())
+                .unwrap();
+
+        assert_eq!(recovered.kind(), PreparedStrategyKind::Active);
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert!(matches!(
+            recover_leased_file_strategy(gateway, paths, runtime_settings()),
+            Err(FileStrategyRecoveryError::Lease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+    }
+
+    #[test]
+    fn recovery_rejects_gateway_mismatch_and_dirty_armed_ledger_before_visibility() {
+        let directory = tempdir().unwrap();
+        let active = file_state();
+        let active_paths = StrategyFilePaths::new(directory.path(), active.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(active_paths.state(), active).unwrap();
+        let wrong_gateway = MockGateway::new(rules(), 1_100).with_exchange(Exchange::Aster);
+        assert!(matches!(
+            recover_leased_file_strategy(wrong_gateway.clone(), active_paths, runtime_settings()),
+            Err(FileStrategyRecoveryError::GatewayMismatch {
+                expected: Exchange::Binance,
+                actual: Exchange::Aster
+            })
+        ));
+        assert_eq!(wrong_gateway.all_bootstrap_call_count(), 0);
+
+        let armed = armed_file_state();
+        let armed_paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();
+        FileArmedStrategyStateStore::create(armed_paths.state(), armed).unwrap();
+        let mut intents = FileOrderIntentStore::load(armed_paths.intents()).unwrap();
+        intents
+            .insert_prepared(
+                OrderIntent::prepare(
+                    ClientOrderId::parse("dirty_arm").unwrap(),
+                    Exchange::Binance,
+                    OrderShape {
+                        symbol: "MUUSDT".into(),
+                        side: OrderSide::Sell,
+                        price: Some(Decimal::new(1014, 0)),
+                        quantity: Decimal::new(2, 1),
+                        reduce_only: false,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                    },
+                    1_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        assert!(matches!(
+            recover_leased_file_strategy(gateway.clone(), armed_paths, runtime_settings()),
+            Err(FileStrategyRecoveryError::IntentLedgerMismatch)
+        ));
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registry_rejects_overlapping_same_run_but_does_not_serialize_other_runs() {
+        let first_directory = tempdir().unwrap();
+        let second_directory = tempdir().unwrap();
+        let first_gateway = MockGateway::new(rules(), 1_100);
+        let second_gateway = MockGateway::new(rules(), 1_100);
+        let first_run = StrategyRunId::parse("sched001").unwrap();
+        let second_run = StrategyRunId::parse("sched002").unwrap();
+        let first = prepare_leased_file_strategy(
+            first_gateway.clone(),
+            first_directory.path(),
+            first_run.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let second = prepare_leased_file_strategy(
+            second_gateway.clone(),
+            second_directory.path(),
+            second_run.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(RuntimeRegistry::new());
+        assert!(matches!(
+            registry.register(first).await,
+            RuntimeRegistration::Registered
+        ));
+        assert!(matches!(
+            registry.register(second).await,
+            RuntimeRegistration::Registered
+        ));
+        let gate = first_gateway.block_market_snapshot();
+        let advancing_registry = Arc::clone(&registry);
+        let advancing_run = first_run.clone();
+        let first_tick =
+            tokio::spawn(async move { advancing_registry.advance(&advancing_run, 1_200).await });
+        gate.wait_until_entered().await;
+
+        assert!(matches!(
+            registry.advance(&first_run, 1_200).await,
+            Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id)) if run_id == first_run
+        ));
+        let entries = registry.entries().await;
+        assert!(
+            entries.iter().any(|entry| {
+                entry.run_id == first_run && entry.advancing && entry.kind.is_none()
+            })
+        );
+
+        let PreparedStrategyStep::Active(second_report) =
+            registry.advance(&second_run, 1_200).await.unwrap()
+        else {
+            panic!("the unrelated runtime must advance independently");
+        };
+        assert_eq!(second_report.submissions.len(), 1);
+        assert_eq!(second_gateway.placement_call_count(), 1);
+
+        gate.release();
+        let PreparedStrategyStep::Active(first_report) = first_tick.await.unwrap().unwrap() else {
+            panic!("the blocked runtime must finish after release");
+        };
+        assert_eq!(first_report.submissions.len(), 1);
+        assert_eq!(first_gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_registry_entry_returns_the_rejected_runtime_without_replacing_owner() {
+        let first_directory = tempdir().unwrap();
+        let duplicate_directory = tempdir().unwrap();
+        let run_id = StrategyRunId::parse("duprun01").unwrap();
+        let first = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            first_directory.path(),
+            run_id.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let duplicate = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            duplicate_directory.path(),
+            run_id.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let duplicate_paths = duplicate.paths().clone();
+        let registry = RuntimeRegistry::new();
+
+        assert!(matches!(
+            registry.register(first).await,
+            RuntimeRegistration::Registered
+        ));
+        let RuntimeRegistration::Duplicate(rejected) = registry.register(duplicate).await else {
+            panic!("the existing run ID must remain the sole registry owner");
+        };
+
+        assert_eq!(registry.len().await, 1);
+        assert!(registry.contains(&run_id).await);
+        assert_eq!(rejected.paths(), &duplicate_paths);
+        assert!(matches!(
+            LeasedFileStrategyRuntime::load(
+                MockGateway::new(rules(), 1_100),
+                duplicate_paths,
+                runtime_settings()
+            ),
+            Err(FileRuntimeLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
+        ));
+    }
+
     #[test]
     fn leased_file_runtime_has_one_owner_and_releases_on_drop() {
         let directory = tempdir().unwrap();
@@ -1940,15 +2568,31 @@ mod tests {
         let paths = StrategyFilePaths::new(directory.path(), state.run_id.clone()).unwrap();
         FileStrategyStateStore::create(paths.state(), state).unwrap();
 
-        let first = LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()).unwrap();
+        let first = LeasedFileStrategyRuntime::load(
+            MockGateway::new(rules(), 1_100),
+            paths.clone(),
+            runtime_settings(),
+        )
+        .unwrap();
         assert_eq!(first.paths(), &paths);
         assert!(matches!(
-            LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()),
+            LeasedFileStrategyRuntime::load(
+                MockGateway::new(rules(), 1_100),
+                paths.clone(),
+                runtime_settings()
+            ),
             Err(FileRuntimeLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
         ));
 
         drop(first);
-        assert!(LeasedFileStrategyRuntime::load((), paths, runtime_settings()).is_ok());
+        assert!(
+            LeasedFileStrategyRuntime::load(
+                MockGateway::new(rules(), 1_100),
+                paths,
+                runtime_settings()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1960,7 +2604,11 @@ mod tests {
         FileStrategyStateStore::create(paths.state(), file_state()).unwrap();
 
         assert!(matches!(
-            LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()),
+            LeasedFileStrategyRuntime::load(
+                MockGateway::new(rules(), 1_100),
+                paths.clone(),
+                runtime_settings()
+            ),
             Err(FileRuntimeLoadError::RunIdentityMismatch)
         ));
         assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
@@ -1994,7 +2642,11 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()),
+            LeasedFileStrategyRuntime::load(
+                MockGateway::new(rules(), 1_100),
+                paths.clone(),
+                runtime_settings()
+            ),
             Err(FileRuntimeLoadError::IntentLedgerMismatch)
         ));
         assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
@@ -2076,6 +2728,29 @@ mod tests {
         assert!(LeasedFileArmedStrategy::load(paths, runtime_settings()).is_ok());
     }
 
+    #[tokio::test]
+    async fn low_level_armed_activation_rejects_wrong_exchange_before_any_gateway_call() {
+        let directory = tempdir().unwrap();
+        let armed = armed_file_state();
+        let paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();
+        FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
+        let bytes_before = std::fs::read(paths.state()).unwrap();
+        let leased = LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()).unwrap();
+        let gateway = MockGateway::new(rules(), 1_100).with_exchange(Exchange::Aster);
+
+        assert!(matches!(
+            leased.activate(gateway.clone(), 1_100).await,
+            Err(FileArmedActivationError::GatewayMismatch {
+                expected: Exchange::Binance,
+                actual: Exchange::Aster
+            })
+        ));
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(std::fs::read(paths.state()).unwrap(), bytes_before);
+        assert!(LeasedFileArmedStrategy::load(paths, runtime_settings()).is_ok());
+    }
+
     #[test]
     fn invalid_runtime_settings_cannot_construct_an_armed_runtime() {
         let directory = tempdir().unwrap();
@@ -2117,6 +2792,7 @@ mod tests {
         let paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();
         FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
         let bytes_before = std::fs::read(paths.state()).unwrap();
+        let leased = LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()).unwrap();
         let mut intents = FileOrderIntentStore::load(paths.intents()).unwrap();
         intents
             .insert_prepared(
@@ -2137,7 +2813,6 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let leased = LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()).unwrap();
         let gateway = MockGateway::new(rules(), 1_100);
 
         assert!(matches!(
@@ -2147,7 +2822,10 @@ mod tests {
         assert_eq!(gateway.placement_call_count(), 0);
         assert_eq!(gateway.all_bootstrap_call_count(), 0);
         assert_eq!(std::fs::read(paths.state()).unwrap(), bytes_before);
-        assert!(LeasedFileArmedStrategy::load(paths, runtime_settings()).is_ok());
+        assert!(matches!(
+            LeasedFileArmedStrategy::load(paths, runtime_settings()),
+            Err(FileArmedLoadError::IntentLedgerMismatch)
+        ));
     }
 
     #[tokio::test]

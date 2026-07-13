@@ -11,6 +11,7 @@ mod reconciliation;
 mod runtime;
 mod strategy_machine;
 mod submission;
+mod supervisor;
 
 pub use armed_strategy::{
     ArmedStrategyError, ArmedStrategyLifecycle, ArmedStrategyState, TriggerCondition,
@@ -39,10 +40,12 @@ pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };
 pub use runtime::{
-    FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, FileStrategyStartError,
-    LeasedFileArmedStrategy, LeasedFileStrategyRuntime, PreparedLeasedFileStrategy, RuntimeBlocker,
-    RuntimeBuildError, RuntimeCancellation, RuntimeSettings, RuntimeStage, RuntimeSubmission,
-    RuntimeTickError, RuntimeTickReport, StrategyRuntime, prepare_leased_file_strategy,
+    FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, FileStrategyRecoveryError,
+    FileStrategyStartError, LeasedFileArmedStrategy, LeasedFileStrategyRuntime,
+    PreparedLeasedFileStrategy, PreparedStrategyKind, PreparedStrategyStep,
+    PreparedStrategyStepError, RuntimeBlocker, RuntimeBuildError, RuntimeCancellation,
+    RuntimeSettings, RuntimeStage, RuntimeSubmission, RuntimeTickError, RuntimeTickReport,
+    StrategyRuntime, prepare_leased_file_strategy, recover_leased_file_strategy,
 };
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{
@@ -53,3 +56,6 @@ pub use strategy_machine::{
     StrategyStoreError, StrategyTransition,
 };
 pub use submission::{SubmissionError, SubmissionResult, SubmissionService, submit_with};
+pub use supervisor::{
+    RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError, RuntimeRegistryEntry,
+};
