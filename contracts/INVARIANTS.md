@@ -182,6 +182,12 @@ the OpenAPI schema.
   existing run. A failed or interrupted first write is retained as blocking evidence and is
   never reset to an empty strategy. The runtime can observe a new strategy only after the
   complete prepared state has been durably written.
+- Every active or armed strategy has one independent operating-system runtime lease. A second
+  process must fail before loading or mutating either ledger, and a crashed owner releases the
+  lease automatically without deleting audit evidence.
+- Runtime state, order-intent ledger, and lease paths are derived from one validated run ID.
+  Loading acquires the lease first, then verifies the persisted run ID and cross-ledger ownership;
+  any mismatch prevents the runtime from becoming visible and performs no exchange operation.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
   rule, or baseline failure leaves the armed bytes unchanged and creates no order.
 - Trigger direction is derived from the trigger price relative to the arming market, not

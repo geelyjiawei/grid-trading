@@ -7,8 +7,8 @@ use crate::{
         CancellationResult, CancellationServiceError, ExecutionAccountingError,
         ExecutionSyncService, ReconciliationError, ReconciliationResult, StrategyLifecycle,
         StrategyMachine, StrategyMachineError, StrategyOrderPurpose, StrategyOrderTracking,
-        StrategyStateError, StrategyStateStore, StrategyTransition, SubmissionError,
-        SubmissionResult, cancel_with, load_strategy_inputs, reconcile_with,
+        StrategyStateError, StrategyStateStore, StrategyStoreError, StrategyTransition,
+        SubmissionError, SubmissionResult, cancel_with, load_strategy_inputs, reconcile_with,
         resolve_cancellation_with, submit_with,
     },
     exchange::{
@@ -16,7 +16,10 @@ use crate::{
         MarketSnapshotGateway, OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway,
         PositionSnapshotGateway,
     },
-    persistence::IntentStore,
+    persistence::{
+        FileOrderIntentStore, FileStrategyStateStore, IntentStore, LedgerError, RuntimeLeaseError,
+        StrategyFilePaths, StrategyRuntimeLease,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +120,77 @@ pub struct StrategyRuntime<G, I, S> {
     maximum_submissions_per_tick: usize,
 }
 
+pub struct LeasedFileStrategyRuntime<G> {
+    paths: StrategyFilePaths,
+    _lease: StrategyRuntimeLease,
+    runtime: StrategyRuntime<G, FileOrderIntentStore, FileStrategyStateStore>,
+}
+
+impl<G> LeasedFileStrategyRuntime<G> {
+    pub fn load(
+        gateway: G,
+        paths: StrategyFilePaths,
+        quote_asset: &str,
+        maximum_market_age_ms: u64,
+        maximum_future_skew_ms: u64,
+        maximum_submissions_per_tick: usize,
+    ) -> Result<Self, FileRuntimeLoadError> {
+        let lease = StrategyRuntimeLease::acquire(paths.lease())?;
+        let state_store = FileStrategyStateStore::load(paths.state())?;
+        if &state_store.snapshot().run_id != paths.run_id() {
+            return Err(FileRuntimeLoadError::RunIdentityMismatch);
+        }
+        let intent_store = FileOrderIntentStore::load(paths.intents())?;
+        let runtime = StrategyRuntime::new(
+            gateway,
+            intent_store,
+            StrategyMachine::new(state_store),
+            quote_asset,
+            maximum_market_age_ms,
+            maximum_future_skew_ms,
+            maximum_submissions_per_tick,
+        )?;
+        runtime
+            .verify_ledger_ownership()
+            .map_err(|_| FileRuntimeLoadError::IntentLedgerMismatch)?;
+        Ok(Self {
+            paths,
+            _lease: lease,
+            runtime,
+        })
+    }
+
+    pub fn paths(&self) -> &StrategyFilePaths {
+        &self.paths
+    }
+
+    pub fn runtime(&self) -> &StrategyRuntime<G, FileOrderIntentStore, FileStrategyStateStore> {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(
+        &mut self,
+    ) -> &mut StrategyRuntime<G, FileOrderIntentStore, FileStrategyStateStore> {
+        &mut self.runtime
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FileRuntimeLoadError {
+    #[error(transparent)]
+    Lease(#[from] RuntimeLeaseError),
+    #[error(transparent)]
+    StrategyState(#[from] StrategyStoreError),
+    #[error(transparent)]
+    IntentLedger(#[from] LedgerError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeBuildError),
+    #[error("strategy state run identity does not match its file directory")]
+    RunIdentityMismatch,
+    #[error("strategy and order-intent ledgers disagree")]
+    IntentLedgerMismatch,
+}
+
 impl<G, I, S> StrategyRuntime<G, I, S>
 where
     I: IntentStore,
@@ -163,6 +237,10 @@ where
 
     pub fn machine_mut(&mut self) -> &mut StrategyMachine<S> {
         &mut self.machine
+    }
+
+    pub fn verify_ledger_ownership(&self) -> Result<(), RuntimeTickError> {
+        self.validate_ledger_ownership()
     }
 
     fn validate_ledger_ownership(&self) -> Result<(), RuntimeTickError> {
@@ -705,6 +783,7 @@ mod tests {
 
     use async_trait::async_trait;
     use rust_decimal::Decimal;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::{
@@ -724,7 +803,10 @@ mod tests {
             OrderExecutionSnapshot, OrderLifecycle, OrderLookup, PlacementAcknowledgement,
             PlacementError, PositionLeg, PositionSide, PositionSnapshot, SnapshotError, TradeFill,
         },
-        persistence::{IntentStore, MemoryOrderIntentStore},
+        persistence::{
+            FileOrderIntentStore, FileStrategyStateStore, IntentStore, MemoryOrderIntentStore,
+            StrategyFilePaths, StrategyRuntimeLease,
+        },
     };
 
     #[derive(Clone)]
@@ -1214,6 +1296,78 @@ mod tests {
             .unwrap()
             .client_order_id
             .clone()
+    }
+
+    fn file_state() -> StrategyState {
+        machine(config(None), &rules()).store().snapshot().clone()
+    }
+
+    #[test]
+    fn leased_file_runtime_has_one_owner_and_releases_on_drop() {
+        let directory = tempdir().unwrap();
+        let state = file_state();
+        let paths = StrategyFilePaths::new(directory.path(), state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(paths.state(), state).unwrap();
+
+        let first =
+            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100).unwrap();
+        assert_eq!(first.paths(), &paths);
+        assert!(matches!(
+            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100),
+            Err(FileRuntimeLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
+        ));
+
+        drop(first);
+        assert!(LeasedFileStrategyRuntime::load((), paths, "USDT", 10_000, 100, 100).is_ok());
+    }
+
+    #[test]
+    fn file_runtime_rejects_state_from_another_run_and_releases_lease() {
+        let directory = tempdir().unwrap();
+        let paths =
+            StrategyFilePaths::new(directory.path(), StrategyRunId::parse("OTHER001").unwrap())
+                .unwrap();
+        FileStrategyStateStore::create(paths.state(), file_state()).unwrap();
+
+        assert!(matches!(
+            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100),
+            Err(FileRuntimeLoadError::RunIdentityMismatch)
+        ));
+        assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
+    }
+
+    #[test]
+    fn file_runtime_rejects_foreign_intent_ledger_before_becoming_visible() {
+        let directory = tempdir().unwrap();
+        let state = file_state();
+        let paths = StrategyFilePaths::new(directory.path(), state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(paths.state(), state).unwrap();
+        let mut intents = FileOrderIntentStore::load(paths.intents()).unwrap();
+        intents
+            .insert_prepared(
+                OrderIntent::prepare(
+                    ClientOrderId::parse("foreign_1").unwrap(),
+                    Exchange::Binance,
+                    OrderShape {
+                        symbol: "MUUSDT".into(),
+                        side: OrderSide::Sell,
+                        price: Some(Decimal::new(1015, 0)),
+                        quantity: Decimal::new(2, 1),
+                        reduce_only: false,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                    },
+                    1_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100),
+            Err(FileRuntimeLoadError::IntentLedgerMismatch)
+        ));
+        assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
     }
 
     #[tokio::test]
