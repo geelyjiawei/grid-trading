@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, State},
+    extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{
@@ -24,6 +24,11 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::{
+    domain::{Exchange, OrderSide},
+    exchange::{
+        ActiveOrderStatus, OrderLifecycle, PositionLeg, SnapshotError,
+        registry::{ExchangeGatewayRegistry, ReadOnlyExchangeGateway, RegistryError},
+    },
     persistence::{
         BeginIdempotency, FileIdempotencyStore, IdempotencyError, IdempotencyKey, IdempotencyStore,
         RequestFingerprint, StoredCommandResponse,
@@ -69,12 +74,14 @@ struct ApiState {
     trading_enabled: bool,
     idempotency: Arc<dyn IdempotencyStore>,
     start_command: Arc<dyn StartGridCommand>,
+    exchange_gateways: ExchangeGatewayRegistry,
 }
 
 impl ApiState {
     fn disabled(
         admin_token: Option<AdminTokenVerifier>,
         web_authentication: WebAuthService,
+        exchange_gateways: ExchangeGatewayRegistry,
         idempotency_root: PathBuf,
     ) -> Self {
         Self {
@@ -86,6 +93,7 @@ impl ApiState {
             trading_enabled: false,
             idempotency: Arc::new(FileIdempotencyStore::new(idempotency_root)),
             start_command: Arc::new(DisabledStartGridCommand),
+            exchange_gateways,
         }
     }
 
@@ -102,12 +110,19 @@ impl ApiState {
             trading_enabled,
             idempotency,
             start_command,
+            exchange_gateways: ExchangeGatewayRegistry::default(),
         }
     }
 
     #[cfg(test)]
     fn with_web_authentication(mut self, web_authentication: WebAuthService) -> Self {
         self.web_authentication = web_authentication;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_exchange_gateways(mut self, exchange_gateways: ExchangeGatewayRegistry) -> Self {
+        self.exchange_gateways = exchange_gateways;
         self
     }
 }
@@ -613,6 +628,288 @@ fn session_cookie(token: &str, secure: bool, max_age: u64) -> Option<HeaderValue
     HeaderValue::from_str(&value).ok()
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ExchangeSelection {
+    exchange: Option<Exchange>,
+}
+
+async fn exchange_config(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+) -> Response {
+    let preferred = state.exchange_gateways.preferred();
+    let preferred_summary = state.exchange_gateways.summary(preferred);
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "configured": preferred_summary.configured,
+            "exchange": preferred,
+            "active_exchange": preferred,
+            "testnet": preferred_summary.testnet,
+            "configs": {
+                "binance": state.exchange_gateways.summary(Exchange::Binance),
+                "aster": state.exchange_gateways.summary(Exchange::Aster),
+                "bybit": state.exchange_gateways.summary(Exchange::Bybit),
+            }
+        }),
+    )
+}
+
+async fn exchange_price(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let gateway = match read_gateway(&state, exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+    match gateway.market_snapshot(exchange, &symbol).await {
+        Ok(snapshot) => no_store_json(
+            StatusCode::OK,
+            json!({
+                "exchange": snapshot.exchange,
+                "symbol": snapshot.symbol,
+                "last_price": snapshot.last_price.to_string(),
+                "mark_price": snapshot.mark_price.to_string(),
+                "observed_at_ms": snapshot.observed_at_ms,
+            }),
+        ),
+        Err(error) => snapshot_failure("market", exchange, error),
+    }
+}
+
+async fn exchange_fee_rates(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let gateway = match read_gateway(&state, exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+    match gateway.trading_fee_rates(exchange, &symbol).await {
+        Ok(rates) => {
+            let maker_fee_rate = match decimal_json_number(rates.maker_rate) {
+                Ok(rate) => rate,
+                Err(error) => return error.response(),
+            };
+            let taker_fee_rate = match decimal_json_number(rates.taker_rate) {
+                Ok(rate) => rate,
+                Err(error) => return error.response(),
+            };
+            no_store_json(
+                StatusCode::OK,
+                json!({
+                    "exchange": rates.exchange,
+                    "symbol": rates.symbol,
+                    "maker_fee_rate": maker_fee_rate,
+                    "taker_fee_rate": taker_fee_rate,
+                    "source": "exchange",
+                }),
+            )
+        }
+        Err(error) => snapshot_failure("fee rates", exchange, error),
+    }
+}
+
+async fn exchange_positions(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let gateway = match read_gateway(&state, exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+    match gateway.position_snapshot(exchange, &symbol).await {
+        Ok(snapshot) => {
+            let positions = snapshot
+                .legs
+                .iter()
+                .filter_map(position_response)
+                .collect::<Vec<_>>();
+            no_store_json(StatusCode::OK, json!({"positions": positions}))
+        }
+        Err(error) => snapshot_failure("positions", exchange, error),
+    }
+}
+
+async fn exchange_open_orders(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let gateway = match read_gateway(&state, exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+    match gateway.open_orders_snapshot(exchange, &symbol).await {
+        Ok(snapshot) => {
+            let mut orders = Vec::with_capacity(snapshot.len());
+            for order in snapshot {
+                let status = match order.lifecycle {
+                    OrderLifecycle::Active(ActiveOrderStatus::New) => "NEW",
+                    OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled) => {
+                        "PARTIALLY_FILLED"
+                    }
+                    OrderLifecycle::Terminal(_) => {
+                        return snapshot_failure(
+                            "open orders",
+                            exchange,
+                            SnapshotError::new("open-order snapshot contained a terminal order"),
+                        );
+                    }
+                };
+                orders.push(json!({
+                    "order_id": order.exchange_order_id,
+                    "order_link_id": order.client_order_id.as_str(),
+                    "side": order_side_name(order.shape.side),
+                    "price": order.shape.price.map(|price| price.to_string()).unwrap_or_else(|| "0".into()),
+                    "qty": order.shape.quantity.to_string(),
+                    "status": status,
+                    "reduce_only": order.shape.reduce_only,
+                }));
+            }
+            no_store_json(
+                StatusCode::OK,
+                json!({"orders": orders, "scope": "strategy"}),
+            )
+        }
+        Err(error) => snapshot_failure("open orders", exchange, error),
+    }
+}
+
+fn selected_exchange(state: &ApiState, selection: ExchangeSelection) -> Exchange {
+    selection
+        .exchange
+        .unwrap_or_else(|| state.exchange_gateways.preferred())
+}
+
+fn read_gateway(
+    state: &ApiState,
+    exchange: Exchange,
+) -> Result<Arc<dyn ReadOnlyExchangeGateway>, ReadApiError> {
+    state.exchange_gateways.gateway(exchange).map_err(|error| {
+        if matches!(error, RegistryError::NotConfigured(_)) {
+            ReadApiError::ExchangeNotConfigured
+        } else {
+            ReadApiError::RegistryUnavailable
+        }
+    })
+}
+
+fn normalize_symbol(value: &str) -> Result<String, ReadApiError> {
+    if value.is_empty()
+        || value.len() > 32
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(ReadApiError::InvalidSymbol);
+    }
+    Ok(value.to_ascii_uppercase())
+}
+
+fn decimal_json_number(value: rust_decimal::Decimal) -> Result<f64, ReadApiError> {
+    value
+        .to_string()
+        .parse::<f64>()
+        .map_err(|_| ReadApiError::InvalidExchangeDecimal)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadApiError {
+    InvalidSymbol,
+    ExchangeNotConfigured,
+    RegistryUnavailable,
+    InvalidExchangeDecimal,
+}
+
+impl ReadApiError {
+    fn response(self) -> Response {
+        match self {
+            Self::InvalidSymbol => api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_symbol",
+                "Symbol must contain only ASCII letters and digits",
+            ),
+            Self::ExchangeNotConfigured => api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "exchange_not_configured",
+                "The selected exchange is not configured",
+            ),
+            Self::RegistryUnavailable => api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "exchange_registry_unavailable",
+                "The exchange registry is unavailable",
+            ),
+            Self::InvalidExchangeDecimal => api_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_exchange_decimal",
+                "The exchange returned an invalid decimal value",
+            ),
+        }
+    }
+}
+
+fn position_response(leg: &PositionLeg) -> Option<Value> {
+    if leg.signed_quantity.is_zero() {
+        return None;
+    }
+    let side = if leg.signed_quantity.is_sign_positive() {
+        "Buy"
+    } else {
+        "Sell"
+    };
+    Some(json!({
+        "side": side,
+        "size": leg.signed_quantity.abs().to_string(),
+        "entry_price": leg.entry_price.map(|price| price.to_string()),
+        "mark_price": leg.mark_price.to_string(),
+        "unrealised_pnl": leg.unrealized_profit.to_string(),
+        "leverage": leg.leverage,
+    }))
+}
+
+fn order_side_name(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "Buy",
+        OrderSide::Sell => "Sell",
+    }
+}
+
+fn snapshot_failure(context: &'static str, exchange: Exchange, error: SnapshotError) -> Response {
+    tracing::warn!(?exchange, context, error = %error, "exchange snapshot failed");
+    api_error(
+        StatusCode::BAD_GATEWAY,
+        "exchange_snapshot_unavailable",
+        "The exchange snapshot is unavailable or invalid",
+    )
+}
+
 async fn api_not_found(_session: AuthenticatedWebSession) -> Response {
     api_error(
         StatusCode::NOT_FOUND,
@@ -624,11 +921,13 @@ async fn api_not_found(_session: AuthenticatedWebSession) -> Response {
 pub(crate) fn router(
     admin_token: Option<AdminTokenVerifier>,
     web_authentication: WebAuthService,
+    exchange_gateways: ExchangeGatewayRegistry,
     idempotency_root: PathBuf,
 ) -> Router {
     router_with_state(ApiState::disabled(
         admin_token,
         web_authentication,
+        exchange_gateways,
         idempotency_root,
     ))
 }
@@ -639,6 +938,11 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/auth/status", get(web_auth_status))
         .route("/api/auth/login", post(web_auth_login))
         .route("/api/auth/logout", post(web_auth_logout))
+        .route("/api/config", get(exchange_config))
+        .route("/api/price/{symbol}", get(exchange_price))
+        .route("/api/fees/{symbol}", get(exchange_fee_rates))
+        .route("/api/positions/{symbol}", get(exchange_positions))
+        .route("/api/orders/open/{symbol}", get(exchange_open_orders))
         .route("/api/v1/grid/start", post(start_grid))
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
@@ -660,6 +964,7 @@ mod tests {
             header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
         },
     };
+    use rust_decimal::Decimal;
     use serde_json::json;
     use tempfile::tempdir;
     use tokio::sync::Notify;
@@ -667,9 +972,18 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::web_auth::{
-        WebAuthConfiguration,
-        test_support::{PASSWORD, USERNAME, configured_service},
+    use crate::{
+        domain::{ClientOrderId, OrderKind, OrderShape, TimeInForce},
+        exchange::{
+            AuthoritativeOrder, ExchangeIdentityGateway, ExchangeMarketSnapshot,
+            MarketSnapshotGateway, OpenOrderSnapshotGateway, PositionSide, PositionSnapshot,
+            PositionSnapshotGateway, TradingFeeRateGateway, TradingFeeRates,
+            configured::ExchangeEnvironment,
+        },
+        web_auth::{
+            WebAuthConfiguration,
+            test_support::{PASSWORD, USERNAME, configured_service},
+        },
     };
 
     const ADMIN_TOKEN: &str = "zN5Vh8cnwT-NfY2M8N1oFhNtvxZ7AS-fBk4B8I3IRXY";
@@ -821,6 +1135,247 @@ mod tests {
                 "injected completion failure",
             )))
         }
+    }
+
+    struct ExactReadGateway;
+
+    impl ExchangeIdentityGateway for ExactReadGateway {
+        fn exchange(&self) -> Exchange {
+            Exchange::Aster
+        }
+    }
+
+    #[async_trait]
+    impl MarketSnapshotGateway for ExactReadGateway {
+        async fn market_snapshot(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+        ) -> Result<ExchangeMarketSnapshot, SnapshotError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            Ok(ExchangeMarketSnapshot {
+                exchange,
+                symbol: symbol.into(),
+                last_price: Decimal::from_str_exact("0.38000").unwrap(),
+                mark_price: Decimal::from_str_exact("0.37990").unwrap(),
+                observed_at_ms: 1_780_000_000_000,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl TradingFeeRateGateway for ExactReadGateway {
+        async fn trading_fee_rates(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+        ) -> Result<TradingFeeRates, SnapshotError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            Ok(TradingFeeRates {
+                exchange,
+                symbol: symbol.into(),
+                maker_rate: Decimal::from_str_exact("0.00020").unwrap(),
+                taker_rate: Decimal::from_str_exact("0.00050").unwrap(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PositionSnapshotGateway for ExactReadGateway {
+        async fn position_snapshot(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+        ) -> Result<PositionSnapshot, SnapshotError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            Ok(PositionSnapshot {
+                exchange,
+                symbol: symbol.into(),
+                legs: vec![PositionLeg {
+                    side: PositionSide::Both,
+                    signed_quantity: Decimal::from_str_exact("-1326.000").unwrap(),
+                    entry_price: Some(Decimal::from_str_exact("0.40010").unwrap()),
+                    mark_price: Decimal::from_str_exact("0.37990").unwrap(),
+                    unrealized_profit: Decimal::from_str_exact("26.78660").unwrap(),
+                    leverage: Some(5),
+                }],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OpenOrderSnapshotGateway for ExactReadGateway {
+        async fn open_orders_snapshot(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+        ) -> Result<Vec<AuthoritativeOrder>, SnapshotError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            Ok(vec![AuthoritativeOrder {
+                client_order_id: ClientOrderId::parse("g_9_B_exact01").unwrap(),
+                exchange_order_id: "90071992547409931234".into(),
+                exchange,
+                shape: OrderShape {
+                    symbol: symbol.into(),
+                    side: OrderSide::Buy,
+                    price: Some(Decimal::from_str_exact("0.38000").unwrap()),
+                    quantity: Decimal::from_str_exact("100.000").unwrap(),
+                    reduce_only: true,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                },
+                lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            }])
+        }
+    }
+
+    fn exact_read_app() -> Router {
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(ExactReadGateway),
+                ExchangeEnvironment::Production,
+                "env",
+                Some("wallet configured".into()),
+            )
+            .unwrap();
+        router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    std::env::temp_dir().join("grid-trading-api-read-tests"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways),
+        )
+    }
+
+    #[tokio::test]
+    async fn exchange_read_endpoints_preserve_exact_exchange_values() {
+        let app = exact_read_app();
+
+        let config = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(config.status(), StatusCode::OK);
+        assert_eq!(config.headers()[CACHE_CONTROL], "no-store");
+        let config = response_json(config).await;
+        assert_eq!(config["active_exchange"], "aster");
+        assert_eq!(config["configs"]["aster"]["configured"], true);
+        assert_eq!(config["configs"]["aster"]["api_key"], "wallet configured");
+        assert_eq!(config["configs"]["binance"]["configured"], false);
+
+        let price = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/price/ansemusdt?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let price = response_json(price).await;
+        assert_eq!(price["last_price"], "0.38000");
+        assert_eq!(price["mark_price"], "0.37990");
+
+        let fees = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fees/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fees = response_json(fees).await;
+        assert_eq!(fees["maker_fee_rate"].as_f64(), Some(0.0002));
+        assert_eq!(fees["taker_fee_rate"].as_f64(), Some(0.0005));
+
+        let positions = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/positions/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let positions = response_json(positions).await;
+        assert_eq!(positions["positions"][0]["side"], "Sell");
+        assert_eq!(positions["positions"][0]["size"], "1326.000");
+        assert_eq!(positions["positions"][0]["entry_price"], "0.40010");
+        assert_eq!(positions["positions"][0]["unrealised_pnl"], "26.78660");
+
+        let orders = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/orders/open/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let orders = response_json(orders).await;
+        assert_eq!(orders["scope"], "strategy");
+        assert_eq!(orders["orders"][0]["order_id"], "90071992547409931234");
+        assert_eq!(orders["orders"][0]["price"], "0.38000");
+        assert_eq!(orders["orders"][0]["qty"], "100.000");
+        assert_eq!(orders["orders"][0]["reduce_only"], true);
+    }
+
+    #[tokio::test]
+    async fn exchange_read_endpoints_fail_closed_for_bad_symbols_and_missing_config() {
+        let invalid = exact_read_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/price/ANSEM-USDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(invalid).await["error"]["code"],
+            "invalid_symbol"
+        );
+
+        let directory = tempdir().unwrap();
+        let unconfigured = router_with_state(ApiState::for_test(
+            verifier(),
+            false,
+            Arc::new(FileIdempotencyStore::new(directory.path())),
+            Arc::new(DisabledStartGridCommand),
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/api/price/MUUSDT?exchange=binance")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unconfigured.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(unconfigured).await["error"]["code"],
+            "exchange_not_configured"
+        );
     }
 
     #[tokio::test]

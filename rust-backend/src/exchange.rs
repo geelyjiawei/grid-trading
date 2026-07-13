@@ -34,6 +34,7 @@ mod codec;
 pub mod configured;
 mod execution;
 pub mod protocol;
+pub mod registry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementAcknowledgement {
