@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,7 @@ use crate::domain::{
 pub mod aster;
 pub mod binance;
 mod codec;
+mod execution;
 pub mod protocol;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +106,61 @@ pub trait OrderLookupGateway: Send + Sync {
         symbol: &str,
         client_order_id: &ClientOrderId,
     ) -> Result<OrderLookup, LookupError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradeFill {
+    pub trade_id: u64,
+    pub exchange_order_id: String,
+    pub symbol: String,
+    pub side: crate::domain::OrderSide,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub quote_quantity: Decimal,
+    /// Exact signed value returned by the exchange.
+    pub raw_commission: Decimal,
+    /// Positive fee cost under the exchange-specific commission convention.
+    pub commission_cost: Decimal,
+    pub commission_asset: String,
+    pub realized_profit: Decimal,
+    pub is_maker: bool,
+    pub trade_time_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderExecutionSnapshot {
+    pub order: AuthoritativeOrder,
+    pub cumulative_quantity: Decimal,
+    pub cumulative_quote: Decimal,
+    pub fees_by_asset: BTreeMap<String, Decimal>,
+    pub trades: Vec<TradeFill>,
+    pub order_time_ms: u64,
+    pub update_time_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("exchange execution snapshot is inconclusive: {message}")]
+pub struct ExecutionSnapshotError {
+    pub message: String,
+}
+
+impl ExecutionSnapshotError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[async_trait]
+pub trait ExecutionSnapshotGateway: Send + Sync {
+    async fn execution_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

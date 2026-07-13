@@ -8,14 +8,19 @@ use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
-        InstrumentRulesGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderLookup, OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement,
-        PlacementError, PositionSnapshot, PositionSnapshotGateway, SnapshotError,
+        ExecutionSnapshotError, ExecutionSnapshotGateway, InstrumentRulesGateway, LookupError,
+        MarketSnapshotGateway, OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup,
+        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
+        PositionSnapshot, PositionSnapshotGateway, SnapshotError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
             parse_instrument_rules, parse_market_snapshot, parse_placement_acknowledgement,
             parse_position_snapshot, validate_snapshot_request,
+        },
+        execution::{
+            CommissionConvention, assemble_execution_snapshot, parse_order_execution_header,
+            parse_trade_page,
         },
         protocol::{
             HttpMethod, HttpTransport, MillisecondClock, Parameters, PreparedHttpRequest,
@@ -26,6 +31,8 @@ use crate::{
 
 const PRODUCTION_BASE_URL: &str = "https://fapi.binance.com";
 const TESTNET_BASE_URL: &str = "https://testnet.binancefuture.com";
+const TRADE_PAGE_LIMIT: usize = 1_000;
+const MAX_TRADE_PAGES: usize = 64;
 
 pub trait BinanceRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, SignatureError>;
@@ -443,6 +450,119 @@ where
     }
 }
 
+#[async_trait]
+impl<T, S, C> ExecutionSnapshotGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn execution_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)
+            .map_err(|error| execution_error(error.to_string()))?;
+        if exchange_order_id.trim().is_empty() {
+            return Err(execution_error("exchange order ID is required"));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let detail_request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v1/order",
+                vec![
+                    ("symbol".into(), symbol.clone()),
+                    ("origClientOrderId".into(), client_order_id.as_str().into()),
+                ],
+            )
+            .map_err(|error| execution_error(error.to_string()))?;
+        let detail_body = self
+            .execute_snapshot(detail_request, "Binance execution order snapshot")
+            .await
+            .map_err(|error| execution_error(error.to_string()))?;
+        let header = parse_order_execution_header(
+            &detail_body,
+            Exchange::Binance,
+            &symbol,
+            client_order_id,
+            exchange_order_id,
+        )
+        .map_err(|error| execution_error(format!("invalid Binance order totals: {error}")))?;
+        if header.cumulative_quantity.is_zero() {
+            return assemble_execution_snapshot(header, vec![])
+                .map_err(|error| execution_error(error.to_string()));
+        }
+
+        let mut trades = Vec::new();
+        let mut next_from_id: Option<u64> = None;
+        let mut completed = false;
+        for _ in 0..MAX_TRADE_PAGES {
+            let mut parameters = vec![
+                ("symbol".into(), symbol.clone()),
+                ("orderId".into(), exchange_order_id.into()),
+                ("limit".into(), TRADE_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(from_id) = next_from_id {
+                parameters.push(("fromId".into(), from_id.to_string()));
+            }
+            let request = self
+                .signed_request(HttpMethod::Get, "/fapi/v1/userTrades", parameters)
+                .map_err(|error| execution_error(error.to_string()))?;
+            let body = self
+                .execute_snapshot(request, "Binance account trade snapshot")
+                .await
+                .map_err(|error| execution_error(error.to_string()))?;
+            let page = parse_trade_page(&body, &symbol, CommissionConvention::PositiveCost)
+                .map_err(|error| execution_error(format!("invalid Binance trade page: {error}")))?;
+            if page.len() > TRADE_PAGE_LIMIT {
+                return Err(execution_error(
+                    "Binance trade page exceeds the requested limit",
+                ));
+            }
+            if page
+                .iter()
+                .any(|trade| trade.exchange_order_id != exchange_order_id)
+            {
+                return Err(execution_error(
+                    "Binance order-filtered trade page contains another order",
+                ));
+            }
+            if let Some(from_id) = next_from_id
+                && page.iter().any(|trade| trade.trade_id < from_id)
+            {
+                return Err(execution_error("Binance trade pagination moved backwards"));
+            }
+            if page.len() < TRADE_PAGE_LIMIT {
+                trades.extend(page);
+                completed = true;
+                break;
+            }
+            let next = page
+                .iter()
+                .map(|trade| trade.trade_id)
+                .max()
+                .and_then(|trade_id| trade_id.checked_add(1))
+                .ok_or_else(|| execution_error("Binance trade pagination cannot advance"))?;
+            if next_from_id.is_some_and(|current| next <= current) {
+                return Err(execution_error("Binance trade pagination did not advance"));
+            }
+            trades.extend(page);
+            next_from_id = Some(next);
+        }
+        if !completed {
+            return Err(execution_error(
+                "Binance trade history exceeded the bounded pagination limit",
+            ));
+        }
+        assemble_execution_snapshot(header, trades)
+            .map_err(|error| execution_error(format!("incomplete Binance execution: {error}")))
+    }
+}
+
 fn definitive_local_error(message: &str) -> PlacementError {
     PlacementError::Definitive {
         code: None,
@@ -460,6 +580,10 @@ fn invalid_cancellation(message: &str) -> CancellationError {
     CancellationError::Invalid {
         message: message.into(),
     }
+}
+
+fn execution_error(message: impl Into<String>) -> ExecutionSnapshotError {
+    ExecutionSnapshotError::new(message)
 }
 
 #[cfg(test)]
@@ -554,6 +678,18 @@ mod tests {
             FixedClock(1_700_000_000_123),
             "test-key",
             "https://example.test",
+        )
+    }
+
+    fn execution_order_detail(original: &str, executed: &str, quote: &str, status: &str) -> String {
+        format!(
+            r#"{{"symbol":"MUUSDT","orderId":91,"clientOrderId":"g_7_S_fixed","side":"SELL","price":"1","origQty":"{original}","executedQty":"{executed}","cumQuote":"{quote}","status":"{status}","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT","time":1000000,"updateTime":1100000}}"#
+        )
+    }
+
+    fn binance_trade(trade_id: u64, quantity: &str, quote: &str) -> String {
+        format!(
+            r#"{{"symbol":"MUUSDT","id":{trade_id},"orderId":91,"side":"SELL","buyer":false,"price":"1","qty":"{quantity}","quoteQty":"{quote}","commission":"0","commissionAsset":"USDT","realizedPnl":"0","maker":true,"time":1050000}}"#
         )
     }
 
@@ -849,5 +985,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, OrderLookup::NotFound);
+    }
+
+    #[tokio::test]
+    async fn execution_snapshot_reconciles_order_totals_and_preserves_fee_assets() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"[
+                    {"symbol":"MUUSDT","id":7,"orderId":91,"side":"SELL","buyer":false,"price":"1","qty":"2","quoteQty":"2","commission":"0.0001","commissionAsset":"BNB","realizedPnl":"0","maker":true,"time":1050000},
+                    {"symbol":"MUUSDT","id":8,"orderId":91,"side":"SELL","buyer":false,"price":"1","qty":"1.14","quoteQty":"1.14","commission":"0.000628","commissionAsset":"USDT","realizedPnl":"0","maker":true,"time":1060000}
+                ]"#
+                .into(),
+            }),
+        ]);
+        let snapshot = adapter(transport.clone())
+            .execution_snapshot(
+                Exchange::Binance,
+                "MUUSDT",
+                &ClientOrderId::parse("g_7_S_fixed").unwrap(),
+                "91",
+            )
+            .await
+            .unwrap();
+        let requests = transport.all_requests();
+
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(314, 2));
+        assert_eq!(snapshot.fees_by_asset["BNB"], Decimal::new(1, 4));
+        assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::new(628, 6));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/fapi/v1/order");
+        assert_eq!(requests[1].path, "/fapi/v1/userTrades");
+        assert!(requests[1].query_string().contains("orderId=91"));
+    }
+
+    #[tokio::test]
+    async fn full_binance_trade_page_must_advance_before_completion() {
+        let full_page = format!(
+            "[{}]",
+            (1..=TRADE_PAGE_LIMIT as u64)
+                .map(|id| binance_trade(id, "1", "1"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("1001", "1001", "1001", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: full_page,
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", binance_trade(1001, "1", "1")),
+            }),
+        ]);
+        let snapshot = adapter(transport.clone())
+            .execution_snapshot(
+                Exchange::Binance,
+                "MUUSDT",
+                &ClientOrderId::parse("g_7_S_fixed").unwrap(),
+                "91",
+            )
+            .await
+            .unwrap();
+        let requests = transport.all_requests();
+
+        assert_eq!(snapshot.trades.len(), 1001);
+        assert!(requests[2].query_string().contains("fromId=1001"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_binance_trade_history_never_becomes_an_execution() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", binance_trade(1, "3", "3")),
+            }),
+        ]);
+
+        assert!(
+            adapter(transport)
+                .execution_snapshot(
+                    Exchange::Binance,
+                    "MUUSDT",
+                    &ClientOrderId::parse("g_7_S_fixed").unwrap(),
+                    "91",
+                )
+                .await
+                .is_err()
+        );
     }
 }

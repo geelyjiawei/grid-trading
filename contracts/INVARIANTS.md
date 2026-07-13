@@ -51,6 +51,15 @@ the OpenAPI schema.
 - A cancellation acknowledgement must match both immutable client and exchange order
   IDs. It confirms only that cancellation was accepted; terminal state still requires
   authoritative cumulative execution accounting.
+- An execution snapshot is accepted only when one exact order lookup and the complete
+  bounded account-trade pagination agree on exchange order ID, client order ID, symbol,
+  side, cumulative quantity, and cumulative quote.
+- A full account-trade page always requires a strictly advancing follow-up query. A
+  duplicate trade ID, backward page, malformed row, pagination cap, or cumulative total
+  mismatch remains inconclusive and can never be interpreted as a fill.
+- Exchange commission is retained per trade in its original signed value and asset.
+  Positive fee cost is aggregated by asset; BNB or any non-quote fee is never silently
+  relabelled as USDT or included in quote-currency profit without explicit valuation.
 
 ## Position ownership
 

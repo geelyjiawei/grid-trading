@@ -8,14 +8,19 @@ use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
-        InstrumentRulesGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderLookup, OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement,
-        PlacementError, PositionSnapshot, PositionSnapshotGateway, SnapshotError,
+        ExecutionSnapshotError, ExecutionSnapshotGateway, InstrumentRulesGateway, LookupError,
+        MarketSnapshotGateway, OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup,
+        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
+        PositionSnapshot, PositionSnapshotGateway, SnapshotError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
             parse_instrument_rules, parse_market_snapshot, parse_placement_acknowledgement,
             parse_position_snapshot, validate_snapshot_request,
+        },
+        execution::{
+            CommissionConvention, assemble_execution_snapshot, parse_order_execution_header,
+            parse_trade_page,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -30,6 +35,10 @@ const ASTER_CHAIN_ID: u64 = 1666;
 const EIP712_DOMAIN_TYPE: &str =
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 const ASTER_MESSAGE_TYPE: &str = "Message(string msg)";
+const TRADE_PAGE_LIMIT: usize = 1_000;
+const MAX_TRADE_HISTORY_QUERIES: usize = 64;
+const TRADE_PROBE_PADDING_MS: u64 = 5 * 60 * 1_000;
+const TRADE_WINDOW_LIMIT_MS: u64 = (7 * 24 * 60 * 60 * 1_000) - 1;
 
 pub trait AsterMessageSigner: Send + Sync {
     fn signer_address(&self) -> &str;
@@ -519,6 +528,173 @@ where
     }
 }
 
+#[async_trait]
+impl<T, S, N> ExecutionSnapshotGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    async fn execution_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)
+            .map_err(|error| execution_error(error.to_string()))?;
+        if exchange_order_id.trim().is_empty() {
+            return Err(execution_error("exchange order ID is required"));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let detail_request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v3/order",
+                vec![
+                    ("symbol".into(), symbol.clone()),
+                    ("origClientOrderId".into(), client_order_id.as_str().into()),
+                ],
+            )
+            .map_err(|error| execution_error(error.to_string()))?;
+        let detail_body = self
+            .execute_snapshot(detail_request, "Aster execution order snapshot")
+            .await
+            .map_err(|error| execution_error(error.to_string()))?;
+        let header = parse_order_execution_header(
+            &detail_body,
+            Exchange::Aster,
+            &symbol,
+            client_order_id,
+            exchange_order_id,
+        )
+        .map_err(|error| execution_error(format!("invalid Aster order totals: {error}")))?;
+        if header.cumulative_quantity.is_zero() {
+            return assemble_execution_snapshot(header, vec![])
+                .map_err(|error| execution_error(error.to_string()));
+        }
+
+        let final_end = header
+            .update_time_ms
+            .checked_add(TRADE_PROBE_PADDING_MS)
+            .ok_or_else(|| execution_error("Aster execution time range overflowed"))?;
+        let mut window_start = header.order_time_ms.saturating_sub(TRADE_PROBE_PADDING_MS);
+        let mut query_count = 0usize;
+        let mut trades = Vec::new();
+        while window_start <= final_end {
+            let window_end = window_start
+                .saturating_add(TRADE_WINDOW_LIMIT_MS)
+                .min(final_end);
+            query_count = query_count
+                .checked_add(1)
+                .ok_or_else(|| execution_error("Aster trade query count overflowed"))?;
+            if query_count > MAX_TRADE_HISTORY_QUERIES {
+                return Err(execution_error(
+                    "Aster trade history requires too many bounded queries",
+                ));
+            }
+            let request = self
+                .signed_request(
+                    HttpMethod::Get,
+                    "/fapi/v3/userTrades",
+                    vec![
+                        ("symbol".into(), symbol.clone()),
+                        ("startTime".into(), window_start.to_string()),
+                        ("endTime".into(), window_end.to_string()),
+                        ("limit".into(), TRADE_PAGE_LIMIT.to_string()),
+                    ],
+                )
+                .map_err(|error| execution_error(error.to_string()))?;
+            let body = self
+                .execute_snapshot(request, "Aster account trade snapshot")
+                .await
+                .map_err(|error| execution_error(error.to_string()))?;
+            let mut page = parse_trade_page(
+                &body,
+                &symbol,
+                CommissionConvention::SignedBalanceDeltaOrPositiveCost,
+            )
+            .map_err(|error| execution_error(format!("invalid Aster trade page: {error}")))?;
+
+            loop {
+                if page.len() > TRADE_PAGE_LIMIT {
+                    return Err(execution_error(
+                        "Aster trade page exceeds the requested limit",
+                    ));
+                }
+                if page.len() == TRADE_PAGE_LIMIT
+                    && page.windows(2).any(|pair| {
+                        pair[0].trade_id >= pair[1].trade_id
+                            || pair[0].trade_time_ms > pair[1].trade_time_ms
+                    })
+                {
+                    return Err(execution_error(
+                        "Aster full trade page is not strictly ordered",
+                    ));
+                }
+                let reached_window_end = page.iter().any(|trade| trade.trade_time_ms > window_end);
+                trades.extend(
+                    page.iter()
+                        .filter(|trade| {
+                            trade.trade_time_ms >= window_start
+                                && trade.trade_time_ms <= window_end
+                                && trade.exchange_order_id == exchange_order_id
+                        })
+                        .cloned(),
+                );
+                if page.len() < TRADE_PAGE_LIMIT || reached_window_end {
+                    break;
+                }
+                let next_from_id = page
+                    .last()
+                    .and_then(|trade| trade.trade_id.checked_add(1))
+                    .ok_or_else(|| execution_error("Aster trade pagination cannot advance"))?;
+                query_count = query_count
+                    .checked_add(1)
+                    .ok_or_else(|| execution_error("Aster trade query count overflowed"))?;
+                if query_count > MAX_TRADE_HISTORY_QUERIES {
+                    return Err(execution_error(
+                        "Aster trade history requires too many bounded queries",
+                    ));
+                }
+                let request = self
+                    .signed_request(
+                        HttpMethod::Get,
+                        "/fapi/v3/userTrades",
+                        vec![
+                            ("symbol".into(), symbol.clone()),
+                            ("fromId".into(), next_from_id.to_string()),
+                            ("limit".into(), TRADE_PAGE_LIMIT.to_string()),
+                        ],
+                    )
+                    .map_err(|error| execution_error(error.to_string()))?;
+                let body = self
+                    .execute_snapshot(request, "Aster paginated account trade snapshot")
+                    .await
+                    .map_err(|error| execution_error(error.to_string()))?;
+                page = parse_trade_page(
+                    &body,
+                    &symbol,
+                    CommissionConvention::SignedBalanceDeltaOrPositiveCost,
+                )
+                .map_err(|error| {
+                    execution_error(format!("invalid Aster paginated trade page: {error}"))
+                })?;
+                if page.iter().any(|trade| trade.trade_id < next_from_id) {
+                    return Err(execution_error("Aster trade pagination moved backwards"));
+                }
+            }
+            if window_end == u64::MAX {
+                break;
+            }
+            window_start = window_end + 1;
+        }
+        assemble_execution_snapshot(header, trades)
+            .map_err(|error| execution_error(format!("incomplete Aster execution: {error}")))
+    }
+}
+
 fn aster_eip712_digest(message: &str) -> [u8; 32] {
     let mut domain_words = Vec::with_capacity(32 * 5);
     domain_words.extend_from_slice(&keccak256(EIP712_DOMAIN_TYPE.as_bytes()));
@@ -593,6 +769,10 @@ fn invalid_cancellation(message: &str) -> CancellationError {
     CancellationError::Invalid {
         message: message.into(),
     }
+}
+
+fn execution_error(message: impl Into<String>) -> ExecutionSnapshotError {
+    ExecutionSnapshotError::new(message)
 }
 
 #[cfg(test)]
@@ -714,6 +894,24 @@ mod tests {
             FixedNonce(1_700_000_000_123_456),
             "0x1111111111111111111111111111111111111111",
             "https://example.test",
+        )
+    }
+
+    fn execution_order_detail(
+        executed: &str,
+        quote: &str,
+        status: &str,
+        order_time: u64,
+        update_time: u64,
+    ) -> String {
+        format!(
+            r#"{{"symbol":"ANSEMUSDT","orderId":4770039,"clientOrderId":"g_0_B_fixed","side":"BUY","price":"0.38","origQty":"100","executedQty":"{executed}","cumQuote":"{quote}","status":"{status}","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT","time":{order_time},"updateTime":{update_time}}}"#
+        )
+    }
+
+    fn aster_trade(trade_id: u64, quantity: &str, quote: &str, time: u64) -> String {
+        format!(
+            r#"{{"symbol":"ANSEMUSDT","id":{trade_id},"orderId":4770039,"side":"BUY","buyer":true,"price":"0.38","qty":"{quantity}","quoteQty":"{quote}","commission":"-0.001","commissionAsset":"USDT","realizedPnl":"0","maker":true,"time":{time}}}"#
         )
     }
 
@@ -974,5 +1172,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, OrderLookup::NotFound);
+    }
+
+    #[tokio::test]
+    async fn aster_execution_snapshot_uses_order_bounded_trade_windows() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("100", "38", "FILLED", 1_000_000, 1_100_000),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", aster_trade(7, "100", "38", 1_050_000)),
+            }),
+        ]);
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let snapshot = adapter(transport.clone(), signer)
+            .execution_snapshot(
+                Exchange::Aster,
+                "ANSEMUSDT",
+                &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                "4770039",
+            )
+            .await
+            .unwrap();
+        let requests = transport.all_requests();
+
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(100, 0));
+        assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::new(1, 3));
+        assert_eq!(snapshot.trades[0].raw_commission, Decimal::new(-1, 3));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/fapi/v3/order");
+        assert_eq!(requests[1].path, "/fapi/v3/userTrades");
+        assert!(requests[1].query_string().contains("startTime=700000"));
+        assert!(requests[1].query_string().contains("endTime=1400000"));
+    }
+
+    #[tokio::test]
+    async fn long_lived_aster_order_is_reconciled_across_seven_day_windows() {
+        let order_time = 1_000_000;
+        let update_time = order_time + TRADE_WINDOW_LIMIT_MS + 1_000;
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("100", "38", "FILLED", order_time, update_time),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", aster_trade(7, "40", "15.2", order_time)),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", aster_trade(8, "60", "22.8", update_time)),
+            }),
+        ]);
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let snapshot = adapter(transport.clone(), signer)
+            .execution_snapshot(
+                Exchange::Aster,
+                "ANSEMUSDT",
+                &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                "4770039",
+            )
+            .await
+            .unwrap();
+        let trade_requests = transport
+            .all_requests()
+            .into_iter()
+            .filter(|request| request.path == "/fapi/v3/userTrades")
+            .collect::<Vec<_>>();
+
+        assert_eq!(snapshot.trades.len(), 2);
+        assert_eq!(snapshot.cumulative_quote, Decimal::new(38, 0));
+        assert_eq!(trade_requests.len(), 2);
+        assert!(
+            trade_requests
+                .iter()
+                .all(|request| !request.query_string().contains("fromId="))
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_aster_trade_history_never_becomes_an_execution() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("100", "38", "FILLED", 1_000_000, 1_100_000),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", aster_trade(7, "70", "26.6", 1_050_000)),
+            }),
+        ]);
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+        assert!(
+            adapter(transport, signer)
+                .execution_snapshot(
+                    Exchange::Aster,
+                    "ANSEMUSDT",
+                    &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                    "4770039",
+                )
+                .await
+                .is_err()
+        );
     }
 }
