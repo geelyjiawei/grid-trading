@@ -1,7 +1,9 @@
+mod cancellation;
 mod grid_config;
 mod instrument;
 mod order;
 
+pub use cancellation::{CancellationIntent, CancellationIntentError, CancellationState};
 pub use grid_config::{
     Direction, Exchange, GridConfig, GridConfigError, GridMode, InitialOrderType,
     PositionSizingMode,

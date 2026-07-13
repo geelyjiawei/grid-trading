@@ -51,6 +51,12 @@ the OpenAPI schema.
 - A cancellation acknowledgement must match both immutable client and exchange order
   IDs. It confirms only that cancellation was accepted; terminal state still requires
   authoritative cumulative execution accounting.
+- Cancellation has its own write-ahead record in the same atomic intent ledger. A retry
+  is allowed only for the identical exchange/client/order target after an exact lookup
+  still shows that order active; an acknowledged cancellation is never sent twice.
+- Acknowledged cancellations that remain active do not consume the bounded dispatch
+  slots needed by later orders. Every active order eventually receives its own durable
+  cancellation attempt without queue starvation.
 - An execution snapshot is accepted only when one exact order lookup and the complete
   bounded account-trade pagination agree on exchange order ID, client order ID, symbol,
   side, cumulative quantity, and cumulative quote.
@@ -102,6 +108,10 @@ the OpenAPI schema.
   action requires it.
 - Every authoritative position check must exactly equal baseline plus grid-owned position;
   mismatch fails closed and never rewrites either ledger component.
+- A position mismatch observed between execution and position reads blocks all placement
+  for that tick but does not immediately corrupt or permanently fail the strategy. The
+  next tick replays authoritative executions first; normal fill/read races can converge,
+  while a persistent unexplained delta remains blocked for operator review.
 
 ## Grid behavior
 

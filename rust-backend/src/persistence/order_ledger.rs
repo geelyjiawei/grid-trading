@@ -9,13 +9,17 @@ use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{ClientOrderId, IntentState, OrderIntent};
+use crate::domain::{
+    CancellationIntent, CancellationState, ClientOrderId, IntentState, OrderIntent,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LedgerSnapshot {
     pub version: u8,
     pub revision: u64,
     pub intents: BTreeMap<ClientOrderId, OrderIntent>,
+    #[serde(default)]
+    pub cancellations: BTreeMap<ClientOrderId, CancellationIntent>,
 }
 
 impl Default for LedgerSnapshot {
@@ -24,6 +28,7 @@ impl Default for LedgerSnapshot {
             version: 1,
             revision: 0,
             intents: BTreeMap::new(),
+            cancellations: BTreeMap::new(),
         }
     }
 }
@@ -35,6 +40,16 @@ pub trait IntentStore {
         &mut self,
         client_order_id: &ClientOrderId,
         next_state: IntentState,
+        now_ms: u64,
+    ) -> Result<(), LedgerError>;
+    fn insert_cancellation_prepared(
+        &mut self,
+        intent: CancellationIntent,
+    ) -> Result<(), LedgerError>;
+    fn transition_cancellation(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        next_state: CancellationState,
         now_ms: u64,
     ) -> Result<(), LedgerError>;
 }
@@ -116,6 +131,44 @@ impl IntentStore for FileOrderIntentStore {
             .get_mut(client_order_id)
             .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
         validate_transition(&intent.state, &next_state)?;
+        if now_ms < intent.updated_at_ms {
+            return Err(LedgerError::TimestampRegression);
+        }
+        intent.state = next_state;
+        intent.updated_at_ms = now_ms;
+        self.replace(next)
+    }
+
+    fn insert_cancellation_prepared(
+        &mut self,
+        intent: CancellationIntent,
+    ) -> Result<(), LedgerError> {
+        if intent.state != CancellationState::Prepared {
+            return Err(LedgerError::NewCancellationNotPrepared);
+        }
+        let mut next = self.snapshot.clone();
+        if next.cancellations.contains_key(&intent.client_order_id) {
+            return Err(LedgerError::DuplicateCancellation(
+                intent.client_order_id.as_str().to_owned(),
+            ));
+        }
+        next.cancellations
+            .insert(intent.client_order_id.clone(), intent);
+        self.replace(next)
+    }
+
+    fn transition_cancellation(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        next_state: CancellationState,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        let mut next = self.snapshot.clone();
+        let intent = next
+            .cancellations
+            .get_mut(client_order_id)
+            .ok_or_else(|| LedgerError::MissingCancellation(client_order_id.as_str().to_owned()))?;
+        validate_cancellation_transition(&intent.state, &next_state)?;
         if now_ms < intent.updated_at_ms {
             return Err(LedgerError::TimestampRegression);
         }
@@ -206,6 +259,61 @@ impl IntentStore for MemoryOrderIntentStore {
         self.snapshot.revision = next_revision;
         Ok(())
     }
+
+    fn insert_cancellation_prepared(
+        &mut self,
+        intent: CancellationIntent,
+    ) -> Result<(), LedgerError> {
+        self.before_write()?;
+        if intent.state != CancellationState::Prepared {
+            return Err(LedgerError::NewCancellationNotPrepared);
+        }
+        if self
+            .snapshot
+            .cancellations
+            .contains_key(&intent.client_order_id)
+        {
+            return Err(LedgerError::DuplicateCancellation(
+                intent.client_order_id.as_str().to_owned(),
+            ));
+        }
+        self.snapshot.revision = self
+            .snapshot
+            .revision
+            .checked_add(1)
+            .ok_or(LedgerError::RevisionOverflow)?;
+        self.snapshot
+            .cancellations
+            .insert(intent.client_order_id.clone(), intent);
+        Ok(())
+    }
+
+    fn transition_cancellation(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        next_state: CancellationState,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        self.before_write()?;
+        let next_revision = self
+            .snapshot
+            .revision
+            .checked_add(1)
+            .ok_or(LedgerError::RevisionOverflow)?;
+        let intent = self
+            .snapshot
+            .cancellations
+            .get_mut(client_order_id)
+            .ok_or_else(|| LedgerError::MissingCancellation(client_order_id.as_str().to_owned()))?;
+        validate_cancellation_transition(&intent.state, &next_state)?;
+        if now_ms < intent.updated_at_ms {
+            return Err(LedgerError::TimestampRegression);
+        }
+        intent.state = next_state;
+        intent.updated_at_ms = now_ms;
+        self.snapshot.revision = next_revision;
+        Ok(())
+    }
 }
 
 fn validate_snapshot(snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
@@ -217,6 +325,26 @@ fn validate_snapshot(snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
             return Err(LedgerError::IdentityMismatch);
         }
         intent.validate().map_err(LedgerError::InvalidIntent)?;
+    }
+    for (key, intent) in &snapshot.cancellations {
+        if key != &intent.client_order_id {
+            return Err(LedgerError::IdentityMismatch);
+        }
+        intent
+            .validate()
+            .map_err(LedgerError::InvalidCancellation)?;
+        let order = snapshot
+            .intents
+            .get(key)
+            .ok_or(LedgerError::CancellationWithoutOrder)?;
+        if order.exchange != intent.exchange || order.shape.symbol != intent.symbol {
+            return Err(LedgerError::CancellationTargetMismatch);
+        }
+        if let IntentState::Accepted { exchange_order_id } = &order.state
+            && exchange_order_id != &intent.exchange_order_id
+        {
+            return Err(LedgerError::CancellationTargetMismatch);
+        }
     }
     Ok(())
 }
@@ -247,6 +375,36 @@ fn validate_transition(current: &IntentState, next: &IntentState) -> Result<(), 
     }
 }
 
+fn validate_cancellation_transition(
+    current: &CancellationState,
+    next: &CancellationState,
+) -> Result<(), LedgerError> {
+    let allowed = matches!(
+        (current, next),
+        (
+            CancellationState::Prepared,
+            CancellationState::SubmitUnknown { .. }
+                | CancellationState::Acknowledged
+                | CancellationState::Rejected { .. }
+                | CancellationState::Resolved { .. }
+        ) | (
+            CancellationState::SubmitUnknown { .. },
+            CancellationState::SubmitUnknown { .. }
+                | CancellationState::Acknowledged
+                | CancellationState::Rejected { .. }
+                | CancellationState::Resolved { .. }
+        ) | (
+            CancellationState::Acknowledged,
+            CancellationState::Resolved { .. }
+        )
+    );
+    if allowed {
+        next.validate().map_err(LedgerError::InvalidCancellation)
+    } else {
+        Err(LedgerError::InvalidCancellationTransition)
+    }
+}
+
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), LedgerError> {
     if let Some(parent) = path.parent() {
@@ -274,6 +432,12 @@ pub enum LedgerError {
     IdentityMismatch,
     #[error("ledger contains an invalid order intent: {0}")]
     InvalidIntent(crate::domain::OrderIntentError),
+    #[error("ledger contains an invalid cancellation intent: {0}")]
+    InvalidCancellation(crate::domain::CancellationIntentError),
+    #[error("cancellation intent has no matching order intent")]
+    CancellationWithoutOrder,
+    #[error("cancellation target differs from its matching order intent")]
+    CancellationTargetMismatch,
     #[error("failed to create ledger directory: {0}")]
     CreateDirectory(std::io::Error),
     #[error("failed to open atomic ledger writer: {0}")]
@@ -290,12 +454,20 @@ pub enum LedgerError {
     RevisionOverflow,
     #[error("new order intent must be prepared")]
     NewIntentNotPrepared,
+    #[error("new cancellation intent must be prepared")]
+    NewCancellationNotPrepared,
     #[error("duplicate client order ID {0}")]
     DuplicateClientOrderId(String),
+    #[error("duplicate cancellation intent for client order ID {0}")]
+    DuplicateCancellation(String),
     #[error("missing order intent {0}")]
     MissingIntent(String),
+    #[error("missing cancellation intent for client order ID {0}")]
+    MissingCancellation(String),
     #[error("invalid order intent state transition")]
     InvalidTransition,
+    #[error("invalid cancellation intent state transition")]
+    InvalidCancellationTransition,
     #[error("order intent timestamp moved backwards")]
     TimestampRegression,
     #[error("injected ledger write failure")]
@@ -371,5 +543,93 @@ mod tests {
             Err(LedgerError::InvalidJson(_))
         ));
         assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn cancellation_intent_round_trips_in_the_same_atomic_ledger() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("order-ledger.json");
+        let mut store = FileOrderIntentStore::load(&path).unwrap();
+        let order = intent("g_1_S_cancel_roundtrip");
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::Accepted {
+                    exchange_order_id: "exchange-1".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let cancellation = CancellationIntent::prepare(
+            order.client_order_id.clone(),
+            "exchange-1",
+            order.exchange,
+            order.shape.symbol,
+            102,
+        )
+        .unwrap();
+        store
+            .insert_cancellation_prepared(cancellation.clone())
+            .unwrap();
+        store
+            .transition_cancellation(&order.client_order_id, CancellationState::Acknowledged, 103)
+            .unwrap();
+
+        let restored = FileOrderIntentStore::load(&path).unwrap();
+        let restored_cancellation = restored
+            .snapshot()
+            .cancellations
+            .get(&order.client_order_id)
+            .unwrap();
+        assert!(restored_cancellation.has_same_target(&cancellation));
+        assert_eq!(restored_cancellation.state, CancellationState::Acknowledged);
+    }
+
+    #[test]
+    fn legacy_ledger_without_cancellations_field_loads_as_empty() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-order-ledger.json");
+        let mut value = serde_json::to_value(LedgerSnapshot::default()).unwrap();
+        value.as_object_mut().unwrap().remove("cancellations");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let restored = FileOrderIntentStore::load(&path).unwrap();
+
+        assert!(restored.snapshot().cancellations.is_empty());
+        assert!(restored.snapshot().intents.is_empty());
+    }
+
+    #[test]
+    fn cancellation_exchange_order_id_mismatch_never_changes_the_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("mismatched-cancellation.json");
+        let mut store = FileOrderIntentStore::load(&path).unwrap();
+        let order = intent("g_1_S_cancel_mismatch");
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::Accepted {
+                    exchange_order_id: "exchange-1".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let cancellation = CancellationIntent::prepare(
+            order.client_order_id,
+            "exchange-2",
+            order.exchange,
+            order.shape.symbol,
+            102,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.insert_cancellation_prepared(cancellation),
+            Err(LedgerError::CancellationTargetMismatch)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }

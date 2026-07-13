@@ -2,16 +2,19 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    domain::ClientOrderId,
+    domain::{CancellationIntent, CancellationState, ClientOrderId, IntentState},
     engine::{
-        ExecutionAccountingError, ExecutionSyncService, ReconciliationError, ReconciliationResult,
-        StrategyMachine, StrategyMachineError, StrategyOrderTracking, StrategyStateError,
-        StrategyStateStore, StrategyTransition, SubmissionError, SubmissionResult,
-        load_strategy_inputs, reconcile_with, submit_with,
+        CancellationResult, CancellationServiceError, ExecutionAccountingError,
+        ExecutionSyncService, ReconciliationError, ReconciliationResult, StrategyLifecycle,
+        StrategyMachine, StrategyMachineError, StrategyOrderPurpose, StrategyOrderTracking,
+        StrategyStateError, StrategyStateStore, StrategyTransition, SubmissionError,
+        SubmissionResult, cancel_with, load_strategy_inputs, reconcile_with,
+        resolve_cancellation_with, submit_with,
     },
     exchange::{
         ExecutionSnapshotGateway, HistoricalPriceGateway, InstrumentRulesGateway,
-        MarketSnapshotGateway, OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway,
+        MarketSnapshotGateway, OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway,
+        PositionSnapshotGateway,
     },
     persistence::IntentStore,
 };
@@ -29,6 +32,9 @@ pub enum RuntimeStage {
     StrategyFailed,
     SubmissionUnknown,
     SubmissionRejected,
+    CancellationPending,
+    CancellationUnknown,
+    CancellationRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,10 +51,17 @@ pub struct RuntimeSubmission {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCancellation {
+    pub client_order_id: ClientOrderId,
+    pub result: CancellationResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTickReport {
     pub ledger_reconciliations: usize,
     pub execution_syncs: usize,
     pub submissions: Vec<RuntimeSubmission>,
+    pub cancellations: Vec<RuntimeCancellation>,
     pub blockers: Vec<RuntimeBlocker>,
 }
 
@@ -58,6 +71,7 @@ impl RuntimeTickReport {
             ledger_reconciliations: 0,
             execution_syncs: 0,
             submissions: Vec::new(),
+            cancellations: Vec::new(),
             blockers: Vec::new(),
         }
     }
@@ -87,6 +101,8 @@ pub enum RuntimeTickError {
     Strategy(#[from] StrategyMachineError),
     #[error(transparent)]
     Submission(#[from] SubmissionError),
+    #[error(transparent)]
+    Cancellation(#[from] CancellationServiceError),
     #[error(transparent)]
     State(#[from] StrategyStateError),
 }
@@ -177,6 +193,35 @@ where
                 return Err(RuntimeTickError::IntentLedgerMismatch);
             }
         }
+        for (client_order_id, cancellation) in &self.intent_store.snapshot().cancellations {
+            let Some(order) = strategy.orders.get(client_order_id) else {
+                return Err(RuntimeTickError::IntentLedgerMismatch);
+            };
+            let Some(intent) = self.intent_store.snapshot().intents.get(client_order_id) else {
+                return Err(RuntimeTickError::IntentLedgerMismatch);
+            };
+            if cancellation.client_order_id != *client_order_id
+                || cancellation.exchange != strategy.exchange
+                || cancellation.symbol != strategy.symbol
+                || cancellation.symbol != order.shape.symbol
+                || order.exchange_order_id.as_deref()
+                    != Some(cancellation.exchange_order_id.as_str())
+                || intent.exchange != cancellation.exchange
+                || intent.shape.symbol != cancellation.symbol
+                || matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Dormant | StrategyOrderTracking::Ready
+                )
+            {
+                return Err(RuntimeTickError::IntentLedgerMismatch);
+            }
+            if let CancellationState::Resolved { status } = cancellation.state
+                && (!matches!(intent.state, IntentState::Terminal { status: order_status } if order_status == status)
+                    || !matches!(order.tracking, StrategyOrderTracking::Intent { state: IntentState::Terminal { status: order_status } } if order_status == status))
+            {
+                return Err(RuntimeTickError::IntentLedgerMismatch);
+            }
+        }
         Ok(())
     }
 }
@@ -184,6 +229,7 @@ where
 impl<G, I, S> StrategyRuntime<G, I, S>
 where
     G: OrderPlacementGateway
+        + OrderCancellationGateway
         + OrderLookupGateway
         + ExecutionSnapshotGateway
         + HistoricalPriceGateway
@@ -237,6 +283,33 @@ where
                 });
             }
         }
+        let terminal_cancellations = self
+            .intent_store
+            .snapshot()
+            .cancellations
+            .values()
+            .filter_map(|cancellation| {
+                if matches!(
+                    cancellation.state,
+                    CancellationState::Resolved { .. } | CancellationState::Rejected { .. }
+                ) {
+                    return None;
+                }
+                self.intent_store
+                    .snapshot()
+                    .intents
+                    .get(&cancellation.client_order_id)
+                    .and_then(|intent| match intent.state {
+                        IntentState::Terminal { status } => {
+                            Some((cancellation.client_order_id.clone(), status))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (client_order_id, status) in terminal_cancellations {
+            resolve_cancellation_with(&mut self.intent_store, &client_order_id, status, now_ms)?;
+        }
         self.validate_ledger_ownership()?;
 
         let execution_ids = self
@@ -279,7 +352,7 @@ where
             let state = self.machine.store().snapshot();
             (state.exchange, state.symbol.clone(), state.lifecycle)
         };
-        if lifecycle == crate::engine::StrategyLifecycle::Failed {
+        if lifecycle == StrategyLifecycle::Failed {
             report.blockers.push(RuntimeBlocker {
                 stage: RuntimeStage::StrategyFailed,
                 client_order_id: None,
@@ -287,21 +360,11 @@ where
             });
             return Ok(report);
         }
-        if lifecycle == crate::engine::StrategyLifecycle::StopRequested {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::Stop,
-                client_order_id: None,
-                message: "stop cancellation workflow is not yet complete".into(),
-            });
-            return Ok(report);
-        }
-        if lifecycle == crate::engine::StrategyLifecycle::RiskExitRequested {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::RiskExit,
-                client_order_id: None,
-                message: "risk-exit cancellation workflow is not yet complete".into(),
-            });
-            return Ok(report);
+        if matches!(
+            lifecycle,
+            StrategyLifecycle::StopRequested | StrategyLifecycle::RiskExitRequested
+        ) {
+            return self.drive_exit(report, lifecycle, now_ms).await;
         }
 
         let inputs = match load_strategy_inputs(
@@ -335,14 +398,19 @@ where
             });
             return Ok(report);
         }
-        let position_transition = self
+        let expected_position = self
             .machine
-            .reconcile_position(inputs.baseline.signed_quantity, now_ms)?;
-        if matches!(position_transition, StrategyTransition::Failed { .. }) {
+            .store()
+            .snapshot()
+            .expected_exchange_position()?;
+        if inputs.baseline.signed_quantity != expected_position {
             report.blockers.push(RuntimeBlocker {
                 stage: RuntimeStage::PositionReconciliation,
                 client_order_id: None,
-                message: "exchange position differs from the owned strategy ledger".into(),
+                message: format!(
+                    "position snapshot is not yet consistent with execution accounting: expected {expected_position}, actual {}",
+                    inputs.baseline.signed_quantity
+                ),
             });
             return Ok(report);
         }
@@ -353,16 +421,22 @@ where
             risk_transition,
             StrategyTransition::RiskExitRequested { .. }
         ) {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::RiskExit,
-                client_order_id: None,
-                message: "configured risk price triggered; cancellation is required".into(),
-            });
-            return Ok(report);
+            return self
+                .drive_exit(report, StrategyLifecycle::RiskExitRequested, now_ms)
+                .await;
         }
         self.machine
             .materialize_replacements(&inputs.instrument_rules, now_ms)?;
+        self.submit_ready_orders(&mut report, now_ms).await?;
+        self.validate_ledger_ownership()?;
+        Ok(report)
+    }
 
+    async fn submit_ready_orders(
+        &mut self,
+        report: &mut RuntimeTickReport,
+        now_ms: u64,
+    ) -> Result<(), RuntimeTickError> {
         let ready = self.machine.store().snapshot().ready_intents(now_ms)?;
         for intent in ready.into_iter().take(self.maximum_submissions_per_tick) {
             let client_order_id = intent.client_order_id.clone();
@@ -407,6 +481,216 @@ where
                 break;
             }
         }
+        Ok(())
+    }
+
+    async fn drive_exit(
+        &mut self,
+        mut report: RuntimeTickReport,
+        lifecycle: StrategyLifecycle,
+        now_ms: u64,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        let (exchange, symbol, cancellation_targets) = {
+            let state = self.machine.store().snapshot();
+            let targets = state
+                .orders
+                .values()
+                .filter(|order| {
+                    !matches!(order.purpose, StrategyOrderPurpose::RiskClose)
+                        && matches!(
+                            order.tracking,
+                            StrategyOrderTracking::Intent {
+                                state: IntentState::Accepted { .. }
+                            }
+                        )
+                })
+                .map(|order| {
+                    let exchange_order_id = order
+                        .exchange_order_id
+                        .clone()
+                        .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+                    CancellationIntent::prepare(
+                        order.client_order_id.clone(),
+                        exchange_order_id,
+                        state.exchange,
+                        state.symbol.clone(),
+                        now_ms,
+                    )
+                    .map_err(CancellationServiceError::from)
+                    .map_err(RuntimeTickError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (state.exchange, state.symbol.clone(), targets)
+        };
+
+        let mut dispatch_targets = Vec::new();
+        for target in &cancellation_targets {
+            match self
+                .intent_store
+                .snapshot()
+                .cancellations
+                .get(&target.client_order_id)
+                .map(|cancellation| cancellation.state.clone())
+            {
+                Some(CancellationState::Acknowledged) => {
+                    report.cancellations.push(RuntimeCancellation {
+                        client_order_id: target.client_order_id.clone(),
+                        result: CancellationResult::AlreadyAcknowledged,
+                    });
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::CancellationPending,
+                        client_order_id: Some(target.client_order_id.clone()),
+                        message: "cancellation was acknowledged; authoritative terminal status is pending"
+                            .into(),
+                    });
+                }
+                Some(CancellationState::Rejected { .. }) => {
+                    report.cancellations.push(RuntimeCancellation {
+                        client_order_id: target.client_order_id.clone(),
+                        result: CancellationResult::Rejected,
+                    });
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::CancellationRejected,
+                        client_order_id: Some(target.client_order_id.clone()),
+                        message:
+                            "cancellation request was rejected before authoritative terminal status"
+                                .into(),
+                    });
+                }
+                Some(CancellationState::Resolved { .. }) => {
+                    return Err(RuntimeTickError::IntentLedgerMismatch);
+                }
+                Some(CancellationState::Prepared)
+                | Some(CancellationState::SubmitUnknown { .. })
+                | None => dispatch_targets.push(target.clone()),
+            }
+        }
+
+        for target in dispatch_targets
+            .iter()
+            .take(self.maximum_submissions_per_tick)
+            .cloned()
+        {
+            let client_order_id = target.client_order_id.clone();
+            let result = cancel_with(&self.gateway, &mut self.intent_store, target, now_ms).await?;
+            report.cancellations.push(RuntimeCancellation {
+                client_order_id: client_order_id.clone(),
+                result: result.clone(),
+            });
+            let (stage, message) = match result {
+                CancellationResult::Acknowledged | CancellationResult::AlreadyAcknowledged => (
+                    RuntimeStage::CancellationPending,
+                    "cancellation was acknowledged; authoritative terminal status is pending",
+                ),
+                CancellationResult::SubmitUnknown => (
+                    RuntimeStage::CancellationUnknown,
+                    "cancellation outcome is unknown; the exact order will be reconciled before retry",
+                ),
+                CancellationResult::Rejected => (
+                    RuntimeStage::CancellationRejected,
+                    "cancellation request was rejected before authoritative terminal status",
+                ),
+                CancellationResult::AlreadyResolved { .. } => (
+                    RuntimeStage::StrategyFailed,
+                    "resolved cancellation still points to an active strategy order",
+                ),
+            };
+            report.blockers.push(RuntimeBlocker {
+                stage,
+                client_order_id: Some(client_order_id),
+                message: message.into(),
+            });
+        }
+        if dispatch_targets.len() > self.maximum_submissions_per_tick {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::CancellationPending,
+                client_order_id: None,
+                message: "additional active orders remain queued for cancellation".into(),
+            });
+        }
+        if !cancellation_targets.is_empty() {
+            self.validate_ledger_ownership()?;
+            return Ok(report);
+        }
+
+        let inputs = match load_strategy_inputs(
+            &self.gateway,
+            exchange,
+            &symbol,
+            now_ms,
+            self.maximum_market_age_ms,
+            self.maximum_future_skew_ms,
+        )
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::ExchangeInputs,
+                    client_order_id: None,
+                    message: error.to_string(),
+                });
+                return Ok(report);
+            }
+        };
+        let rules_transition = self
+            .machine
+            .reconcile_instrument_rules(&inputs.instrument_rules, now_ms)?;
+        if matches!(rules_transition, StrategyTransition::Failed { .. }) {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::InstrumentRules,
+                client_order_id: None,
+                message: "exchange instrument rules changed during strategy exit".into(),
+            });
+            return Ok(report);
+        }
+        let expected_position = self
+            .machine
+            .store()
+            .snapshot()
+            .expected_exchange_position()?;
+        if inputs.baseline.signed_quantity != expected_position {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::PositionReconciliation,
+                client_order_id: None,
+                message: format!(
+                    "exit position snapshot is not yet consistent with execution accounting: expected {expected_position}, actual {}",
+                    inputs.baseline.signed_quantity
+                ),
+            });
+            return Ok(report);
+        }
+
+        match lifecycle {
+            StrategyLifecycle::StopRequested => {
+                self.machine.mark_stopped(now_ms)?;
+            }
+            StrategyLifecycle::RiskExitRequested => {
+                let transition = self.machine.prepare_risk_close(
+                    inputs.baseline.signed_quantity,
+                    &inputs.instrument_rules,
+                    now_ms,
+                )?;
+                if matches!(transition, StrategyTransition::Failed { .. }) {
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::StrategyFailed,
+                        client_order_id: None,
+                        message: "risk-close preparation failed".into(),
+                    });
+                    return Ok(report);
+                }
+                self.submit_ready_orders(&mut report, now_ms).await?;
+                if self.machine.store().snapshot().lifecycle == StrategyLifecycle::RiskExitRequested
+                {
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::RiskExit,
+                        client_order_id: None,
+                        message: "risk close remains pending authoritative execution".into(),
+                    });
+                }
+            }
+            _ => return Err(StrategyStateError::InvalidLifecycleTransition.into()),
+        }
         self.validate_ledger_ownership()?;
         Ok(report)
     }
@@ -435,10 +719,10 @@ mod tests {
             StrategyStateStore, build_grid_plan,
         },
         exchange::{
-            ActiveOrderStatus, AuthoritativeOrder, ExchangeMarketSnapshot, ExecutionSnapshotError,
-            HistoricalMinutePrice, LookupError, OrderExecutionSnapshot, OrderLifecycle,
-            OrderLookup, PlacementAcknowledgement, PlacementError, PositionLeg, PositionSide,
-            PositionSnapshot, SnapshotError, TradeFill,
+            ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
+            ExchangeMarketSnapshot, ExecutionSnapshotError, HistoricalMinutePrice, LookupError,
+            OrderExecutionSnapshot, OrderLifecycle, OrderLookup, PlacementAcknowledgement,
+            PlacementError, PositionLeg, PositionSide, PositionSnapshot, SnapshotError, TradeFill,
         },
         persistence::{IntentStore, MemoryOrderIntentStore},
     };
@@ -451,6 +735,9 @@ mod tests {
     struct MockGatewayState {
         placement_calls: Vec<OrderIntent>,
         next_placement_error: Option<PlacementError>,
+        cancellation_calls: Vec<(ClientOrderId, String)>,
+        next_cancellation_error: Option<CancellationError>,
+        cancellation_marks_terminal: bool,
         orders: BTreeMap<ClientOrderId, AuthoritativeOrder>,
         executions: BTreeMap<ClientOrderId, OrderExecutionSnapshot>,
         market: ExchangeMarketSnapshot,
@@ -465,6 +752,9 @@ mod tests {
                 state: Arc::new(Mutex::new(MockGatewayState {
                     placement_calls: Vec::new(),
                     next_placement_error: None,
+                    cancellation_calls: Vec::new(),
+                    next_cancellation_error: None,
+                    cancellation_marks_terminal: false,
                     orders: BTreeMap::new(),
                     executions: BTreeMap::new(),
                     market: ExchangeMarketSnapshot {
@@ -499,6 +789,48 @@ mod tests {
             self.state.lock().unwrap().next_placement_error = Some(error);
         }
 
+        fn cancellation_call_count(&self) -> usize {
+            self.state.lock().unwrap().cancellation_calls.len()
+        }
+
+        fn cancellation_ids(&self) -> Vec<ClientOrderId> {
+            self.state
+                .lock()
+                .unwrap()
+                .cancellation_calls
+                .iter()
+                .map(|(client_order_id, _)| client_order_id.clone())
+                .collect()
+        }
+
+        fn fail_next_cancellation(&self, error: CancellationError) {
+            self.state.lock().unwrap().next_cancellation_error = Some(error);
+        }
+
+        fn set_cancellation_marks_terminal(&self, enabled: bool) {
+            self.state.lock().unwrap().cancellation_marks_terminal = enabled;
+        }
+
+        fn mark_order_cancelled(&self, client_order_id: &ClientOrderId) {
+            let mut state = self.state.lock().unwrap();
+            let order = state
+                .orders
+                .get_mut(client_order_id)
+                .expect("order must have been placed");
+            order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled);
+            let order = order.clone();
+            let execution = state
+                .executions
+                .get_mut(client_order_id)
+                .expect("placed order must have an execution snapshot");
+            execution.order = order;
+            execution.update_time_ms = execution.update_time_ms.max(1_150);
+        }
+
+        fn hide_order_from_lookup(&self, client_order_id: &ClientOrderId) {
+            self.state.lock().unwrap().orders.remove(client_order_id);
+        }
+
         fn set_rules(&self, rules: InstrumentRules) {
             self.state.lock().unwrap().rules = rules;
         }
@@ -518,6 +850,11 @@ mod tests {
 
         fn fill_order(&self, client_order_id: &ClientOrderId, price: Decimal, fee: Decimal) {
             let mut state = self.state.lock().unwrap();
+            let previous = state
+                .executions
+                .get(client_order_id)
+                .cloned()
+                .expect("placed order must have an execution snapshot");
             let order = state
                 .orders
                 .get_mut(client_order_id)
@@ -527,6 +864,7 @@ mod tests {
             let quantity = order.shape.quantity;
             let quote_quantity = quantity * price;
             let exchange_order_id = order.exchange_order_id.clone();
+            let trade_time_ms = previous.update_time_ms + 1;
             let trade = TradeFill {
                 trade_id: 1,
                 exchange_order_id,
@@ -540,7 +878,7 @@ mod tests {
                 commission_asset: "USDT".into(),
                 realized_profit: Decimal::ZERO,
                 is_maker: true,
-                trade_time_ms: 1_150,
+                trade_time_ms,
             };
             state.executions.insert(
                 client_order_id.clone(),
@@ -550,8 +888,8 @@ mod tests {
                     cumulative_quote: quote_quantity,
                     fees_by_asset: [("USDT".into(), fee)].into_iter().collect(),
                     trades: vec![trade],
-                    order_time_ms: 1_100,
-                    update_time_ms: 1_150,
+                    order_time_ms: previous.order_time_ms,
+                    update_time_ms: trade_time_ms,
                 },
             );
         }
@@ -564,6 +902,11 @@ mod tests {
             fee: Decimal,
         ) {
             let mut state = self.state.lock().unwrap();
+            let previous = state
+                .executions
+                .get(client_order_id)
+                .cloned()
+                .expect("placed order must have an execution snapshot");
             let order = state
                 .orders
                 .get_mut(client_order_id)
@@ -572,6 +915,7 @@ mod tests {
             order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
             let order = order.clone();
             let quote_quantity = quantity * price;
+            let trade_time_ms = previous.update_time_ms + 1;
             let trade = TradeFill {
                 trade_id: 1,
                 exchange_order_id: order.exchange_order_id.clone(),
@@ -585,7 +929,7 @@ mod tests {
                 commission_asset: "USDT".into(),
                 realized_profit: Decimal::ZERO,
                 is_maker: true,
-                trade_time_ms: 1_150,
+                trade_time_ms,
             };
             state.executions.insert(
                 client_order_id.clone(),
@@ -595,8 +939,8 @@ mod tests {
                     cumulative_quote: quote_quantity,
                     fees_by_asset: [("USDT".into(), fee)].into_iter().collect(),
                     trades: vec![trade],
-                    order_time_ms: 1_100,
-                    update_time_ms: 1_150,
+                    order_time_ms: previous.order_time_ms,
+                    update_time_ms: trade_time_ms,
                 },
             );
         }
@@ -639,6 +983,50 @@ mod tests {
             Ok(PlacementAcknowledgement {
                 client_order_id: intent.client_order_id.clone(),
                 exchange_order_id,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OrderCancellationGateway for MockGateway {
+        async fn cancel_order(
+            &self,
+            _exchange: Exchange,
+            _symbol: &str,
+            client_order_id: &ClientOrderId,
+            exchange_order_id: &str,
+        ) -> Result<CancellationAcknowledgement, CancellationError> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .cancellation_calls
+                .push((client_order_id.clone(), exchange_order_id.to_owned()));
+            if let Some(error) = state.next_cancellation_error.take() {
+                return Err(error);
+            }
+            let order = state
+                .orders
+                .get(client_order_id)
+                .filter(|order| order.exchange_order_id == exchange_order_id)
+                .cloned()
+                .ok_or_else(|| CancellationError::Unknown {
+                    message: "order is not visible".into(),
+                })?;
+            if state.cancellation_marks_terminal {
+                let mut cancelled = order.clone();
+                cancelled.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled);
+                state
+                    .orders
+                    .insert(client_order_id.clone(), cancelled.clone());
+                let execution = state
+                    .executions
+                    .get_mut(client_order_id)
+                    .expect("placed order must have an execution snapshot");
+                execution.order = cancelled;
+                execution.update_time_ms = execution.update_time_ms.max(1_150);
+            }
+            Ok(CancellationAcknowledgement {
+                client_order_id: client_order_id.clone(),
+                exchange_order_id: exchange_order_id.to_owned(),
             })
         }
     }
@@ -992,7 +1380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authoritative_position_mismatch_fails_before_any_exchange_write() {
+    async fn position_mismatch_blocks_without_permanent_failure_and_recovers_when_consistent() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
         gateway.set_position(-Decimal::ONE, Some(Decimal::new(1014, 0)));
@@ -1011,8 +1399,63 @@ mod tests {
         assert_eq!(gateway.placement_call_count(), 0);
         assert_eq!(
             runtime.machine().store().snapshot().lifecycle,
-            StrategyLifecycle::Failed
+            StrategyLifecycle::AwaitingOpening
         );
+
+        gateway.set_position(Decimal::ZERO, None);
+        let recovered = runtime.tick(1_200).await.unwrap();
+        assert!(!recovered.is_blocked());
+        assert_eq!(recovered.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fill_between_execution_and_position_reads_blocks_then_reconciles_next_tick() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let partial_quantity = opening_quantity / Decimal::new(2, 0);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+
+        gateway.set_position(-partial_quantity, Some(Decimal::new(1014, 0)));
+        let raced = runtime.tick(1_200).await.unwrap();
+        assert_eq!(
+            raced.blockers[0].stage,
+            RuntimeStage::PositionReconciliation
+        );
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::AwaitingOpening
+        );
+        assert_eq!(gateway.placement_call_count(), 1);
+
+        gateway.partially_fill_order(
+            &opening_id,
+            partial_quantity,
+            Decimal::new(1014, 0),
+            Decimal::new(2, 2),
+        );
+        let reconciled = runtime.tick(1_300).await.unwrap();
+        assert!(!reconciled.is_blocked());
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            -partial_quantity
+        );
+        assert_eq!(gateway.placement_call_count(), 1);
     }
 
     #[tokio::test]
@@ -1168,7 +1611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_request_blocks_all_new_orders() {
+    async fn unsubmitted_stop_finishes_without_creating_or_cancelling_orders() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
         let mut machine = machine(config(None), &rules);
@@ -1177,12 +1620,17 @@ mod tests {
 
         let report = runtime.tick(1_100).await.unwrap();
 
-        assert_eq!(report.blockers[0].stage, RuntimeStage::Stop);
+        assert!(!report.is_blocked());
         assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(gateway.cancellation_call_count(), 0);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
     }
 
     #[tokio::test]
-    async fn configured_risk_trigger_blocks_all_new_orders() {
+    async fn flat_risk_trigger_closes_without_creating_an_order() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
         gateway.set_market_price(Decimal::new(1022, 0), 1_100);
@@ -1194,11 +1642,358 @@ mod tests {
 
         let report = runtime.tick(1_100).await.unwrap();
 
-        assert_eq!(report.blockers[0].stage, RuntimeStage::RiskExit);
+        assert!(!report.is_blocked());
         assert_eq!(gateway.placement_call_count(), 0);
         assert_eq!(
             runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_terminal_cancellation_and_complete_execution_accounting() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.set_cancellation_marks_terminal(true);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        runtime.machine_mut().request_stop(1_150).unwrap();
+
+        let cancellation = runtime.tick(1_200).await.unwrap();
+        assert_eq!(cancellation.cancellations.len(), 1);
+        assert_eq!(
+            cancellation.blockers[0].stage,
+            RuntimeStage::CancellationPending
+        );
+        assert_eq!(gateway.cancellation_call_count(), 1);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::StopRequested
+        );
+
+        let stopped = runtime.tick(1_300).await.unwrap();
+        assert!(!stopped.is_blocked(), "{stopped:?}");
+        assert_eq!(gateway.cancellation_call_count(), 1);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
+        assert_eq!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .cancellations
+                .get(&opening_id)
+                .unwrap()
+                .state,
+            CancellationState::Resolved {
+                status: TerminalOrderStatus::Cancelled
+            }
+        );
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .orders
+                .get(&opening_id)
+                .unwrap()
+                .terminal_processed
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_cancellation_is_not_repeated_while_terminal_status_is_delayed() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        runtime.machine_mut().request_stop(1_150).unwrap();
+
+        runtime.tick(1_200).await.unwrap();
+        let delayed = runtime.tick(1_300).await.unwrap();
+        assert_eq!(gateway.cancellation_call_count(), 1);
+        assert_eq!(delayed.cancellations.len(), 1);
+        assert_eq!(
+            delayed.cancellations[0].result,
+            CancellationResult::AlreadyAcknowledged
+        );
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::StopRequested
+        );
+
+        gateway.mark_order_cancelled(&opening_id);
+        runtime.tick(1_400).await.unwrap();
+        assert_eq!(gateway.cancellation_call_count(), 1);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_cancellation_retries_only_after_exact_active_order_reconciliation() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        runtime.machine_mut().request_stop(1_150).unwrap();
+        gateway.fail_next_cancellation(CancellationError::Unknown {
+            message: "timeout after cancellation request".into(),
+        });
+
+        let unknown = runtime.tick(1_200).await.unwrap();
+        assert_eq!(unknown.blockers[0].stage, RuntimeStage::CancellationUnknown);
+        assert_eq!(gateway.cancellation_call_count(), 1);
+
+        let retried = runtime.tick(1_300).await.unwrap();
+        assert_eq!(retried.blockers[0].stage, RuntimeStage::CancellationPending);
+        assert_eq!(gateway.cancellation_call_count(), 2);
+        gateway.mark_order_cancelled(&opening_id);
+        runtime.tick(1_400).await.unwrap();
+        assert_eq!(gateway.cancellation_call_count(), 2);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_cancellation_is_not_retried_when_exact_lookup_is_not_found() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        runtime.machine_mut().request_stop(1_150).unwrap();
+        gateway.fail_next_cancellation(CancellationError::Unknown {
+            message: "timeout after cancellation request".into(),
+        });
+        runtime.tick(1_200).await.unwrap();
+        assert_eq!(gateway.cancellation_call_count(), 1);
+
+        gateway.hide_order_from_lookup(&opening_id);
+        let inconclusive = runtime.tick(1_300).await.unwrap();
+
+        assert!(
+            inconclusive
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::LedgerReconciliation)
+        );
+        assert_eq!(gateway.cancellation_call_count(), 1);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::StopRequested
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_cancellations_never_starve_later_orders_under_a_small_batch_limit() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        runtime.tick(1_200).await.unwrap();
+        runtime.machine_mut().request_stop(1_250).unwrap();
+        runtime.maximum_submissions_per_tick = 1;
+
+        runtime.tick(1_300).await.unwrap();
+        runtime.tick(1_400).await.unwrap();
+
+        let ids = gateway.cancellation_ids();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn fill_winning_the_cancellation_race_is_accounted_without_a_replacement() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        runtime.tick(1_200).await.unwrap();
+        runtime.machine_mut().request_stop(1_250).unwrap();
+        runtime.maximum_submissions_per_tick = 1;
+        runtime.tick(1_300).await.unwrap();
+
+        let raced_id = gateway.cancellation_ids()[0].clone();
+        let raced_shape = gateway
+            .state
+            .lock()
+            .unwrap()
+            .orders
+            .get(&raced_id)
+            .unwrap()
+            .shape
+            .clone();
+        gateway.fill_order(&raced_id, raced_shape.price.unwrap(), Decimal::new(1, 2));
+        let signed_delta = match raced_shape.side {
+            OrderSide::Buy => raced_shape.quantity,
+            OrderSide::Sell => -raced_shape.quantity,
+        };
+        let expected_position = -opening_quantity + signed_delta;
+        gateway.set_position(expected_position, Some(Decimal::new(1014, 0)));
+        gateway.set_cancellation_marks_terminal(true);
+        runtime.maximum_submissions_per_tick = 100;
+
+        let race_reconciliation = runtime.tick(1_400).await.unwrap();
+        assert!(
+            !race_reconciliation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::StrategyFailed),
+            "{race_reconciliation:?}; failure={:?}",
+            runtime.machine().store().snapshot().failure
+        );
+        let stopped = runtime.tick(1_500).await.unwrap();
+
+        assert!(!stopped.is_blocked(), "{stopped:?}");
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            expected_position
+        );
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .replacement_obligations
+                .is_empty()
+        );
+        assert_eq!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .cancellations
+                .get(&raced_id)
+                .unwrap()
+                .state,
+            CancellationState::Resolved {
+                status: TerminalOrderStatus::Filled
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn risk_exit_cancels_grid_then_submits_and_accounts_exact_reduce_only_close() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(Some(Decimal::new(1021, 0))), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let initial_grid_count = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| matches!(order.purpose, StrategyOrderPurpose::InitialGrid { .. }))
+            .count();
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        runtime.tick(1_200).await.unwrap();
+        assert_eq!(gateway.placement_call_count(), initial_grid_count + 1);
+
+        gateway.set_cancellation_marks_terminal(true);
+        gateway.set_market_price(Decimal::new(1022, 0), 1_300);
+        let cancelling = runtime.tick(1_300).await.unwrap();
+        assert_eq!(cancelling.cancellations.len(), initial_grid_count);
+        assert_eq!(gateway.cancellation_call_count(), initial_grid_count);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
             StrategyLifecycle::RiskExitRequested
+        );
+
+        let closing = runtime.tick(1_400).await.unwrap();
+        assert_eq!(closing.submissions.len(), 1);
+        let close_intent = gateway
+            .state
+            .lock()
+            .unwrap()
+            .placement_calls
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(close_intent.shape.side, OrderSide::Buy);
+        assert_eq!(close_intent.shape.quantity, opening_quantity);
+        assert!(close_intent.shape.reduce_only);
+        assert_eq!(close_intent.shape.kind, OrderKind::Market);
+        assert_eq!(close_intent.shape.price, None);
+        assert_eq!(gateway.cancellation_call_count(), initial_grid_count);
+
+        gateway.fill_order(
+            &close_intent.client_order_id,
+            Decimal::new(1022, 0),
+            Decimal::new(5, 2),
+        );
+        gateway.set_position(Decimal::ZERO, None);
+        let closed = runtime.tick(1_500).await.unwrap();
+        assert!(
+            !closed
+                .submissions
+                .iter()
+                .any(|submission| submission.client_order_id != close_intent.client_order_id)
+        );
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Closed
+        );
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            Decimal::ZERO
         );
     }
 }

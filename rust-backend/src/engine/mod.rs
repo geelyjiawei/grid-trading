@@ -1,4 +1,5 @@
 mod armed_strategy;
+mod cancellation;
 mod exchange_inputs;
 mod execution_accounting;
 mod execution_sync;
@@ -10,6 +11,9 @@ mod submission;
 
 pub use armed_strategy::{
     ArmedStrategyError, ArmedStrategyLifecycle, ArmedStrategyState, TriggerCondition,
+};
+pub use cancellation::{
+    CancellationResult, CancellationServiceError, cancel_with, resolve_cancellation_with,
 };
 pub use exchange_inputs::{
     AuthoritativeStrategyInputs, StrategyInputError, StrategyInputService, load_strategy_inputs,
@@ -27,8 +31,8 @@ pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };
 pub use runtime::{
-    RuntimeBlocker, RuntimeBuildError, RuntimeStage, RuntimeSubmission, RuntimeTickError,
-    RuntimeTickReport, StrategyRuntime,
+    RuntimeBlocker, RuntimeBuildError, RuntimeCancellation, RuntimeStage, RuntimeSubmission,
+    RuntimeTickError, RuntimeTickReport, StrategyRuntime,
 };
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{
