@@ -49,6 +49,18 @@ impl PositionBaseline {
         }
     }
 
+    pub fn from_authoritative_position(
+        signed_quantity: Decimal,
+        entry_price: Option<Decimal>,
+    ) -> Result<Self, StrategyStateError> {
+        let baseline = Self {
+            signed_quantity,
+            entry_price,
+        };
+        baseline.validate()?;
+        Ok(baseline)
+    }
+
     fn validate(&self) -> Result<(), StrategyStateError> {
         if self.signed_quantity.is_zero() {
             if self.entry_price.is_some_and(|price| price <= Decimal::ZERO) {

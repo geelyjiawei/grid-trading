@@ -7,13 +7,15 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
-        CancellationAcknowledgement, CancellationError, LookupError, OrderCancellationGateway,
+        CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
+        InstrumentRulesGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
         OrderLookup, OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement,
-        PlacementError,
+        PlacementError, PositionSnapshot, PositionSnapshotGateway, SnapshotError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
-            parse_placement_acknowledgement,
+            parse_instrument_rules, parse_market_snapshot, parse_placement_acknowledgement,
+            parse_position_snapshot, validate_snapshot_request,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -154,6 +156,17 @@ impl<T, S, N> AsterAdapter<T, S, N> {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
         }
     }
+
+    fn public_request(&self, path: &str, parameters: Parameters) -> PreparedHttpRequest {
+        PreparedHttpRequest {
+            method: HttpMethod::Get,
+            base_url: self.base_url.clone(),
+            path: path.into(),
+            query: parameters,
+            body: vec![],
+            headers: vec![],
+        }
+    }
 }
 
 impl<T, N> AsterAdapter<T, LocalEip712Signer, N> {
@@ -223,6 +236,124 @@ where
                 "Content-Type".into(),
                 "application/x-www-form-urlencoded".into(),
             )],
+        })
+    }
+}
+
+impl<T, S, N> AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+{
+    async fn execute_snapshot(
+        &self,
+        request: PreparedHttpRequest,
+        context: &str,
+    ) -> Result<String, SnapshotError> {
+        let response = self
+            .transport
+            .execute(request)
+            .await
+            .map_err(|error| SnapshotError::new(format!("{context}: {error}")))?;
+        if !(200..300).contains(&response.status) {
+            let error = parse_exchange_error(&response.body);
+            return Err(SnapshotError::new(format!(
+                "{context}: HTTP {}: {}",
+                response.status, error.message
+            )));
+        }
+        Ok(response.body)
+    }
+}
+
+#[async_trait]
+impl<T, S, N> MarketSnapshotGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: Send + Sync,
+    N: Send + Sync,
+{
+    async fn market_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<ExchangeMarketSnapshot, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let ticker = self
+            .execute_snapshot(
+                self.public_request(
+                    "/fapi/v3/ticker/24hr",
+                    vec![("symbol".into(), symbol.clone())],
+                ),
+                "Aster ticker snapshot",
+            )
+            .await?;
+        let premium = self
+            .execute_snapshot(
+                self.public_request(
+                    "/fapi/v3/premiumIndex",
+                    vec![("symbol".into(), symbol.clone())],
+                ),
+                "Aster mark-price snapshot",
+            )
+            .await?;
+        parse_market_snapshot(&ticker, &premium, Exchange::Aster, &symbol)
+            .map_err(|error| SnapshotError::new(format!("invalid Aster market snapshot: {error}")))
+    }
+}
+
+#[async_trait]
+impl<T, S, N> InstrumentRulesGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: Send + Sync,
+    N: Send + Sync,
+{
+    async fn instrument_rules(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<crate::domain::InstrumentRules, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let body = self
+            .execute_snapshot(
+                self.public_request("/fapi/v3/exchangeInfo", vec![]),
+                "Aster instrument snapshot",
+            )
+            .await?;
+        parse_instrument_rules(&body, &symbol).map_err(|error| {
+            SnapshotError::new(format!("invalid Aster instrument snapshot: {error}"))
+        })
+    }
+}
+
+#[async_trait]
+impl<T, S, N> PositionSnapshotGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    async fn position_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<PositionSnapshot, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v3/positionRisk",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Aster position snapshot")
+            .await?;
+        parse_position_snapshot(&body, Exchange::Aster, &symbol).map_err(|error| {
+            SnapshotError::new(format!("invalid Aster position snapshot: {error}"))
         })
     }
 }
@@ -533,6 +664,10 @@ mod tests {
         fn request(&self) -> PreparedHttpRequest {
             self.requests.lock().unwrap()[0].clone()
         }
+
+        fn all_requests(&self) -> Vec<PreparedHttpRequest> {
+            self.requests.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -625,6 +760,74 @@ mod tests {
             LocalEip712Signer::from_private_key("not-a-private-key"),
             Err(AsterSignatureError::InvalidPrivateKey)
         ));
+    }
+
+    #[tokio::test]
+    async fn market_and_instrument_snapshots_use_public_v3_endpoints() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"ANSEMUSDT","lastPrice":"0.381"}"#.into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"ANSEMUSDT","markPrice":"0.3809","time":1700000000000}"#.into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{
+                    "symbols":[{"symbol":"ANSEMUSDT","status":"TRADING","filters":[
+                        {"filterType":"PRICE_FILTER","tickSize":"0.0001"},
+                        {"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"100000"},
+                        {"filterType":"MIN_NOTIONAL","notional":"5"}
+                    ]}]
+                }"#
+                .into(),
+            }),
+        ]);
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let adapter = adapter(transport.clone(), signer);
+
+        let market = adapter
+            .market_snapshot(Exchange::Aster, "ANSEMUSDT")
+            .await
+            .unwrap();
+        let rules = adapter
+            .instrument_rules(Exchange::Aster, "ANSEMUSDT")
+            .await
+            .unwrap();
+        let requests = transport.all_requests();
+
+        assert_eq!(market.mark_price, Decimal::new(3809, 4));
+        assert_eq!(rules.tick_size, Decimal::new(1, 4));
+        assert_eq!(rules.market_quantity, rules.limit_quantity);
+        assert_eq!(requests[0].path, "/fapi/v3/ticker/24hr");
+        assert_eq!(requests[1].path, "/fapi/v3/premiumIndex");
+        assert_eq!(requests[2].path, "/fapi/v3/exchangeInfo");
+        assert!(requests.iter().all(|request| request.headers.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn signed_hedge_position_snapshot_is_rejected_as_one_way_baseline() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[
+                {"symbol":"ANSEMUSDT","positionSide":"LONG","positionAmt":"200","entryPrice":"0.38","markPrice":"0.381","unRealizedProfit":"0.2"},
+                {"symbol":"ANSEMUSDT","positionSide":"SHORT","positionAmt":"-100","entryPrice":"0.39","markPrice":"0.381","unRealizedProfit":"0.9"}
+            ]"#
+            .into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let snapshot = adapter(transport.clone(), signer)
+            .position_snapshot(Exchange::Aster, "ANSEMUSDT")
+            .await
+            .unwrap();
+
+        assert!(snapshot.one_way_position().is_err());
+        let request = transport.request();
+        assert_eq!(request.path, "/fapi/v3/positionRisk");
+        assert!(request.query_string().contains("signature="));
     }
 
     #[tokio::test]

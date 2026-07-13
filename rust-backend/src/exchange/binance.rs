@@ -7,13 +7,15 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
-        CancellationAcknowledgement, CancellationError, LookupError, OrderCancellationGateway,
+        CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
+        InstrumentRulesGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
         OrderLookup, OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement,
-        PlacementError,
+        PlacementError, PositionSnapshot, PositionSnapshotGateway, SnapshotError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
-            parse_placement_acknowledgement,
+            parse_instrument_rules, parse_market_snapshot, parse_placement_acknowledgement,
+            parse_position_snapshot, validate_snapshot_request,
         },
         protocol::{
             HttpMethod, HttpTransport, MillisecondClock, Parameters, PreparedHttpRequest,
@@ -171,6 +173,17 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
     pub fn set_recv_window_ms(&mut self, recv_window_ms: u64) {
         self.recv_window_ms = recv_window_ms;
     }
+
+    fn public_request(&self, path: &str, parameters: Parameters) -> PreparedHttpRequest {
+        PreparedHttpRequest {
+            method: HttpMethod::Get,
+            base_url: self.base_url.clone(),
+            path: path.into(),
+            query: parameters,
+            body: vec![],
+            headers: vec![],
+        }
+    }
 }
 
 impl<T, S, C> BinanceAdapter<T, S, C>
@@ -201,6 +214,125 @@ where
             query: parameters,
             body: vec![],
             headers: vec![("X-MBX-APIKEY".into(), self.api_key.to_string())],
+        })
+    }
+}
+
+impl<T, S, C> BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+{
+    async fn execute_snapshot(
+        &self,
+        request: PreparedHttpRequest,
+        context: &str,
+    ) -> Result<String, SnapshotError> {
+        let response = self
+            .transport
+            .execute(request)
+            .await
+            .map_err(|error| SnapshotError::new(format!("{context}: {error}")))?;
+        if !(200..300).contains(&response.status) {
+            let error = parse_exchange_error(&response.body);
+            return Err(SnapshotError::new(format!(
+                "{context}: HTTP {}: {}",
+                response.status, error.message
+            )));
+        }
+        Ok(response.body)
+    }
+}
+
+#[async_trait]
+impl<T, S, C> MarketSnapshotGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: Send + Sync,
+    C: Send + Sync,
+{
+    async fn market_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<ExchangeMarketSnapshot, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let ticker = self
+            .execute_snapshot(
+                self.public_request(
+                    "/fapi/v1/ticker/24hr",
+                    vec![("symbol".into(), symbol.clone())],
+                ),
+                "Binance ticker snapshot",
+            )
+            .await?;
+        let premium = self
+            .execute_snapshot(
+                self.public_request(
+                    "/fapi/v1/premiumIndex",
+                    vec![("symbol".into(), symbol.clone())],
+                ),
+                "Binance mark-price snapshot",
+            )
+            .await?;
+        parse_market_snapshot(&ticker, &premium, Exchange::Binance, &symbol).map_err(|error| {
+            SnapshotError::new(format!("invalid Binance market snapshot: {error}"))
+        })
+    }
+}
+
+#[async_trait]
+impl<T, S, C> InstrumentRulesGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: Send + Sync,
+    C: Send + Sync,
+{
+    async fn instrument_rules(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<crate::domain::InstrumentRules, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let body = self
+            .execute_snapshot(
+                self.public_request("/fapi/v1/exchangeInfo", vec![]),
+                "Binance instrument snapshot",
+            )
+            .await?;
+        parse_instrument_rules(&body, &symbol).map_err(|error| {
+            SnapshotError::new(format!("invalid Binance instrument snapshot: {error}"))
+        })
+    }
+}
+
+#[async_trait]
+impl<T, S, C> PositionSnapshotGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn position_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<PositionSnapshot, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v3/positionRisk",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Binance position snapshot")
+            .await?;
+        parse_position_snapshot(&body, Exchange::Binance, &symbol).map_err(|error| {
+            SnapshotError::new(format!("invalid Binance position snapshot: {error}"))
         })
     }
 }
@@ -373,6 +505,10 @@ mod tests {
         fn request(&self) -> PreparedHttpRequest {
             self.requests.lock().unwrap()[0].clone()
         }
+
+        fn all_requests(&self) -> Vec<PreparedHttpRequest> {
+            self.requests.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -430,6 +566,104 @@ mod tests {
                 .unwrap(),
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+
+    #[tokio::test]
+    async fn market_snapshot_uses_separate_authoritative_ticker_and_mark_endpoints() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"MUUSDT","lastPrice":"1011.25"}"#.into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"MUUSDT","markPrice":"1011.20","time":1700000000000}"#.into(),
+            }),
+        ]);
+        let snapshot = adapter(transport.clone())
+            .market_snapshot(Exchange::Binance, "muusdt")
+            .await
+            .unwrap();
+        let requests = transport.all_requests();
+
+        assert_eq!(snapshot.last_price, Decimal::new(101125, 2));
+        assert_eq!(snapshot.mark_price, Decimal::new(101120, 2));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/fapi/v1/ticker/24hr");
+        assert_eq!(requests[1].path, "/fapi/v1/premiumIndex");
+        assert!(requests.iter().all(|request| request.headers.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn missing_mark_price_never_falls_back_to_last_price() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"MUUSDT","lastPrice":"1011.25"}"#.into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"MUUSDT"}"#.into(),
+            }),
+        ]);
+
+        assert!(
+            adapter(transport)
+                .market_snapshot(Exchange::Binance, "MUUSDT")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn instrument_rules_are_loaded_from_the_exchange_without_local_defaults() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{
+                "symbols":[{"symbol":"MUUSDT","status":"TRADING","filters":[
+                    {"filterType":"PRICE_FILTER","tickSize":"0.01"},
+                    {"filterType":"LOT_SIZE","stepSize":"0.01","minQty":"0.01","maxQty":"100"},
+                    {"filterType":"MARKET_LOT_SIZE","stepSize":"0.1","minQty":"0.1","maxQty":"50"},
+                    {"filterType":"MIN_NOTIONAL","notional":"5"}
+                ]}]
+            }"#
+            .into(),
+        }));
+        let rules = adapter(transport.clone())
+            .instrument_rules(Exchange::Binance, "MUUSDT")
+            .await
+            .unwrap();
+
+        assert_eq!(rules.limit_quantity.step, Decimal::new(1, 2));
+        assert_eq!(rules.market_quantity.step, Decimal::new(1, 1));
+        assert_eq!(transport.request().path, "/fapi/v1/exchangeInfo");
+        assert!(transport.request().query.is_empty());
+    }
+
+    #[tokio::test]
+    async fn signed_position_snapshot_keeps_existing_short_as_a_separate_baseline() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[{
+                "symbol":"MUUSDT","positionSide":"BOTH","positionAmt":"-3",
+                "entryPrice":"1011.25","markPrice":"1008.10","unRealizedProfit":"9.45"
+            }]"#
+            .into(),
+        }));
+        let snapshot = adapter(transport.clone())
+            .position_snapshot(Exchange::Binance, "MUUSDT")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.one_way_position().unwrap(),
+            (Decimal::new(-3, 0), Some(Decimal::new(101125, 2)))
+        );
+        let request = transport.request();
+        assert_eq!(request.path, "/fapi/v3/positionRisk");
+        assert!(request.query_string().contains("signature="));
     }
 
     #[tokio::test]

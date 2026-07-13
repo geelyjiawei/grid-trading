@@ -55,6 +55,12 @@ the OpenAPI schema.
 ## Position ownership
 
 - Position at grid start is the baseline and is never silently absorbed by the grid.
+- Strategy initialization obtains market price, instrument rules, and position directly
+  from the selected exchange and accepts the bundle only when exchange and symbol
+  identities all match.
+- Existing one-way position quantity and entry price become an immutable baseline.
+  Hedge-mode `LONG` and `SHORT` legs remain separate and cannot be netted into that
+  baseline while the strategy ledger is one-way only.
 - In one-way position mode, an opposite-side baseline and a directional grid cannot be
   isolated. That configuration is rejected instead of netting through the old position.
 - A neutral grid requires a flat baseline unless the exchange adapter later provides an
@@ -90,6 +96,12 @@ the OpenAPI schema.
   replacement chain is accepted; the cancelled order itself never counts as coverage.
 - Replacement orders exactly equal their assigned durable obligations. Quantity, side,
   price, reduce-only, level, and exchange rules are revalidated on every state write.
+- Last price and mark price come from their distinct exchange fields. A missing mark
+  price never falls back to last price, and stale or future-dated market snapshots are
+  rejected before planning or risk evaluation.
+- Tick size, limit quantity rules, market quantity rules, and minimum notional are parsed
+  from one exact, currently trading symbol row. Missing, duplicate, malformed, or
+  non-trading exchange rules fail closed without local defaults.
 - Counter and cancelled-remainder obligations are created only while a strategy is
   deploying or running. Fills observed during stop, risk exit, failure, or finalization
   are still booked exactly, but can never schedule a normal grid replacement.

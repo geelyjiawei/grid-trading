@@ -4,11 +4,13 @@ use thiserror::Error;
 
 use crate::{
     domain::{
-        ClientOrderId, Exchange, OrderKind, OrderShape, OrderSide, TerminalOrderStatus, TimeInForce,
+        ClientOrderId, Exchange, InstrumentRules, OrderKind, OrderShape, OrderSide, QuantityRules,
+        TerminalOrderStatus, TimeInForce,
     },
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, OrderLifecycle,
-        PlacementAcknowledgement, protocol::Parameters,
+        ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
+        OrderLifecycle, PlacementAcknowledgement, PositionLeg, PositionSide, PositionSnapshot,
+        SnapshotError, protocol::Parameters,
     },
 };
 
@@ -49,12 +51,186 @@ pub(super) fn parse_exchange_error(body: &str) -> ExchangeErrorBody {
     }
 }
 
+pub(super) fn parse_market_snapshot(
+    ticker_body: &str,
+    premium_body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+) -> Result<ExchangeMarketSnapshot, CodecError> {
+    let ticker = parse_json(ticker_body)?;
+    let premium = parse_json(premium_body)?;
+    require_symbol(&ticker, expected_symbol)?;
+    require_symbol(&premium, expected_symbol)?;
+    let last_price = decimal_from_first(&ticker, &["lastPrice", "price"])?;
+    let mark_price = required_decimal(&premium, "markPrice")?;
+    if last_price <= Decimal::ZERO || mark_price <= Decimal::ZERO {
+        return Err(CodecError::InvalidField("marketPrice"));
+    }
+    let observed_at_ms = required_scalar_text(&premium, "time")?
+        .parse::<u64>()
+        .map_err(|_| CodecError::InvalidField("time"))?;
+    if observed_at_ms == 0 {
+        return Err(CodecError::InvalidField("time"));
+    }
+    Ok(ExchangeMarketSnapshot {
+        exchange,
+        symbol: expected_symbol.to_ascii_uppercase(),
+        last_price,
+        mark_price,
+        observed_at_ms,
+    })
+}
+
+pub(super) fn parse_instrument_rules(
+    body: &str,
+    expected_symbol: &str,
+) -> Result<InstrumentRules, CodecError> {
+    let root = parse_json(body)?;
+    let symbols = root
+        .get("symbols")
+        .and_then(Value::as_array)
+        .ok_or(CodecError::InvalidField("symbols"))?;
+    let matches = symbols
+        .iter()
+        .filter(|row| {
+            row.get("symbol")
+                .and_then(Value::as_str)
+                .is_some_and(|symbol| symbol.eq_ignore_ascii_case(expected_symbol))
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(CodecError::InvalidField("symbols"));
+    }
+    let instrument = matches[0];
+    if !required_string(instrument, "status")?.eq_ignore_ascii_case("TRADING") {
+        return Err(CodecError::InvalidField("status"));
+    }
+    let filters = instrument
+        .get("filters")
+        .and_then(Value::as_array)
+        .ok_or(CodecError::InvalidField("filters"))?;
+    let price_filter = unique_filter(filters, "PRICE_FILTER")?;
+    let lot_filter = unique_filter(filters, "LOT_SIZE")?;
+    let market_filter = optional_unique_filter(filters, "MARKET_LOT_SIZE")?.unwrap_or(lot_filter);
+    let legacy_notional = optional_unique_filter(filters, "MIN_NOTIONAL")?;
+    let current_notional = optional_unique_filter(filters, "NOTIONAL")?;
+    let notional_filter = match (legacy_notional, current_notional) {
+        (Some(_), Some(_)) => return Err(CodecError::InvalidField("notionalFilter")),
+        (legacy, current) => legacy.or(current),
+    };
+    let min_notional = match notional_filter {
+        Some(filter) => decimal_from_first(filter, &["notional", "minNotional"])?,
+        None => Decimal::ZERO,
+    };
+    let rules = InstrumentRules {
+        tick_size: required_decimal(price_filter, "tickSize")?,
+        limit_quantity: quantity_rules(lot_filter)?,
+        market_quantity: quantity_rules(market_filter)?,
+        min_notional,
+    };
+    rules
+        .validate()
+        .map_err(|_| CodecError::InvalidField("instrumentRules"))?;
+    Ok(rules)
+}
+
+pub(super) fn parse_position_snapshot(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+) -> Result<PositionSnapshot, CodecError> {
+    let root = parse_json(body)?;
+    let rows = root
+        .as_array()
+        .ok_or(CodecError::InvalidField("positions"))?;
+    let mut legs = Vec::new();
+    for row in rows {
+        let Some(symbol) = row.get("symbol").and_then(Value::as_str) else {
+            return Err(CodecError::InvalidField("symbol"));
+        };
+        if !symbol.eq_ignore_ascii_case(expected_symbol) {
+            continue;
+        }
+        let side = match required_string(row, "positionSide")?
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "BOTH" => PositionSide::Both,
+            "LONG" => PositionSide::Long,
+            "SHORT" => PositionSide::Short,
+            _ => return Err(CodecError::InvalidField("positionSide")),
+        };
+        if legs.iter().any(|leg: &PositionLeg| leg.side == side) {
+            return Err(CodecError::InvalidField("positionSide"));
+        }
+        let signed_quantity = required_decimal(row, "positionAmt")?;
+        if (side == PositionSide::Long && signed_quantity < Decimal::ZERO)
+            || (side == PositionSide::Short && signed_quantity > Decimal::ZERO)
+        {
+            return Err(CodecError::InvalidField("positionAmt"));
+        }
+        let raw_entry_price = required_decimal(row, "entryPrice")?;
+        let entry_price = if signed_quantity.is_zero() {
+            if raw_entry_price < Decimal::ZERO {
+                return Err(CodecError::InvalidField("entryPrice"));
+            }
+            None
+        } else if raw_entry_price > Decimal::ZERO {
+            Some(raw_entry_price)
+        } else {
+            return Err(CodecError::InvalidField("entryPrice"));
+        };
+        let mark_price = required_decimal(row, "markPrice")?;
+        if mark_price <= Decimal::ZERO {
+            return Err(CodecError::InvalidField("markPrice"));
+        }
+        let unrealized_profit = decimal_from_first(
+            row,
+            &["unRealizedProfit", "unrealizedProfit", "unrealisedPnl"],
+        )?;
+        legs.push(PositionLeg {
+            side,
+            signed_quantity,
+            entry_price,
+            mark_price,
+            unrealized_profit,
+        });
+    }
+    if legs.is_empty() {
+        return Err(CodecError::InvalidField("positions"));
+    }
+    legs.sort_by_key(|leg| match leg.side {
+        PositionSide::Both => 0,
+        PositionSide::Long => 1,
+        PositionSide::Short => 2,
+    });
+    Ok(PositionSnapshot {
+        exchange,
+        symbol: expected_symbol.to_ascii_uppercase(),
+        legs,
+    })
+}
+
 pub(super) fn execution_status_is_unknown(code: Option<&str>) -> bool {
     matches!(code, Some("-1006" | "-1007"))
 }
 
 pub(super) fn order_is_definitively_absent(code: Option<&str>) -> bool {
     matches!(code, Some("-2013"))
+}
+
+pub(super) fn validate_snapshot_request(
+    actual_exchange: Exchange,
+    expected_exchange: Exchange,
+    symbol: &str,
+) -> Result<(), SnapshotError> {
+    if actual_exchange != expected_exchange {
+        return Err(SnapshotError::new("snapshot belongs to another exchange"));
+    }
+    if symbol.trim().is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(SnapshotError::new("snapshot symbol is invalid"));
+    }
+    Ok(())
 }
 
 pub(super) fn build_order_parameters(
@@ -239,6 +415,69 @@ fn parse_lifecycle(status: &str) -> Result<OrderLifecycle, CodecError> {
     }
 }
 
+fn parse_json(body: &str) -> Result<Value, CodecError> {
+    serde_json::from_str(body).map_err(|error| CodecError::InvalidJson(error.to_string()))
+}
+
+fn require_symbol(value: &Value, expected_symbol: &str) -> Result<(), CodecError> {
+    if required_string(value, "symbol")?.eq_ignore_ascii_case(expected_symbol) {
+        Ok(())
+    } else {
+        Err(CodecError::SymbolMismatch)
+    }
+}
+
+fn decimal_from_first(value: &Value, fields: &[&'static str]) -> Result<Decimal, CodecError> {
+    for field in fields {
+        if value.get(field).is_some() {
+            return required_decimal(value, field);
+        }
+    }
+    Err(CodecError::InvalidField(
+        fields.first().copied().unwrap_or("decimal"),
+    ))
+}
+
+fn unique_filter<'a>(
+    filters: &'a [Value],
+    filter_type: &'static str,
+) -> Result<&'a Value, CodecError> {
+    optional_unique_filter(filters, filter_type)?.ok_or(CodecError::InvalidField(filter_type))
+}
+
+fn optional_unique_filter<'a>(
+    filters: &'a [Value],
+    filter_type: &'static str,
+) -> Result<Option<&'a Value>, CodecError> {
+    let mut found = None;
+    for filter in filters {
+        let current_type = required_string(filter, "filterType")?;
+        if current_type.eq_ignore_ascii_case(filter_type) {
+            if found.is_some() {
+                return Err(CodecError::InvalidField(filter_type));
+            }
+            found = Some(filter);
+        }
+    }
+    Ok(found)
+}
+
+fn quantity_rules(filter: &Value) -> Result<QuantityRules, CodecError> {
+    let maximum = required_decimal(filter, "maxQty")?;
+    let max = if maximum.is_zero() {
+        None
+    } else if maximum > Decimal::ZERO {
+        Some(maximum)
+    } else {
+        return Err(CodecError::InvalidField("maxQty"));
+    };
+    Ok(QuantityRules {
+        step: required_decimal(filter, "stepSize")?,
+        min: required_decimal(filter, "minQty")?,
+        max,
+    })
+}
+
 fn required_string<'a>(value: &'a Value, field: &'static str) -> Result<&'a str, CodecError> {
     value
         .get(field)
@@ -314,5 +553,125 @@ mod tests {
             ),
             Err(CodecError::ClientOrderIdMismatch)
         );
+    }
+
+    #[test]
+    fn market_snapshot_requires_matching_positive_ticker_and_mark_price() {
+        let snapshot = parse_market_snapshot(
+            r#"{"symbol":"MUUSDT","lastPrice":"1011.25"}"#,
+            r#"{"symbol":"MUUSDT","markPrice":"1011.20","time":1700000000000}"#,
+            Exchange::Binance,
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.last_price, Decimal::new(101125, 2));
+        assert_eq!(snapshot.mark_price, Decimal::new(101120, 2));
+        assert_eq!(snapshot.observed_at_ms, 1_700_000_000_000);
+        assert_eq!(
+            parse_market_snapshot(
+                r#"{"symbol":"OTHERUSDT","lastPrice":"1011.25"}"#,
+                r#"{"symbol":"MUUSDT","markPrice":"1011.20"}"#,
+                Exchange::Binance,
+                "MUUSDT",
+            ),
+            Err(CodecError::SymbolMismatch)
+        );
+    }
+
+    #[test]
+    fn instrument_snapshot_preserves_distinct_limit_and_market_quantity_rules() {
+        let rules = parse_instrument_rules(
+            r#"{
+                "symbols":[{
+                    "symbol":"MUUSDT","status":"TRADING","filters":[
+                        {"filterType":"PRICE_FILTER","tickSize":"0.01"},
+                        {"filterType":"LOT_SIZE","stepSize":"0.01","minQty":"0.01","maxQty":"100"},
+                        {"filterType":"MARKET_LOT_SIZE","stepSize":"0.1","minQty":"0.1","maxQty":"50"},
+                        {"filterType":"MIN_NOTIONAL","notional":"5"}
+                    ]
+                }]
+            }"#,
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(rules.tick_size, Decimal::new(1, 2));
+        assert_eq!(rules.limit_quantity.step, Decimal::new(1, 2));
+        assert_eq!(rules.market_quantity.step, Decimal::new(1, 1));
+        assert_eq!(rules.market_quantity.max, Some(Decimal::new(50, 0)));
+        assert_eq!(rules.min_notional, Decimal::new(5, 0));
+    }
+
+    #[test]
+    fn instrument_snapshot_rejects_duplicate_or_non_trading_contracts() {
+        let duplicate = r#"{
+            "symbols":[{
+                "symbol":"MUUSDT","status":"TRADING","filters":[
+                    {"filterType":"PRICE_FILTER","tickSize":"0.01"},
+                    {"filterType":"PRICE_FILTER","tickSize":"0.02"},
+                    {"filterType":"LOT_SIZE","stepSize":"0.1","minQty":"0.1","maxQty":"10"}
+                ]
+            }]
+        }"#;
+        assert!(parse_instrument_rules(duplicate, "MUUSDT").is_err());
+
+        let paused = r#"{
+            "symbols":[{
+                "symbol":"MUUSDT","status":"BREAK","filters":[
+                    {"filterType":"PRICE_FILTER","tickSize":"0.01"},
+                    {"filterType":"LOT_SIZE","stepSize":"0.1","minQty":"0.1","maxQty":"10"}
+                ]
+            }]
+        }"#;
+        assert!(parse_instrument_rules(paused, "MUUSDT").is_err());
+    }
+
+    #[test]
+    fn one_way_position_preserves_old_short_baseline_exactly() {
+        let snapshot = parse_position_snapshot(
+            r#"[{
+                "symbol":"MUUSDT","positionSide":"BOTH","positionAmt":"-3",
+                "entryPrice":"1011.25","markPrice":"1008.10","unRealizedProfit":"9.45"
+            }]"#,
+            Exchange::Binance,
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.one_way_position().unwrap(),
+            (Decimal::new(-3, 0), Some(Decimal::new(101125, 2)))
+        );
+    }
+
+    #[test]
+    fn hedge_position_is_visible_but_cannot_be_netted_into_one_way_baseline() {
+        let snapshot = parse_position_snapshot(
+            r#"[
+                {"symbol":"MUUSDT","positionSide":"LONG","positionAmt":"2","entryPrice":"1000","markPrice":"1010","unRealizedProfit":"20"},
+                {"symbol":"MUUSDT","positionSide":"SHORT","positionAmt":"-1","entryPrice":"1020","markPrice":"1010","unRealizedProfit":"10"}
+            ]"#,
+            Exchange::Aster,
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.legs.len(), 2);
+        assert!(snapshot.one_way_position().is_err());
+    }
+
+    #[test]
+    fn flat_position_has_no_fake_entry_price() {
+        let snapshot = parse_position_snapshot(
+            r#"[{
+                "symbol":"MUUSDT","positionSide":"BOTH","positionAmt":"0",
+                "entryPrice":"0","markPrice":"1010","unRealizedProfit":"0"
+            }]"#,
+            Exchange::Binance,
+            "MUUSDT",
+        )
+        .unwrap();
+        assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
     }
 }
