@@ -23,8 +23,8 @@ use crate::{
     },
     persistence::{
         FileArmedStrategyStateStore, FileOrderIntentStore, FilePreparedStrategyStore,
-        FileStrategyStateStore, IntentStore, LedgerError, RuntimeLeaseError, StrategyFilePathError,
-        StrategyFilePaths, StrategyRuntimeLease,
+        FileStrategyStateStore, IntentStore, LedgerError, LedgerSnapshot, RuntimeLeaseError,
+        StrategyFilePathError, StrategyFilePaths, StrategyRuntimeLease,
     },
 };
 
@@ -420,14 +420,100 @@ pub fn recover_leased_file_strategy<G>(
 where
     G: ExchangeIdentityGateway,
 {
+    claim_leased_file_strategy(paths)?.attach_gateway(gateway, settings)
+}
+
+enum LeasedFileStrategyRecoveryInner {
+    Armed(Box<FileArmedStrategyStateStore>),
+    Active {
+        store: Box<FileStrategyStateStore>,
+        intents: FileOrderIntentStore,
+    },
+}
+
+pub struct LeasedFileStrategyRecovery {
+    paths: StrategyFilePaths,
+    lease: StrategyRuntimeLease,
+    inner: LeasedFileStrategyRecoveryInner,
+}
+
+impl LeasedFileStrategyRecovery {
+    pub fn paths(&self) -> &StrategyFilePaths {
+        &self.paths
+    }
+
+    pub fn run_id(&self) -> &StrategyRunId {
+        self.paths.run_id()
+    }
+
+    pub fn exchange(&self) -> Exchange {
+        match &self.inner {
+            LeasedFileStrategyRecoveryInner::Armed(store) => store.snapshot().exchange,
+            LeasedFileStrategyRecoveryInner::Active { store, .. } => store.snapshot().exchange,
+        }
+    }
+
+    pub fn kind(&self) -> PreparedStrategyKind {
+        match self.inner {
+            LeasedFileStrategyRecoveryInner::Armed(_) => PreparedStrategyKind::Armed,
+            LeasedFileStrategyRecoveryInner::Active { .. } => PreparedStrategyKind::Active,
+        }
+    }
+
+    pub fn attach_gateway<G>(
+        self,
+        gateway: G,
+        settings: RuntimeSettings,
+    ) -> Result<PreparedLeasedFileStrategy<G>, FileStrategyRecoveryError>
+    where
+        G: ExchangeIdentityGateway,
+    {
+        verify_gateway_identity(&gateway, self.exchange())?;
+        match self.inner {
+            LeasedFileStrategyRecoveryInner::Armed(store) => Ok(PreparedLeasedFileStrategy::armed(
+                LeasedFileArmedStrategy {
+                    paths: self.paths,
+                    lease: self.lease,
+                    store: *store,
+                    settings,
+                },
+                gateway,
+            )),
+            LeasedFileStrategyRecoveryInner::Active { store, intents } => {
+                let runtime = StrategyRuntime::new(
+                    gateway,
+                    intents,
+                    StrategyMachine::new(*store),
+                    &settings.quote_asset,
+                    settings.maximum_market_age_ms,
+                    settings.maximum_future_skew_ms,
+                    settings.maximum_submissions_per_tick,
+                )?;
+                runtime
+                    .verify_ledger_ownership()
+                    .map_err(|_| FileStrategyRecoveryError::IntentLedgerMismatch)?;
+                Ok(PreparedLeasedFileStrategy::active(
+                    LeasedFileStrategyRuntime {
+                        paths: self.paths,
+                        _lease: self.lease,
+                        runtime,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+pub fn claim_leased_file_strategy(
+    paths: StrategyFilePaths,
+) -> Result<LeasedFileStrategyRecovery, FileStrategyRecoveryError> {
     let lease = StrategyRuntimeLease::acquire(paths.lease())?;
     let persisted = FilePreparedStrategyStore::load(paths.state())?;
-    match persisted {
+    let inner = match persisted {
         FilePreparedStrategyStore::Armed(store) => {
             if &store.snapshot().run_id != paths.run_id() {
                 return Err(FileStrategyRecoveryError::RunIdentityMismatch);
             }
-            verify_gateway_identity(&gateway, store.snapshot().exchange)?;
             match load_empty_intent_store(paths.intents()) {
                 Ok(_) => {}
                 Err(EmptyIntentLedgerError::Ledger(error)) => {
@@ -437,43 +523,23 @@ where
                     return Err(FileStrategyRecoveryError::IntentLedgerMismatch);
                 }
             }
-            Ok(PreparedLeasedFileStrategy::armed(
-                LeasedFileArmedStrategy {
-                    paths,
-                    lease,
-                    store: *store,
-                    settings,
-                },
-                gateway,
-            ))
+            LeasedFileStrategyRecoveryInner::Armed(store)
         }
         FilePreparedStrategyStore::Active(store) => {
             if &store.snapshot().run_id != paths.run_id() {
                 return Err(FileStrategyRecoveryError::RunIdentityMismatch);
             }
-            verify_gateway_identity(&gateway, store.snapshot().exchange)?;
-            let intent_store = FileOrderIntentStore::load(paths.intents())?;
-            let runtime = StrategyRuntime::new(
-                gateway,
-                intent_store,
-                StrategyMachine::new(*store),
-                &settings.quote_asset,
-                settings.maximum_market_age_ms,
-                settings.maximum_future_skew_ms,
-                settings.maximum_submissions_per_tick,
-            )?;
-            runtime
-                .verify_ledger_ownership()
+            let intents = FileOrderIntentStore::load(paths.intents())?;
+            validate_cross_ledger_ownership(store.snapshot(), intents.snapshot())
                 .map_err(|_| FileStrategyRecoveryError::IntentLedgerMismatch)?;
-            Ok(PreparedLeasedFileStrategy::active(
-                LeasedFileStrategyRuntime {
-                    paths,
-                    _lease: lease,
-                    runtime,
-                },
-            ))
+            LeasedFileStrategyRecoveryInner::Active { store, intents }
         }
-    }
+    };
+    Ok(LeasedFileStrategyRecovery {
+        paths,
+        lease,
+        inner,
+    })
 }
 
 fn verify_gateway_identity<G>(
@@ -903,64 +969,70 @@ where
     }
 
     fn validate_ledger_ownership(&self) -> Result<(), RuntimeTickError> {
-        let strategy = self.machine.store().snapshot();
-        for (client_order_id, intent) in &self.intent_store.snapshot().intents {
-            let Some(order) = strategy.orders.get(client_order_id) else {
-                return Err(RuntimeTickError::IntentLedgerMismatch);
-            };
-            if intent.client_order_id != *client_order_id
-                || intent.exchange != strategy.exchange
-                || intent.shape != order.shape
-                || order.tracking == StrategyOrderTracking::Dormant
-            {
-                return Err(RuntimeTickError::IntentLedgerMismatch);
-            }
-        }
-        for order in strategy.orders.values() {
-            if matches!(order.tracking, StrategyOrderTracking::Intent { .. })
-                && self
-                    .intent_store
-                    .snapshot()
-                    .intents
-                    .get(&order.client_order_id)
-                    .is_none_or(|intent| {
-                        intent.exchange != strategy.exchange || intent.shape != order.shape
-                    })
-            {
-                return Err(RuntimeTickError::IntentLedgerMismatch);
-            }
-        }
-        for (client_order_id, cancellation) in &self.intent_store.snapshot().cancellations {
-            let Some(order) = strategy.orders.get(client_order_id) else {
-                return Err(RuntimeTickError::IntentLedgerMismatch);
-            };
-            let Some(intent) = self.intent_store.snapshot().intents.get(client_order_id) else {
-                return Err(RuntimeTickError::IntentLedgerMismatch);
-            };
-            if cancellation.client_order_id != *client_order_id
-                || cancellation.exchange != strategy.exchange
-                || cancellation.symbol != strategy.symbol
-                || cancellation.symbol != order.shape.symbol
-                || order.exchange_order_id.as_deref()
-                    != Some(cancellation.exchange_order_id.as_str())
-                || intent.exchange != cancellation.exchange
-                || intent.shape.symbol != cancellation.symbol
-                || matches!(
-                    order.tracking,
-                    StrategyOrderTracking::Dormant | StrategyOrderTracking::Ready
-                )
-            {
-                return Err(RuntimeTickError::IntentLedgerMismatch);
-            }
-            if let CancellationState::Resolved { status } = cancellation.state
-                && (!matches!(intent.state, IntentState::Terminal { status: order_status } if order_status == status)
-                    || !matches!(order.tracking, StrategyOrderTracking::Intent { state: IntentState::Terminal { status: order_status } } if order_status == status))
-            {
-                return Err(RuntimeTickError::IntentLedgerMismatch);
-            }
-        }
-        Ok(())
+        validate_cross_ledger_ownership(
+            self.machine.store().snapshot(),
+            self.intent_store.snapshot(),
+        )
     }
+}
+
+fn validate_cross_ledger_ownership(
+    strategy: &StrategyState,
+    ledger: &LedgerSnapshot,
+) -> Result<(), RuntimeTickError> {
+    for (client_order_id, intent) in &ledger.intents {
+        let Some(order) = strategy.orders.get(client_order_id) else {
+            return Err(RuntimeTickError::IntentLedgerMismatch);
+        };
+        if intent.client_order_id != *client_order_id
+            || intent.exchange != strategy.exchange
+            || intent.shape != order.shape
+            || order.tracking == StrategyOrderTracking::Dormant
+        {
+            return Err(RuntimeTickError::IntentLedgerMismatch);
+        }
+    }
+    for order in strategy.orders.values() {
+        if matches!(order.tracking, StrategyOrderTracking::Intent { .. })
+            && ledger
+                .intents
+                .get(&order.client_order_id)
+                .is_none_or(|intent| {
+                    intent.exchange != strategy.exchange || intent.shape != order.shape
+                })
+        {
+            return Err(RuntimeTickError::IntentLedgerMismatch);
+        }
+    }
+    for (client_order_id, cancellation) in &ledger.cancellations {
+        let Some(order) = strategy.orders.get(client_order_id) else {
+            return Err(RuntimeTickError::IntentLedgerMismatch);
+        };
+        let Some(intent) = ledger.intents.get(client_order_id) else {
+            return Err(RuntimeTickError::IntentLedgerMismatch);
+        };
+        if cancellation.client_order_id != *client_order_id
+            || cancellation.exchange != strategy.exchange
+            || cancellation.symbol != strategy.symbol
+            || cancellation.symbol != order.shape.symbol
+            || order.exchange_order_id.as_deref() != Some(cancellation.exchange_order_id.as_str())
+            || intent.exchange != cancellation.exchange
+            || intent.shape.symbol != cancellation.symbol
+            || matches!(
+                order.tracking,
+                StrategyOrderTracking::Dormant | StrategyOrderTracking::Ready
+            )
+        {
+            return Err(RuntimeTickError::IntentLedgerMismatch);
+        }
+        if let CancellationState::Resolved { status } = cancellation.state
+            && (!matches!(intent.state, IntentState::Terminal { status: order_status } if order_status == status)
+                || !matches!(order.tracking, StrategyOrderTracking::Intent { state: IntentState::Terminal { status: order_status } } if order_status == status))
+        {
+            return Err(RuntimeTickError::IntentLedgerMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn validate_runtime_settings(
@@ -1469,9 +1541,10 @@ mod tests {
         },
         engine::{
             GridOrderRole, MarketSnapshot, MemoryStrategyStateStore, PositionBaseline,
-            RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError, StrategyLifecycle,
+            RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry,
+            RuntimeRegistryAdvanceError, RuntimeStartupFailure, StrategyLifecycle,
             StrategyOrderPurpose, StrategyRunId, StrategyState, StrategyStateStore,
-            build_grid_plan,
+            build_grid_plan, recover_discovered_strategies,
         },
         exchange::{
             ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
@@ -1483,6 +1556,7 @@ mod tests {
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
             MemoryOrderIntentStore, StrategyFilePaths, StrategyRuntimeLease,
+            discover_strategy_files,
         },
     };
 
@@ -1773,6 +1847,51 @@ mod tests {
     impl ExchangeIdentityGateway for MockGateway {
         fn exchange(&self) -> Exchange {
             self.exchange
+        }
+    }
+
+    struct MockRecoveryProvider {
+        gateway: MockGateway,
+        requests: Arc<Mutex<Vec<(Exchange, StrategyRunId)>>>,
+        fail_run: Option<StrategyRunId>,
+    }
+
+    impl MockRecoveryProvider {
+        fn new(gateway: MockGateway) -> Self {
+            Self {
+                gateway,
+                requests: Arc::new(Mutex::new(Vec::new())),
+                fail_run: None,
+            }
+        }
+
+        fn failing_for(mut self, run_id: StrategyRunId) -> Self {
+            self.fail_run = Some(run_id);
+            self
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    impl RuntimeRecoveryProvider for MockRecoveryProvider {
+        type Gateway = MockGateway;
+        type Error = &'static str;
+
+        fn runtime_for(
+            &self,
+            exchange: Exchange,
+            run_id: &StrategyRunId,
+        ) -> Result<(Self::Gateway, RuntimeSettings), Self::Error> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((exchange, run_id.clone()));
+            if self.fail_run.as_ref() == Some(run_id) {
+                return Err("credentials unavailable");
+            }
+            Ok((self.gateway.clone(), runtime_settings()))
         }
     }
 
@@ -2379,9 +2498,20 @@ mod tests {
         FileStrategyStateStore::create(paths.state(), state).unwrap();
         let gateway = MockGateway::new(rules(), 1_100);
 
-        let recovered =
-            recover_leased_file_strategy(gateway.clone(), paths.clone(), runtime_settings())
-                .unwrap();
+        let claim = claim_leased_file_strategy(paths.clone()).unwrap();
+
+        assert_eq!(claim.run_id(), paths.run_id());
+        assert_eq!(claim.exchange(), Exchange::Binance);
+        assert_eq!(claim.kind(), PreparedStrategyKind::Active);
+        assert!(matches!(
+            claim_leased_file_strategy(paths.clone()),
+            Err(FileStrategyRecoveryError::Lease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        let recovered = claim
+            .attach_gateway(gateway.clone(), runtime_settings())
+            .unwrap();
 
         assert_eq!(recovered.kind(), PreparedStrategyKind::Active);
         assert_eq!(gateway.all_bootstrap_call_count(), 0);
@@ -2395,6 +2525,146 @@ mod tests {
     }
 
     #[test]
+    fn active_claim_rejects_foreign_ledger_before_gateway_selection() {
+        let directory = tempdir().unwrap();
+        let state = file_state();
+        let paths = StrategyFilePaths::new(directory.path(), state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(paths.state(), state).unwrap();
+        let mut intents = FileOrderIntentStore::load(paths.intents()).unwrap();
+        intents
+            .insert_prepared(
+                OrderIntent::prepare(
+                    ClientOrderId::parse("claimbad").unwrap(),
+                    Exchange::Binance,
+                    OrderShape {
+                        symbol: "MUUSDT".into(),
+                        side: OrderSide::Sell,
+                        price: Some(Decimal::new(1015, 0)),
+                        quantity: Decimal::new(2, 1),
+                        reduce_only: false,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                    },
+                    1_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            claim_leased_file_strategy(paths.clone()),
+            Err(FileStrategyRecoveryError::IntentLedgerMismatch)
+        ));
+        assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_registers_valid_runs_and_reports_each_failed_claim() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        let active = file_state();
+        let active_run = active.run_id.clone();
+        let active_paths = StrategyFilePaths::new(&root, active_run.clone()).unwrap();
+        FileStrategyStateStore::create(active_paths.state(), active).unwrap();
+        let armed = armed_file_state();
+        let armed_run = armed.run_id.clone();
+        let armed_paths = StrategyFilePaths::new(&root, armed_run.clone()).unwrap();
+        FileArmedStrategyStateStore::create(armed_paths.state(), armed).unwrap();
+        std::fs::create_dir(root.join("bad-name")).unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let provider = MockRecoveryProvider::new(gateway.clone());
+        let registry = RuntimeRegistry::new();
+
+        let report = recover_discovered_strategies(
+            &registry,
+            discover_strategy_files(&root).unwrap(),
+            &provider,
+        )
+        .await;
+
+        let mut expected = vec![active_run.clone(), armed_run.clone()];
+        expected.sort();
+        assert_eq!(report.registered, expected);
+        assert_eq!(report.discovery_anomalies.len(), 1);
+        assert!(report.failures.is_empty());
+        assert_eq!(provider.request_count(), 2);
+        assert_eq!(registry.len().await, 2);
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+        assert_eq!(gateway.placement_call_count(), 0);
+
+        let repeated = recover_discovered_strategies(
+            &registry,
+            discover_strategy_files(&root).unwrap(),
+            &provider,
+        )
+        .await;
+        assert!(repeated.registered.is_empty());
+        assert_eq!(repeated.failures.len(), 2);
+        assert!(repeated.failures.iter().all(|failure| {
+            matches!(
+                failure,
+                RuntimeStartupFailure::Claim {
+                    error: FileStrategyRecoveryError::Lease(RuntimeLeaseError::AlreadyHeld),
+                    ..
+                }
+            )
+        }));
+        assert_eq!(provider.request_count(), 2);
+        assert_eq!(registry.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn startup_provider_or_gateway_failure_releases_claim_for_retry() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        let state = file_state();
+        let run_id = state.run_id.clone();
+        let paths = StrategyFilePaths::new(&root, run_id.clone()).unwrap();
+        FileStrategyStateStore::create(paths.state(), state).unwrap();
+        let registry = RuntimeRegistry::new();
+        let unavailable =
+            MockRecoveryProvider::new(MockGateway::new(rules(), 1_100)).failing_for(run_id.clone());
+
+        let provider_failure = recover_discovered_strategies(
+            &registry,
+            discover_strategy_files(&root).unwrap(),
+            &unavailable,
+        )
+        .await;
+        assert!(matches!(
+            provider_failure.failures.as_slice(),
+            [RuntimeStartupFailure::Provider {
+                run_id: failed_run,
+                exchange: Exchange::Binance,
+                error: "credentials unavailable"
+            }] if failed_run == &run_id
+        ));
+        assert!(claim_leased_file_strategy(paths.clone()).is_ok());
+
+        let wrong_gateway = MockGateway::new(rules(), 1_100).with_exchange(Exchange::Aster);
+        let mismatched = MockRecoveryProvider::new(wrong_gateway.clone());
+        let attach_failure = recover_discovered_strategies(
+            &registry,
+            discover_strategy_files(&root).unwrap(),
+            &mismatched,
+        )
+        .await;
+        assert!(matches!(
+            attach_failure.failures.as_slice(),
+            [RuntimeStartupFailure::Attach {
+                run_id: failed_run,
+                error: FileStrategyRecoveryError::GatewayMismatch {
+                    expected: Exchange::Binance,
+                    actual: Exchange::Aster
+                }
+            }] if failed_run == &run_id
+        ));
+        assert_eq!(wrong_gateway.all_bootstrap_call_count(), 0);
+        assert!(claim_leased_file_strategy(paths).is_ok());
+        assert!(registry.is_empty().await);
+    }
+
+    #[test]
     fn recovery_rejects_gateway_mismatch_and_dirty_armed_ledger_before_visibility() {
         let directory = tempdir().unwrap();
         let active = file_state();
@@ -2402,13 +2672,18 @@ mod tests {
         FileStrategyStateStore::create(active_paths.state(), active).unwrap();
         let wrong_gateway = MockGateway::new(rules(), 1_100).with_exchange(Exchange::Aster);
         assert!(matches!(
-            recover_leased_file_strategy(wrong_gateway.clone(), active_paths, runtime_settings()),
+            recover_leased_file_strategy(
+                wrong_gateway.clone(),
+                active_paths.clone(),
+                runtime_settings()
+            ),
             Err(FileStrategyRecoveryError::GatewayMismatch {
                 expected: Exchange::Binance,
                 actual: Exchange::Aster
             })
         ));
         assert_eq!(wrong_gateway.all_bootstrap_call_count(), 0);
+        assert!(StrategyRuntimeLease::acquire(active_paths.lease()).is_ok());
 
         let armed = armed_file_state();
         let armed_paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();

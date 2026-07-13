@@ -41,11 +41,12 @@ pub use reconciliation::{
 };
 pub use runtime::{
     FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, FileStrategyRecoveryError,
-    FileStrategyStartError, LeasedFileArmedStrategy, LeasedFileStrategyRuntime,
-    PreparedLeasedFileStrategy, PreparedStrategyKind, PreparedStrategyStep,
-    PreparedStrategyStepError, RuntimeBlocker, RuntimeBuildError, RuntimeCancellation,
-    RuntimeSettings, RuntimeStage, RuntimeSubmission, RuntimeTickError, RuntimeTickReport,
-    StrategyRuntime, prepare_leased_file_strategy, recover_leased_file_strategy,
+    FileStrategyStartError, LeasedFileArmedStrategy, LeasedFileStrategyRecovery,
+    LeasedFileStrategyRuntime, PreparedLeasedFileStrategy, PreparedStrategyKind,
+    PreparedStrategyStep, PreparedStrategyStepError, RuntimeBlocker, RuntimeBuildError,
+    RuntimeCancellation, RuntimeSettings, RuntimeStage, RuntimeSubmission, RuntimeTickError,
+    RuntimeTickReport, StrategyRuntime, claim_leased_file_strategy, prepare_leased_file_strategy,
+    recover_leased_file_strategy,
 };
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{
@@ -57,5 +58,7 @@ pub use strategy_machine::{
 };
 pub use submission::{SubmissionError, SubmissionResult, SubmissionService, submit_with};
 pub use supervisor::{
-    RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError, RuntimeRegistryEntry,
+    RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError,
+    RuntimeRegistryEntry, RuntimeStartupFailure, RuntimeStartupReport,
+    recover_discovered_strategies,
 };

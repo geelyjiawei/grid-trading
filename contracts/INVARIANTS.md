@@ -199,6 +199,11 @@ the OpenAPI schema.
   An armed strategy with any order or cancellation intent is never admitted into memory. Temporary
   trigger or preflight failures retain the same armed instance and lease without changing its file;
   activation itself revalidates gateway identity before its first exchange call.
+- Startup discovery never follows symbolic links and never silently discards invalid run
+  directories, missing state, orphan ledgers, or non-regular runtime files. Each valid run is
+  claimed under its lease before the persisted exchange is exposed to the credential provider;
+  attaching a gateway transfers that same lease into the registered runtime. Claim, provider,
+  attachment, and duplicate failures are reported per run and release only the rejected claim.
 - The runtime registry owns one independent asynchronous mutex per run ID. A second tick for the
   same run is rejected rather than queued with stale time, while unrelated runs can advance in
   parallel. Registration never replaces an existing owner and returns the rejected leased handle.

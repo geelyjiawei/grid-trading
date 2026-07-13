@@ -3,15 +3,18 @@ use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::domain::Exchange;
 use crate::exchange::{
     ExchangeIdentityGateway, ExecutionSnapshotGateway, HistoricalPriceGateway,
     InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway, OrderCancellationGateway,
     OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
 };
+use crate::persistence::{StrategyDiscoveryAnomaly, StrategyDiscoveryReport, StrategyFilePaths};
 
 use super::{
-    PreparedLeasedFileStrategy, PreparedStrategyKind, PreparedStrategyStep,
-    PreparedStrategyStepError, StrategyRunId,
+    FileStrategyRecoveryError, PreparedLeasedFileStrategy, PreparedStrategyKind,
+    PreparedStrategyStep, PreparedStrategyStepError, RuntimeSettings, StrategyRunId,
+    claim_leased_file_strategy,
 };
 
 type RuntimeSlot<G> = Arc<Mutex<PreparedLeasedFileStrategy<G>>>;
@@ -31,6 +34,44 @@ impl<G> Default for RuntimeRegistry<G> {
 pub enum RuntimeRegistration<G> {
     Registered,
     Duplicate(PreparedLeasedFileStrategy<G>),
+}
+
+pub trait RuntimeRecoveryProvider {
+    type Gateway: ExchangeIdentityGateway;
+    type Error;
+
+    fn runtime_for(
+        &self,
+        exchange: Exchange,
+        run_id: &StrategyRunId,
+    ) -> Result<(Self::Gateway, RuntimeSettings), Self::Error>;
+}
+
+#[derive(Debug)]
+pub struct RuntimeStartupReport<E> {
+    pub registered: Vec<StrategyRunId>,
+    pub discovery_anomalies: Vec<StrategyDiscoveryAnomaly>,
+    pub failures: Vec<RuntimeStartupFailure<E>>,
+}
+
+#[derive(Debug)]
+pub enum RuntimeStartupFailure<E> {
+    Claim {
+        paths: StrategyFilePaths,
+        error: FileStrategyRecoveryError,
+    },
+    Provider {
+        run_id: StrategyRunId,
+        exchange: Exchange,
+        error: E,
+    },
+    Attach {
+        run_id: StrategyRunId,
+        error: FileStrategyRecoveryError,
+    },
+    Duplicate {
+        run_id: StrategyRunId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +166,65 @@ impl<G> RuntimeRegistry<G> {
             .map_err(|_| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?;
         strategy.advance(now_ms).await.map_err(Into::into)
     }
+}
+
+pub async fn recover_discovered_strategies<P>(
+    registry: &RuntimeRegistry<P::Gateway>,
+    discovery: StrategyDiscoveryReport,
+    provider: &P,
+) -> RuntimeStartupReport<P::Error>
+where
+    P: RuntimeRecoveryProvider,
+{
+    let mut report = RuntimeStartupReport {
+        registered: Vec::new(),
+        discovery_anomalies: discovery.anomalies,
+        failures: Vec::new(),
+    };
+    for paths in discovery.strategies {
+        let claim = match claim_leased_file_strategy(paths.clone()) {
+            Ok(claim) => claim,
+            Err(error) => {
+                report
+                    .failures
+                    .push(RuntimeStartupFailure::Claim { paths, error });
+                continue;
+            }
+        };
+        let run_id = claim.run_id().clone();
+        let exchange = claim.exchange();
+        let (gateway, settings) = match provider.runtime_for(exchange, &run_id) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                report.failures.push(RuntimeStartupFailure::Provider {
+                    run_id,
+                    exchange,
+                    error,
+                });
+                continue;
+            }
+        };
+        let strategy = match claim.attach_gateway(gateway, settings) {
+            Ok(strategy) => strategy,
+            Err(error) => {
+                report
+                    .failures
+                    .push(RuntimeStartupFailure::Attach { run_id, error });
+                continue;
+            }
+        };
+        match registry.register(strategy).await {
+            RuntimeRegistration::Registered => report.registered.push(run_id),
+            RuntimeRegistration::Duplicate(rejected) => {
+                drop(rejected);
+                report
+                    .failures
+                    .push(RuntimeStartupFailure::Duplicate { run_id });
+            }
+        }
+    }
+    report.registered.sort();
+    report
 }
 
 #[derive(Debug, Error)]
