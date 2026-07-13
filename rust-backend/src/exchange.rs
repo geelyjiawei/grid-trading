@@ -164,6 +164,24 @@ pub trait ExecutionSnapshotGateway: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalMinutePrice {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub minute_start_ms: u64,
+    pub open_price: Decimal,
+}
+
+#[async_trait]
+pub trait HistoricalPriceGateway: Send + Sync {
+    async fn historical_minute_open(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        minute_start_ms: u64,
+    ) -> Result<HistoricalMinutePrice, SnapshotError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExchangeMarketSnapshot {
     pub exchange: Exchange,
     pub symbol: String,

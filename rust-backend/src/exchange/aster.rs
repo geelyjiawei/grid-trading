@@ -8,10 +8,11 @@ use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
-        ExecutionSnapshotError, ExecutionSnapshotGateway, InstrumentRulesGateway, LookupError,
-        MarketSnapshotGateway, OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup,
-        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
-        PositionSnapshot, PositionSnapshotGateway, SnapshotError,
+        ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
+        HistoricalPriceGateway, InstrumentRulesGateway, LookupError, MarketSnapshotGateway,
+        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
@@ -19,8 +20,8 @@ use crate::{
             parse_position_snapshot, validate_snapshot_request,
         },
         execution::{
-            CommissionConvention, assemble_execution_snapshot, parse_order_execution_header,
-            parse_trade_page,
+            CommissionConvention, assemble_execution_snapshot, parse_historical_minute_open,
+            parse_order_execution_header, parse_trade_page,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -308,6 +309,45 @@ where
             .await?;
         parse_market_snapshot(&ticker, &premium, Exchange::Aster, &symbol)
             .map_err(|error| SnapshotError::new(format!("invalid Aster market snapshot: {error}")))
+    }
+}
+
+#[async_trait]
+impl<T, S, N> HistoricalPriceGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: Send + Sync,
+    N: Send + Sync,
+{
+    async fn historical_minute_open(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        minute_start_ms: u64,
+    ) -> Result<HistoricalMinutePrice, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        if minute_start_ms == 0 || !minute_start_ms.is_multiple_of(60_000) {
+            return Err(SnapshotError::new(
+                "historical price minute must be a positive UTC minute boundary",
+            ));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let body = self
+            .execute_snapshot(
+                self.public_request(
+                    "/fapi/v3/klines",
+                    vec![
+                        ("symbol".into(), symbol.clone()),
+                        ("interval".into(), "1m".into()),
+                        ("startTime".into(), minute_start_ms.to_string()),
+                        ("limit".into(), "1".into()),
+                    ],
+                ),
+                "Aster historical fee-price snapshot",
+            )
+            .await?;
+        parse_historical_minute_open(&body, Exchange::Aster, &symbol, minute_start_ms)
+            .map_err(|error| SnapshotError::new(format!("invalid Aster minute price: {error}")))
     }
 }
 
@@ -1026,6 +1066,28 @@ mod tests {
         let request = transport.request();
         assert_eq!(request.path, "/fapi/v3/positionRisk");
         assert!(request.query_string().contains("signature="));
+    }
+
+    #[tokio::test]
+    async fn historical_fee_price_uses_one_exact_public_v3_minute_candle() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[[1020000,"602.25","603","601","602","100"]]"#.into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let price = adapter(transport.clone(), signer)
+            .historical_minute_open(Exchange::Aster, "BNBUSDT", 1_020_000)
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(price.open_price, Decimal::new(60225, 2));
+        assert_eq!(request.path, "/fapi/v3/klines");
+        assert_eq!(
+            request.query_string(),
+            "symbol=BNBUSDT&interval=1m&startTime=1020000&limit=1"
+        );
+        assert!(request.headers.is_empty());
     }
 
     #[tokio::test]

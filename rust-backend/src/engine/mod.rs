@@ -1,5 +1,6 @@
 mod armed_strategy;
 mod exchange_inputs;
+mod execution_accounting;
 mod grid_plan;
 mod reconciliation;
 mod strategy_machine;
@@ -9,6 +10,10 @@ pub use armed_strategy::{
     ArmedStrategyError, ArmedStrategyLifecycle, ArmedStrategyState, TriggerCondition,
 };
 pub use exchange_inputs::{AuthoritativeStrategyInputs, StrategyInputError, StrategyInputService};
+pub use execution_accounting::{
+    ExecutionAccountingError, ExecutionAccountingService, FeeValuation, FeeValuationSource,
+    ValuedExecutionReport,
+};
 pub use grid_plan::{
     GridOrderRole, GridPlan, GridPlanError, MarketSnapshot, PlannedGridOrder, PlannedOpeningOrder,
     build_grid_plan,

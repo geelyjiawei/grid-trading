@@ -60,6 +60,12 @@ the OpenAPI schema.
 - Exchange commission is retained per trade in its original signed value and asset.
   Positive fee cost is aggregated by asset; BNB or any non-quote fee is never silently
   relabelled as USDT or included in quote-currency profit without explicit valuation.
+- A non-quote commission is valued only from the exact one-minute candle containing that
+  trade, on the same exchange and against the configured quote asset. Missing or
+  mismatched historical candles block accounting; current prices are never substituted.
+- The execution-to-strategy bridge independently revalidates order identity, lifecycle,
+  trade IDs, quantities, quotes, fee assets, and per-asset totals before producing one
+  cumulative quote-currency fee value.
 
 ## Position ownership
 

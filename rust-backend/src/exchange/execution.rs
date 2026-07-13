@@ -7,8 +7,8 @@ use thiserror::Error;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderSide, TerminalOrderStatus},
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, OrderExecutionSnapshot, OrderLifecycle, TradeFill,
-        codec::parse_authoritative_order,
+        ActiveOrderStatus, AuthoritativeOrder, HistoricalMinutePrice, OrderExecutionSnapshot,
+        OrderLifecycle, TradeFill, codec::parse_authoritative_order,
     },
 };
 
@@ -185,6 +185,43 @@ pub(super) fn parse_trade_page(
     Ok(trades)
 }
 
+pub(super) fn parse_historical_minute_open(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_minute_start_ms: u64,
+) -> Result<HistoricalMinutePrice, ExecutionCodecError> {
+    if expected_minute_start_ms == 0 || !expected_minute_start_ms.is_multiple_of(60_000) {
+        return Err(ExecutionCodecError::InvalidField("minuteStart"));
+    }
+    let root = parse_json(body)?;
+    let rows = root
+        .as_array()
+        .ok_or(ExecutionCodecError::InvalidField("klines"))?;
+    if rows.len() != 1 {
+        return Err(ExecutionCodecError::InvalidField("klines"));
+    }
+    let row = rows[0]
+        .as_array()
+        .filter(|row| row.len() >= 2)
+        .ok_or(ExecutionCodecError::InvalidField("kline"))?;
+    let minute_start_ms = scalar_text(&row[0])
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(ExecutionCodecError::InvalidField("kline.openTime"))?;
+    let open_price = scalar_text(&row[1])
+        .and_then(|value| value.parse::<Decimal>().ok())
+        .ok_or(ExecutionCodecError::InvalidField("kline.open"))?;
+    if minute_start_ms != expected_minute_start_ms || open_price <= Decimal::ZERO {
+        return Err(ExecutionCodecError::InvalidField("kline"));
+    }
+    Ok(HistoricalMinutePrice {
+        exchange,
+        symbol: expected_symbol.to_ascii_uppercase(),
+        minute_start_ms,
+        open_price,
+    })
+}
+
 pub(super) fn assemble_execution_snapshot(
     header: OrderExecutionHeader,
     mut trades: Vec<TradeFill>,
@@ -249,13 +286,17 @@ fn required_string<'a>(
 fn required_scalar_text(value: &Value, field: &'static str) -> Result<String, ExecutionCodecError> {
     value
         .get(field)
-        .and_then(|value| match value {
-            Value::String(text) => Some(text.clone()),
-            Value::Number(number) => Some(number.to_string()),
-            _ => None,
-        })
+        .and_then(scalar_text)
         .filter(|text| !text.trim().is_empty())
         .ok_or(ExecutionCodecError::InvalidField(field))
+}
+
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 fn required_decimal(value: &Value, field: &'static str) -> Result<Decimal, ExecutionCodecError> {
@@ -395,5 +436,36 @@ mod tests {
             "42",
         );
         assert_eq!(invalid, Err(ExecutionCodecError::InvalidField("status")));
+    }
+
+    #[test]
+    fn historical_price_requires_one_exact_minute_and_positive_open() {
+        let price = parse_historical_minute_open(
+            r#"[[1020000,"602.25","603","601","602","100"]]"#,
+            Exchange::Binance,
+            "BNBUSDT",
+            1_020_000,
+        )
+        .unwrap();
+        assert_eq!(price.open_price, Decimal::new(60225, 2));
+
+        assert!(
+            parse_historical_minute_open(
+                r#"[[960000,"602.25"]]"#,
+                Exchange::Binance,
+                "BNBUSDT",
+                1_020_000,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_historical_minute_open(
+                r#"[[1020000,"0"]]"#,
+                Exchange::Binance,
+                "BNBUSDT",
+                1_020_000,
+            )
+            .is_err()
+        );
     }
 }
