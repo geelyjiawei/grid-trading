@@ -1,6 +1,7 @@
 mod armed_strategy;
 mod exchange_inputs;
 mod execution_accounting;
+mod execution_sync;
 mod grid_plan;
 mod reconciliation;
 mod strategy_machine;
@@ -14,6 +15,7 @@ pub use execution_accounting::{
     ExecutionAccountingError, ExecutionAccountingService, FeeValuation, FeeValuationSource,
     ValuedExecutionReport,
 };
+pub use execution_sync::{ExecutionSyncError, ExecutionSyncResult, ExecutionSyncService};
 pub use grid_plan::{
     GridOrderRole, GridPlan, GridPlanError, MarketSnapshot, PlannedGridOrder, PlannedOpeningOrder,
     build_grid_plan,

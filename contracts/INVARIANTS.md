@@ -66,6 +66,11 @@ the OpenAPI schema.
 - The execution-to-strategy bridge independently revalidates order identity, lifecycle,
   trade IDs, quantities, quotes, fee assets, and per-asset totals before producing one
   cumulative quote-currency fee value.
+- Execution lookup and fee valuation complete before the strategy state is cloned for its
+  single atomic transition. A transport, identity, valuation, or persistence failure
+  leaves position, fees, lots, pair counts, and replacement obligations unchanged.
+- Retrying the same complete cumulative execution snapshot after a persistence failure is
+  idempotent; it cannot double-count a fill, fee, lot, completed pair, or replacement.
 
 ## Position ownership
 
