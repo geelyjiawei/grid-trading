@@ -48,6 +48,9 @@ the OpenAPI schema.
   is an unknown outcome. The same client order ID must be reconciled before any retry.
 - Only the exchange's definitive order-not-found code is `NotFound`; transport and
   malformed lookup responses remain inconclusive.
+- A cancellation acknowledgement must match both immutable client and exchange order
+  IDs. It confirms only that cancellation was accepted; terminal state still requires
+  authoritative cumulative execution accounting.
 
 ## Position ownership
 
@@ -87,6 +90,9 @@ the OpenAPI schema.
   replacement chain is accepted; the cancelled order itself never counts as coverage.
 - Replacement orders exactly equal their assigned durable obligations. Quantity, side,
   price, reduce-only, level, and exchange rules are revalidated on every state write.
+- Counter and cancelled-remainder obligations are created only while a strategy is
+  deploying or running. Fills observed during stop, risk exit, failure, or finalization
+  are still booked exactly, but can never schedule a normal grid replacement.
 
 ## Persistence and recovery
 

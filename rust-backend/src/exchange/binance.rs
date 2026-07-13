@@ -7,11 +7,13 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
-        LookupError, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError,
+        CancellationAcknowledgement, CancellationError, LookupError, OrderCancellationGateway,
+        OrderLookup, OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement,
+        PlacementError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
-            parse_authoritative_order, parse_exchange_error, parse_placement_acknowledgement,
+            parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
+            parse_placement_acknowledgement,
         },
         protocol::{
             HttpMethod, HttpTransport, MillisecondClock, Parameters, PreparedHttpRequest,
@@ -25,6 +27,61 @@ const TESTNET_BASE_URL: &str = "https://testnet.binancefuture.com";
 
 pub trait BinanceRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, SignatureError>;
+}
+
+#[async_trait]
+impl<T, S, C> OrderCancellationGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn cancel_order(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<CancellationAcknowledgement, CancellationError> {
+        if exchange != Exchange::Binance {
+            return Err(invalid_cancellation("order belongs to another exchange"));
+        }
+        if symbol.trim().is_empty() || exchange_order_id.trim().is_empty() {
+            return Err(invalid_cancellation(
+                "symbol and exchange order ID are required",
+            ));
+        }
+        let params = vec![
+            ("symbol".into(), symbol.to_ascii_uppercase()),
+            ("orderId".into(), exchange_order_id.into()),
+        ];
+        let request = self
+            .signed_request(HttpMethod::Delete, "/fapi/v1/order", params)
+            .map_err(|error| invalid_cancellation(&error.to_string()))?;
+        let response =
+            self.transport
+                .execute(request)
+                .await
+                .map_err(|error| CancellationError::Unknown {
+                    message: error.to_string(),
+                })?;
+        if (200..300).contains(&response.status) {
+            return parse_cancellation_acknowledgement(
+                &response.body,
+                client_order_id,
+                exchange_order_id,
+            )
+            .map_err(|error| CancellationError::Unknown {
+                message: format!(
+                    "Binance cancellation acknowledgement is not authoritative: {error}"
+                ),
+            });
+        }
+        let error = parse_exchange_error(&response.body);
+        Err(CancellationError::Unknown {
+            message: error.message,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -267,6 +324,12 @@ fn lookup_error(message: &str) -> LookupError {
     }
 }
 
+fn invalid_cancellation(message: &str) -> CancellationError {
+    CancellationError::Invalid {
+        message: message.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -454,6 +517,51 @@ mod tests {
 
         assert!(matches!(result, Err(PlacementError::Unknown { .. })));
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_verifies_both_order_identities_and_never_marks_execution_terminal() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"orderId":91,"clientOrderId":"g_7_S_fixed","status":"CANCELED"}"#.into(),
+        }));
+        let acknowledgement = adapter(transport.clone())
+            .cancel_order(
+                Exchange::Binance,
+                "MUUSDT",
+                &ClientOrderId::parse("g_7_S_fixed").unwrap(),
+                "91",
+            )
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(acknowledgement.exchange_order_id, "91");
+        assert_eq!(request.method, HttpMethod::Delete);
+        assert_eq!(request.path, "/fapi/v1/order");
+        assert!(
+            request
+                .query_string()
+                .starts_with("symbol=MUUSDT&orderId=91&timestamp=1700000000123")
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_cancellation_acknowledgement_remains_unknown() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"orderId":92,"clientOrderId":"g_7_S_fixed","status":"CANCELED"}"#.into(),
+        }));
+        let result = adapter(transport)
+            .cancel_order(
+                Exchange::Binance,
+                "MUUSDT",
+                &ClientOrderId::parse("g_7_S_fixed").unwrap(),
+                "91",
+            )
+            .await;
+
+        assert!(matches!(result, Err(CancellationError::Unknown { .. })));
     }
 
     #[tokio::test]

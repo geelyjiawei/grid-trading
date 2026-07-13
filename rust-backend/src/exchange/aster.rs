@@ -7,11 +7,13 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
-        LookupError, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError,
+        CancellationAcknowledgement, CancellationError, LookupError, OrderCancellationGateway,
+        OrderLookup, OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement,
+        PlacementError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
-            parse_authoritative_order, parse_exchange_error, parse_placement_acknowledgement,
+            parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
+            parse_placement_acknowledgement,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -331,6 +333,61 @@ where
     }
 }
 
+#[async_trait]
+impl<T, S, N> OrderCancellationGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    async fn cancel_order(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<CancellationAcknowledgement, CancellationError> {
+        if exchange != Exchange::Aster {
+            return Err(invalid_cancellation("order belongs to another exchange"));
+        }
+        if symbol.trim().is_empty() || exchange_order_id.trim().is_empty() {
+            return Err(invalid_cancellation(
+                "symbol and exchange order ID are required",
+            ));
+        }
+        let params = vec![
+            ("symbol".into(), symbol.to_ascii_uppercase()),
+            ("orderId".into(), exchange_order_id.into()),
+        ];
+        let request = self
+            .signed_request(HttpMethod::Delete, "/fapi/v3/order", params)
+            .map_err(|error| invalid_cancellation(&error.to_string()))?;
+        let response =
+            self.transport
+                .execute(request)
+                .await
+                .map_err(|error| CancellationError::Unknown {
+                    message: error.to_string(),
+                })?;
+        if (200..300).contains(&response.status) {
+            return parse_cancellation_acknowledgement(
+                &response.body,
+                client_order_id,
+                exchange_order_id,
+            )
+            .map_err(|error| CancellationError::Unknown {
+                message: format!(
+                    "Aster cancellation acknowledgement is not authoritative: {error}"
+                ),
+            });
+        }
+        let error = parse_exchange_error(&response.body);
+        Err(CancellationError::Unknown {
+            message: error.message,
+        })
+    }
+}
+
 fn aster_eip712_digest(message: &str) -> [u8; 32] {
     let mut domain_words = Vec::with_capacity(32 * 5);
     domain_words.extend_from_slice(&keccak256(EIP712_DOMAIN_TYPE.as_bytes()));
@@ -397,6 +454,12 @@ fn definitive_local_error(message: &str) -> PlacementError {
 
 fn lookup_error(message: &str) -> LookupError {
     LookupError {
+        message: message.into(),
+    }
+}
+
+fn invalid_cancellation(message: &str) -> CancellationError {
+    CancellationError::Invalid {
         message: message.into(),
     }
 }
@@ -621,6 +684,39 @@ mod tests {
             adapter(transport, signer).place_order(&intent()).await,
             Err(PlacementError::Unknown { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_uses_signed_v3_delete_and_strict_identity_acknowledgement() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{
+                "orderId":4770039,"clientOrderId":"g_0_B_fixed","status":"CANCELED"
+            }"#
+            .into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let acknowledgement = adapter(transport.clone(), signer.clone())
+            .cancel_order(
+                Exchange::Aster,
+                "ANSEMUSDT",
+                &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                "4770039",
+            )
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(acknowledgement.exchange_order_id, "4770039");
+        assert_eq!(request.method, HttpMethod::Delete);
+        assert_eq!(request.path, "/fapi/v3/order");
+        assert!(request.query.is_empty());
+        assert!(
+            request
+                .body_string()
+                .starts_with("symbol=ANSEMUSDT&orderId=4770039&nonce=1700000000123456&user=")
+        );
+        assert_eq!(signer.messages.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

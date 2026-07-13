@@ -1607,6 +1607,9 @@ fn apply_execution_delta(
             .checked_add(realized)
             .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
     }
+    if !normal_grid_replacements_enabled(state.lifecycle) {
+        return Ok(());
+    }
     let counter = counter_shape(state, level_index, delta.shape, delta.quantity)?;
     let id = add_obligation(
         state,
@@ -1984,7 +1987,8 @@ fn process_terminal_order(
     if matches!(
         report.terminal_status,
         Some(TerminalOrderStatus::Cancelled | TerminalOrderStatus::Expired)
-    ) {
+    ) && normal_grid_replacements_enabled(state.lifecycle)
+    {
         let remaining = shape.quantity - report.cumulative_quantity;
         if remaining > Decimal::ZERO {
             let mut replacement = shape.clone();
@@ -2006,6 +2010,13 @@ fn process_terminal_order(
         return Err("grid order was rejected and requires explicit review".into());
     }
     Ok(())
+}
+
+fn normal_grid_replacements_enabled(lifecycle: StrategyLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        StrategyLifecycle::DeployingGrid | StrategyLifecycle::Running
+    )
 }
 
 fn allocate_opening_delta(
@@ -4213,6 +4224,55 @@ mod tests {
         assert_eq!(
             machine.store().snapshot().lifecycle,
             StrategyLifecycle::StopRequested
+        );
+    }
+
+    #[test]
+    fn stop_race_fill_is_owned_without_creating_counter_or_remainder_orders() {
+        let mut machine = short_machine_with_opening();
+        let client_order_id = grid_id(machine.store().snapshot(), 14, OrderSide::Sell, false);
+        let mut intent = machine
+            .store()
+            .snapshot()
+            .ready_intents(110)
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.client_order_id == client_order_id)
+            .unwrap();
+        intent.state = IntentState::Accepted {
+            exchange_order_id: "stop-race-order".into(),
+        };
+        machine.synchronize_intent(&intent, 111).unwrap();
+        machine.request_stop(112).unwrap();
+
+        assert_eq!(
+            machine
+                .apply_execution(
+                    &report(
+                        client_order_id,
+                        "stop-race-order",
+                        Decimal::new(1, 1),
+                        Decimal::new(1015, 1),
+                        Some(TerminalOrderStatus::Cancelled),
+                    ),
+                    113,
+                )
+                .unwrap(),
+            StrategyTransition::Updated {
+                new_obligation_ids: vec![]
+            }
+        );
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::StopRequested);
+        assert_eq!(state.grid_position_net_quantity, Decimal::new(-29, 1));
+        assert!(state.replacement_obligations.is_empty());
+        assert!(state.ready_intents(114).unwrap().is_empty());
+        assert_eq!(
+            machine.mark_stopped(115).unwrap(),
+            StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::Stopped
+            }
         );
     }
 

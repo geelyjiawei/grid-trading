@@ -7,8 +7,8 @@ use crate::{
         ClientOrderId, Exchange, OrderKind, OrderShape, OrderSide, TerminalOrderStatus, TimeInForce,
     },
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, OrderLifecycle, PlacementAcknowledgement,
-        protocol::Parameters,
+        ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, OrderLifecycle,
+        PlacementAcknowledgement, protocol::Parameters,
     },
 };
 
@@ -116,6 +116,35 @@ pub(super) fn parse_placement_acknowledgement(
     }
 
     Ok(PlacementAcknowledgement {
+        client_order_id: expected_client_order_id.clone(),
+        exchange_order_id,
+    })
+}
+
+pub(super) fn parse_cancellation_acknowledgement(
+    body: &str,
+    expected_client_order_id: &ClientOrderId,
+    expected_exchange_order_id: &str,
+) -> Result<CancellationAcknowledgement, CodecError> {
+    let value: Value =
+        serde_json::from_str(body).map_err(|error| CodecError::InvalidJson(error.to_string()))?;
+    let exchange_order_id = required_scalar_text(&value, "orderId")?;
+    if exchange_order_id != expected_exchange_order_id {
+        return Err(CodecError::InvalidField("orderId"));
+    }
+    let returned_client_id = required_scalar_text(&value, "clientOrderId")?;
+    if returned_client_id != expected_client_order_id.as_str() {
+        return Err(CodecError::ClientOrderIdMismatch);
+    }
+    if !matches!(
+        required_string(&value, "status")?
+            .to_ascii_uppercase()
+            .as_str(),
+        "CANCELED" | "CANCELLED"
+    ) {
+        return Err(CodecError::InvalidField("status"));
+    }
+    Ok(CancellationAcknowledgement {
         client_order_id: expected_client_order_id.clone(),
         exchange_order_id,
     })

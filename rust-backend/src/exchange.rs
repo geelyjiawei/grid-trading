@@ -34,6 +34,31 @@ pub trait OrderPlacementGateway: Send + Sync {
     ) -> Result<PlacementAcknowledgement, PlacementError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancellationAcknowledgement {
+    pub client_order_id: ClientOrderId,
+    pub exchange_order_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CancellationError {
+    #[error("order cancellation request is invalid: {message}")]
+    Invalid { message: String },
+    #[error("order cancellation outcome is unknown: {message}")]
+    Unknown { message: String },
+}
+
+#[async_trait]
+pub trait OrderCancellationGateway: Send + Sync {
+    async fn cancel_order(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<CancellationAcknowledgement, CancellationError>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActiveOrderStatus {
     New,
