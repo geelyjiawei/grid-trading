@@ -1274,6 +1274,28 @@ where
         finalize_and_store(&mut self.store, next, now_ms, transition)
     }
 
+    pub fn reconcile_instrument_rules(
+        &mut self,
+        fresh_rules: &InstrumentRules,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        fresh_rules
+            .validate()
+            .map_err(StrategyStateError::InvalidInstrument)?;
+        if fresh_rules == &self.store.snapshot().instrument_rules {
+            return Ok(StrategyTransition::NoChange);
+        }
+        let mut next = self.store.snapshot().clone();
+        let message = "authoritative exchange instrument rules changed".to_owned();
+        next.fail(message.clone());
+        finalize_and_store(
+            &mut self.store,
+            next,
+            now_ms,
+            StrategyTransition::Failed { message },
+        )
+    }
+
     pub fn evaluate_risk_price(
         &mut self,
         mark_price: Decimal,

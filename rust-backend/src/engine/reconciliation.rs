@@ -47,104 +47,116 @@ where
         client_order_id: &ClientOrderId,
         now_ms: u64,
     ) -> Result<ReconciliationResult, ReconciliationError> {
-        let intent = self
-            .store
-            .snapshot()
-            .intents
-            .get(client_order_id)
-            .cloned()
-            .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
+        reconcile_with(&self.gateway, &mut self.store, client_order_id, now_ms).await
+    }
+}
 
-        if matches!(
-            intent.state,
-            IntentState::Rejected { .. }
-                | IntentState::OwnershipConflict { .. }
-                | IntentState::Terminal { .. }
-        ) {
-            return Ok(ReconciliationResult::AlreadyFinal);
-        }
+pub async fn reconcile_with<G, S>(
+    gateway: &G,
+    store: &mut S,
+    client_order_id: &ClientOrderId,
+    now_ms: u64,
+) -> Result<ReconciliationResult, ReconciliationError>
+where
+    G: OrderLookupGateway,
+    S: IntentStore,
+{
+    let intent = store
+        .snapshot()
+        .intents
+        .get(client_order_id)
+        .cloned()
+        .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
 
-        let lookup = self
-            .gateway
-            .lookup_order_by_client_id(
-                intent.exchange,
-                &intent.shape.symbol,
-                &intent.client_order_id,
-            )
-            .await;
-
-        match lookup {
-            Ok(OrderLookup::Found(snapshot)) => self.reconcile_found(intent, snapshot, now_ms),
-            Ok(OrderLookup::NotFound) => self.preserve_unknown(
-                intent,
-                "order is not currently visible in the authoritative exchange lookup",
-                now_ms,
-            ),
-            Err(error) => self.preserve_unknown(intent, &error.message, now_ms),
-        }
+    if matches!(
+        intent.state,
+        IntentState::Rejected { .. }
+            | IntentState::OwnershipConflict { .. }
+            | IntentState::Terminal { .. }
+    ) {
+        return Ok(ReconciliationResult::AlreadyFinal);
     }
 
-    fn preserve_unknown(
-        &mut self,
-        intent: OrderIntent,
-        message: &str,
-        now_ms: u64,
-    ) -> Result<ReconciliationResult, ReconciliationError> {
-        if intent.state == IntentState::Prepared {
-            self.store.transition(
-                &intent.client_order_id,
-                IntentState::SubmitUnknown {
-                    message: message.to_owned(),
-                },
-                now_ms,
-            )?;
-        }
-        Ok(ReconciliationResult::StillUnknown {
-            message: message.to_owned(),
-        })
+    let lookup = gateway
+        .lookup_order_by_client_id(
+            intent.exchange,
+            &intent.shape.symbol,
+            &intent.client_order_id,
+        )
+        .await;
+
+    match lookup {
+        Ok(OrderLookup::Found(snapshot)) => reconcile_found(store, intent, snapshot, now_ms),
+        Ok(OrderLookup::NotFound) => preserve_unknown(
+            store,
+            intent,
+            "order is not currently visible in the authoritative exchange lookup",
+            now_ms,
+        ),
+        Err(error) => preserve_unknown(store, intent, &error.message, now_ms),
+    }
+}
+
+fn preserve_unknown<S: IntentStore>(
+    store: &mut S,
+    intent: OrderIntent,
+    message: &str,
+    now_ms: u64,
+) -> Result<ReconciliationResult, ReconciliationError> {
+    if intent.state == IntentState::Prepared {
+        store.transition(
+            &intent.client_order_id,
+            IntentState::SubmitUnknown {
+                message: message.to_owned(),
+            },
+            now_ms,
+        )?;
+    }
+    Ok(ReconciliationResult::StillUnknown {
+        message: message.to_owned(),
+    })
+}
+
+fn reconcile_found<S: IntentStore>(
+    store: &mut S,
+    intent: OrderIntent,
+    snapshot: AuthoritativeOrder,
+    now_ms: u64,
+) -> Result<ReconciliationResult, ReconciliationError> {
+    if let Some(message) = ownership_conflict(&intent, &snapshot) {
+        store.transition(
+            &intent.client_order_id,
+            IntentState::OwnershipConflict {
+                message: message.clone(),
+            },
+            now_ms,
+        )?;
+        return Ok(ReconciliationResult::OwnershipConflict { message });
     }
 
-    fn reconcile_found(
-        &mut self,
-        intent: OrderIntent,
-        snapshot: AuthoritativeOrder,
-        now_ms: u64,
-    ) -> Result<ReconciliationResult, ReconciliationError> {
-        if let Some(message) = ownership_conflict(&intent, &snapshot) {
-            self.store.transition(
+    let exchange_order_id = snapshot.exchange_order_id;
+    if !matches!(intent.state, IntentState::Accepted { .. }) {
+        store.transition(
+            &intent.client_order_id,
+            IntentState::Accepted {
+                exchange_order_id: exchange_order_id.clone(),
+            },
+            now_ms,
+        )?;
+    }
+
+    match snapshot.lifecycle {
+        OrderLifecycle::Active(_) => Ok(ReconciliationResult::Accepted { exchange_order_id }),
+        OrderLifecycle::Terminal(status) => {
+            store.transition(
                 &intent.client_order_id,
-                IntentState::OwnershipConflict {
-                    message: message.clone(),
-                },
+                IntentState::Terminal { status },
                 now_ms,
             )?;
-            return Ok(ReconciliationResult::OwnershipConflict { message });
-        }
-
-        let exchange_order_id = snapshot.exchange_order_id;
-        if !matches!(intent.state, IntentState::Accepted { .. }) {
-            self.store.transition(
-                &intent.client_order_id,
-                IntentState::Accepted {
-                    exchange_order_id: exchange_order_id.clone(),
-                },
-                now_ms,
-            )?;
-        }
-
-        match snapshot.lifecycle {
-            OrderLifecycle::Active(_) => Ok(ReconciliationResult::Accepted { exchange_order_id }),
-            OrderLifecycle::Terminal(status) => {
-                self.store.transition(
-                    &intent.client_order_id,
-                    IntentState::Terminal { status },
-                    now_ms,
-                )?;
-                Ok(ReconciliationResult::Terminal {
-                    exchange_order_id,
-                    status,
-                })
-            }
+            Ok(ReconciliationResult::Terminal {
+                exchange_order_id,
+                status,
+            })
         }
     }
 }

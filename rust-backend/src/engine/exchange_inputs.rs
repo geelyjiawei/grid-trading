@@ -55,45 +55,66 @@ where
         symbol: &str,
         now_ms: u64,
     ) -> Result<AuthoritativeStrategyInputs, StrategyInputError> {
-        if symbol.trim().is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-            return Err(StrategyInputError::InvalidSymbol);
-        }
-        let symbol = symbol.to_ascii_uppercase();
-        let (market, instrument_rules, position) = tokio::try_join!(
-            self.gateway.market_snapshot(exchange, &symbol),
-            self.gateway.instrument_rules(exchange, &symbol),
-            self.gateway.position_snapshot(exchange, &symbol),
-        )?;
-
-        if market.exchange != exchange
-            || market.symbol != symbol
-            || position.exchange != exchange
-            || position.symbol != symbol
-        {
-            return Err(StrategyInputError::IdentityMismatch);
-        }
-        market.ensure_fresh(
+        load_strategy_inputs(
+            &self.gateway,
+            exchange,
+            symbol,
             now_ms,
             self.maximum_market_age_ms,
             self.maximum_future_skew_ms,
-        )?;
-        instrument_rules
-            .validate()
-            .map_err(|error| StrategyInputError::InvalidInstrument(error.to_string()))?;
-        let (signed_quantity, entry_price) = position.one_way_position()?;
-        let baseline = PositionBaseline::from_authoritative_position(signed_quantity, entry_price)?;
-
-        Ok(AuthoritativeStrategyInputs {
-            exchange,
-            symbol,
-            market: MarketSnapshot {
-                last_price: market.last_price,
-                mark_price: market.mark_price,
-            },
-            instrument_rules,
-            baseline,
-        })
+        )
+        .await
     }
+}
+
+pub async fn load_strategy_inputs<G>(
+    gateway: &G,
+    exchange: Exchange,
+    symbol: &str,
+    now_ms: u64,
+    maximum_market_age_ms: u64,
+    maximum_future_skew_ms: u64,
+) -> Result<AuthoritativeStrategyInputs, StrategyInputError>
+where
+    G: MarketSnapshotGateway + InstrumentRulesGateway + PositionSnapshotGateway,
+{
+    if maximum_market_age_ms == 0 {
+        return Err(StrategyInputError::InvalidFreshnessWindow);
+    }
+    if symbol.trim().is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(StrategyInputError::InvalidSymbol);
+    }
+    let symbol = symbol.to_ascii_uppercase();
+    let (market, instrument_rules, position) = tokio::try_join!(
+        gateway.market_snapshot(exchange, &symbol),
+        gateway.instrument_rules(exchange, &symbol),
+        gateway.position_snapshot(exchange, &symbol),
+    )?;
+
+    if market.exchange != exchange
+        || market.symbol != symbol
+        || position.exchange != exchange
+        || position.symbol != symbol
+    {
+        return Err(StrategyInputError::IdentityMismatch);
+    }
+    market.ensure_fresh(now_ms, maximum_market_age_ms, maximum_future_skew_ms)?;
+    instrument_rules
+        .validate()
+        .map_err(|error| StrategyInputError::InvalidInstrument(error.to_string()))?;
+    let (signed_quantity, entry_price) = position.one_way_position()?;
+    let baseline = PositionBaseline::from_authoritative_position(signed_quantity, entry_price)?;
+
+    Ok(AuthoritativeStrategyInputs {
+        exchange,
+        symbol,
+        market: MarketSnapshot {
+            last_price: market.last_price,
+            mark_price: market.mark_price,
+        },
+        instrument_rules,
+        baseline,
+    })
 }
 
 #[derive(Debug, Error)]

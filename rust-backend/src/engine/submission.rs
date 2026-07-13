@@ -36,50 +36,63 @@ where
         intent: OrderIntent,
         result_time_ms: u64,
     ) -> Result<SubmissionResult, SubmissionError> {
-        let client_order_id = intent.client_order_id.clone();
-        self.store.insert_prepared(intent.clone())?;
+        submit_with(&self.gateway, &mut self.store, intent, result_time_ms).await
+    }
+}
 
-        match self.gateway.place_order(&intent).await {
-            Ok(acknowledgement) => {
-                if acknowledgement.client_order_id != client_order_id
-                    || acknowledgement.exchange_order_id.is_empty()
-                {
-                    self.store.transition(
-                        &client_order_id,
-                        IntentState::SubmitUnknown {
-                            message: "placement acknowledgement identity is missing or mismatched"
-                                .into(),
-                        },
-                        result_time_ms,
-                    )?;
-                    return Ok(SubmissionResult::SubmitUnknown);
-                }
-                let exchange_order_id = acknowledgement.exchange_order_id;
-                self.store.transition(
+pub async fn submit_with<G, S>(
+    gateway: &G,
+    store: &mut S,
+    intent: OrderIntent,
+    result_time_ms: u64,
+) -> Result<SubmissionResult, SubmissionError>
+where
+    G: OrderPlacementGateway,
+    S: IntentStore,
+{
+    let client_order_id = intent.client_order_id.clone();
+    store.insert_prepared(intent.clone())?;
+
+    match gateway.place_order(&intent).await {
+        Ok(acknowledgement) => {
+            if acknowledgement.client_order_id != client_order_id
+                || acknowledgement.exchange_order_id.is_empty()
+            {
+                store.transition(
                     &client_order_id,
-                    IntentState::Accepted {
-                        exchange_order_id: exchange_order_id.clone(),
+                    IntentState::SubmitUnknown {
+                        message: "placement acknowledgement identity is missing or mismatched"
+                            .into(),
                     },
                     result_time_ms,
                 )?;
-                Ok(SubmissionResult::Accepted { exchange_order_id })
+                return Ok(SubmissionResult::SubmitUnknown);
             }
-            Err(PlacementError::Unknown { message }) => {
-                self.store.transition(
-                    &client_order_id,
-                    IntentState::SubmitUnknown { message },
-                    result_time_ms,
-                )?;
-                Ok(SubmissionResult::SubmitUnknown)
-            }
-            Err(PlacementError::Definitive { code, message }) => {
-                self.store.transition(
-                    &client_order_id,
-                    IntentState::Rejected { code, message },
-                    result_time_ms,
-                )?;
-                Ok(SubmissionResult::Rejected)
-            }
+            let exchange_order_id = acknowledgement.exchange_order_id;
+            store.transition(
+                &client_order_id,
+                IntentState::Accepted {
+                    exchange_order_id: exchange_order_id.clone(),
+                },
+                result_time_ms,
+            )?;
+            Ok(SubmissionResult::Accepted { exchange_order_id })
+        }
+        Err(PlacementError::Unknown { message }) => {
+            store.transition(
+                &client_order_id,
+                IntentState::SubmitUnknown { message },
+                result_time_ms,
+            )?;
+            Ok(SubmissionResult::SubmitUnknown)
+        }
+        Err(PlacementError::Definitive { code, message }) => {
+            store.transition(
+                &client_order_id,
+                IntentState::Rejected { code, message },
+                result_time_ms,
+            )?;
+            Ok(SubmissionResult::Rejected)
         }
     }
 }

@@ -135,6 +135,17 @@ the OpenAPI schema.
 ## Persistence and recovery
 
 - State/history updates are atomic and durable.
+- Every runtime tick reconciles all durable order intents and applies complete execution
+  accounting before it reads fresh market/rule/position inputs or submits another order.
+- A prepared, unknown, rejected, conflicted, or incompletely accounted intent blocks all
+  later submissions in that tick. Batch placement stops at the first unknown or rejected
+  result; later grid orders are not sent speculatively.
+- If the exchange accepts an order but either the intent ledger or strategy-state commit
+  fails, the next tick performs authoritative client-ID reconciliation before submission.
+  The immutable client order ID is never submitted a second time.
+- Fresh exchange instrument rules must exactly match the rules that produced the durable
+  plan. Any change fails the strategy before a new order is placed; an existing plan is
+  never silently requantized under new rules.
 - A waiting trigger has no grid plan, baseline, or order intent. Trigger activation uses
   fresh market data, fresh exchange rules, and the authoritative position at trigger time.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
