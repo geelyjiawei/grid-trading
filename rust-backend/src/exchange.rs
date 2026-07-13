@@ -14,6 +14,7 @@ pub mod binance;
 pub mod bybit;
 mod bybit_codec;
 mod codec;
+pub mod configured;
 mod execution;
 pub mod protocol;
 
