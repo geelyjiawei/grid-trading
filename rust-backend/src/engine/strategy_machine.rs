@@ -8,8 +8,12 @@ use crate::domain::{
     ClientOrderId, Direction, Exchange, GridConfig, InstrumentRules, IntentState, OrderIntent,
     OrderKind, OrderShape, OrderSide, TerminalOrderStatus,
 };
+use crate::exchange::OrderLifecycle;
 
-use super::{GridOrderRole, GridPlan};
+use super::{
+    GridOrderRole, GridPlan,
+    execution_accounting::{ExecutionAuditRecord, FeeValuationSource, ValuedExecutionReport},
+};
 
 fn one_u64() -> u64 {
     1
@@ -160,6 +164,8 @@ pub struct StrategyOrderRecord {
     pub cumulative_quantity: Decimal,
     pub cumulative_quote: Decimal,
     pub cumulative_fee: Decimal,
+    #[serde(default)]
+    pub execution_audit: Option<ExecutionAuditRecord>,
     pub terminal_status: Option<TerminalOrderStatus>,
     pub terminal_processed: bool,
     pub completed_pair_counted: bool,
@@ -492,6 +498,20 @@ impl StrategyState {
             {
                 return Err(StrategyStateError::InvalidExecutionTotals);
             }
+            if let Some(audit) = &order.execution_audit {
+                validate_execution_audit_payload(
+                    self.exchange,
+                    order,
+                    audit,
+                    order.cumulative_quantity,
+                    order.cumulative_quote,
+                    order.cumulative_fee,
+                    order.terminal_status,
+                )?;
+                if audit.synced_at_ms > self.updated_at_ms {
+                    return Err(StrategyStateError::InvalidExecutionAudit);
+                }
+            }
             if order.terminal_processed != order.terminal_status.is_some() {
                 return Err(StrategyStateError::TerminalProcessingMismatch);
             }
@@ -658,6 +678,7 @@ impl StrategyState {
                 cumulative_quantity: Decimal::ZERO,
                 cumulative_quote: Decimal::ZERO,
                 cumulative_fee: Decimal::ZERO,
+                execution_audit: None,
                 terminal_status: None,
                 terminal_processed: false,
                 completed_pair_counted: false,
@@ -691,6 +712,7 @@ impl StrategyState {
                 cumulative_quantity: Decimal::ZERO,
                 cumulative_quote: Decimal::ZERO,
                 cumulative_fee: Decimal::ZERO,
+                execution_audit: None,
                 terminal_status: None,
                 terminal_processed: false,
                 completed_pair_counted: false,
@@ -829,6 +851,220 @@ fn validate_obligation_against_instrument(
     Ok(())
 }
 
+fn validate_execution_audit_payload(
+    strategy_exchange: Exchange,
+    order: &StrategyOrderRecord,
+    audit: &ExecutionAuditRecord,
+    expected_quantity: Decimal,
+    expected_quote: Decimal,
+    expected_fee: Decimal,
+    expected_terminal_status: Option<TerminalOrderStatus>,
+) -> Result<(), StrategyStateError> {
+    let snapshot = &audit.snapshot;
+    if audit.synced_at_ms == 0
+        || snapshot.order.exchange != strategy_exchange
+        || snapshot.order.client_order_id != order.client_order_id
+        || snapshot.order.exchange_order_id.trim().is_empty()
+        || order.exchange_order_id.as_deref() != Some(&snapshot.order.exchange_order_id)
+        || snapshot.order.shape != order.shape
+        || snapshot.cumulative_quantity != expected_quantity
+        || snapshot.cumulative_quote != expected_quote
+        || snapshot.order_time_ms == 0
+        || snapshot.update_time_ms < snapshot.order_time_ms
+        || expected_quantity < Decimal::ZERO
+        || expected_quote < Decimal::ZERO
+        || expected_fee < Decimal::ZERO
+    {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+    let snapshot_terminal_status = match snapshot.order.lifecycle {
+        OrderLifecycle::Active(crate::exchange::ActiveOrderStatus::New) => {
+            if !expected_quantity.is_zero() {
+                return Err(StrategyStateError::InvalidExecutionAudit);
+            }
+            None
+        }
+        OrderLifecycle::Active(crate::exchange::ActiveOrderStatus::PartiallyFilled) => {
+            if expected_quantity <= Decimal::ZERO || expected_quantity >= order.shape.quantity {
+                return Err(StrategyStateError::InvalidExecutionAudit);
+            }
+            None
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Filled) => {
+            if expected_quantity != order.shape.quantity {
+                return Err(StrategyStateError::InvalidExecutionAudit);
+            }
+            Some(TerminalOrderStatus::Filled)
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Rejected) => {
+            if !expected_quantity.is_zero() {
+                return Err(StrategyStateError::InvalidExecutionAudit);
+            }
+            Some(TerminalOrderStatus::Rejected)
+        }
+        OrderLifecycle::Terminal(status) => Some(status),
+    };
+    if snapshot_terminal_status != expected_terminal_status {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+
+    let mut trades = BTreeMap::new();
+    let mut trade_quantity = Decimal::ZERO;
+    let mut trade_quote = Decimal::ZERO;
+    let mut fees_by_asset = BTreeMap::new();
+    for trade in &snapshot.trades {
+        if trades.insert(trade.trade_id, trade).is_some()
+            || trade.trade_id == 0
+            || trade.exchange_order_id != snapshot.order.exchange_order_id
+            || trade.symbol != order.shape.symbol
+            || trade.side != order.shape.side
+            || trade.price <= Decimal::ZERO
+            || trade.quantity <= Decimal::ZERO
+            || trade.quote_quantity <= Decimal::ZERO
+            || trade.commission_cost < Decimal::ZERO
+            || trade.commission_asset.is_empty()
+            || trade.trade_time_ms < snapshot.order_time_ms
+            || trade.trade_time_ms > snapshot.update_time_ms
+        {
+            return Err(StrategyStateError::InvalidExecutionAudit);
+        }
+        trade_quantity = trade_quantity.checked_add(trade.quantity).ok_or(
+            StrategyStateError::NumericOverflow("audited trade quantity"),
+        )?;
+        trade_quote = trade_quote
+            .checked_add(trade.quote_quantity)
+            .ok_or(StrategyStateError::NumericOverflow("audited trade quote"))?;
+        let fee = fees_by_asset
+            .entry(trade.commission_asset.clone())
+            .or_insert(Decimal::ZERO);
+        *fee = fee
+            .checked_add(trade.commission_cost)
+            .ok_or(StrategyStateError::NumericOverflow("audited fee asset"))?;
+    }
+    if trade_quantity != expected_quantity
+        || trade_quote != expected_quote
+        || fees_by_asset != snapshot.fees_by_asset
+        || audit.fee_valuations.len() != trades.len()
+    {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+
+    let mut valuation_trade_ids = BTreeSet::new();
+    let mut valued_fee = Decimal::ZERO;
+    let mut audit_quote_asset: Option<&str> = None;
+    for valuation in &audit.fee_valuations {
+        let Some(trade) = trades.get(&valuation.trade_id) else {
+            return Err(StrategyStateError::InvalidExecutionAudit);
+        };
+        if !valuation_trade_ids.insert(valuation.trade_id)
+            || valuation.fee_asset != trade.commission_asset
+            || valuation.fee_amount != trade.commission_cost
+            || valuation.quote_asset.is_empty()
+            || !valuation
+                .quote_asset
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            || !order.shape.symbol.ends_with(&valuation.quote_asset)
+            || order.shape.symbol.len() == valuation.quote_asset.len()
+            || valuation.quote_value < Decimal::ZERO
+        {
+            return Err(StrategyStateError::InvalidExecutionAudit);
+        }
+        if audit_quote_asset.is_some_and(|quote_asset| quote_asset != valuation.quote_asset) {
+            return Err(StrategyStateError::InvalidExecutionAudit);
+        }
+        audit_quote_asset = Some(&valuation.quote_asset);
+        let source_is_valid = match valuation.source {
+            FeeValuationSource::ExchangeZero => {
+                valuation.fee_amount.is_zero()
+                    && valuation.quote_value.is_zero()
+                    && valuation.valuation_symbol.is_none()
+                    && valuation.valuation_minute_start_ms.is_none()
+                    && valuation.valuation_price.is_none()
+            }
+            FeeValuationSource::QuoteAsset => {
+                valuation.fee_asset == valuation.quote_asset
+                    && valuation.quote_value == valuation.fee_amount
+                    && valuation.valuation_symbol.is_none()
+                    && valuation.valuation_minute_start_ms.is_none()
+                    && valuation.valuation_price == Some(Decimal::ONE)
+            }
+            FeeValuationSource::HistoricalMinuteOpen => {
+                let expected_minute = trade.trade_time_ms - (trade.trade_time_ms % 60_000);
+                let expected_symbol = format!("{}{}", valuation.fee_asset, valuation.quote_asset);
+                valuation.fee_amount > Decimal::ZERO
+                    && valuation.fee_asset != valuation.quote_asset
+                    && expected_minute > 0
+                    && valuation.valuation_symbol.as_deref() == Some(&expected_symbol)
+                    && valuation.valuation_minute_start_ms == Some(expected_minute)
+                    && valuation.valuation_price.is_some_and(|price| {
+                        price > Decimal::ZERO
+                            && valuation.fee_amount.checked_mul(price)
+                                == Some(valuation.quote_value)
+                    })
+            }
+        };
+        if !source_is_valid {
+            return Err(StrategyStateError::InvalidExecutionAudit);
+        }
+        valued_fee = valued_fee
+            .checked_add(valuation.quote_value)
+            .ok_or(StrategyStateError::NumericOverflow("audited valued fee"))?;
+    }
+    if valued_fee != expected_fee {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+    Ok(())
+}
+
+fn validate_execution_audit_extension(
+    previous: &ExecutionAuditRecord,
+    candidate: &ExecutionAuditRecord,
+) -> Result<(), StrategyStateError> {
+    if candidate.synced_at_ms < previous.synced_at_ms
+        || candidate.snapshot.order_time_ms != previous.snapshot.order_time_ms
+        || candidate.snapshot.update_time_ms < previous.snapshot.update_time_ms
+        || candidate.snapshot.cumulative_quantity < previous.snapshot.cumulative_quantity
+        || candidate.snapshot.cumulative_quote < previous.snapshot.cumulative_quote
+    {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+    let candidate_trades = candidate
+        .snapshot
+        .trades
+        .iter()
+        .map(|trade| (trade.trade_id, trade))
+        .collect::<BTreeMap<_, _>>();
+    if previous
+        .snapshot
+        .trades
+        .iter()
+        .any(|trade| candidate_trades.get(&trade.trade_id).copied() != Some(trade))
+    {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+    let candidate_valuations = candidate
+        .fee_valuations
+        .iter()
+        .map(|valuation| (valuation.trade_id, valuation))
+        .collect::<BTreeMap<_, _>>();
+    if previous
+        .fee_valuations
+        .iter()
+        .any(|valuation| candidate_valuations.get(&valuation.trade_id).copied() != Some(valuation))
+    {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+    if matches!(
+        previous.snapshot.order.lifecycle,
+        OrderLifecycle::Terminal(_)
+    ) && previous.snapshot.order.lifecycle != candidate.snapshot.order.lifecycle
+    {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionReport {
     pub client_order_id: ClientOrderId,
@@ -950,6 +1186,68 @@ where
     ) -> Result<StrategyTransition, StrategyMachineError> {
         let mut next = self.store.snapshot().clone();
         let transition = apply_execution_report(&mut next, report, now_ms);
+        finalize_and_store(&mut self.store, next, now_ms, transition)
+    }
+
+    pub fn apply_valued_execution(
+        &mut self,
+        snapshot: &crate::exchange::OrderExecutionSnapshot,
+        valued: &ValuedExecutionReport,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        let mut next = self.store.snapshot().clone();
+        let candidate = ExecutionAuditRecord {
+            snapshot: snapshot.clone(),
+            fee_valuations: valued.fee_valuations.clone(),
+            synced_at_ms: now_ms,
+        };
+        let audit_validation = next
+            .orders
+            .get(&valued.report.client_order_id)
+            .ok_or(StrategyStateError::InvalidExecutionAudit)
+            .and_then(|order| {
+                validate_execution_audit_payload(
+                    next.exchange,
+                    order,
+                    &candidate,
+                    valued.report.cumulative_quantity,
+                    valued.report.cumulative_quote,
+                    valued.report.cumulative_fee,
+                    valued.report.terminal_status,
+                )?;
+                if let Some(previous) = &order.execution_audit {
+                    validate_execution_audit_extension(previous, &candidate)?;
+                }
+                Ok(())
+            });
+        if audit_validation.is_err() {
+            let transition = fail_transition(&mut next, "valued execution audit is invalid");
+            return finalize_and_store(&mut self.store, next, now_ms, transition);
+        }
+        let audit_changed = next
+            .orders
+            .get(&valued.report.client_order_id)
+            .and_then(|order| order.execution_audit.as_ref())
+            .is_none_or(|previous| {
+                previous.snapshot != candidate.snapshot
+                    || previous.fee_valuations != candidate.fee_valuations
+            });
+        let mut transition = apply_execution_report(&mut next, &valued.report, now_ms);
+        if !matches!(transition, StrategyTransition::Failed { .. }) && audit_changed {
+            let Some(order) = next.orders.get_mut(&valued.report.client_order_id) else {
+                transition = fail_transition(
+                    &mut next,
+                    "valued execution order disappeared during audit persistence",
+                );
+                return finalize_and_store(&mut self.store, next, now_ms, transition);
+            };
+            order.execution_audit = Some(candidate);
+            if transition == StrategyTransition::NoChange {
+                transition = StrategyTransition::Updated {
+                    new_obligation_ids: Vec::new(),
+                };
+            }
+        }
         finalize_and_store(&mut self.store, next, now_ms, transition)
     }
 
@@ -1158,6 +1456,7 @@ where
             cumulative_quantity: Decimal::ZERO,
             cumulative_quote: Decimal::ZERO,
             cumulative_fee: Decimal::ZERO,
+            execution_audit: None,
             terminal_status: None,
             terminal_processed: false,
             completed_pair_counted: false,
@@ -2312,6 +2611,7 @@ fn materialize_obligation_bucket(
             cumulative_quantity: Decimal::ZERO,
             cumulative_quote: Decimal::ZERO,
             cumulative_fee: Decimal::ZERO,
+            execution_audit: None,
             terminal_status: None,
             terminal_processed: false,
             completed_pair_counted: false,
@@ -2374,6 +2674,8 @@ pub enum StrategyStateError {
     OrderViolatesInstrumentRules,
     #[error("strategy execution totals are invalid")]
     InvalidExecutionTotals,
+    #[error("strategy execution audit evidence is invalid")]
+    InvalidExecutionAudit,
     #[error("terminal order processing state is inconsistent")]
     TerminalProcessingMismatch,
     #[error("strategy level lot is invalid")]

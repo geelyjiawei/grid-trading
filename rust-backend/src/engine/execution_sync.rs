@@ -87,7 +87,7 @@ impl ExecutionSyncService {
             return Err(ExecutionSyncError::OrderIdentityMismatch);
         }
         let valued_report = self.accounting.value_snapshot(gateway, &snapshot).await?;
-        let transition = machine.apply_execution(&valued_report.report, now_ms)?;
+        let transition = machine.apply_valued_execution(&snapshot, &valued_report, now_ms)?;
         Ok(ExecutionSyncResult {
             snapshot,
             valued_report,
@@ -102,6 +102,7 @@ mod tests {
 
     use async_trait::async_trait;
     use rust_decimal::Decimal;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::{
@@ -111,13 +112,14 @@ mod tests {
             TerminalOrderStatus,
         },
         engine::{
-            MarketSnapshot, MemoryStrategyStateStore, PositionBaseline, StrategyOrderPurpose,
-            StrategyState, StrategyStateStore, build_grid_plan,
+            MarketSnapshot, MemoryStrategyStateStore, PositionBaseline, StrategyLifecycle,
+            StrategyOrderPurpose, StrategyState, StrategyStateStore, build_grid_plan,
         },
         exchange::{
-            AuthoritativeOrder, ExecutionSnapshotError, HistoricalMinutePrice,
+            ActiveOrderStatus, AuthoritativeOrder, ExecutionSnapshotError, HistoricalMinutePrice,
             OrderExecutionSnapshot, OrderLifecycle, SnapshotError, TradeFill,
         },
+        persistence::FileStrategyStateStore,
     };
 
     #[derive(Clone)]
@@ -317,6 +319,14 @@ mod tests {
             after_first.grid_position_net_quantity,
             -snapshot.cumulative_quantity
         );
+        let audit = after_first
+            .orders
+            .get(&id)
+            .and_then(|order| order.execution_audit.as_ref())
+            .expect("execution evidence must be embedded in strategy state");
+        assert_eq!(audit.snapshot, snapshot);
+        assert_eq!(audit.fee_valuations, first.valued_report.fee_valuations);
+        assert_eq!(audit.synced_at_ms, 1_200);
         assert_eq!(after_second.total_fee, after_first.total_fee);
         assert_eq!(
             after_second.grid_position_net_quantity,
@@ -411,5 +421,142 @@ mod tests {
         );
         assert_eq!(*gateway.execution_calls.lock().unwrap(), 1);
         assert_eq!(*gateway.price_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn execution_audit_round_trips_with_the_atomic_strategy_file() {
+        let (mut machine, id) = accepted_machine();
+        let snapshot = execution_for(&machine, &id);
+        let gateway = gateway(Ok(snapshot));
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let expected = machine.store().snapshot().clone();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy-with-audit.json");
+
+        FileStrategyStateStore::create(&path, expected.clone()).unwrap();
+        let restored = FileStrategyStateStore::load(&path).unwrap();
+
+        assert_eq!(restored.snapshot(), &expected);
+        assert!(
+            restored
+                .snapshot()
+                .orders
+                .get(&id)
+                .and_then(|order| order.execution_audit.as_ref())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn previously_audited_trade_evidence_can_never_be_rewritten() {
+        let (mut machine, id) = accepted_machine();
+        let snapshot = execution_for(&machine, &id);
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway(Ok(snapshot.clone())), &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let owned_quantity = machine.store().snapshot().grid_position_net_quantity;
+        let mut rewritten = snapshot;
+        rewritten.trades[0].price += Decimal::ONE;
+
+        let result = service
+            .synchronize(&gateway(Ok(rewritten)), &mut machine, &id, 1_300)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.transition,
+            StrategyTransition::Failed { .. }
+        ));
+        assert_eq!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::Failed
+        );
+        assert_eq!(
+            machine.store().snapshot().grid_position_net_quantity,
+            owned_quantity
+        );
+        assert_eq!(
+            machine
+                .store()
+                .snapshot()
+                .orders
+                .get(&id)
+                .unwrap()
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .trades[0]
+                .price,
+            Decimal::new(1014, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_execution_audit_extends_by_new_trade_id_without_recounting() {
+        let (mut machine, id) = accepted_machine();
+        let mut complete = execution_for(&machine, &id);
+        let total_quantity = complete.cumulative_quantity;
+        let total_quote = complete.cumulative_quote;
+        let first_quantity = total_quantity / Decimal::new(2, 0);
+        let first_quote = total_quote / Decimal::new(2, 0);
+        let first_fee = Decimal::new(2, 2);
+        let second_fee = Decimal::new(3, 2);
+        let mut first_trade = complete.trades[0].clone();
+        first_trade.quantity = first_quantity;
+        first_trade.quote_quantity = first_quote;
+        first_trade.raw_commission = first_fee;
+        first_trade.commission_cost = first_fee;
+        let mut partial = complete.clone();
+        partial.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        partial.cumulative_quantity = first_quantity;
+        partial.cumulative_quote = first_quote;
+        partial.fees_by_asset = [("USDT".into(), first_fee)].into_iter().collect();
+        partial.trades = vec![first_trade.clone()];
+        partial.update_time_ms = 1_050_000;
+
+        let mut second_trade = complete.trades[0].clone();
+        second_trade.trade_id = 8;
+        second_trade.quantity = total_quantity - first_quantity;
+        second_trade.quote_quantity = total_quote - first_quote;
+        second_trade.raw_commission = second_fee;
+        second_trade.commission_cost = second_fee;
+        second_trade.trade_time_ms = 1_060_000;
+        complete.trades = vec![first_trade, second_trade];
+        complete.fees_by_asset = [("USDT".into(), first_fee + second_fee)]
+            .into_iter()
+            .collect();
+
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway(Ok(partial)), &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let after_partial = machine.store().snapshot().clone();
+        service
+            .synchronize(&gateway(Ok(complete)), &mut machine, &id, 1_300)
+            .await
+            .unwrap();
+        let after_complete = machine.store().snapshot();
+        let audit = after_complete
+            .orders
+            .get(&id)
+            .unwrap()
+            .execution_audit
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(after_partial.grid_position_net_quantity, -first_quantity);
+        assert_eq!(after_complete.grid_position_net_quantity, -total_quantity);
+        assert_eq!(after_complete.total_fee, first_fee + second_fee);
+        assert_eq!(audit.snapshot.trades.len(), 2);
+        assert_eq!(audit.snapshot.trades[0].trade_id, 7);
+        assert_eq!(audit.snapshot.trades[1].trade_id, 8);
     }
 }

@@ -12,8 +12,8 @@ pub use armed_strategy::{
 };
 pub use exchange_inputs::{AuthoritativeStrategyInputs, StrategyInputError, StrategyInputService};
 pub use execution_accounting::{
-    ExecutionAccountingError, ExecutionAccountingService, FeeValuation, FeeValuationSource,
-    ValuedExecutionReport,
+    ExecutionAccountingError, ExecutionAccountingService, ExecutionAuditRecord, FeeValuation,
+    FeeValuationSource, ValuedExecutionReport,
 };
 pub use execution_sync::{ExecutionSyncError, ExecutionSyncResult, ExecutionSyncService};
 pub use grid_plan::{

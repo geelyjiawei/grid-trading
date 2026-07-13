@@ -42,6 +42,13 @@ pub struct ValuedExecutionReport {
     pub fee_valuations: Vec<FeeValuation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionAuditRecord {
+    pub snapshot: OrderExecutionSnapshot,
+    pub fee_valuations: Vec<FeeValuation>,
+    pub synced_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExecutionAccountingError {
     #[error("quote asset is invalid")]

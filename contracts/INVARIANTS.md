@@ -71,6 +71,12 @@ the OpenAPI schema.
   leaves position, fees, lots, pair counts, and replacement obligations unchanged.
 - Retrying the same complete cumulative execution snapshot after a persistence failure is
   idempotent; it cannot double-count a fill, fee, lot, completed pair, or replacement.
+- Complete cumulative exchange fills and their per-trade fee valuations are embedded in
+  the same atomic strategy-state file as the resulting position and PnL transition.
+  There is no second audit file that can commit before or after the strategy state.
+- A later snapshot may append new trade IDs but can never alter or remove an already
+  audited trade or valuation. Evidence mutation fails the strategy closed while retaining
+  the last valid audit record.
 
 ## Position ownership
 
