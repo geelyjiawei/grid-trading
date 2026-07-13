@@ -112,6 +112,24 @@ pub enum IntentState {
     },
 }
 
+impl IntentState {
+    pub fn validate(&self) -> Result<(), OrderIntentError> {
+        let valid = match self {
+            Self::Prepared | Self::Terminal { .. } => true,
+            Self::SubmitUnknown { message } | Self::OwnershipConflict { message } => {
+                !message.trim().is_empty()
+            }
+            Self::Accepted { exchange_order_id } => !exchange_order_id.trim().is_empty(),
+            Self::Rejected { message, .. } => !message.trim().is_empty(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(OrderIntentError::InvalidStateMetadata)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderIntent {
     pub client_order_id: ClientOrderId,
@@ -143,6 +161,7 @@ impl OrderIntent {
     pub fn validate(&self) -> Result<(), OrderIntentError> {
         ClientOrderId::parse(self.client_order_id.as_str())?;
         self.shape.validate()?;
+        self.state.validate()?;
         if self.updated_at_ms < self.created_at_ms {
             return Err(OrderIntentError::InvalidTimestamp);
         }
@@ -166,6 +185,8 @@ pub enum OrderIntentError {
     MarketPostOnly,
     #[error("updated timestamp precedes created timestamp")]
     InvalidTimestamp,
+    #[error("order intent state metadata is missing")]
+    InvalidStateMetadata,
 }
 
 #[cfg(test)]
@@ -198,5 +219,32 @@ mod tests {
             time_in_force: TimeInForce::Gtc,
         };
         assert_eq!(shape.validate(), Err(OrderIntentError::MarketHasPrice));
+    }
+
+    #[test]
+    fn accepted_intent_requires_an_exchange_order_identity() {
+        let mut intent = OrderIntent::prepare(
+            ClientOrderId::parse("g_1_S_missing").unwrap(),
+            Exchange::Binance,
+            OrderShape {
+                symbol: "MUUSDT".into(),
+                side: OrderSide::Sell,
+                price: Some(Decimal::new(1011, 0)),
+                quantity: Decimal::new(2, 1),
+                reduce_only: false,
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::Gtc,
+            },
+            100,
+        )
+        .unwrap();
+        intent.state = IntentState::Accepted {
+            exchange_order_id: " ".into(),
+        };
+
+        assert_eq!(
+            intent.validate(),
+            Err(OrderIntentError::InvalidStateMetadata)
+        );
     }
 }

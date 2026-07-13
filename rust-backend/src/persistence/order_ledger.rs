@@ -142,7 +142,10 @@ impl MemoryOrderIntentStore {
     }
 
     fn before_write(&mut self) -> Result<(), LedgerError> {
-        self.write_attempts += 1;
+        self.write_attempts = self
+            .write_attempts
+            .checked_add(1)
+            .ok_or(LedgerError::RevisionOverflow)?;
         if self.fail_write_attempt == Some(self.write_attempts) {
             self.fail_write_attempt = None;
             return Err(LedgerError::InjectedWriteFailure);
@@ -166,7 +169,11 @@ impl IntentStore for MemoryOrderIntentStore {
                 intent.client_order_id.as_str().to_owned(),
             ));
         }
-        self.snapshot.revision += 1;
+        self.snapshot.revision = self
+            .snapshot
+            .revision
+            .checked_add(1)
+            .ok_or(LedgerError::RevisionOverflow)?;
         self.snapshot
             .intents
             .insert(intent.client_order_id.clone(), intent);
@@ -180,6 +187,11 @@ impl IntentStore for MemoryOrderIntentStore {
         now_ms: u64,
     ) -> Result<(), LedgerError> {
         self.before_write()?;
+        let next_revision = self
+            .snapshot
+            .revision
+            .checked_add(1)
+            .ok_or(LedgerError::RevisionOverflow)?;
         let intent = self
             .snapshot
             .intents
@@ -191,7 +203,7 @@ impl IntentStore for MemoryOrderIntentStore {
         }
         intent.state = next_state;
         intent.updated_at_ms = now_ms;
-        self.snapshot.revision += 1;
+        self.snapshot.revision = next_revision;
         Ok(())
     }
 }

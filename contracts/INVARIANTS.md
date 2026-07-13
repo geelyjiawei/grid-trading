@@ -25,6 +25,10 @@ the OpenAPI schema.
 - An order is removed only after authoritative terminal status and complete execution
   accounting.
 - A cancelled order is not equivalent to a filled order.
+- Intent state is monotonic. Accepted or terminal orders can never regress to prepared
+  or unknown states.
+- A terminal exchange label without cumulative execution accounting remains unresolved
+  and blocks final strategy shutdown.
 
 ## Position ownership
 
@@ -50,6 +54,10 @@ the OpenAPI schema.
 - Completed legs restore the exact opposite order, including outside the configured
   range when that is the defined grid transition.
 - A strategy is ready only when the entire initial target plan is represented.
+- If an initial target is cancelled, the strategy remains in deployment until the exact
+  replacement chain is accepted; the cancelled order itself never counts as coverage.
+- Replacement orders exactly equal their assigned durable obligations. Quantity, side,
+  price, reduce-only, level, and exchange rules are revalidated on every state write.
 
 ## Persistence and recovery
 
@@ -57,6 +65,10 @@ the OpenAPI schema.
 - Initial deployment ownership is retained until every linked exchange order is
   reconciled and terminal.
 - Failed, closed, stopped, and saved are distinct lifecycle states.
+- A normal stop creates no market order and does not change baseline or grid-owned
+  position. It waits for every submitted or uncertain order to become authoritative.
+- A late fill after a stopped or closed state is still booked to owned position and then
+  escalated durably as a failure; it is never discarded.
 - A restart cannot resume normal placement before fresh exchange rules and
   authoritative state are validated.
 - Corrupt or incomplete storage fails closed and is retained for audit.
