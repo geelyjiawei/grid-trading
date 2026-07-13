@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::InstrumentRules,
     engine::{
-        ArmedStrategyState, MarketSnapshot, PositionBaseline, StrategyState, StrategyStateStore,
-        StrategyStoreError,
+        ArmedStrategyState, MarketSnapshot, PositionBaseline, PreparedStrategy, StrategyState,
+        StrategyStateStore, StrategyStoreError,
     },
 };
 
@@ -44,6 +44,66 @@ fn commit_persisted(
     Ok(())
 }
 
+fn create_persisted(
+    path: &Path,
+    snapshot: &PersistedStrategyState,
+) -> Result<(), StrategyStoreError> {
+    let mut bytes = serde_json::to_vec_pretty(snapshot).map_err(StrategyStoreError::Serialize)?;
+    bytes.push(b'\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(StrategyStoreError::CreateDirectory)?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(StrategyStoreError::AlreadyExists);
+        }
+        Err(error) => return Err(StrategyStoreError::CreateNew(error)),
+    };
+    file.write_all(&bytes).map_err(StrategyStoreError::Write)?;
+    file.sync_all().map_err(StrategyStoreError::SyncFile)?;
+    sync_parent(path)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum FilePreparedStrategyStore {
+    Armed(Box<FileArmedStrategyStateStore>),
+    Active(Box<FileStrategyStateStore>),
+}
+
+impl FilePreparedStrategyStore {
+    pub fn create(
+        path: impl Into<PathBuf>,
+        prepared: PreparedStrategy,
+    ) -> Result<Self, StrategyStoreError> {
+        let path = path.into();
+        match prepared {
+            PreparedStrategy::Armed(state) => FileArmedStrategyStateStore::create(path, *state)
+                .map(Box::new)
+                .map(Self::Armed),
+            PreparedStrategy::Active(state) => FileStrategyStateStore::create(path, *state)
+                .map(Box::new)
+                .map(Self::Active),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Armed(store) => store.path(),
+            Self::Active(store) => store.path(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FileStrategyStateStore {
     path: PathBuf,
@@ -56,14 +116,14 @@ impl FileStrategyStateStore {
         snapshot: StrategyState,
     ) -> Result<Self, StrategyStoreError> {
         let path = path.into();
-        if path.exists() {
-            return Err(StrategyStoreError::AlreadyExists);
-        }
         snapshot
             .validate()
             .map_err(StrategyStoreError::InvalidState)?;
         let store = Self { path, snapshot };
-        store.commit_snapshot(&store.snapshot)?;
+        create_persisted(
+            &store.path,
+            &PersistedStrategyState::Active(Box::new(store.snapshot.clone())),
+        )?;
         Ok(store)
     }
 
@@ -103,11 +163,8 @@ impl FileArmedStrategyStateStore {
         snapshot: ArmedStrategyState,
     ) -> Result<Self, StrategyStoreError> {
         let path = path.into();
-        if path.exists() {
-            return Err(StrategyStoreError::AlreadyExists);
-        }
         snapshot.validate()?;
-        commit_persisted(
+        create_persisted(
             &path,
             &PersistedStrategyState::Armed(Box::new(snapshot.clone())),
         )?;
@@ -126,6 +183,10 @@ impl FileArmedStrategyStateStore {
 
     pub fn snapshot(&self) -> &ArmedStrategyState {
         &self.snapshot
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn activate(
@@ -195,6 +256,11 @@ fn sync_parent(_: &Path) -> Result<(), StrategyStoreError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use rust_decimal::Decimal;
     use tempfile::tempdir;
 
@@ -309,6 +375,82 @@ mod tests {
             Err(StrategyStoreError::AlreadyExists)
         ));
         assert_eq!(fs::read(&path).unwrap(), b"audit evidence");
+    }
+
+    #[test]
+    fn concurrent_first_creation_has_exactly_one_winner_and_never_overwrites() {
+        let directory = tempdir().unwrap();
+        let path = Arc::new(directory.path().join("strategy.json"));
+        let barrier = Arc::new(Barrier::new(16));
+        let handles = (0..16)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                let snapshot = state();
+                thread::spawn(move || {
+                    barrier.wait();
+                    FileStrategyStateStore::create(path.as_ref().clone(), snapshot)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Err(StrategyStoreError::AlreadyExists)))
+                .count(),
+            15
+        );
+        assert_eq!(
+            FileStrategyStateStore::load(path.as_ref().clone())
+                .unwrap()
+                .snapshot(),
+            &state()
+        );
+    }
+
+    #[test]
+    fn prepared_bootstrap_state_is_exposed_only_after_durable_creation() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("active.json");
+        let active = FilePreparedStrategyStore::create(
+            &active_path,
+            PreparedStrategy::Active(Box::new(state())),
+        )
+        .unwrap();
+        assert!(matches!(&active, FilePreparedStrategyStore::Active(_)));
+        assert_eq!(active.path(), active_path);
+        assert!(FileStrategyStateStore::load(&active_path).is_ok());
+
+        let armed_path = directory.path().join("armed.json");
+        let armed = FilePreparedStrategyStore::create(
+            &armed_path,
+            PreparedStrategy::Armed(Box::new(armed_state())),
+        )
+        .unwrap();
+        assert!(matches!(&armed, FilePreparedStrategyStore::Armed(_)));
+        assert_eq!(armed.path(), armed_path);
+        assert!(FileArmedStrategyStateStore::load(&armed_path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_state_file_is_owner_read_write_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        FileStrategyStateStore::create(&path, state()).unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

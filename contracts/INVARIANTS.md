@@ -178,6 +178,10 @@ the OpenAPI schema.
 - A non-triggered strategy can produce its first durable state only after authoritative
   fee replacement, leverage verification, fresh market/rules, and baseline validation all
   succeed. Failure in any stage produces no order intent.
+- First persistence uses an operating-system exclusive create and can never overwrite an
+  existing run. A failed or interrupted first write is retained as blocking evidence and is
+  never reset to an empty strategy. The runtime can observe a new strategy only after the
+  complete prepared state has been durably written.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
   rule, or baseline failure leaves the armed bytes unchanged and creates no order.
 - Trigger direction is derived from the trigger price relative to the arming market, not

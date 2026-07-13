@@ -2741,6 +2741,8 @@ pub enum StrategyStoreError {
     RevisionMismatch,
     #[error("strategy state file already exists")]
     AlreadyExists,
+    #[error("failed to exclusively create strategy state: {0}")]
+    CreateNew(std::io::Error),
     #[error("expected an active strategy file but found an armed strategy")]
     UnexpectedArmedState,
     #[error("expected an armed strategy file but found an active strategy")]
@@ -2757,6 +2759,8 @@ pub enum StrategyStoreError {
     Serialize(serde_json::Error),
     #[error("failed to write strategy state: {0}")]
     Write(std::io::Error),
+    #[error("failed to sync strategy state file: {0}")]
+    SyncFile(std::io::Error),
     #[error("failed to commit strategy state: {0}")]
     Commit(std::io::Error),
     #[error("failed to sync strategy state directory: {0}")]
