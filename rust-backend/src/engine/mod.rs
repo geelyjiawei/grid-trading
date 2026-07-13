@@ -9,6 +9,7 @@ mod grid_plan;
 mod leverage;
 mod reconciliation;
 mod runtime;
+mod shadow_audit;
 mod strategy_machine;
 mod submission;
 mod supervisor;
@@ -47,6 +48,10 @@ pub use runtime::{
     RuntimeCancellation, RuntimeSettings, RuntimeStage, RuntimeSubmission, RuntimeTickError,
     RuntimeTickReport, StrategyRuntime, claim_leased_file_strategy, prepare_leased_file_strategy,
     recover_leased_file_strategy,
+};
+pub use shadow_audit::{
+    ShadowAuditIssue, ShadowAuditReport, ShadowExpectedLifecycle, ShadowLevelCoverage,
+    ShadowOrderAuditSummary, ShadowPositionAudit, audit_strategy_shadow,
 };
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{

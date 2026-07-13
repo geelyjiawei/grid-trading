@@ -127,6 +127,16 @@ the OpenAPI schema.
   for that tick but does not immediately corrupt or permanently fail the strategy. The
   next tick replays authoritative executions first; normal fill/read races can converge,
   while a persistent unexplained delta remains blocked for operator review.
+- A shadow audit is read-only by construction and compares the immutable baseline plus
+  grid-owned quantity with one exact authoritative one-way position. Empty, hedge-mode,
+  malformed, foreign-exchange, and foreign-symbol snapshots are never interpreted as flat.
+- Shadow order comparison uses the complete immutable shape and both client and exchange
+  order identities. Missing, duplicate, orphaned, terminal-vs-active, quantity, side,
+  price, reduce-only, type, or time-in-force differences are explicit blockers; they are
+  never repaired by changing the ledger or guessing an exchange outcome.
+- Running-grid coverage is counted by unique planned level, not raw order count. Two valid
+  opposite-side orders may coexist at one level, but every configured level must still have
+  at least one exact active authoritative order before the audit can be clean.
 
 ## Grid behavior
 
