@@ -7,19 +7,21 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent},
     exchange::{
-        CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
-        ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
-        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
-        LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
+        CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
+        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalPriceGateway,
+        InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
+        LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
+        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
-            parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
-            parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_open_orders, parse_placement_acknowledgement, parse_position_snapshot,
-            parse_trading_fee_rates, validate_snapshot_request,
+            parse_account_balance_snapshot, parse_authoritative_order,
+            parse_cancellation_acknowledgement, parse_exchange_error, parse_instrument_rules,
+            parse_leverage_acknowledgement, parse_market_snapshot, parse_open_orders,
+            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
+            validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -137,6 +139,34 @@ where
             .await?;
         parse_trading_fee_rates(&body, Exchange::Binance, &symbol)
             .map_err(|error| SnapshotError::new(format!("invalid Binance fee rates: {error}")))
+    }
+}
+
+#[async_trait]
+impl<T, S, C> AccountBalanceSnapshotGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn account_balance_snapshot(
+        &self,
+        exchange: Exchange,
+    ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+        if exchange != Exchange::Binance {
+            return Err(SnapshotError::new(
+                "account balance belongs to another exchange",
+            ));
+        }
+        let request = self
+            .signed_request(HttpMethod::Get, "/fapi/v3/account", vec![])
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Binance account balance snapshot")
+            .await?;
+        parse_account_balance_snapshot(&body, Exchange::Binance).map_err(|error| {
+            SnapshotError::new(format!("invalid Binance account balance snapshot: {error}"))
+        })
     }
 }
 
@@ -1091,6 +1121,41 @@ mod tests {
             request
                 .query_string()
                 .starts_with("symbol=MUUSDT&timestamp=1700000000123&recvWindow=5000&signature=")
+        );
+    }
+
+    #[tokio::test]
+    async fn account_balance_query_uses_signed_v3_account_totals() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{
+                "totalWalletBalance":"126.724692060",
+                "totalUnrealizedProfit":"-0.00400000",
+                "totalMarginBalance":"126.720692060",
+                "availableBalance":"120.10000000",
+                "assets":[],"positions":[]
+            }"#
+            .into(),
+        }));
+
+        let snapshot = adapter(transport.clone())
+            .account_balance_snapshot(Exchange::Binance)
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(snapshot.wallet_balance.to_string(), "126.724692060");
+        assert_eq!(snapshot.equity.to_string(), "126.720692060");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.path, "/fapi/v3/account");
+        assert!(
+            request
+                .query_string()
+                .starts_with("timestamp=1700000000123&recvWindow=5000&signature=")
+        );
+        assert_eq!(
+            request.headers,
+            vec![("X-MBX-APIKEY".into(), "test-key".into())]
         );
     }
 

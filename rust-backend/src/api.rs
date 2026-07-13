@@ -655,6 +655,46 @@ async fn exchange_config(
     )
 }
 
+async fn exchange_balance(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Query(selection): Query<ExchangeSelection>,
+) -> Response {
+    let exchange = selected_exchange(&state, selection);
+    let gateway = match read_gateway(&state, exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+    match gateway.account_balance_snapshot(exchange).await {
+        Ok(snapshot) => {
+            if snapshot.exchange != exchange {
+                return snapshot_failure(
+                    "account balance",
+                    exchange,
+                    SnapshotError::new("account balance belongs to another exchange"),
+                );
+            }
+            if let Err(error) = snapshot.validate() {
+                return snapshot_failure("account balance", exchange, error);
+            }
+            no_store_json(
+                StatusCode::OK,
+                json!({
+                    "exchange": snapshot.exchange,
+                    "unit": snapshot.unit,
+                    "available": snapshot.available_balance.to_string(),
+                    "available_balance": snapshot.available_balance.to_string(),
+                    "wallet_balance": snapshot.wallet_balance.to_string(),
+                    "equity": snapshot.equity.to_string(),
+                    "unrealised_pnl": snapshot.unrealized_profit.to_string(),
+                    "source": "exchange",
+                }),
+            )
+        }
+        Err(error) => snapshot_failure("account balance", exchange, error),
+    }
+}
+
 async fn exchange_price(
     _session: AuthenticatedWebSession,
     State(state): State<ApiState>,
@@ -939,6 +979,7 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/auth/login", post(web_auth_login))
         .route("/api/auth/logout", post(web_auth_logout))
         .route("/api/config", get(exchange_config))
+        .route("/api/balance", get(exchange_balance))
         .route("/api/price/{symbol}", get(exchange_price))
         .route("/api/fees/{symbol}", get(exchange_fee_rates))
         .route("/api/positions/{symbol}", get(exchange_positions))
@@ -975,6 +1016,7 @@ mod tests {
     use crate::{
         domain::{ClientOrderId, OrderKind, OrderShape, TimeInForce},
         exchange::{
+            AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
             AuthoritativeOrder, ExchangeIdentityGateway, ExchangeMarketSnapshot,
             MarketSnapshotGateway, OpenOrderSnapshotGateway, PositionSide, PositionSnapshot,
             PositionSnapshotGateway, TradingFeeRateGateway, TradingFeeRates,
@@ -1146,6 +1188,24 @@ mod tests {
     }
 
     #[async_trait]
+    impl AccountBalanceSnapshotGateway for ExactReadGateway {
+        async fn account_balance_snapshot(
+            &self,
+            exchange: Exchange,
+        ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+            assert_eq!(exchange, Exchange::Aster);
+            Ok(AccountBalanceSnapshot {
+                exchange,
+                unit: AccountBalanceUnit::Usdt,
+                available_balance: Decimal::from_str_exact("120.10000000").unwrap(),
+                wallet_balance: Decimal::from_str_exact("126.724692060").unwrap(),
+                equity: Decimal::from_str_exact("126.720692060").unwrap(),
+                unrealized_profit: Decimal::from_str_exact("-0.00400000").unwrap(),
+            })
+        }
+    }
+
+    #[async_trait]
     impl MarketSnapshotGateway for ExactReadGateway {
         async fn market_snapshot(
             &self,
@@ -1277,6 +1337,28 @@ mod tests {
         assert_eq!(config["configs"]["aster"]["configured"], true);
         assert_eq!(config["configs"]["aster"]["api_key"], "wallet configured");
         assert_eq!(config["configs"]["binance"]["configured"], false);
+
+        let balance = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/balance?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance.status(), StatusCode::OK);
+        assert_eq!(balance.headers()[CACHE_CONTROL], "no-store");
+        let balance = response_json(balance).await;
+        assert_eq!(balance["exchange"], "aster");
+        assert_eq!(balance["unit"], "USDT");
+        assert_eq!(balance["available"], "120.10000000");
+        assert_eq!(balance["available_balance"], "120.10000000");
+        assert_eq!(balance["wallet_balance"], "126.724692060");
+        assert_eq!(balance["equity"], "126.720692060");
+        assert_eq!(balance["unrealised_pnl"], "-0.00400000");
+        assert_eq!(balance["source"], "exchange");
 
         let price = app
             .clone()

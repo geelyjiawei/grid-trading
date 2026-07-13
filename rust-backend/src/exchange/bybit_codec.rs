@@ -10,9 +10,10 @@ use crate::{
         TerminalOrderStatus, TimeInForce,
     },
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
-        HistoricalMinutePrice, LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement,
-        PositionLeg, PositionSide, PositionSnapshot, TradeFill, TradingFeeRates,
+        AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
+        CancellationAcknowledgement, ExchangeMarketSnapshot, HistoricalMinutePrice,
+        LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
+        PositionSide, PositionSnapshot, TradeFill, TradingFeeRates,
         execution::OrderExecutionHeader, is_valid_trade_id, strategy_client_order_id,
     },
 };
@@ -141,6 +142,35 @@ pub(super) fn parse_trading_fee_rates(
         .validate()
         .map_err(|_| BybitCodecError::InvalidField("feeRate"))?;
     Ok(rates)
+}
+
+pub(super) fn parse_account_balance_snapshot(
+    body: &str,
+) -> Result<AccountBalanceSnapshot, BybitCodecError> {
+    let root = success_root(body)?;
+    let result = result_object(&root)?;
+    let rows = required_array(result, "list")?;
+    match rows.len() {
+        1 => {}
+        0 => return Err(BybitCodecError::InvalidField("list")),
+        _ => return Err(BybitCodecError::DuplicateRecord),
+    }
+    let account = &rows[0];
+    if required_string(account, "accountType")? != "UNIFIED" {
+        return Err(BybitCodecError::IdentityMismatch);
+    }
+    let snapshot = AccountBalanceSnapshot {
+        exchange: Exchange::Bybit,
+        unit: AccountBalanceUnit::Usd,
+        available_balance: required_decimal(account, "totalAvailableBalance")?,
+        wallet_balance: required_decimal(account, "totalWalletBalance")?,
+        equity: required_decimal(account, "totalEquity")?,
+        unrealized_profit: required_decimal(account, "totalPerpUPL")?,
+    };
+    snapshot
+        .validate()
+        .map_err(|_| BybitCodecError::InvalidField("accountBalance"))?;
+    Ok(snapshot)
 }
 
 pub(super) fn parse_exact_order_record(
@@ -780,6 +810,61 @@ fn scalar_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_balance_parser_uses_unified_account_usd_totals() {
+        let snapshot = parse_account_balance_snapshot(
+            r#"{
+                "retCode":0,
+                "retMsg":"OK",
+                "result":{"list":[{
+                    "accountType":"UNIFIED",
+                    "totalEquity":"3.312165910",
+                    "totalWalletBalance":"3.003260560",
+                    "totalAvailableBalance":"2.900000000",
+                    "totalPerpUPL":"0.308905350",
+                    "coin":[]
+                }]}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.exchange, Exchange::Bybit);
+        assert_eq!(snapshot.unit, AccountBalanceUnit::Usd);
+        assert_eq!(snapshot.equity.to_string(), "3.312165910");
+        assert_eq!(snapshot.wallet_balance.to_string(), "3.003260560");
+        assert_eq!(snapshot.available_balance.to_string(), "2.900000000");
+        assert_eq!(snapshot.unrealized_profit.to_string(), "0.308905350");
+    }
+
+    #[test]
+    fn wallet_balance_parser_rejects_duplicate_or_non_unified_accounts() {
+        let duplicate = r#"{
+            "retCode":0,"retMsg":"OK","result":{"list":[
+                {"accountType":"UNIFIED","totalEquity":"1","totalWalletBalance":"1","totalAvailableBalance":"1","totalPerpUPL":"0"},
+                {"accountType":"UNIFIED","totalEquity":"1","totalWalletBalance":"1","totalAvailableBalance":"1","totalPerpUPL":"0"}
+            ]}
+        }"#;
+        assert_eq!(
+            parse_account_balance_snapshot(duplicate),
+            Err(BybitCodecError::DuplicateRecord)
+        );
+
+        let single_contract = r#"{
+            "retCode":0,"retMsg":"OK","result":{"list":[
+                {"accountType":"CONTRACT","totalEquity":"1","totalWalletBalance":"1","totalAvailableBalance":"1","totalPerpUPL":"0"}
+            ]}
+        }"#;
+        assert_eq!(
+            parse_account_balance_snapshot(single_contract),
+            Err(BybitCodecError::IdentityMismatch)
+        );
+
+        assert_eq!(
+            parse_account_balance_snapshot(r#"{"retCode":0,"retMsg":"OK","result":{"list":[]}}"#),
+            Err(BybitCodecError::InvalidField("list"))
+        );
+    }
 
     #[test]
     fn open_order_page_preserves_exact_shapes_and_cursor() {

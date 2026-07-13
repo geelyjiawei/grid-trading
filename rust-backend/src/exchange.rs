@@ -308,6 +308,46 @@ pub trait TradingFeeRateGateway: Send + Sync {
     ) -> Result<TradingFeeRates, SnapshotError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum AccountBalanceUnit {
+    Usdt,
+    Usd,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountBalanceSnapshot {
+    pub exchange: Exchange,
+    pub unit: AccountBalanceUnit,
+    pub available_balance: Decimal,
+    pub wallet_balance: Decimal,
+    pub equity: Decimal,
+    pub unrealized_profit: Decimal,
+}
+
+impl AccountBalanceSnapshot {
+    pub fn validate(&self) -> Result<(), SnapshotError> {
+        let expected_unit = match self.exchange {
+            Exchange::Binance | Exchange::Aster => AccountBalanceUnit::Usdt,
+            Exchange::Bybit => AccountBalanceUnit::Usd,
+        };
+        if self.unit != expected_unit {
+            return Err(SnapshotError::new(
+                "account balance unit does not match the exchange contract",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait AccountBalanceSnapshotGateway: Send + Sync {
+    async fn account_balance_snapshot(
+        &self,
+        exchange: Exchange,
+    ) -> Result<AccountBalanceSnapshot, SnapshotError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExchangeMarketSnapshot {
     pub exchange: Exchange,
@@ -468,5 +508,19 @@ mod snapshot_tests {
             legs: vec![leg],
         };
         assert!(position.one_way_leverage().is_err());
+    }
+
+    #[test]
+    fn balance_snapshot_rejects_a_unit_from_another_exchange_contract() {
+        let snapshot = AccountBalanceSnapshot {
+            exchange: Exchange::Bybit,
+            unit: AccountBalanceUnit::Usdt,
+            available_balance: Decimal::ONE,
+            wallet_balance: Decimal::ONE,
+            equity: Decimal::ONE,
+            unrealized_profit: Decimal::ZERO,
+        };
+
+        assert!(snapshot.validate().is_err());
     }
 }

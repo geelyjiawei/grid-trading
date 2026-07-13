@@ -155,13 +155,15 @@ describe("Vue migration components", () => {
         symbol: "ANSEMUSDT",
         configured: true,
         price: null,
-        balance: { available: "123.4567", equity: "140" },
+        balance: { available: "123.4567", equity: "140", unit: "USDT" },
         fees: null,
         loading: false,
       },
     });
 
     expect(wrapper.text()).toContain("123.4567");
+    expect(wrapper.text()).toContain("可用余额 (USDT)");
+    expect(wrapper.text()).toContain("账户权益 (USDT)");
   });
 
   it("shows authoritative open order quantities without normalizing them", async () => {

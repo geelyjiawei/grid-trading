@@ -8,11 +8,11 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, InstrumentRules, OrderIntent},
     exchange::{
-        CancellationAcknowledgement, CancellationError, ExchangeIdentityGateway,
-        ExchangeMarketSnapshot, ExecutionSnapshotError, ExecutionSnapshotGateway,
-        HistoricalMinutePrice, HistoricalPriceGateway, InstrumentRulesGateway,
-        LeverageAcknowledgement, LeverageError, LeverageGateway, LookupError,
-        MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
+        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
+        CancellationError, ExchangeIdentityGateway, ExchangeMarketSnapshot, ExecutionSnapshotError,
+        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalPriceGateway,
+        InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
+        LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
         OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
         PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
         SnapshotError, TradingFeeRateGateway, TradingFeeRates,
@@ -285,6 +285,20 @@ impl TradingFeeRateGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
             Self::Aster(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
             Self::Bybit(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
+        }
+    }
+}
+
+#[async_trait]
+impl AccountBalanceSnapshotGateway for ConfiguredExchangeGateway {
+    async fn account_balance_snapshot(
+        &self,
+        exchange: Exchange,
+    ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+        match self {
+            Self::Binance(gateway) => gateway.account_balance_snapshot(exchange).await,
+            Self::Aster(gateway) => gateway.account_balance_snapshot(exchange).await,
+            Self::Bybit(gateway) => gateway.account_balance_snapshot(exchange).await,
         }
     }
 }

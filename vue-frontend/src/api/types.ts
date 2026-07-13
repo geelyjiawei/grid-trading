@@ -116,6 +116,9 @@ export interface PriceSnapshot {
 }
 
 export interface BalanceSnapshot {
+  exchange?: Exchange;
+  unit?: "USDT" | "USD";
+  source?: string;
   available?: string | number;
   available_balance?: string | number;
   wallet_balance?: string | number;

@@ -10,18 +10,20 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent, OrderKind, OrderSide, TimeInForce},
     exchange::{
-        CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
-        ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
-        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
-        LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
+        CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
+        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalPriceGateway,
+        InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
+        LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
+        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         bybit_codec::{
-            parse_cancellation_acknowledgement, parse_error, parse_exact_order_record,
-            parse_execution_page, parse_historical_minute_open, parse_instrument_rules,
-            parse_leverage_acknowledgement, parse_market_snapshot, parse_open_order_page,
-            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
+            parse_account_balance_snapshot, parse_cancellation_acknowledgement, parse_error,
+            parse_exact_order_record, parse_execution_page, parse_historical_minute_open,
+            parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
+            parse_open_order_page, parse_placement_acknowledgement, parse_position_snapshot,
+            parse_trading_fee_rates,
         },
         codec::validate_snapshot_request,
         execution::assemble_execution_snapshot,
@@ -428,6 +430,37 @@ where
             .await?;
         parse_trading_fee_rates(&body, &symbol)
             .map_err(|error| SnapshotError::new(format!("invalid Bybit fee rates: {error}")))
+    }
+}
+
+#[async_trait]
+impl<T, S, C> AccountBalanceSnapshotGateway for BybitAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BybitRequestSigner,
+    C: MillisecondClock,
+{
+    async fn account_balance_snapshot(
+        &self,
+        exchange: Exchange,
+    ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+        if exchange != Exchange::Bybit {
+            return Err(SnapshotError::new(
+                "account balance belongs to another exchange",
+            ));
+        }
+        let request = self
+            .signed_get(
+                "/v5/account/wallet-balance",
+                vec![("accountType".into(), "UNIFIED".into())],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Bybit account balance snapshot")
+            .await?;
+        parse_account_balance_snapshot(&body).map_err(|error| {
+            SnapshotError::new(format!("invalid Bybit account balance snapshot: {error}"))
+        })
     }
 }
 
@@ -1233,6 +1266,26 @@ mod tests {
         assert_eq!(rates.taker_rate, Decimal::new(5, 4));
         assert_eq!(request.path, "/v5/account/fee-rate");
         assert_eq!(request.query_string(), "category=linear&symbol=MUUSDT");
+        assert!(!request.headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_balance_query_uses_signed_unified_usd_totals() {
+        let transport = MockTransport::with_response(ok(
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","totalEquity":"3.312165910","totalWalletBalance":"3.003260560","totalAvailableBalance":"2.900000000","totalPerpUPL":"0.308905350","coin":[]}]},"time":1700000000124}"#,
+        ));
+
+        let snapshot = adapter(transport.clone())
+            .account_balance_snapshot(Exchange::Bybit)
+            .await
+            .unwrap();
+        let request = &transport.requests()[0];
+
+        assert_eq!(snapshot.equity.to_string(), "3.312165910");
+        assert_eq!(snapshot.available_balance.to_string(), "2.900000000");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.path, "/v5/account/wallet-balance");
+        assert_eq!(request.query_string(), "accountType=UNIFIED");
         assert!(!request.headers.is_empty());
     }
 

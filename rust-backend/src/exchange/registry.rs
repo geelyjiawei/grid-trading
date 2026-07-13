@@ -6,14 +6,15 @@ use thiserror::Error;
 use crate::{
     domain::Exchange,
     exchange::{
-        ExchangeIdentityGateway, MarketSnapshotGateway, OpenOrderSnapshotGateway,
-        PositionSnapshotGateway, TradingFeeRateGateway,
+        AccountBalanceSnapshotGateway, ExchangeIdentityGateway, MarketSnapshotGateway,
+        OpenOrderSnapshotGateway, PositionSnapshotGateway, TradingFeeRateGateway,
         configured::{ConfiguredExchangeGateway, ExchangeEnvironment},
     },
 };
 
 pub trait ReadOnlyExchangeGateway:
     ExchangeIdentityGateway
+    + AccountBalanceSnapshotGateway
     + MarketSnapshotGateway
     + TradingFeeRateGateway
     + PositionSnapshotGateway
@@ -23,6 +24,7 @@ pub trait ReadOnlyExchangeGateway:
 
 impl<T> ReadOnlyExchangeGateway for T where
     T: ExchangeIdentityGateway
+        + AccountBalanceSnapshotGateway
         + MarketSnapshotGateway
         + TradingFeeRateGateway
         + PositionSnapshotGateway

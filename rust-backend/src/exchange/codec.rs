@@ -10,10 +10,10 @@ use crate::{
         TerminalOrderStatus, TimeInForce,
     },
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
-        LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
-        PositionSide, PositionSnapshot, SnapshotError, TradingFeeRates, protocol::Parameters,
-        strategy_client_order_id,
+        AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
+        CancellationAcknowledgement, ExchangeMarketSnapshot, LeverageAcknowledgement,
+        OrderLifecycle, PlacementAcknowledgement, PositionLeg, PositionSide, PositionSnapshot,
+        SnapshotError, TradingFeeRates, protocol::Parameters, strategy_client_order_id,
     },
 };
 
@@ -254,6 +254,31 @@ pub(super) fn parse_trading_fee_rates(
         .validate()
         .map_err(|_| CodecError::InvalidField("commissionRate"))?;
     Ok(rates)
+}
+
+pub(super) fn parse_account_balance_snapshot(
+    body: &str,
+    exchange: Exchange,
+) -> Result<AccountBalanceSnapshot, CodecError> {
+    if !matches!(exchange, Exchange::Binance | Exchange::Aster) {
+        return Err(CodecError::InvalidField("exchange"));
+    }
+    let root = parse_json(body)?;
+    if !root.is_object() {
+        return Err(CodecError::InvalidField("account"));
+    }
+    let snapshot = AccountBalanceSnapshot {
+        exchange,
+        unit: AccountBalanceUnit::Usdt,
+        available_balance: required_decimal(&root, "availableBalance")?,
+        wallet_balance: required_decimal(&root, "totalWalletBalance")?,
+        equity: required_decimal(&root, "totalMarginBalance")?,
+        unrealized_profit: required_decimal(&root, "totalUnrealizedProfit")?,
+    };
+    snapshot
+        .validate()
+        .map_err(|_| CodecError::InvalidField("accountBalance"))?;
+    Ok(snapshot)
 }
 
 pub(super) fn execution_status_is_unknown(code: Option<&str>) -> bool {
@@ -637,6 +662,49 @@ fn optional_positive_u16(value: &Value, field: &'static str) -> Result<Option<u1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_balance_parser_preserves_authoritative_totals_and_scale() {
+        let snapshot = parse_account_balance_snapshot(
+            r#"{
+                "totalWalletBalance":"126.724692060",
+                "totalUnrealizedProfit":"-0.00400000",
+                "totalMarginBalance":"126.720692060",
+                "availableBalance":"120.10000000",
+                "assets":[]
+            }"#,
+            Exchange::Binance,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.unit, AccountBalanceUnit::Usdt);
+        assert_eq!(snapshot.wallet_balance.to_string(), "126.724692060");
+        assert_eq!(snapshot.equity.to_string(), "126.720692060");
+        assert_eq!(snapshot.unrealized_profit.to_string(), "-0.00400000");
+        assert_eq!(snapshot.available_balance.to_string(), "120.10000000");
+    }
+
+    #[test]
+    fn account_balance_parser_fails_closed_for_missing_totals_or_wrong_exchange() {
+        let incomplete = r#"{
+            "totalWalletBalance":"1",
+            "totalUnrealizedProfit":"0",
+            "availableBalance":"1"
+        }"#;
+        assert!(parse_account_balance_snapshot(incomplete, Exchange::Aster).is_err());
+        assert!(
+            parse_account_balance_snapshot(
+                r#"{
+                    "totalWalletBalance":"1",
+                    "totalUnrealizedProfit":"0",
+                    "totalMarginBalance":"1",
+                    "availableBalance":"1"
+                }"#,
+                Exchange::Bybit,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn authoritative_parser_preserves_exchange_quantity_exactly() {
