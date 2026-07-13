@@ -11,6 +11,8 @@ use crate::domain::{
 
 pub mod aster;
 pub mod binance;
+pub mod bybit;
+mod bybit_codec;
 mod codec;
 mod execution;
 pub mod protocol;

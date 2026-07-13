@@ -189,6 +189,7 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
             path: path.into(),
             query: parameters,
             body: vec![],
+            raw_body: None,
             headers: vec![],
         }
     }
@@ -221,6 +222,7 @@ where
             path: path.into(),
             query: parameters,
             body: vec![],
+            raw_body: None,
             headers: vec![("X-MBX-APIKEY".into(), self.api_key.to_string())],
         })
     }

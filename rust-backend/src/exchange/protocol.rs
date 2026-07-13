@@ -25,6 +25,9 @@ pub struct PreparedHttpRequest {
     pub path: String,
     pub query: Parameters,
     pub body: Parameters,
+    /// Exact bytes for APIs that sign a JSON body. Exchange adapters must not
+    /// combine this with form body parameters.
+    pub raw_body: Option<String>,
     pub headers: Parameters,
 }
 
@@ -34,7 +37,9 @@ impl PreparedHttpRequest {
     }
 
     pub fn body_string(&self) -> String {
-        encode_parameters(&self.body)
+        self.raw_body
+            .clone()
+            .unwrap_or_else(|| encode_parameters(&self.body))
     }
 
     pub fn url(&self) -> String {
@@ -55,7 +60,11 @@ impl fmt::Debug for PreparedHttpRequest {
                 .map(|(key, value)| {
                     let hidden = matches!(
                         key.to_ascii_lowercase().as_str(),
-                        "signature" | "x-mbx-apikey" | "authorization"
+                        "signature"
+                            | "x-mbx-apikey"
+                            | "x-bapi-api-key"
+                            | "x-bapi-sign"
+                            | "authorization"
                     );
                     (
                         key.clone(),
@@ -76,6 +85,10 @@ impl fmt::Debug for PreparedHttpRequest {
             .field("path", &self.path)
             .field("query", &redact(&self.query))
             .field("body", &redact(&self.body))
+            .field(
+                "raw_body",
+                &self.raw_body.as_ref().map(|_| "[REDACTED JSON BODY]"),
+            )
             .field("headers", &redact(&self.headers))
             .finish()
     }
@@ -167,8 +180,9 @@ impl HttpTransport for ReqwestTransport {
                 .map_err(|error| TransportError::Other(format!("invalid header value: {error}")))?;
             builder = builder.header(name, value);
         }
-        if !request.body.is_empty() {
-            builder = builder.body(request.body_string());
+        let body = request.body_string();
+        if !body.is_empty() {
+            builder = builder.body(body);
         }
         let response = builder.send().await.map_err(classify_reqwest_error)?;
         let status = response.status().as_u16();
@@ -262,6 +276,7 @@ mod tests {
             path: "/order".into(),
             query: vec![("signature".into(), "secret-signature".into())],
             body: vec![],
+            raw_body: None,
             headers: vec![("X-MBX-APIKEY".into(), "secret-key".into())],
         };
 
@@ -269,6 +284,30 @@ mod tests {
         assert!(!rendered.contains("secret-signature"));
         assert!(!rendered.contains("secret-key"));
         assert_eq!(rendered.matches("[REDACTED]").count(), 2);
+    }
+
+    #[test]
+    fn exact_json_body_is_transported_without_reencoding_and_debug_is_redacted() {
+        let exact_body = r#"{"category":"linear","qty":"0.20"}"#;
+        let request = PreparedHttpRequest {
+            method: HttpMethod::Post,
+            base_url: "https://example.test".into(),
+            path: "/v5/order/create".into(),
+            query: vec![],
+            body: vec![],
+            raw_body: Some(exact_body.into()),
+            headers: vec![
+                ("X-BAPI-API-KEY".into(), "secret-key".into()),
+                ("X-BAPI-SIGN".into(), "secret-signature".into()),
+            ],
+        };
+
+        assert_eq!(request.body_string(), exact_body);
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(exact_body));
+        assert!(!rendered.contains("secret-key"));
+        assert!(!rendered.contains("secret-signature"));
+        assert!(rendered.contains("[REDACTED JSON BODY]"));
     }
 
     #[test]

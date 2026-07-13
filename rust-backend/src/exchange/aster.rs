@@ -174,6 +174,7 @@ impl<T, S, N> AsterAdapter<T, S, N> {
             path: path.into(),
             query: parameters,
             body: vec![],
+            raw_body: None,
             headers: vec![],
         }
     }
@@ -242,6 +243,7 @@ where
             path: path.into(),
             query,
             body,
+            raw_body: None,
             headers: vec![(
                 "Content-Type".into(),
                 "application/x-www-form-urlencoded".into(),
