@@ -57,6 +57,19 @@ impl PositionBaseline {
         }
         Ok(())
     }
+
+    fn validate_for_direction(&self, direction: Direction) -> Result<(), StrategyStateError> {
+        let compatible = match direction {
+            Direction::Long => self.signed_quantity >= Decimal::ZERO,
+            Direction::Short => self.signed_quantity <= Decimal::ZERO,
+            Direction::Neutral => self.signed_quantity.is_zero(),
+        };
+        if compatible {
+            Ok(())
+        } else {
+            Err(StrategyStateError::BaselineDirectionConflict)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,16 +78,25 @@ pub enum StrategyLifecycle {
     AwaitingOpening,
     DeployingGrid,
     Running,
+    RiskExitRequested,
     StopRequested,
     Stopped,
     Failed,
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskExitReason {
+    StopLoss,
+    TakeProfit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StrategyOrderPurpose {
     Opening,
+    RiskClose,
     InitialGrid {
         level_index: u16,
         role: GridOrderRole,
@@ -88,7 +110,7 @@ pub enum StrategyOrderPurpose {
 impl StrategyOrderPurpose {
     fn level_index(&self) -> Option<u16> {
         match self {
-            Self::Opening => None,
+            Self::Opening | Self::RiskClose => None,
             Self::InitialGrid { level_index, .. } | Self::Replacement { level_index, .. } => {
                 Some(*level_index)
             }
@@ -97,6 +119,10 @@ impl StrategyOrderPurpose {
 
     fn is_initial_grid(&self) -> bool {
         matches!(self, Self::InitialGrid { .. })
+    }
+
+    fn is_risk_close(&self) -> bool {
+        matches!(self, Self::RiskClose)
     }
 }
 
@@ -169,6 +195,10 @@ pub struct StrategyState {
     pub next_order_sequence: u64,
     pub next_obligation_sequence: u64,
     pub initial_deployment_complete: bool,
+    #[serde(default)]
+    pub risk_exit_reason: Option<RiskExitReason>,
+    #[serde(default)]
+    pub risk_trigger_mark_price: Option<Decimal>,
     pub completed_pairs: u64,
     pub gross_realized_profit: Decimal,
     pub total_volume: Decimal,
@@ -198,6 +228,8 @@ impl StrategyState {
         let direction = config.direction;
         validate_symbol(&symbol)?;
         baseline.validate()?;
+        baseline.validate_for_direction(direction)?;
+        validate_risk_prices(&config, plan.reference_price)?;
         if plan.grid_orders.is_empty() || plan.participating_level_count == 0 {
             return Err(StrategyStateError::InvalidPlan);
         }
@@ -228,6 +260,8 @@ impl StrategyState {
             next_order_sequence: 1,
             next_obligation_sequence: 1,
             initial_deployment_complete: false,
+            risk_exit_reason: None,
+            risk_trigger_mark_price: None,
             completed_pairs: 0,
             gross_realized_profit: Decimal::ZERO,
             total_volume: Decimal::ZERO,
@@ -262,7 +296,11 @@ impl StrategyState {
         }
         self.orders
             .values()
-            .filter(|order| order.tracking == StrategyOrderTracking::Ready)
+            .filter(|order| {
+                order.tracking == StrategyOrderTracking::Ready
+                    && (self.lifecycle != StrategyLifecycle::RiskExitRequested
+                        || order.purpose.is_risk_close())
+            })
             .map(|order| {
                 OrderIntent::prepare(
                     order.client_order_id.clone(),
@@ -294,6 +332,23 @@ impl StrategyState {
             return Err(StrategyStateError::ConfigIdentityMismatch);
         }
         self.baseline.validate()?;
+        self.baseline.validate_for_direction(self.direction)?;
+        validate_risk_prices(&self.config, self.plan.reference_price)?;
+        if self
+            .risk_trigger_mark_price
+            .is_some_and(|price| price <= Decimal::ZERO)
+            || (self.lifecycle == StrategyLifecycle::RiskExitRequested
+                && (self.risk_exit_reason.is_none() || self.risk_trigger_mark_price.is_none()))
+        {
+            return Err(StrategyStateError::InvalidRiskExitState);
+        }
+        if self.lifecycle == StrategyLifecycle::Closed
+            && (!self.grid_position_net_quantity.is_zero()
+                || !self.lots_by_level.is_empty()
+                || self.orders.values().any(order_may_still_be_live))
+        {
+            return Err(StrategyStateError::CannotCloseStrategy);
+        }
         if self.updated_at_ms < self.created_at_ms {
             return Err(StrategyStateError::TimestampRegression);
         }
@@ -557,6 +612,31 @@ fn validate_symbol(symbol: &str) -> Result<(), StrategyStateError> {
     Ok(())
 }
 
+fn validate_risk_prices(
+    config: &GridConfig,
+    reference_price: Decimal,
+) -> Result<(), StrategyStateError> {
+    let stop_loss_valid = config
+        .stop_loss_price
+        .is_none_or(|price| match config.direction {
+            Direction::Long => price < reference_price,
+            Direction::Short => price > reference_price,
+            Direction::Neutral => price < config.lower_price,
+        });
+    let take_profit_valid = config
+        .take_profit_price
+        .is_none_or(|price| match config.direction {
+            Direction::Long => price > reference_price,
+            Direction::Short => price < reference_price,
+            Direction::Neutral => price > config.upper_price,
+        });
+    if stop_loss_valid && take_profit_valid {
+        Ok(())
+    } else {
+        Err(StrategyStateError::InvalidRiskPriceDirection)
+    }
+}
+
 fn validate_order_against_instrument(
     order: &StrategyOrderRecord,
     rules: &InstrumentRules,
@@ -633,6 +713,14 @@ pub enum StrategyTransition {
     },
     LifecycleChanged {
         lifecycle: StrategyLifecycle,
+    },
+    RiskExitRequested {
+        reason: RiskExitReason,
+        mark_price: Decimal,
+    },
+    RiskCloseOrderReady {
+        client_order_id: ClientOrderId,
+        quantity: Decimal,
     },
     Failed {
         message: String,
@@ -739,7 +827,8 @@ where
         let mut next = self.store.snapshot().clone();
         if matches!(
             next.lifecycle,
-            StrategyLifecycle::StopRequested
+            StrategyLifecycle::RiskExitRequested
+                | StrategyLifecycle::StopRequested
                 | StrategyLifecycle::Stopped
                 | StrategyLifecycle::Failed
                 | StrategyLifecycle::Closed
@@ -750,6 +839,233 @@ where
         finalize_and_store(&mut self.store, next, now_ms, transition)
     }
 
+    pub fn evaluate_risk_price(
+        &mut self,
+        mark_price: Decimal,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        if mark_price <= Decimal::ZERO {
+            return Err(StrategyStateError::InvalidMarketPrice.into());
+        }
+        let snapshot = self.store.snapshot();
+        if !matches!(
+            snapshot.lifecycle,
+            StrategyLifecycle::AwaitingOpening
+                | StrategyLifecycle::DeployingGrid
+                | StrategyLifecycle::Running
+        ) {
+            return Ok(StrategyTransition::NoChange);
+        }
+        let reason = match snapshot.direction {
+            Direction::Long => {
+                if snapshot
+                    .config
+                    .stop_loss_price
+                    .is_some_and(|price| mark_price <= price)
+                {
+                    Some(RiskExitReason::StopLoss)
+                } else if snapshot
+                    .config
+                    .take_profit_price
+                    .is_some_and(|price| mark_price >= price)
+                {
+                    Some(RiskExitReason::TakeProfit)
+                } else {
+                    None
+                }
+            }
+            Direction::Short => {
+                if snapshot
+                    .config
+                    .stop_loss_price
+                    .is_some_and(|price| mark_price >= price)
+                {
+                    Some(RiskExitReason::StopLoss)
+                } else if snapshot
+                    .config
+                    .take_profit_price
+                    .is_some_and(|price| mark_price <= price)
+                {
+                    Some(RiskExitReason::TakeProfit)
+                } else {
+                    None
+                }
+            }
+            Direction::Neutral => {
+                if snapshot
+                    .config
+                    .stop_loss_price
+                    .is_some_and(|price| mark_price <= price)
+                {
+                    Some(RiskExitReason::StopLoss)
+                } else if snapshot
+                    .config
+                    .take_profit_price
+                    .is_some_and(|price| mark_price >= price)
+                {
+                    Some(RiskExitReason::TakeProfit)
+                } else {
+                    None
+                }
+            }
+        };
+        let Some(reason) = reason else {
+            return Ok(StrategyTransition::NoChange);
+        };
+        let mut next = snapshot.clone();
+        next.lifecycle = StrategyLifecycle::RiskExitRequested;
+        next.risk_exit_reason = Some(reason);
+        next.risk_trigger_mark_price = Some(mark_price);
+        finalize_and_store(
+            &mut self.store,
+            next,
+            now_ms,
+            StrategyTransition::RiskExitRequested { reason, mark_price },
+        )
+    }
+
+    pub fn prepare_risk_close(
+        &mut self,
+        actual_signed_quantity: Decimal,
+        fresh_rules: &InstrumentRules,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        fresh_rules
+            .validate()
+            .map_err(StrategyStateError::InvalidInstrument)?;
+        let snapshot = self.store.snapshot();
+        if snapshot.lifecycle == StrategyLifecycle::Closed {
+            return Ok(StrategyTransition::NoChange);
+        }
+        if snapshot.lifecycle != StrategyLifecycle::RiskExitRequested {
+            return Err(StrategyStateError::InvalidLifecycleTransition.into());
+        }
+        if snapshot
+            .orders
+            .values()
+            .any(|order| order.purpose.is_risk_close() && !order.terminal_processed)
+        {
+            return Ok(StrategyTransition::NoChange);
+        }
+
+        let mut next = snapshot.clone();
+        if fresh_rules != &next.instrument_rules {
+            let transition = fail_transition(
+                &mut next,
+                "exchange instrument rules changed before the risk close",
+            );
+            return finalize_and_store(&mut self.store, next, now_ms, transition);
+        }
+        if next.orders.values().any(order_may_still_be_live) {
+            return Err(StrategyStateError::OrdersNotTerminal.into());
+        }
+        let expected = next.expected_exchange_position()?;
+        if actual_signed_quantity != expected {
+            let transition = fail_transition(
+                &mut next,
+                format!(
+                    "risk close position mismatch: expected {expected}, actual {actual_signed_quantity}"
+                ),
+            );
+            return finalize_and_store(&mut self.store, next, now_ms, transition);
+        }
+        if next.grid_position_net_quantity.is_zero() {
+            next.lifecycle = StrategyLifecycle::Closed;
+            return finalize_and_store(
+                &mut self.store,
+                next,
+                now_ms,
+                StrategyTransition::LifecycleChanged {
+                    lifecycle: StrategyLifecycle::Closed,
+                },
+            );
+        }
+        if next.direction == Direction::Neutral {
+            let transition = fail_transition(
+                &mut next,
+                "neutral risk close requires a directional cost-basis ledger",
+            );
+            return finalize_and_store(&mut self.store, next, now_ms, transition);
+        }
+
+        let total_quantity = next.grid_position_net_quantity.abs();
+        let close_quantity = if let Some(maximum) = fresh_rules.market_quantity.max
+            && total_quantity > maximum
+        {
+            fresh_rules
+                .market_quantity
+                .floor(maximum)
+                .ok_or(StrategyStateError::RiskCloseQuantityInvalid)?
+        } else {
+            total_quantity
+        };
+        if !fresh_rules.market_quantity.accepts(close_quantity) {
+            let transition = fail_transition(
+                &mut next,
+                "exact grid-owned risk close quantity is not accepted by market rules",
+            );
+            return finalize_and_store(&mut self.store, next, now_ms, transition);
+        }
+        let side = if next.grid_position_net_quantity > Decimal::ZERO {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        let client_order_id = next.next_client_order_id("c", None, side)?;
+        next.insert_order(StrategyOrderRecord {
+            client_order_id: client_order_id.clone(),
+            shape: OrderShape {
+                symbol: next.symbol.clone(),
+                side,
+                price: None,
+                quantity: close_quantity,
+                reduce_only: true,
+                kind: OrderKind::Market,
+                time_in_force: crate::domain::TimeInForce::Gtc,
+            },
+            purpose: StrategyOrderPurpose::RiskClose,
+            tracking: StrategyOrderTracking::Ready,
+            exchange_order_id: None,
+            cumulative_quantity: Decimal::ZERO,
+            cumulative_quote: Decimal::ZERO,
+            cumulative_fee: Decimal::ZERO,
+            terminal_status: None,
+            terminal_processed: false,
+            completed_pair_counted: false,
+        })?;
+        finalize_and_store(
+            &mut self.store,
+            next,
+            now_ms,
+            StrategyTransition::RiskCloseOrderReady {
+                client_order_id,
+                quantity: close_quantity,
+            },
+        )
+    }
+
+    pub fn reconcile_position(
+        &mut self,
+        actual_signed_quantity: Decimal,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        let expected = self.store.snapshot().expected_exchange_position()?;
+        if actual_signed_quantity == expected {
+            return Ok(StrategyTransition::NoChange);
+        }
+        let mut next = self.store.snapshot().clone();
+        let message = format!(
+            "authoritative position mismatch: expected {expected}, actual {actual_signed_quantity}"
+        );
+        next.fail(message.clone());
+        finalize_and_store(
+            &mut self.store,
+            next,
+            now_ms,
+            StrategyTransition::Failed { message },
+        )
+    }
+
     pub fn request_stop(
         &mut self,
         now_ms: u64,
@@ -757,7 +1073,8 @@ where
         let mut next = self.store.snapshot().clone();
         if matches!(
             next.lifecycle,
-            StrategyLifecycle::StopRequested
+            StrategyLifecycle::RiskExitRequested
+                | StrategyLifecycle::StopRequested
                 | StrategyLifecycle::Stopped
                 | StrategyLifecycle::Failed
                 | StrategyLifecycle::Closed
@@ -1135,7 +1452,18 @@ fn apply_execution_delta(
             .opening_filled_value
             .checked_add(delta.quote)
             .ok_or_else(|| "opening value overflowed".to_owned())?;
+        allocate_opening_delta(state, delta.quantity, delta.quote)?;
         return validate_directional_position(state, delta.shape);
+    }
+
+    if matches!(delta.purpose, StrategyOrderPurpose::RiskClose) {
+        validate_directional_position(state, delta.shape)?;
+        let realized = consume_risk_close_lots(state, delta.quantity, delta.quote)?;
+        state.gross_realized_profit = state
+            .gross_realized_profit
+            .checked_add(realized)
+            .ok_or_else(|| "risk close realized profit overflowed".to_owned())?;
+        return Ok(());
     }
 
     validate_directional_position(state, delta.shape)?;
@@ -1255,6 +1583,55 @@ fn consume_level_lot(
     }
 }
 
+fn consume_risk_close_lots(
+    state: &mut StrategyState,
+    quantity: Decimal,
+    exit_value: Decimal,
+) -> Result<Decimal, String> {
+    if state.direction == Direction::Neutral {
+        return Err("neutral risk close has no directional lot ledger".into());
+    }
+    let level_indices = state.lots_by_level.keys().copied().collect::<Vec<_>>();
+    let mut remaining_quantity = quantity;
+    let mut remaining_exit_value = exit_value;
+    let mut realized = Decimal::ZERO;
+    for level_index in level_indices {
+        if remaining_quantity.is_zero() {
+            break;
+        }
+        let available = state
+            .lots_by_level
+            .get(&level_index)
+            .map_or(Decimal::ZERO, |lot| lot.quantity);
+        if available.is_zero() {
+            continue;
+        }
+        let consumed = available.min(remaining_quantity);
+        let consumed_exit_value = if consumed == remaining_quantity {
+            remaining_exit_value
+        } else {
+            exit_value
+                .checked_mul(consumed)
+                .and_then(|value| value.checked_div(quantity))
+                .ok_or_else(|| "risk close exit allocation overflowed".to_owned())?
+        };
+        realized = realized
+            .checked_add(consume_level_lot(
+                state,
+                level_index,
+                consumed,
+                consumed_exit_value,
+            )?)
+            .ok_or_else(|| "risk close realized profit overflowed".to_owned())?;
+        remaining_quantity -= consumed;
+        remaining_exit_value -= consumed_exit_value;
+    }
+    if !remaining_quantity.is_zero() || !remaining_exit_value.is_zero() {
+        return Err("risk close quantity exceeds the owned directional lots".into());
+    }
+    Ok(realized)
+}
+
 fn counter_shape(
     state: &StrategyState,
     level_index: u16,
@@ -1333,12 +1710,17 @@ fn process_terminal_order(
 ) -> Result<(), String> {
     if matches!(purpose, StrategyOrderPurpose::Opening) {
         if report.cumulative_quantity != shape.quantity {
+            if matches!(
+                state.lifecycle,
+                StrategyLifecycle::RiskExitRequested | StrategyLifecycle::StopRequested
+            ) {
+                return Ok(());
+            }
             return Err(format!(
                 "opening order ended with retained grid quantity {} of {}",
                 report.cumulative_quantity, shape.quantity
             ));
         }
-        initialize_opening_lots(state)?;
         if state.lifecycle == StrategyLifecycle::AwaitingOpening {
             for order in state.orders.values_mut() {
                 if order.purpose.is_initial_grid()
@@ -1348,6 +1730,13 @@ fn process_terminal_order(
                 }
             }
             state.lifecycle = StrategyLifecycle::DeployingGrid;
+        }
+        return Ok(());
+    }
+
+    if matches!(purpose, StrategyOrderPurpose::RiskClose) {
+        if report.terminal_status == Some(TerminalOrderStatus::Rejected) {
+            return Err("risk close order was rejected and requires explicit review".into());
         }
         return Ok(());
     }
@@ -1393,18 +1782,15 @@ fn process_terminal_order(
     Ok(())
 }
 
-fn initialize_opening_lots(state: &mut StrategyState) -> Result<(), String> {
-    if state.opening_filled_quantity <= Decimal::ZERO
-        || state.opening_filled_value <= Decimal::ZERO
-        || !state.lots_by_level.is_empty()
-    {
-        return Err("opening lot initialization state is invalid".into());
+fn allocate_opening_delta(
+    state: &mut StrategyState,
+    delta_quantity: Decimal,
+    delta_quote: Decimal,
+) -> Result<(), String> {
+    if delta_quantity <= Decimal::ZERO || delta_quote <= Decimal::ZERO {
+        return Err("opening execution delta is invalid".into());
     }
-    let average = state
-        .opening_filled_value
-        .checked_div(state.opening_filled_quantity)
-        .ok_or_else(|| "opening average price overflowed".to_owned())?;
-    let protected_orders = state
+    let mut protected_orders = state
         .orders
         .values()
         .filter(|order| order.purpose.is_initial_grid() && order.shape.reduce_only)
@@ -1416,18 +1802,36 @@ fn initialize_opening_lots(state: &mut StrategyState) -> Result<(), String> {
                 .ok_or_else(|| "initial grid order has no level identity".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let protected_quantity = protected_orders
-        .iter()
-        .map(|(_, quantity)| *quantity)
-        .sum::<Decimal>();
-    if protected_quantity != state.opening_filled_quantity {
-        return Err("opening quantity does not equal initial reduce protection".into());
-    }
-    for (level_index, quantity) in protected_orders {
-        let entry_value = average
-            .checked_mul(quantity)
-            .ok_or_else(|| "opening lot value overflowed".to_owned())?;
+    protected_orders.sort_by_key(|(level_index, _)| *level_index);
+    let mut remaining_quantity = delta_quantity;
+    let mut remaining_quote = delta_quote;
+    for (level_index, planned_quantity) in protected_orders {
+        if remaining_quantity.is_zero() {
+            break;
+        }
+        let already_allocated = state
+            .lots_by_level
+            .get(&level_index)
+            .map_or(Decimal::ZERO, |lot| lot.quantity);
+        let available = planned_quantity - already_allocated;
+        if available <= Decimal::ZERO {
+            continue;
+        }
+        let quantity = available.min(remaining_quantity);
+        let entry_value = if quantity == remaining_quantity {
+            remaining_quote
+        } else {
+            delta_quote
+                .checked_mul(quantity)
+                .and_then(|value| value.checked_div(delta_quantity))
+                .ok_or_else(|| "opening lot value allocation overflowed".to_owned())?
+        };
         add_level_lot(state, level_index, quantity, entry_value)?;
+        remaining_quantity -= quantity;
+        remaining_quote -= entry_value;
+    }
+    if !remaining_quantity.is_zero() || !remaining_quote.is_zero() {
+        return Err("opening lot allocation is incomplete".into());
     }
     Ok(())
 }
@@ -1691,6 +2095,16 @@ pub enum StrategyStateError {
     InvalidSymbol,
     #[error("strategy baseline is invalid")]
     InvalidBaseline,
+    #[error("existing one-way position cannot be isolated from this grid direction")]
+    BaselineDirectionConflict,
+    #[error("stop loss or take profit is on the unsafe side of the strategy reference")]
+    InvalidRiskPriceDirection,
+    #[error("risk exit state is incomplete or invalid")]
+    InvalidRiskExitState,
+    #[error("market price must be positive")]
+    InvalidMarketPrice,
+    #[error("grid-owned risk close quantity cannot be represented by market rules")]
+    RiskCloseQuantityInvalid,
     #[error("strategy plan is empty or incomplete")]
     InvalidPlan,
     #[error("unsupported strategy state version {0}")]
@@ -1919,6 +2333,50 @@ mod tests {
         machine
     }
 
+    fn short_machine_with_risk() -> StrategyMachine<MemoryStrategyStateStore> {
+        let mut config = config(Direction::Short);
+        config.stop_loss_price = Some(decimal(1016));
+        config.take_profit_price = Some(decimal(1005));
+        let rules = instrument();
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: decimal(1012),
+                mark_price: decimal(1012),
+            },
+            &rules,
+        )
+        .unwrap();
+        let state = StrategyState::from_plan(
+            StrategyRunId::parse("RISK0001").unwrap(),
+            config,
+            rules,
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        StrategyMachine::new(MemoryStrategyStateStore::new(state))
+    }
+
+    fn short_risk_machine_with_opening() -> StrategyMachine<MemoryStrategyStateStore> {
+        let mut machine = short_machine_with_risk();
+        let opening = opening_id(machine.store().snapshot());
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "risk-opening",
+                    Decimal::new(28, 1),
+                    Decimal::new(28392, 1),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                101,
+            )
+            .unwrap();
+        machine
+    }
+
     fn small_neutral_machine() -> StrategyMachine<MemoryStrategyStateStore> {
         let config = GridConfig {
             exchange: Some(Exchange::Aster),
@@ -2005,6 +2463,356 @@ mod tests {
                 .filter(|order| order.tracking == StrategyOrderTracking::Dormant)
                 .count(),
             20
+        );
+    }
+
+    #[test]
+    fn opposite_or_neutral_baseline_is_rejected_when_it_cannot_be_isolated() {
+        for (direction, signed_quantity) in [
+            (Direction::Short, decimal(3)),
+            (Direction::Long, decimal(-3)),
+            (Direction::Neutral, decimal(3)),
+        ] {
+            let config = config(direction);
+            let rules = instrument();
+            let plan = build_grid_plan(
+                &config,
+                &MarketSnapshot {
+                    last_price: decimal(1012),
+                    mark_price: decimal(1012),
+                },
+                &rules,
+            )
+            .unwrap();
+
+            assert_eq!(
+                StrategyState::from_plan(
+                    StrategyRunId::parse("BASEBAD1").unwrap(),
+                    config,
+                    rules,
+                    plan,
+                    PositionBaseline {
+                        signed_quantity,
+                        entry_price: Some(decimal(1010)),
+                    },
+                    100,
+                ),
+                Err(StrategyStateError::BaselineDirectionConflict)
+            );
+        }
+    }
+
+    #[test]
+    fn position_reconciliation_never_rewrites_the_owned_ledger() {
+        let mut machine = short_machine_with_opening();
+        let expected = machine
+            .store()
+            .snapshot()
+            .expected_exchange_position()
+            .unwrap();
+        let revision = machine.store().snapshot().revision;
+
+        assert_eq!(
+            machine.reconcile_position(expected, 110).unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(machine.store().snapshot().revision, revision);
+
+        let transition = machine
+            .reconcile_position(expected + Decimal::new(1, 1), 111)
+            .unwrap();
+        assert!(matches!(transition, StrategyTransition::Failed { .. }));
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.expected_exchange_position().unwrap(), expected);
+        assert_eq!(state.grid_position_net_quantity, Decimal::new(-28, 1));
+        assert_eq!(state.baseline.signed_quantity, decimal(-3));
+    }
+
+    #[test]
+    fn risk_prices_must_be_on_the_correct_side_of_the_strategy() {
+        let mut config = config(Direction::Short);
+        config.stop_loss_price = Some(decimal(1005));
+        let rules = instrument();
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: decimal(1012),
+                mark_price: decimal(1012),
+            },
+            &rules,
+        )
+        .unwrap();
+
+        assert_eq!(
+            StrategyState::from_plan(
+                StrategyRunId::parse("BADRISK1").unwrap(),
+                config,
+                rules,
+                plan,
+                PositionBaseline::flat(),
+                100,
+            ),
+            Err(StrategyStateError::InvalidRiskPriceDirection)
+        );
+    }
+
+    #[test]
+    fn risk_price_hit_blocks_all_new_orders_without_using_grid_boundaries() {
+        let mut machine = short_machine_with_risk();
+        let revision = machine.store().snapshot().revision;
+
+        assert_eq!(
+            machine.evaluate_risk_price(decimal(1015), 101).unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(machine.store().snapshot().revision, revision);
+        assert_eq!(
+            machine.evaluate_risk_price(decimal(1016), 102).unwrap(),
+            StrategyTransition::RiskExitRequested {
+                reason: RiskExitReason::StopLoss,
+                mark_price: decimal(1016)
+            }
+        );
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::RiskExitRequested);
+        assert_eq!(state.risk_exit_reason, Some(RiskExitReason::StopLoss));
+        assert_eq!(state.risk_trigger_mark_price, Some(decimal(1016)));
+        assert!(state.ready_intents(103).unwrap().is_empty());
+        let rules = state.instrument_rules.clone();
+        assert_eq!(
+            machine.materialize_replacements(&rules, 103).unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(
+            machine.request_stop(104).unwrap(),
+            StrategyTransition::NoChange
+        );
+    }
+
+    #[test]
+    fn crossing_a_grid_boundary_without_configured_risk_price_does_nothing() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        let revision = machine.store().snapshot().revision;
+
+        assert_eq!(
+            machine.evaluate_risk_price(decimal(2000), 101).unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(machine.store().snapshot().revision, revision);
+        assert_eq!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::AwaitingOpening
+        );
+    }
+
+    #[test]
+    fn partial_opening_is_owned_before_risk_exit_and_terminal_cancel() {
+        let mut machine = short_machine_with_risk();
+        let opening = opening_id(machine.store().snapshot());
+        machine
+            .apply_execution(
+                &report(
+                    opening.clone(),
+                    "partial-opening",
+                    Decimal::new(1, 1),
+                    Decimal::new(1014, 1),
+                    None,
+                ),
+                101,
+            )
+            .unwrap();
+        assert_eq!(
+            machine
+                .store()
+                .snapshot()
+                .lots_by_level
+                .values()
+                .map(|lot| lot.quantity)
+                .sum::<Decimal>(),
+            Decimal::new(1, 1)
+        );
+
+        machine.evaluate_risk_price(decimal(1016), 102).unwrap();
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "partial-opening",
+                    Decimal::new(1, 1),
+                    Decimal::new(1014, 1),
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                103,
+            )
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::RiskExitRequested);
+        assert_eq!(state.grid_position_net_quantity, Decimal::new(-1, 1));
+        assert_eq!(
+            state
+                .lots_by_level
+                .values()
+                .map(|lot| lot.quantity)
+                .sum::<Decimal>(),
+            Decimal::new(1, 1)
+        );
+        assert!(state.ready_intents(104).unwrap().is_empty());
+    }
+
+    #[test]
+    fn risk_close_is_exact_reduce_only_and_preserves_the_baseline() {
+        let mut machine = short_risk_machine_with_opening();
+        machine.evaluate_risk_price(decimal(1016), 110).unwrap();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+
+        let transition = machine
+            .prepare_risk_close(Decimal::new(-28, 1), &rules, 111)
+            .unwrap();
+        let (close_id, close_quantity) = match transition {
+            StrategyTransition::RiskCloseOrderReady {
+                client_order_id,
+                quantity,
+            } => (client_order_id, quantity),
+            other => panic!("unexpected transition: {other:?}"),
+        };
+        assert_eq!(close_quantity, Decimal::new(28, 1));
+        assert_eq!(
+            machine
+                .prepare_risk_close(Decimal::new(-28, 1), &rules, 112)
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+        let ready = machine.store().snapshot().ready_intents(113).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].client_order_id, close_id);
+        assert_eq!(ready[0].shape.side, OrderSide::Buy);
+        assert_eq!(ready[0].shape.quantity, Decimal::new(28, 1));
+        assert!(ready[0].shape.reduce_only);
+        assert_eq!(ready[0].shape.kind, OrderKind::Market);
+        assert_eq!(ready[0].shape.price, None);
+
+        machine
+            .apply_execution(
+                &report(
+                    close_id,
+                    "risk-close",
+                    Decimal::new(28, 1),
+                    decimal(2800),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                114,
+            )
+            .unwrap();
+        let state = machine.store().snapshot();
+        assert_eq!(state.grid_position_net_quantity, Decimal::ZERO);
+        assert!(state.lots_by_level.is_empty());
+        assert_eq!(state.gross_realized_profit, Decimal::new(392, 1));
+
+        assert_eq!(
+            machine
+                .prepare_risk_close(Decimal::ZERO, &rules, 115)
+                .unwrap(),
+            StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::Closed
+            }
+        );
+        assert_eq!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::Closed
+        );
+        assert!(
+            machine
+                .store()
+                .snapshot()
+                .ready_intents(116)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn partial_cancelled_risk_close_prepares_only_the_exact_remainder() {
+        let mut machine = short_risk_machine_with_opening();
+        machine.evaluate_risk_price(decimal(1016), 110).unwrap();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        let first = match machine
+            .prepare_risk_close(Decimal::new(-28, 1), &rules, 111)
+            .unwrap()
+        {
+            StrategyTransition::RiskCloseOrderReady {
+                client_order_id, ..
+            } => client_order_id,
+            other => panic!("unexpected transition: {other:?}"),
+        };
+        machine
+            .apply_execution(
+                &report(
+                    first,
+                    "risk-close-partial",
+                    decimal(1),
+                    decimal(1000),
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                112,
+            )
+            .unwrap();
+
+        let transition = machine
+            .prepare_risk_close(Decimal::new(-18, 1), &rules, 113)
+            .unwrap();
+        assert!(matches!(
+            transition,
+            StrategyTransition::RiskCloseOrderReady { quantity, .. }
+                if quantity == Decimal::new(18, 1)
+        ));
+        let state = machine.store().snapshot();
+        assert_eq!(state.grid_position_net_quantity, Decimal::new(-18, 1));
+        assert_eq!(
+            state
+                .orders
+                .values()
+                .filter(|order| order.purpose.is_risk_close())
+                .count(),
+            2
+        );
+        assert!(state.replacement_obligations.is_empty());
+    }
+
+    #[test]
+    fn risk_close_waits_for_authoritative_terminal_grid_orders() {
+        let mut machine = short_risk_machine_with_opening();
+        let mut live = machine
+            .store()
+            .snapshot()
+            .ready_intents(110)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        live.state = IntentState::Accepted {
+            exchange_order_id: "still-live".into(),
+        };
+        machine.synchronize_intent(&live, 111).unwrap();
+        machine.evaluate_risk_price(decimal(1016), 112).unwrap();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+
+        assert!(matches!(
+            machine.prepare_risk_close(Decimal::new(-28, 1), &rules, 113),
+            Err(StrategyMachineError::InvalidState(
+                StrategyStateError::OrdersNotTerminal
+            ))
+        ));
+        assert!(
+            machine
+                .store()
+                .snapshot()
+                .orders
+                .values()
+                .all(|order| !order.purpose.is_risk_close())
         );
     }
 

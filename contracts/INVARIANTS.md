@@ -33,11 +33,17 @@ the OpenAPI schema.
 ## Position ownership
 
 - Position at grid start is the baseline and is never silently absorbed by the grid.
+- In one-way position mode, an opposite-side baseline and a directional grid cannot be
+  isolated. That configuration is rejected instead of netting through the old position.
+- A neutral grid requires a flat baseline unless the exchange adapter later provides an
+  explicit hedge-position identity.
 - Grid-owned position equals confirmed opening fills minus confirmed reducing fills.
 - Manual or unexplained exchange position changes fail closed and never rewrite the
   local ledger.
 - Stopping a grid does not market-close a retained position unless an explicit risk
   action requires it.
+- Every authoritative position check must exactly equal baseline plus grid-owned position;
+  mismatch fails closed and never rewrites either ledger component.
 
 ## Grid behavior
 
@@ -67,6 +73,13 @@ the OpenAPI schema.
 - Failed, closed, stopped, and saved are distinct lifecycle states.
 - A normal stop creates no market order and does not change baseline or grid-owned
   position. It waits for every submitted or uncertain order to become authoritative.
+- Grid boundaries never trigger a market close. Only configured stop-loss or take-profit
+  prices create a risk-exit request.
+- A risk exit disables normal placement, waits for every submitted order to become
+  authoritative, revalidates exchange rules and actual position, then prepares only the
+  exact grid-owned quantity as an immutable reduce-only market intent.
+- A partial or cancelled risk close never recreates its planned quantity. A subsequent
+  intent can cover only the exact remaining grid-owned quantity.
 - A late fill after a stopped or closed state is still booked to owned position and then
   escalated durably as a failure; it is never discarded.
 - A restart cannot resume normal placement before fresh exchange rules and
