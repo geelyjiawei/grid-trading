@@ -189,7 +189,9 @@ the OpenAPI schema.
   Loading acquires the lease first, then verifies the persisted run ID and cross-ledger ownership;
   any mismatch prevents the runtime from becoming visible and performs no exchange operation.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
-  rule, or baseline failure leaves the armed bytes unchanged and creates no order.
+  rule, baseline, runtime-setting, or intent-ledger failure leaves the armed bytes unchanged
+  and creates no order. Successful activation transfers the same held runtime lease without
+  an unlocked gap, and still performs no order placement until the first runtime tick.
 - Trigger direction is derived from the trigger price relative to the arming market, not
   guessed from long, short, or neutral grid direction.
 - Initial deployment ownership is retained until every linked exchange order is

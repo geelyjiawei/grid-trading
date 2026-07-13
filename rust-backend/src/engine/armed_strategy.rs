@@ -5,8 +5,8 @@ use thiserror::Error;
 use crate::domain::{Exchange, GridConfig, InstrumentRules};
 
 use super::{
-    GridPlanError, MarketSnapshot, PositionBaseline, StrategyRunId, StrategyState,
-    StrategyStateError, TriggerActivation, build_grid_plan,
+    GridPlanError, MarketSnapshot, PositionBaseline, StrategyLifecycle, StrategyRunId,
+    StrategyState, StrategyStateError, TriggerActivation, build_grid_plan,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +172,47 @@ impl ArmedStrategyState {
         Ok(active)
     }
 
+    pub fn validate_active_successor(
+        &self,
+        active: &StrategyState,
+    ) -> Result<(), ArmedStrategyError> {
+        self.validate()?;
+        active.validate()?;
+        if self.lifecycle != ArmedStrategyLifecycle::WaitingTrigger {
+            return Err(ArmedStrategyError::NotWaiting);
+        }
+        let expected_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ArmedStrategyError::RevisionOverflow)?;
+        let Some(observed_price) = active.trigger_observed_price else {
+            return Err(ArmedStrategyError::ActiveSuccessorMismatch);
+        };
+        let trigger_still_matches = match self.condition {
+            TriggerCondition::AtOrAbove => observed_price >= self.trigger_price,
+            TriggerCondition::AtOrBelow => observed_price <= self.trigger_price,
+        };
+        if active.run_id != self.run_id
+            || active.revision != expected_revision
+            || active.exchange != self.exchange
+            || active.symbol != self.symbol
+            || active.direction != self.config.direction
+            || !same_strategy_except_fee_rates(&self.config, &active.config)
+            || active.created_at_ms != self.created_at_ms
+            || active.updated_at_ms < self.updated_at_ms
+            || active.triggered_at_ms != Some(active.updated_at_ms)
+            || active.trigger_armed_price != Some(self.armed_market_price)
+            || !trigger_still_matches
+            || !matches!(
+                active.lifecycle,
+                StrategyLifecycle::AwaitingOpening | StrategyLifecycle::DeployingGrid
+            )
+        {
+            return Err(ArmedStrategyError::ActiveSuccessorMismatch);
+        }
+        Ok(())
+    }
+
     pub fn cancelled(&self, now_ms: u64) -> Result<Self, ArmedStrategyError> {
         self.validate()?;
         if now_ms < self.updated_at_ms {
@@ -237,6 +278,8 @@ pub enum ArmedStrategyError {
     NotTriggered,
     #[error("armed strategy revision overflowed")]
     RevisionOverflow,
+    #[error("active strategy is not the direct successor of this armed strategy")]
+    ActiveSuccessorMismatch,
     #[error("grid planning failed at trigger time: {0}")]
     GridPlan(#[from] GridPlanError),
     #[error("active strategy state is invalid: {0}")]
@@ -418,6 +461,14 @@ mod tests {
             .unwrap();
         assert_eq!(active.config.maker_fee_rate, Some(Decimal::new(1, 4)));
         assert_eq!(active.config.taker_fee_rate, Some(Decimal::new(4, 4)));
+        armed.validate_active_successor(&active).unwrap();
+
+        let mut wrong_observation = active.clone();
+        wrong_observation.trigger_observed_price = Some(Decimal::new(1013, 0));
+        assert!(matches!(
+            armed.validate_active_successor(&wrong_observation),
+            Err(ArmedStrategyError::ActiveSuccessorMismatch)
+        ));
 
         let mut drifted = armed.config.clone();
         drifted.grid_order_qty = Some(Decimal::new(3, 1));

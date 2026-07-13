@@ -39,9 +39,9 @@ pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };
 pub use runtime::{
-    FileRuntimeLoadError, LeasedFileStrategyRuntime, RuntimeBlocker, RuntimeBuildError,
-    RuntimeCancellation, RuntimeStage, RuntimeSubmission, RuntimeTickError, RuntimeTickReport,
-    StrategyRuntime,
+    FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, LeasedFileArmedStrategy,
+    LeasedFileStrategyRuntime, RuntimeBlocker, RuntimeBuildError, RuntimeCancellation,
+    RuntimeStage, RuntimeSubmission, RuntimeTickError, RuntimeTickReport, StrategyRuntime,
 };
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{

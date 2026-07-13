@@ -199,6 +199,14 @@ impl FileArmedStrategyStateStore {
         let active = self
             .snapshot
             .activate(market, fresh_rules, baseline, now_ms)?;
+        self.activate_prepared(active)
+    }
+
+    pub fn activate_prepared(
+        self,
+        active: StrategyState,
+    ) -> Result<FileStrategyStateStore, StrategyStoreError> {
+        self.snapshot.validate_active_successor(&active)?;
         commit_persisted(
             &self.path,
             &PersistedStrategyState::Active(Box::new(active.clone())),
@@ -587,6 +595,36 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).unwrap(), bytes_before);
         assert!(FileArmedStrategyStateStore::load(&path).is_ok());
+    }
+
+    #[test]
+    fn prepared_activation_must_be_the_exact_armed_successor() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("armed.json");
+        let armed = armed_state();
+        let store = FileArmedStrategyStateStore::create(&path, armed.clone()).unwrap();
+        let bytes_before = fs::read(&path).unwrap();
+        let mut active = armed
+            .activate(
+                &MarketSnapshot {
+                    last_price: Decimal::new(406, 3),
+                    mark_price: Decimal::new(406, 3),
+                },
+                instrument_rules(),
+                PositionBaseline::flat(),
+                102,
+            )
+            .unwrap();
+        active.trigger_observed_price = Some(Decimal::new(404, 3));
+
+        assert!(matches!(
+            store.activate_prepared(active),
+            Err(StrategyStoreError::ArmedStrategy(
+                crate::engine::ArmedStrategyError::ActiveSuccessorMismatch
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+        assert!(FileArmedStrategyStateStore::load(path).is_ok());
     }
 
     #[test]
