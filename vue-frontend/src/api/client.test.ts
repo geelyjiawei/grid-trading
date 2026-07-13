@@ -46,6 +46,25 @@ describe("typed API client", () => {
     }
   });
 
+  it("surfaces the structured Rust API error message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: { code: "authentication_required", message: "Authentication required" },
+          }),
+          { status: 401, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    await expect(request("/api/config")).rejects.toMatchObject({
+      status: 401,
+      message: "Authentication required",
+    });
+  });
+
   it("joins FastAPI validation messages instead of hiding them", async () => {
     vi.stubGlobal(
       "fetch",
@@ -85,6 +104,23 @@ describe("typed API client", () => {
         method: "POST",
         body: JSON.stringify({ username: "admin", password: "temporary", code: "123456" }),
       }),
+    );
+  });
+
+  it("uses a same-origin POST to revoke the web session", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.logout();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({ method: "POST", credentials: "same-origin" }),
     );
   });
 });

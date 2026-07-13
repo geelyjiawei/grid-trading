@@ -12,13 +12,18 @@ anyhow = "1.0.103"
 async-trait = "0.1.89"
 atomic-write-file = "0.3.0"
 axum = "0.8.9"
+base64 = "0.22.1"
+data-encoding = "2.9.0"
+getrandom = "0.3.4"
 hex = "0.4.3"
 hmac = "0.12.1"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
+pbkdf2 = "0.12.2"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rust_decimal = { version = "1.42.1", features = ["maths-nopanic", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha1 = "0.10.6"
 sha2 = "0.10.9"
 sha3 = "0.10.8"
 subtle = "2.6.1"

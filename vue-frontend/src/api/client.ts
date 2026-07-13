@@ -33,7 +33,7 @@ function errorMessage(body: ApiErrorBody, fallback: string): string {
     const joined = body.detail.map((item) => item.msg).filter(Boolean).join("; ");
     if (joined) return joined;
   }
-  return body.message || fallback;
+  return body.error?.message || body.message || fallback;
 }
 
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -67,6 +67,10 @@ export const api = {
     request<{ ok?: boolean; message?: string }>("/api/auth/login", {
       method: "POST",
       body: JSON.stringify(credentials),
+    }),
+  logout: () =>
+    request<{ ok?: boolean; message?: string }>("/api/auth/logout", {
+      method: "POST",
     }),
   config: () => request<ApiConfigResponse>("/api/config"),
   saveConfig: (config: SaveApiConfigRequest) =>

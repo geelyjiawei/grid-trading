@@ -25,7 +25,17 @@ data-rust-preview/
 It builds Vue in a Node build stage, compiles the Rust server in a Rust build
 stage, and copies only the Vue assets and Rust binary into the runtime image.
 The Rust server serves both `/healthz` and the Vue static files. Unknown API
-routes return `404` and are never rewritten to the Vue index.
+routes are never rewritten to the Vue index. They return `404` when web
+authentication is disabled or a valid session is present; otherwise they fail
+closed with `401` or `503`.
+
+The Rust backend now owns `/api/auth/status`, `/api/auth/login`, and
+`/api/auth/logout`. It accepts the existing `pbkdf2_sha256` password hashes and
+six-digit TOTP setup, but it does not copy the legacy signed-cookie session
+format. Successful logins receive a 12-hour opaque random cookie; Rust stores
+only the SHA-256 token digest in bounded process memory. Logout, expiry, or a
+Rust restart revokes the session. `SESSION_SECRET` remains a legacy Python-only
+setting during migration and is not used by Rust.
 
 The preview stack can be built after creating a local `.env` file:
 

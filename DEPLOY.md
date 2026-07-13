@@ -68,6 +68,8 @@ SESSION_SECRET=上面生成的会话密钥
 AUTH_COOKIE_SECURE=false
 ```
 
+`SESSION_SECRET` 仅供当前 Python 生产服务使用。Vue + Rust 候选服务采用服务端不透明随机会话，只保存令牌摘要，不读取该值；在正式切换完成前仍需保留它，避免影响旧服务。
+
 然后在 Google Authenticator 里选择“输入设置密钥”，账户名可填 `grid-trading`，密钥填 `TOTP_SECRET`。
 
 如果以后配置了 HTTPS，把 `AUTH_COOKIE_SECURE=true`。

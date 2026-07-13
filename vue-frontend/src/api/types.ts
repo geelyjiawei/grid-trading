@@ -238,4 +238,8 @@ export interface GridPreview {
 export interface ApiErrorBody {
   detail?: string | Array<{ msg?: string }>;
   message?: string;
+  error?: {
+    code?: string;
+    message?: string;
+  };
 }

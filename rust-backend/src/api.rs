@@ -10,15 +10,18 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, State},
     http::{
-        HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER, SET_COOKIE, WWW_AUTHENTICATE,
+        },
         request::Parts,
     },
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::{
     persistence::{
@@ -26,6 +29,10 @@ use crate::{
         RequestFingerprint, StoredCommandResponse,
     },
     security::AdminTokenVerifier,
+    web_auth::{
+        SESSION_COOKIE_NAME, SESSION_TTL_SECONDS, WebAuthService, WebAuthUnavailable,
+        WebAuthorizationError, WebLoginError, WebLoginOutcome,
+    },
 };
 
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1_024;
@@ -58,18 +65,24 @@ enum AdminAuthentication {
 #[derive(Clone)]
 struct ApiState {
     authentication: AdminAuthentication,
+    web_authentication: WebAuthService,
     trading_enabled: bool,
     idempotency: Arc<dyn IdempotencyStore>,
     start_command: Arc<dyn StartGridCommand>,
 }
 
 impl ApiState {
-    fn disabled(admin_token: Option<AdminTokenVerifier>, idempotency_root: PathBuf) -> Self {
+    fn disabled(
+        admin_token: Option<AdminTokenVerifier>,
+        web_authentication: WebAuthService,
+        idempotency_root: PathBuf,
+    ) -> Self {
         Self {
             authentication: admin_token.map_or(
                 AdminAuthentication::Unconfigured,
                 AdminAuthentication::Configured,
             ),
+            web_authentication,
             trading_enabled: false,
             idempotency: Arc::new(FileIdempotencyStore::new(idempotency_root)),
             start_command: Arc::new(DisabledStartGridCommand),
@@ -85,10 +98,17 @@ impl ApiState {
     ) -> Self {
         Self {
             authentication: AdminAuthentication::Configured(admin_token),
+            web_authentication: WebAuthService::disabled(),
             trading_enabled,
             idempotency,
             start_command,
         }
+    }
+
+    #[cfg(test)]
+    fn with_web_authentication(mut self, web_authentication: WebAuthService) -> Self {
+        self.web_authentication = web_authentication;
+        self
     }
 }
 
@@ -155,6 +175,108 @@ impl FromRequestParts<ApiState> for AuthenticatedAdmin {
         }
         Ok(Self)
     }
+}
+
+struct AuthenticatedWebSession;
+
+impl FromRequestParts<ApiState> for AuthenticatedWebSession {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        state
+            .web_authentication
+            .authorize(&parts.headers)
+            .map_err(web_authorization_error)?;
+        Ok(Self)
+    }
+}
+
+#[derive(Deserialize)]
+struct WebLoginRequest {
+    username: String,
+    password: String,
+    code: String,
+}
+
+async fn web_auth_status(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    match state.web_authentication.status(&headers) {
+        Ok(status) => no_store_json(StatusCode::OK, status),
+        Err(error) => web_auth_unavailable(error),
+    }
+}
+
+async fn web_auth_login(
+    State(state): State<ApiState>,
+    Json(payload): Json<WebLoginRequest>,
+) -> Response {
+    let password = Zeroizing::new(payload.password);
+    match state
+        .web_authentication
+        .login(&payload.username, &password, &payload.code)
+    {
+        Ok(WebLoginOutcome::AuthenticationDisabled) => no_store_json(
+            StatusCode::OK,
+            json!({"ok": true, "message": "Authentication is disabled"}),
+        ),
+        Ok(WebLoginOutcome::Authenticated { session_token }) => {
+            let Some(cookie) = session_cookie(
+                &session_token,
+                state.web_authentication.cookie_secure(),
+                SESSION_TTL_SECONDS,
+            ) else {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session_cookie_failed",
+                    "The authenticated session could not be returned safely",
+                );
+            };
+            let mut response =
+                no_store_json(StatusCode::OK, json!({"ok": true, "message": "Logged in"}));
+            response.headers_mut().insert(SET_COOKIE, cookie);
+            response
+        }
+        Err(WebLoginError::NotConfigured) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_not_configured",
+            "Authentication is required but not configured",
+        ),
+        Err(WebLoginError::InvalidCredentials) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Invalid username, password, or code",
+        ),
+        Err(WebLoginError::RateLimited) => {
+            let mut response = api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "login_rate_limited",
+                "Too many login attempts; wait before trying again",
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("60"));
+            response
+        }
+        Err(WebLoginError::Unavailable(error)) => web_auth_unavailable(error),
+    }
+}
+
+async fn web_auth_logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(error) = state.web_authentication.logout(&headers) {
+        return web_auth_unavailable(error);
+    }
+    let Some(cookie) = session_cookie("", state.web_authentication.cookie_secure(), 0) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_cookie_failed",
+            "The authenticated session could not be cleared safely",
+        );
+    };
+    let mut response = no_store_json(StatusCode::OK, json!({"ok": true, "message": "Logged out"}));
+    response.headers_mut().insert(SET_COOKIE, cookie);
+    response
 }
 
 struct TradingEnabled;
@@ -433,6 +555,14 @@ fn stored_response(stored: StoredCommandResponse, replayed: bool) -> Response {
     response
 }
 
+fn no_store_json<T: Serialize>(status: StatusCode, body: T) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 fn api_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
     let mut response = (
         status,
@@ -445,7 +575,45 @@ fn api_error(status: StatusCode, code: &'static str, message: &'static str) -> R
     response
 }
 
-async fn api_not_found() -> Response {
+fn web_auth_unavailable(error: WebAuthUnavailable) -> Response {
+    tracing::warn!(error = %error, "web authentication service is unavailable");
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "authentication_unavailable",
+        "The authentication service is unavailable",
+    )
+}
+
+fn web_authorization_error(error: WebAuthorizationError) -> Response {
+    match error {
+        WebAuthorizationError::NotConfigured => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_not_configured",
+            "Authentication is required but not configured",
+        ),
+        WebAuthorizationError::NotAuthenticated => api_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_required",
+            "Authentication required",
+        ),
+        WebAuthorizationError::Unavailable(error) => web_auth_unavailable(error),
+    }
+}
+
+fn session_cookie(token: &str, secure: bool, max_age: u64) -> Option<HeaderValue> {
+    let mut value = Zeroizing::new(format!(
+        "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+    ));
+    if max_age == 0 {
+        value.push_str("; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+    if secure {
+        value.push_str("; Secure");
+    }
+    HeaderValue::from_str(&value).ok()
+}
+
+async fn api_not_found(_session: AuthenticatedWebSession) -> Response {
     api_error(
         StatusCode::NOT_FOUND,
         "api_route_not_found",
@@ -453,13 +621,24 @@ async fn api_not_found() -> Response {
     )
 }
 
-pub(crate) fn router(admin_token: Option<AdminTokenVerifier>, idempotency_root: PathBuf) -> Router {
-    router_with_state(ApiState::disabled(admin_token, idempotency_root))
+pub(crate) fn router(
+    admin_token: Option<AdminTokenVerifier>,
+    web_authentication: WebAuthService,
+    idempotency_root: PathBuf,
+) -> Router {
+    router_with_state(ApiState::disabled(
+        admin_token,
+        web_authentication,
+        idempotency_root,
+    ))
 }
 
 fn router_with_state(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/api/auth/status", get(web_auth_status))
+        .route("/api/auth/login", post(web_auth_login))
+        .route("/api/auth/logout", post(web_auth_logout))
         .route("/api/v1/grid/start", post(start_grid))
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
@@ -476,7 +655,10 @@ mod tests {
 
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, header::CONTENT_TYPE},
+        http::{
+            Request,
+            header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
+        },
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -485,6 +667,10 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+    use crate::web_auth::{
+        WebAuthConfiguration,
+        test_support::{PASSWORD, USERNAME, configured_service},
+    };
 
     const ADMIN_TOKEN: &str = "zN5Vh8cnwT-NfY2M8N1oFhNtvxZ7AS-fBk4B8I3IRXY";
     const KEY: &str = "01J2X0W2F8E4Q8MNNNNNNNNNNN";
@@ -653,6 +839,255 @@ mod tests {
         assert_eq!(payload["runtime"], "rust");
         assert_eq!(payload["trading_enabled"], false);
         assert_eq!(payload["contract_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_web_authentication_is_explicit_and_cache_safe() {
+        let response = super::super::app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "required": false,
+                "configured": false,
+                "authenticated": true,
+                "username": null,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn required_but_incomplete_web_authentication_fails_closed() {
+        let directory = tempdir().unwrap();
+        let web_auth = WebAuthService::from_configuration(WebAuthConfiguration {
+            required: true,
+            username: USERNAME.to_owned(),
+            password_hash: Zeroizing::new(String::new()),
+            totp_secret: Zeroizing::new(String::new()),
+            cookie_secure: true,
+        })
+        .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(directory.path())),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_web_authentication(web_auth),
+        );
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(response_json(status).await["configured"], false);
+
+        let protected = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(protected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(protected).await["error"]["code"],
+            "authentication_not_configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_login_cookie_authenticates_and_logout_revokes_the_session() {
+        let directory = tempdir().unwrap();
+        let (web_auth, code) = configured_service(59, true);
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(directory.path())),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_web_authentication(web_auth),
+        );
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/login")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"username": USERNAME, "password": PASSWORD, "code": code})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(login.status(), StatusCode::OK);
+        assert_eq!(login.headers()[CACHE_CONTROL], "no-store");
+        let set_cookie = login.headers()[SET_COOKIE].to_str().unwrap().to_owned();
+        assert!(set_cookie.starts_with(&format!("{SESSION_COOKIE_NAME}=")));
+        assert!(set_cookie.contains("; Path=/"));
+        assert!(set_cookie.contains("; HttpOnly"));
+        assert!(set_cookie.contains("; SameSite=Strict"));
+        assert!(set_cookie.contains("; Max-Age=43200"));
+        assert!(set_cookie.ends_with("; Secure"));
+        let cookie = set_cookie.split(';').next().unwrap().to_owned();
+        let login_body = response_json(login).await;
+        assert_eq!(login_body["ok"], true);
+        assert!(!login_body.to_string().contains(&code));
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/status")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = response_json(status).await;
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(status["username"], USERNAME);
+
+        let protected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/not-migrated-yet")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(protected.status(), StatusCode::NOT_FOUND);
+
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/logout")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        let cleared = logout.headers()[SET_COOKIE].to_str().unwrap();
+        assert!(cleared.contains("grid_session=;"));
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.ends_with("; Secure"));
+
+        let revoked = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn failed_web_login_is_generic_and_never_sets_a_cookie() {
+        let directory = tempdir().unwrap();
+        let (web_auth, code) = configured_service(59, false);
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(directory.path())),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_web_authentication(web_auth),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/login")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"username": USERNAME, "password": "wrong", "code": code})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!response.headers().contains_key(SET_COOKIE));
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], "invalid_credentials");
+        assert_eq!(
+            body["error"]["message"],
+            "Invalid username, password, or code"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_session_configuration_never_replaces_bearer_control_authentication() {
+        let directory = tempdir().unwrap();
+        let web_auth = WebAuthService::from_configuration(WebAuthConfiguration {
+            required: true,
+            username: USERNAME.to_owned(),
+            password_hash: Zeroizing::new(String::new()),
+            totp_secret: Zeroizing::new(String::new()),
+            cookie_secure: true,
+        })
+        .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(directory.path())),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_web_authentication(web_auth),
+        );
+
+        let response = app
+            .oneshot(request("{}", Some(ADMIN_TOKEN), Some(KEY)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "rust_trading_disabled"
+        );
     }
 
     #[tokio::test]

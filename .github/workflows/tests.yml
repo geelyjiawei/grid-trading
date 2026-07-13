@@ -156,5 +156,8 @@ jobs:
           done
           grep --fixed-strings '"runtime":"rust"' /tmp/health.json
           grep --fixed-strings '"trading_enabled":false' /tmp/health.json
+          curl --fail --silent http://127.0.0.1:18000/api/auth/status > /tmp/auth.json
+          grep --fixed-strings '"required":false' /tmp/auth.json
+          grep --fixed-strings '"authenticated":true' /tmp/auth.json
           curl --fail --silent http://127.0.0.1:18000/ > /tmp/index.html
           grep --fixed-strings '<div id="app"></div>' /tmp/index.html
