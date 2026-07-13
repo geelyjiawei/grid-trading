@@ -3,6 +3,7 @@ mod cancellation;
 mod exchange_inputs;
 mod execution_accounting;
 mod execution_sync;
+mod fee_rates;
 mod grid_plan;
 mod leverage;
 mod reconciliation;
@@ -24,6 +25,7 @@ pub use execution_accounting::{
     FeeValuationSource, ValuedExecutionReport,
 };
 pub use execution_sync::{ExecutionSyncError, ExecutionSyncResult, ExecutionSyncService};
+pub use fee_rates::{AuthoritativeFeeConfig, FeeRateConfigError, load_authoritative_fee_config};
 pub use grid_plan::{
     GridOrderRole, GridPlan, GridPlanError, MarketSnapshot, PlannedGridOrder, PlannedOpeningOrder,
     build_grid_plan,

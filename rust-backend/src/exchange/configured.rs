@@ -14,7 +14,7 @@ use crate::{
         LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
         OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
         PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         aster::{AsterAdapter, AsterSignatureError, LocalEip712Signer},
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
@@ -263,6 +263,21 @@ impl LeverageGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
             Self::Aster(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
             Self::Bybit(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
+        }
+    }
+}
+
+#[async_trait]
+impl TradingFeeRateGateway for ConfiguredExchangeGateway {
+    async fn trading_fee_rates(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<TradingFeeRates, SnapshotError> {
+        match self {
+            Self::Binance(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
+            Self::Aster(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
+            Self::Bybit(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
         }
     }
 }

@@ -10,7 +10,7 @@ use crate::{
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
         LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
-        PositionSide, PositionSnapshot, SnapshotError, protocol::Parameters,
+        PositionSide, PositionSnapshot, SnapshotError, TradingFeeRates, protocol::Parameters,
     },
 };
 
@@ -232,6 +232,25 @@ pub(super) fn parse_leverage_acknowledgement(
         symbol: expected_symbol.to_ascii_uppercase(),
         leverage,
     })
+}
+
+pub(super) fn parse_trading_fee_rates(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+) -> Result<TradingFeeRates, CodecError> {
+    let root = parse_json(body)?;
+    require_symbol(&root, expected_symbol)?;
+    let rates = TradingFeeRates {
+        exchange,
+        symbol: expected_symbol.to_ascii_uppercase(),
+        maker_rate: required_decimal(&root, "makerCommissionRate")?,
+        taker_rate: required_decimal(&root, "takerCommissionRate")?,
+    };
+    rates
+        .validate()
+        .map_err(|_| CodecError::InvalidField("commissionRate"))?;
+    Ok(rates)
 }
 
 pub(super) fn execution_status_is_unknown(code: Option<&str>) -> bool {
@@ -600,6 +619,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn fee_rate_snapshot_preserves_exact_account_rates_and_identity() {
+        let rates = parse_trading_fee_rates(
+            r#"{"symbol":"MUUSDT","makerCommissionRate":"0.0002","takerCommissionRate":"0.0005"}"#,
+            Exchange::Binance,
+            "MUUSDT",
+        )
+        .unwrap();
+        assert_eq!(rates.maker_rate, Decimal::new(2, 4));
+        assert_eq!(rates.taker_rate, Decimal::new(5, 4));
+        assert!(parse_trading_fee_rates(
+            r#"{"symbol":"OTHERUSDT","makerCommissionRate":"0.0002","takerCommissionRate":"0.0005"}"#,
+            Exchange::Binance,
+            "MUUSDT",
+        )
+        .is_err());
     }
 
     #[test]

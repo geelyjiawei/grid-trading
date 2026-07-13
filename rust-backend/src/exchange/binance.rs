@@ -13,12 +13,13 @@ use crate::{
         LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
         OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
         PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
             parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_placement_acknowledgement, parse_position_snapshot, validate_snapshot_request,
+            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
+            validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -107,6 +108,35 @@ where
                 message: error.message,
             })
         }
+    }
+}
+
+#[async_trait]
+impl<T, S, C> TradingFeeRateGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn trading_fee_rates(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<TradingFeeRates, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v1/commissionRate",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Binance trading fee rates")
+            .await?;
+        parse_trading_fee_rates(&body, Exchange::Binance, &symbol)
+            .map_err(|error| SnapshotError::new(format!("invalid Binance fee rates: {error}")))
     }
 }
 
@@ -979,6 +1009,28 @@ mod tests {
                 .await,
             Err(LeverageError::Unknown { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn fee_rate_query_is_signed_and_preserves_account_rates() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"symbol":"MUUSDT","makerCommissionRate":"0.0002","takerCommissionRate":"0.0005"}"#.into(),
+        }));
+        let rates = adapter(transport.clone())
+            .trading_fee_rates(Exchange::Binance, "muusdt")
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(rates.maker_rate, Decimal::new(2, 4));
+        assert_eq!(rates.taker_rate, Decimal::new(5, 4));
+        assert_eq!(request.path, "/fapi/v1/commissionRate");
+        assert!(
+            request
+                .query_string()
+                .starts_with("symbol=MUUSDT&timestamp=1700000000123&recvWindow=5000&signature=")
+        );
     }
 
     #[tokio::test]

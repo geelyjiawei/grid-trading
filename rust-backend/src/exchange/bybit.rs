@@ -16,12 +16,12 @@ use crate::{
         LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
         OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
         PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         bybit_codec::{
             parse_cancellation_acknowledgement, parse_error, parse_exact_order_record,
             parse_execution_page, parse_historical_minute_open, parse_instrument_rules,
             parse_leverage_acknowledgement, parse_market_snapshot, parse_placement_acknowledgement,
-            parse_position_snapshot,
+            parse_position_snapshot, parse_trading_fee_rates,
         },
         codec::validate_snapshot_request,
         execution::assemble_execution_snapshot,
@@ -395,6 +395,37 @@ where
                 message: error.message,
             })
         }
+    }
+}
+
+#[async_trait]
+impl<T, S, C> TradingFeeRateGateway for BybitAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BybitRequestSigner,
+    C: MillisecondClock,
+{
+    async fn trading_fee_rates(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<TradingFeeRates, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Bybit, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_get(
+                "/v5/account/fee-rate",
+                vec![
+                    ("category".into(), CATEGORY.into()),
+                    ("symbol".into(), symbol.clone()),
+                ],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Bybit trading fee rates")
+            .await?;
+        parse_trading_fee_rates(&body, &symbol)
+            .map_err(|error| SnapshotError::new(format!("invalid Bybit fee rates: {error}")))
     }
 }
 
@@ -1016,6 +1047,24 @@ mod tests {
                 .headers
                 .contains(&("X-BAPI-SIGN".into(), expected_signature))
         );
+    }
+
+    #[tokio::test]
+    async fn fee_rate_query_is_signed_and_requires_one_exact_symbol() {
+        let transport = MockTransport::with_response(ok(
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"MUUSDT","takerFeeRate":"0.0005","makerFeeRate":"0.0002"}]},"time":1700000000124}"#,
+        ));
+        let rates = adapter(transport.clone())
+            .trading_fee_rates(Exchange::Bybit, "muusdt")
+            .await
+            .unwrap();
+        let request = &transport.requests()[0];
+
+        assert_eq!(rates.maker_rate, Decimal::new(2, 4));
+        assert_eq!(rates.taker_rate, Decimal::new(5, 4));
+        assert_eq!(request.path, "/v5/account/fee-rate");
+        assert_eq!(request.query_string(), "category=linear&symbol=MUUSDT");
+        assert!(!request.headers.is_empty());
     }
 
     #[tokio::test]

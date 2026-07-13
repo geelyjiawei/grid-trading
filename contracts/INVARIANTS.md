@@ -8,6 +8,12 @@ the OpenAPI schema.
 - Price, quantity, notional, fee, and PnL calculations use decimal arithmetic.
 - Exchange `tickSize`, `qtyStep`, `minQty`, and minimum notional are authoritative.
 - Quantity is never guessed, inflated, or rounded upward to repair local state.
+- Maker and taker rates used for a new strategy preview come from one exact signed
+  account-rate response for the selected exchange and symbol. Browser-supplied rates
+  are estimates only and are replaced before an effective strategy config exists.
+- Missing, ambiguous, foreign-symbol, or malformed fee-rate responses block activation.
+  Completed-trade accounting continues to use each exchange execution's actual fee and
+  fee asset; configured rates never overwrite historical execution evidence.
 
 ## Order ownership
 

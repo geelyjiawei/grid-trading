@@ -12,8 +12,8 @@ use crate::{
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
         HistoricalMinutePrice, LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement,
-        PositionLeg, PositionSide, PositionSnapshot, TradeFill, execution::OrderExecutionHeader,
-        is_valid_trade_id,
+        PositionLeg, PositionSide, PositionSnapshot, TradeFill, TradingFeeRates,
+        execution::OrderExecutionHeader, is_valid_trade_id,
     },
 };
 
@@ -116,6 +116,30 @@ pub(super) fn parse_leverage_acknowledgement(
         symbol: expected_symbol.to_ascii_uppercase(),
         leverage: expected_leverage,
     })
+}
+
+pub(super) fn parse_trading_fee_rates(
+    body: &str,
+    expected_symbol: &str,
+) -> Result<TradingFeeRates, BybitCodecError> {
+    let root = success_root(body)?;
+    let result = result_object(&root)?;
+    let rows = required_array(result, "list")?;
+    if rows.len() != 1
+        || !required_string(&rows[0], "symbol")?.eq_ignore_ascii_case(expected_symbol)
+    {
+        return Err(BybitCodecError::IdentityMismatch);
+    }
+    let rates = TradingFeeRates {
+        exchange: Exchange::Bybit,
+        symbol: expected_symbol.to_ascii_uppercase(),
+        maker_rate: required_decimal(&rows[0], "makerFeeRate")?,
+        taker_rate: required_decimal(&rows[0], "takerFeeRate")?,
+    };
+    rates
+        .validate()
+        .map_err(|_| BybitCodecError::InvalidField("feeRate"))?;
+    Ok(rates)
 }
 
 pub(super) fn parse_exact_order_record(
@@ -851,6 +875,20 @@ mod tests {
                 5,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn fee_rate_parser_requires_one_exact_symbol_row() {
+        let rates = parse_trading_fee_rates(
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"MUUSDT","takerFeeRate":"0.0005","makerFeeRate":"0.0002"}]}}"#,
+            "MUUSDT",
+        )
+        .unwrap();
+        assert_eq!(rates.maker_rate, Decimal::new(2, 4));
+        assert_eq!(rates.taker_rate, Decimal::new(5, 4));
+        assert!(
+            parse_trading_fee_rates(r#"{"retCode":0,"result":{"list":[]}}"#, "MUUSDT",).is_err()
         );
     }
 

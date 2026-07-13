@@ -250,6 +250,38 @@ pub trait HistoricalPriceGateway: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradingFeeRates {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub maker_rate: Decimal,
+    pub taker_rate: Decimal,
+}
+
+impl TradingFeeRates {
+    pub fn validate(&self) -> Result<(), SnapshotError> {
+        if self.symbol.is_empty()
+            || !self.symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || self.maker_rate <= -Decimal::ONE
+            || self.maker_rate >= Decimal::ONE
+            || self.taker_rate < Decimal::ZERO
+            || self.taker_rate >= Decimal::ONE
+        {
+            return Err(SnapshotError::new("trading fee rates are invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait TradingFeeRateGateway: Send + Sync {
+    async fn trading_fee_rates(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<TradingFeeRates, SnapshotError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExchangeMarketSnapshot {
     pub exchange: Exchange,
     pub symbol: String,

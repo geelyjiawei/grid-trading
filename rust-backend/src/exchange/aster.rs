@@ -13,12 +13,13 @@ use crate::{
         LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
         OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
         PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
             parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_placement_acknowledgement, parse_position_snapshot, validate_snapshot_request,
+            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
+            validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -114,6 +115,35 @@ where
                 message: error.message,
             })
         }
+    }
+}
+
+#[async_trait]
+impl<T, S, N> TradingFeeRateGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    async fn trading_fee_rates(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<TradingFeeRates, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v3/commissionRate",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Aster trading fee rates")
+            .await?;
+        parse_trading_fee_rates(&body, Exchange::Aster, &symbol)
+            .map_err(|error| SnapshotError::new(format!("invalid Aster fee rates: {error}")))
     }
 }
 
@@ -1241,6 +1271,28 @@ mod tests {
             signer.messages.lock().unwrap().as_slice(),
             [expected_message]
         );
+    }
+
+    #[tokio::test]
+    async fn fee_rate_query_uses_signed_v3_identity_and_exact_account_rates() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"symbol":"ANSEMUSDT","makerCommissionRate":"0.0002","takerCommissionRate":"0.0004"}"#.into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let rates = adapter(transport.clone(), signer.clone())
+            .trading_fee_rates(Exchange::Aster, "ansemusdt")
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(rates.maker_rate, Decimal::new(2, 4));
+        assert_eq!(rates.taker_rate, Decimal::new(4, 4));
+        assert_eq!(request.path, "/fapi/v3/commissionRate");
+        assert!(request.query_string().starts_with(
+            "symbol=ANSEMUSDT&nonce=1700000000123456&user=0x1111111111111111111111111111111111111111&signer="
+        ));
+        assert_eq!(signer.messages.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
