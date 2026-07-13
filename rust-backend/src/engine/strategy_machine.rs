@@ -8,7 +8,7 @@ use crate::domain::{
     ClientOrderId, Direction, Exchange, GridConfig, InstrumentRules, IntentState, OrderIntent,
     OrderKind, OrderShape, OrderSide, TerminalOrderStatus,
 };
-use crate::exchange::OrderLifecycle;
+use crate::exchange::{OrderLifecycle, is_valid_trade_id};
 
 use super::{
     GridOrderRole, GridPlan,
@@ -913,8 +913,8 @@ fn validate_execution_audit_payload(
     let mut trade_quote = Decimal::ZERO;
     let mut fees_by_asset = BTreeMap::new();
     for trade in &snapshot.trades {
-        if trades.insert(trade.trade_id, trade).is_some()
-            || trade.trade_id == 0
+        if trades.insert(trade.trade_id.as_str(), trade).is_some()
+            || !is_valid_trade_id(&trade.trade_id)
             || trade.exchange_order_id != snapshot.order.exchange_order_id
             || trade.symbol != order.shape.symbol
             || trade.side != order.shape.side
@@ -953,10 +953,10 @@ fn validate_execution_audit_payload(
     let mut valued_fee = Decimal::ZERO;
     let mut audit_quote_asset: Option<&str> = None;
     for valuation in &audit.fee_valuations {
-        let Some(trade) = trades.get(&valuation.trade_id) else {
+        let Some(trade) = trades.get(valuation.trade_id.as_str()) else {
             return Err(StrategyStateError::InvalidExecutionAudit);
         };
-        if !valuation_trade_ids.insert(valuation.trade_id)
+        if !valuation_trade_ids.insert(valuation.trade_id.as_str())
             || valuation.fee_asset != trade.commission_asset
             || valuation.fee_amount != trade.commission_cost
             || valuation.quote_asset.is_empty()
@@ -1033,26 +1033,27 @@ fn validate_execution_audit_extension(
         .snapshot
         .trades
         .iter()
-        .map(|trade| (trade.trade_id, trade))
+        .map(|trade| (trade.trade_id.as_str(), trade))
         .collect::<BTreeMap<_, _>>();
     if previous
         .snapshot
         .trades
         .iter()
-        .any(|trade| candidate_trades.get(&trade.trade_id).copied() != Some(trade))
+        .any(|trade| candidate_trades.get(trade.trade_id.as_str()).copied() != Some(trade))
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
     let candidate_valuations = candidate
         .fee_valuations
         .iter()
-        .map(|valuation| (valuation.trade_id, valuation))
+        .map(|valuation| (valuation.trade_id.as_str(), valuation))
         .collect::<BTreeMap<_, _>>();
-    if previous
-        .fee_valuations
-        .iter()
-        .any(|valuation| candidate_valuations.get(&valuation.trade_id).copied() != Some(valuation))
-    {
+    if previous.fee_valuations.iter().any(|valuation| {
+        candidate_valuations
+            .get(valuation.trade_id.as_str())
+            .copied()
+            != Some(valuation)
+    }) {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
     if matches!(

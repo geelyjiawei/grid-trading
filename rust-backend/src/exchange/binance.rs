@@ -20,8 +20,8 @@ use crate::{
             parse_position_snapshot, validate_snapshot_request,
         },
         execution::{
-            CommissionConvention, assemble_execution_snapshot, parse_historical_minute_open,
-            parse_order_execution_header, parse_trade_page,
+            CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
+            parse_historical_minute_open, parse_order_execution_header, parse_trade_page,
         },
         protocol::{
             HttpMethod, HttpTransport, MillisecondClock, Parameters, PreparedHttpRequest,
@@ -571,8 +571,15 @@ where
                     "Binance order-filtered trade page contains another order",
                 ));
             }
+            let page_trade_ids = page
+                .iter()
+                .map(numeric_trade_id)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    execution_error(format!("invalid Binance numeric trade ID: {error}"))
+                })?;
             if let Some(from_id) = next_from_id
-                && page.iter().any(|trade| trade.trade_id < from_id)
+                && page_trade_ids.iter().any(|trade_id| *trade_id < from_id)
             {
                 return Err(execution_error("Binance trade pagination moved backwards"));
             }
@@ -581,9 +588,8 @@ where
                 completed = true;
                 break;
             }
-            let next = page
-                .iter()
-                .map(|trade| trade.trade_id)
+            let next = page_trade_ids
+                .into_iter()
                 .max()
                 .and_then(|trade_id| trade_id.checked_add(1))
                 .ok_or_else(|| execution_error("Binance trade pagination cannot advance"))?;

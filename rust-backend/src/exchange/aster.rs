@@ -20,8 +20,8 @@ use crate::{
             parse_position_snapshot, validate_snapshot_request,
         },
         execution::{
-            CommissionConvention, assemble_execution_snapshot, parse_historical_minute_open,
-            parse_order_execution_header, parse_trade_page,
+            CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
+            parse_historical_minute_open, parse_order_execution_header, parse_trade_page,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -657,17 +657,30 @@ where
             )
             .map_err(|error| execution_error(format!("invalid Aster trade page: {error}")))?;
 
+            let mut minimum_trade_id = None;
             loop {
                 if page.len() > TRADE_PAGE_LIMIT {
                     return Err(execution_error(
                         "Aster trade page exceeds the requested limit",
                     ));
                 }
+                let page_trade_ids = page
+                    .iter()
+                    .map(numeric_trade_id)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        execution_error(format!("invalid Aster numeric trade ID: {error}"))
+                    })?;
+                if minimum_trade_id.is_some_and(|minimum| {
+                    page_trade_ids.iter().any(|trade_id| *trade_id < minimum)
+                }) {
+                    return Err(execution_error("Aster trade pagination moved backwards"));
+                }
                 if page.len() == TRADE_PAGE_LIMIT
-                    && page.windows(2).any(|pair| {
-                        pair[0].trade_id >= pair[1].trade_id
-                            || pair[0].trade_time_ms > pair[1].trade_time_ms
-                    })
+                    && (page_trade_ids.windows(2).any(|pair| pair[0] >= pair[1])
+                        || page
+                            .windows(2)
+                            .any(|pair| pair[0].trade_time_ms > pair[1].trade_time_ms))
                 {
                     return Err(execution_error(
                         "Aster full trade page is not strictly ordered",
@@ -686,9 +699,9 @@ where
                 if page.len() < TRADE_PAGE_LIMIT || reached_window_end {
                     break;
                 }
-                let next_from_id = page
+                let next_from_id = page_trade_ids
                     .last()
-                    .and_then(|trade| trade.trade_id.checked_add(1))
+                    .and_then(|trade_id| trade_id.checked_add(1))
                     .ok_or_else(|| execution_error("Aster trade pagination cannot advance"))?;
                 query_count = query_count
                     .checked_add(1)
@@ -721,9 +734,7 @@ where
                 .map_err(|error| {
                     execution_error(format!("invalid Aster paginated trade page: {error}"))
                 })?;
-                if page.iter().any(|trade| trade.trade_id < next_from_id) {
-                    return Err(execution_error("Aster trade pagination moved backwards"));
-                }
+                minimum_trade_id = Some(next_from_id);
             }
             if window_end == u64::MAX {
                 break;

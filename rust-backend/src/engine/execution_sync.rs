@@ -252,7 +252,7 @@ mod tests {
         let quote = quantity * Decimal::new(1014, 0);
         let fee = Decimal::new(5, 2);
         let trade = TradeFill {
-            trade_id: 7,
+            trade_id: "7".into(),
             exchange_order_id: "opening-42".into(),
             symbol: "MUUSDT".into(),
             side: OrderSide::Sell,
@@ -522,7 +522,7 @@ mod tests {
         partial.update_time_ms = 1_050_000;
 
         let mut second_trade = complete.trades[0].clone();
-        second_trade.trade_id = 8;
+        second_trade.trade_id = "8".into();
         second_trade.quantity = total_quantity - first_quantity;
         second_trade.quote_quantity = total_quote - first_quote;
         second_trade.raw_commission = second_fee;
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(after_complete.grid_position_net_quantity, -total_quantity);
         assert_eq!(after_complete.total_fee, first_fee + second_fee);
         assert_eq!(audit.snapshot.trades.len(), 2);
-        assert_eq!(audit.snapshot.trades[0].trade_id, 7);
-        assert_eq!(audit.snapshot.trades[1].trade_id, 8);
+        assert_eq!(audit.snapshot.trades[0].trade_id, "7");
+        assert_eq!(audit.snapshot.trades[1].trade_id, "8");
     }
 }

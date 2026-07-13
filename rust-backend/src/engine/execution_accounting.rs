@@ -25,7 +25,8 @@ pub enum FeeValuationSource {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeeValuation {
-    pub trade_id: u64,
+    #[serde(with = "crate::exchange::trade_id_serde")]
+    pub trade_id: String,
     pub fee_asset: String,
     pub fee_amount: Decimal,
     pub quote_asset: String,
@@ -125,7 +126,7 @@ impl ExecutionAccountingService {
         for trade in &snapshot.trades {
             let valuation = if trade.commission_cost.is_zero() {
                 FeeValuation {
-                    trade_id: trade.trade_id,
+                    trade_id: trade.trade_id.clone(),
                     fee_asset: trade.commission_asset.clone(),
                     fee_amount: trade.commission_cost,
                     quote_asset: self.quote_asset.clone(),
@@ -137,7 +138,7 @@ impl ExecutionAccountingService {
                 }
             } else if trade.commission_asset == self.quote_asset {
                 FeeValuation {
-                    trade_id: trade.trade_id,
+                    trade_id: trade.trade_id.clone(),
                     fee_asset: trade.commission_asset.clone(),
                     fee_amount: trade.commission_cost,
                     quote_asset: self.quote_asset.clone(),
@@ -166,7 +167,7 @@ impl ExecutionAccountingService {
                     .checked_mul(price)
                     .ok_or(ExecutionAccountingError::ArithmeticOverflow)?;
                 FeeValuation {
-                    trade_id: trade.trade_id,
+                    trade_id: trade.trade_id.clone(),
                     fee_asset: trade.commission_asset.clone(),
                     fee_amount: trade.commission_cost,
                     quote_asset: self.quote_asset.clone(),
@@ -224,7 +225,8 @@ impl ExecutionAccountingService {
         let mut quote = Decimal::ZERO;
         let mut fees = BTreeMap::new();
         for trade in &snapshot.trades {
-            if !trade_ids.insert(trade.trade_id)
+            if !crate::exchange::is_valid_trade_id(&trade.trade_id)
+                || !trade_ids.insert(trade.trade_id.clone())
                 || trade.exchange_order_id != snapshot.order.exchange_order_id
                 || trade.symbol != snapshot.order.shape.symbol
                 || trade.side != snapshot.order.shape.side
@@ -407,7 +409,7 @@ mod tests {
         time: u64,
     ) -> TradeFill {
         TradeFill {
-            trade_id: id,
+            trade_id: id.to_string(),
             exchange_order_id: "42".into(),
             symbol: "MUUSDT".into(),
             side: OrderSide::Sell,
@@ -604,5 +606,108 @@ mod tests {
 
         let valued = service.value_snapshot(&gateway, &snapshot).await.unwrap();
         assert_eq!(valued.report.terminal_status, None);
+    }
+
+    #[tokio::test]
+    async fn opaque_text_trade_id_is_preserved_through_fee_valuation() {
+        let gateway = gateway(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_020_000,
+            open_price: Decimal::new(600, 0),
+        });
+        let service = ExecutionAccountingService::new("USDT").unwrap();
+        let mut fill = trade(
+            7,
+            Decimal::new(314, 2),
+            Decimal::new(50083, 3),
+            Decimal::new(1, 2),
+            "USDT",
+            1_020_001,
+        );
+        fill.trade_id = "exec-0b7d_4F.91:part-2".into();
+
+        let valued = service
+            .value_snapshot(&gateway, &snapshot(vec![fill]))
+            .await
+            .unwrap();
+
+        assert_eq!(valued.fee_valuations[0].trade_id, "exec-0b7d_4F.91:part-2");
+        assert_eq!(
+            serde_json::to_value(&valued.fee_valuations[0]).unwrap()["trade_id"],
+            "exec-0b7d_4F.91:part-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_opaque_trade_ids_are_rejected_before_accounting() {
+        let gateway = gateway(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_020_000,
+            open_price: Decimal::new(600, 0),
+        });
+        let service = ExecutionAccountingService::new("USDT").unwrap();
+
+        for invalid_id in [
+            String::new(),
+            " ".into(),
+            "line\nbreak".into(),
+            "x".repeat(129),
+        ] {
+            let mut fill = trade(
+                7,
+                Decimal::new(314, 2),
+                Decimal::new(50083, 3),
+                Decimal::ZERO,
+                "USDT",
+                1_020_001,
+            );
+            fill.trade_id = invalid_id;
+            assert_eq!(
+                service
+                    .value_snapshot(&gateway, &snapshot(vec![fill]))
+                    .await,
+                Err(ExecutionAccountingError::InvalidExecutionSnapshot)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_numeric_trade_ids_remain_readable_but_serialize_as_text() {
+        let original = snapshot(vec![trade(
+            7,
+            Decimal::new(314, 2),
+            Decimal::new(50083, 3),
+            Decimal::new(1, 2),
+            "USDT",
+            1_020_001,
+        )]);
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy["trades"][0]["trade_id"] = serde_json::json!(7);
+
+        let restored: OrderExecutionSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.trades[0].trade_id, "7");
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["trades"][0]["trade_id"],
+            "7"
+        );
+
+        let valuation = FeeValuation {
+            trade_id: "7".into(),
+            fee_asset: "USDT".into(),
+            fee_amount: Decimal::new(1, 2),
+            quote_asset: "USDT".into(),
+            quote_value: Decimal::new(1, 2),
+            source: FeeValuationSource::QuoteAsset,
+            valuation_symbol: None,
+            valuation_minute_start_ms: None,
+            valuation_price: Some(Decimal::ONE),
+        };
+        let mut legacy_valuation = serde_json::to_value(&valuation).unwrap();
+        legacy_valuation["trade_id"] = serde_json::json!(7);
+        let restored: FeeValuation = serde_json::from_value(legacy_valuation).unwrap();
+        assert_eq!(restored.trade_id, "7");
+        assert_eq!(serde_json::to_value(restored).unwrap()["trade_id"], "7");
     }
 }

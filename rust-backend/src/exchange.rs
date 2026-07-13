@@ -110,7 +110,10 @@ pub trait OrderLookupGateway: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TradeFill {
-    pub trade_id: u64,
+    /// Opaque exchange-provided execution identity. It must never be parsed as
+    /// a number unless an exchange's pagination contract explicitly requires it.
+    #[serde(with = "trade_id_serde")]
+    pub trade_id: String,
     pub exchange_order_id: String,
     pub symbol: String,
     pub side: crate::domain::OrderSide,
@@ -125,6 +128,38 @@ pub struct TradeFill {
     pub realized_profit: Decimal,
     pub is_maker: bool,
     pub trade_time_ms: u64,
+}
+
+pub(crate) fn is_valid_trade_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+pub(crate) mod trade_id_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CompatibleTradeId {
+        Text(String),
+        LegacyNumber(u64),
+    }
+
+    pub fn serialize<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match CompatibleTradeId::deserialize(deserializer)? {
+            CompatibleTradeId::Text(value) => value,
+            CompatibleTradeId::LegacyNumber(value) => value.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

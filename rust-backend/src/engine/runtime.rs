@@ -866,7 +866,7 @@ mod tests {
             let exchange_order_id = order.exchange_order_id.clone();
             let trade_time_ms = previous.update_time_ms + 1;
             let trade = TradeFill {
-                trade_id: 1,
+                trade_id: "1".into(),
                 exchange_order_id,
                 symbol: order.shape.symbol.clone(),
                 side: order.shape.side,
@@ -917,7 +917,7 @@ mod tests {
             let quote_quantity = quantity * price;
             let trade_time_ms = previous.update_time_ms + 1;
             let trade = TradeFill {
-                trade_id: 1,
+                trade_id: "1".into(),
                 exchange_order_id: order.exchange_order_id.clone(),
                 symbol: order.shape.symbol.clone(),
                 side: order.shape.side,

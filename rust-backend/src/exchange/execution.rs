@@ -119,8 +119,8 @@ pub(super) fn parse_trade_page(
         if symbol != expected_symbol.to_ascii_uppercase() {
             return Err(ExecutionCodecError::InvalidField("symbol"));
         }
-        let trade_id = required_u64(row, "id")?;
-        if !page_ids.insert(trade_id) {
+        let numeric_trade_id = required_u64(row, "id")?;
+        if !page_ids.insert(numeric_trade_id) {
             return Err(ExecutionCodecError::DuplicateTradeId);
         }
         let exchange_order_id = required_scalar_text(row, "orderId")?;
@@ -157,7 +157,7 @@ pub(super) fn parse_trade_page(
         let realized_profit = optional_decimal(row, "realizedPnl")?.unwrap_or(Decimal::ZERO);
         let is_maker = required_bool(row, "maker")?;
         let trade_time_ms = required_u64(row, "time")?;
-        if trade_id == 0
+        if numeric_trade_id == 0
             || exchange_order_id.trim().is_empty()
             || price <= Decimal::ZERO
             || quantity <= Decimal::ZERO
@@ -167,7 +167,7 @@ pub(super) fn parse_trade_page(
             return Err(ExecutionCodecError::InvalidField("trade"));
         }
         trades.push(TradeFill {
-            trade_id,
+            trade_id: numeric_trade_id.to_string(),
             exchange_order_id,
             symbol,
             side,
@@ -226,13 +226,16 @@ pub(super) fn assemble_execution_snapshot(
     header: OrderExecutionHeader,
     mut trades: Vec<TradeFill>,
 ) -> Result<OrderExecutionSnapshot, ExecutionCodecError> {
-    trades.sort_by_key(|trade| (trade.trade_time_ms, trade.trade_id));
+    trades.sort_by(|left, right| {
+        (left.trade_time_ms, left.trade_id.as_str())
+            .cmp(&(right.trade_time_ms, right.trade_id.as_str()))
+    });
     let mut ids = BTreeSet::new();
     let mut quantity = Decimal::ZERO;
     let mut quote = Decimal::ZERO;
     let mut fees_by_asset = BTreeMap::new();
     for trade in &trades {
-        if !ids.insert(trade.trade_id) {
+        if !ids.insert(trade.trade_id.clone()) {
             return Err(ExecutionCodecError::DuplicateTradeId);
         }
         if trade.exchange_order_id != header.order.exchange_order_id
@@ -266,6 +269,17 @@ pub(super) fn assemble_execution_snapshot(
         order_time_ms: header.order_time_ms,
         update_time_ms: header.update_time_ms,
     })
+}
+
+pub(super) fn numeric_trade_id(trade: &TradeFill) -> Result<u64, ExecutionCodecError> {
+    let value = trade
+        .trade_id
+        .parse::<u64>()
+        .map_err(|_| ExecutionCodecError::InvalidField("trade.id"))?;
+    if value == 0 || value.to_string() != trade.trade_id {
+        return Err(ExecutionCodecError::InvalidField("trade.id"));
+    }
+    Ok(value)
 }
 
 fn parse_json(body: &str) -> Result<Value, ExecutionCodecError> {
@@ -369,6 +383,9 @@ mod tests {
         assert_eq!(snapshot.cumulative_quantity, Decimal::new(314, 2));
         assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::new(100166, 7));
         assert_eq!(snapshot.trades.len(), 2);
+        assert_eq!(snapshot.trades[0].trade_id, "7");
+        assert_eq!(snapshot.trades[1].trade_id, "8");
+        assert_eq!(numeric_trade_id(&snapshot.trades[0]), Ok(7));
     }
 
     #[test]
