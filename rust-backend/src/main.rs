@@ -15,14 +15,14 @@ async fn main() -> anyhow::Result<()> {
     let address = std::env::var("GRID_BIND").unwrap_or_else(|_| "127.0.0.1:8001".into());
     let listener = TcpListener::bind(&address)
         .await
-        .with_context(|| format!("failed to bind Rust migration server to {address}"))?;
-    let app = grid_trading_server::app_from_environment()
-        .context("invalid Rust migration server configuration")?;
-    tracing::info!(%address, "Rust migration server listening in non-trading mode");
+        .with_context(|| format!("failed to bind Rust server to {address}"))?;
+    let app =
+        grid_trading_server::app_from_environment().context("invalid Rust server configuration")?;
+    tracing::info!(%address, "Rust server listening with trading writes disabled");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("Rust migration server stopped unexpectedly")?;
+        .context("Rust server stopped unexpectedly")?;
     Ok(())
 }
 

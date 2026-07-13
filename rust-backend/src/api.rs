@@ -15,7 +15,7 @@ use axum::{
         request::Parts,
     },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -445,6 +445,14 @@ fn api_error(status: StatusCode, code: &'static str, message: &'static str) -> R
     response
 }
 
+async fn api_not_found() -> Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "api_route_not_found",
+        "API route not found",
+    )
+}
+
 pub(crate) fn router(admin_token: Option<AdminTokenVerifier>, idempotency_root: PathBuf) -> Router {
     router_with_state(ApiState::disabled(admin_token, idempotency_root))
 }
@@ -453,6 +461,8 @@ fn router_with_state(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/api/v1/grid/start", post(start_grid))
+        .route("/api", any(api_not_found))
+        .route("/api/{*path}", any(api_not_found))
         .layer(DefaultBodyLimit::max(MAX_CONTROL_BODY_BYTES))
         .with_state(state)
 }

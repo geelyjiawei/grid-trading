@@ -118,3 +118,43 @@ jobs:
       - name: Build Vue
         working-directory: vue-frontend
         run: npm run build
+
+  container:
+    name: Vue + Rust container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build locked production image
+        run: docker build --file Dockerfile.rust-vue --tag grid-trading-vue-rust:test .
+
+      - name: Verify image contains only the production stack
+        run: |
+          docker run --rm grid-trading-vue-rust:test sh -eu -c '
+            test "$(id -u)" = "10001"
+            test -x /usr/local/bin/grid-trading-server
+            test -f /app/web/index.html
+            test ! -d /app/backend
+            test ! -d /app/frontend
+            ! command -v python
+            ! command -v node
+          '
+
+      - name: Smoke-test Rust health and Vue entrypoint
+        run: |
+          set -euo pipefail
+          container_id="$(docker run --detach --publish 127.0.0.1:18000:8000 grid-trading-vue-rust:test)"
+          trap 'docker logs "$container_id"; docker rm --force "$container_id"' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18000/healthz > /tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+          grep --fixed-strings '"runtime":"rust"' /tmp/health.json
+          grep --fixed-strings '"trading_enabled":false' /tmp/health.json
+          curl --fail --silent http://127.0.0.1:18000/ > /tmp/index.html
+          grep --fixed-strings '<div id="app"></div>' /tmp/index.html

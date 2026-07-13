@@ -1,0 +1,41 @@
+FROM node:22-alpine AS vue-build
+
+WORKDIR /src/vue-frontend
+COPY vue-frontend/package.json vue-frontend/package-lock.json ./
+RUN npm ci
+COPY vue-frontend/ ./
+RUN npm run build
+
+FROM rust:1.90-bookworm AS rust-build
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY rust-backend/ ./rust-backend/
+RUN cargo build --locked --release --package grid-trading-server
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 grid \
+    && useradd --uid 10001 --gid grid --no-create-home --shell /usr/sbin/nologin grid
+
+WORKDIR /app
+COPY --from=rust-build /src/target/release/grid-trading-server /usr/local/bin/grid-trading-server
+COPY --from=vue-build /src/vue-frontend/dist/ /app/web/
+
+RUN mkdir -p /app/data/rust-control/idempotency \
+    && chown -R grid:grid /app/data
+
+ENV GRID_BIND=0.0.0.0:8000 \
+    GRID_WEB_ROOT=/app/web \
+    GRID_RUST_CONTROL_ROOT=/app/data/rust-control/idempotency \
+    GRID_RUST_TRADING_ENABLED=false
+
+USER grid:grid
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:8000/healthz || exit 1
+
+CMD ["grid-trading-server"]
