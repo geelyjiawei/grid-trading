@@ -1,6 +1,7 @@
 mod armed_strategy;
 mod bootstrap;
 mod cancellation;
+mod coordinator;
 mod exchange_inputs;
 mod execution_accounting;
 mod execution_sync;
@@ -23,6 +24,10 @@ pub use bootstrap::{
 };
 pub use cancellation::{
     CancellationResult, CancellationServiceError, cancel_with, resolve_cancellation_with,
+};
+pub use coordinator::{
+    RuntimeAdvanceResult, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeExchangeGateway,
+    RuntimeRecoveryError, RuntimeStartReceipt, RuntimeStopReceipt,
 };
 pub use exchange_inputs::{
     AuthoritativeStrategyInputs, StrategyInputError, StrategyInputService, load_strategy_inputs,

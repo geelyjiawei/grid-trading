@@ -40,6 +40,7 @@ impl<G> Default for RuntimeRegistry<G> {
 
 pub enum RuntimeRegistration<G> {
     Registered,
+    Terminal(PreparedLeasedFileStrategy<G>),
     Duplicate(PreparedLeasedFileStrategy<G>),
     MarketAlreadyOwned {
         owner_run_id: StrategyRunId,
@@ -61,6 +62,7 @@ pub trait RuntimeRecoveryProvider {
 #[derive(Debug)]
 pub struct RuntimeStartupReport<E> {
     pub registered: Vec<StrategyRunId>,
+    pub skipped_terminal: Vec<StrategyRunId>,
     pub discovery_anomalies: Vec<StrategyDiscoveryAnomaly>,
     pub failures: Vec<RuntimeStartupFailure<E>>,
 }
@@ -113,6 +115,9 @@ impl<G> RuntimeRegistry<G> {
         let run_id = strategy.run_id().clone();
         let exchange = strategy.exchange();
         let symbol = strategy.symbol().to_owned();
+        if strategy.is_terminal() {
+            return RuntimeRegistration::Terminal(strategy);
+        }
         let mut entries = self.entries.write().await;
         prune_terminal_entries(&mut entries);
         if entries.contains_key(&run_id) {
@@ -290,6 +295,7 @@ where
 {
     let mut report = RuntimeStartupReport {
         registered: Vec::new(),
+        skipped_terminal: Vec::new(),
         discovery_anomalies: discovery.anomalies,
         failures: Vec::new(),
     };
@@ -304,6 +310,11 @@ where
             }
         };
         let run_id = claim.run_id().clone();
+        if claim.is_terminal() {
+            drop(claim);
+            report.skipped_terminal.push(run_id);
+            continue;
+        }
         let exchange = claim.exchange();
         let (gateway, settings) = match provider.runtime_for(exchange, &run_id) {
             Ok(runtime) => runtime,
@@ -327,6 +338,10 @@ where
         };
         match registry.register(strategy).await {
             RuntimeRegistration::Registered => report.registered.push(run_id),
+            RuntimeRegistration::Terminal(rejected) => {
+                drop(rejected);
+                report.skipped_terminal.push(run_id);
+            }
             RuntimeRegistration::Duplicate(rejected) => {
                 drop(rejected);
                 report
@@ -352,6 +367,7 @@ where
         }
     }
     report.registered.sort();
+    report.skipped_terminal.sort();
     report
 }
 

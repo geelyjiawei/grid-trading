@@ -575,6 +575,18 @@ impl LeasedFileStrategyRecovery {
         }
     }
 
+    pub fn is_terminal(&self) -> bool {
+        match &self.inner {
+            LeasedFileStrategyRecoveryInner::Armed(store) => {
+                store.snapshot().lifecycle == ArmedStrategyLifecycle::Cancelled
+            }
+            LeasedFileStrategyRecoveryInner::Active { store, .. } => matches!(
+                store.snapshot().lifecycle,
+                StrategyLifecycle::Stopped | StrategyLifecycle::Closed
+            ),
+        }
+    }
+
     pub fn attach_gateway<G>(
         self,
         gateway: G,
@@ -1656,10 +1668,10 @@ mod tests {
         },
         engine::{
             GridOrderRole, MarketSnapshot, MemoryStrategyStateStore, PositionBaseline,
-            RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry,
-            RuntimeRegistryAdvanceError, RuntimeStartupFailure, StrategyLifecycle,
-            StrategyOrderPurpose, StrategyRunId, StrategyState, StrategyStateStore,
-            build_grid_plan, recover_discovered_strategies,
+            RuntimeCoordinator, RuntimeCoordinatorError, RuntimeRecoveryProvider,
+            RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError,
+            RuntimeStartupFailure, StrategyLifecycle, StrategyOrderPurpose, StrategyRunId,
+            StrategyState, StrategyStateStore, build_grid_plan, recover_discovered_strategies,
         },
         exchange::{
             ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
@@ -1671,7 +1683,7 @@ mod tests {
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
             MemoryOrderIntentStore, StrategyFilePaths, StrategyRuntimeLease,
-            discover_strategy_files,
+            discover_strategy_files, load_strategy_catalog,
         },
     };
 
@@ -2464,6 +2476,167 @@ mod tests {
         ));
         assert_eq!(duplicate_gateway.all_bootstrap_call_count(), 0);
         assert_eq!(duplicate_gateway.placement_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_serializes_same_market_start_through_persist_and_registration() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let coordinator = Arc::new(RuntimeCoordinator::new(
+            directory.path().to_path_buf(),
+            runtime_settings(),
+        ));
+        let left_coordinator = Arc::clone(&coordinator);
+        let right_coordinator = Arc::clone(&coordinator);
+        let left_gateway = gateway.clone();
+        let right_gateway = gateway.clone();
+
+        let (left, right) = tokio::join!(
+            left_coordinator.start(left_gateway, config(None), 1_100),
+            right_coordinator.start(right_gateway, config(None), 1_100),
+        );
+
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let failure = if left.is_err() { left } else { right };
+        assert!(matches!(
+            failure,
+            Err(RuntimeCoordinatorError::MarketAlreadyOwned {
+                exchange: Exchange::Binance,
+                symbol,
+                ..
+            }) if symbol == "MUUSDT"
+        ));
+        assert_eq!(coordinator.entries().await.len(), 1);
+        assert_eq!(gateway.market_snapshot_call_count(), 1);
+        assert_eq!(gateway.placement_call_count(), 0);
+
+        let catalog = load_strategy_catalog(directory.path()).unwrap();
+        assert!(catalog.anomalies().is_empty());
+        assert_eq!(
+            catalog
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_live())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_catalog_anomaly_blocks_before_every_exchange_call() {
+        let directory = tempdir().unwrap();
+        std::fs::write(directory.path().join("unexpected-file"), b"do not ignore").unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+
+        assert!(matches!(
+            coordinator
+                .start(gateway.clone(), config(None), 1_100)
+                .await,
+            Err(RuntimeCoordinatorError::CatalogAnomalies { count: 1 })
+        ));
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert!(coordinator.entries().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_scheduler_submits_one_opening_and_never_duplicates_it() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+        let receipt = coordinator
+            .start(gateway.clone(), config(None), 1_100)
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.exchange, Exchange::Binance);
+        assert_eq!(receipt.symbol, "MUUSDT");
+        assert_eq!(
+            receipt.lifecycle,
+            PreparedStrategyLifecycle::AwaitingOpening
+        );
+        assert_eq!(gateway.placement_call_count(), 0);
+
+        let first = coordinator.advance_all(1_200).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].run_id, receipt.run_id);
+        assert!(first[0].result.is_ok());
+        assert_eq!(gateway.placement_call_count(), 1);
+
+        let second = coordinator.advance_all(1_300).await;
+        assert_eq!(second.len(), 1);
+        assert!(second[0].result.is_ok());
+        assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_before_tick_is_durable_zero_write_and_allows_clean_restart() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+        let first = coordinator
+            .start(gateway.clone(), config(None), 1_100)
+            .await
+            .unwrap();
+
+        let stopped = coordinator
+            .request_stop(Exchange::Binance, "MUUSDT", 1_101)
+            .await
+            .unwrap();
+        assert_eq!(stopped.run_id, first.run_id);
+        assert!(matches!(
+            stopped.outcome,
+            PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::StopRequested,
+            })
+        ));
+
+        let reports = coordinator.advance_all(1_102).await;
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].result.is_ok());
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert!(coordinator.entries().await.is_empty());
+        let catalog = load_strategy_catalog(directory.path()).unwrap();
+        assert!(
+            catalog
+                .select_live(Exchange::Binance, "MUUSDT")
+                .unwrap()
+                .is_none()
+        );
+
+        let second = coordinator
+            .start(gateway.clone(), config(None), 1_103)
+            .await
+            .unwrap();
+        assert_ne!(second.run_id, first.run_id);
+        assert_eq!(coordinator.entries().await.len(), 1);
+        assert_eq!(gateway.placement_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovery_skips_terminal_state_without_credentials() {
+        let directory = tempdir().unwrap();
+        let terminal = armed_file_state().cancelled(1_100).unwrap();
+        let run_id = terminal.run_id.clone();
+        let paths = StrategyFilePaths::new(directory.path(), run_id.clone()).unwrap();
+        FileArmedStrategyStateStore::create(paths.state(), terminal).unwrap();
+        let provider = MockRecoveryProvider::new(MockGateway::new(rules(), 1_100));
+        let coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+
+        let report = coordinator.recover(&provider).await.unwrap();
+
+        assert!(report.registered.is_empty());
+        assert_eq!(report.skipped_terminal, vec![run_id]);
+        assert!(report.discovery_anomalies.is_empty());
+        assert!(report.failures.is_empty());
+        assert_eq!(provider.request_count(), 0);
+        assert!(coordinator.entries().await.is_empty());
+        assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
     }
 
     #[tokio::test]
