@@ -10,16 +10,16 @@ use crate::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
         HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
-        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
+        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
             parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
-            validate_snapshot_request,
+            parse_open_orders, parse_placement_acknowledgement, parse_position_snapshot,
+            parse_trading_fee_rates, validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -594,6 +594,36 @@ where
 }
 
 #[async_trait]
+impl<T, S, C> OpenOrderSnapshotGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn open_orders_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Vec<crate::exchange::AuthoritativeOrder>, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v1/openOrders",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Binance open-order snapshot")
+            .await?;
+        parse_open_orders(&body, Exchange::Binance, &symbol).map_err(|error| {
+            SnapshotError::new(format!("invalid Binance open-order snapshot: {error}"))
+        })
+    }
+}
+
+#[async_trait]
 impl<T, S, C> ExecutionSnapshotGateway for BinanceAdapter<T, S, C>
 where
     T: HttpTransport,
@@ -857,6 +887,37 @@ mod tests {
                 .unwrap(),
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+
+    #[tokio::test]
+    async fn open_order_snapshot_is_signed_and_preserves_exchange_original_quantity() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[
+                {"symbol":"MUUSDT","orderId":91,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"70","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"},
+                {"symbol":"MUUSDT","orderId":92,"clientOrderId":"g_RUN00001_2_S_2","side":"SELL","price":"1012","origQty":"100","status":"PARTIALLY_FILLED","reduceOnly":false,"timeInForce":"GTX","type":"LIMIT"}
+            ]"#
+                .into(),
+        }));
+
+        let orders = adapter(transport.clone())
+            .open_orders_snapshot(Exchange::Binance, "MUUSDT")
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(request.path, "/fapi/v1/openOrders");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert!(
+            request
+                .query
+                .iter()
+                .any(|item| item == &("symbol".into(), "MUUSDT".into()))
+        );
+        assert!(request.query.iter().any(|(key, _)| key == "signature"));
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
+        assert_eq!(orders[1].shape.time_in_force, TimeInForce::PostOnly);
     }
 
     #[tokio::test]

@@ -12,10 +12,10 @@ use crate::{
         ExchangeMarketSnapshot, ExecutionSnapshotError, ExecutionSnapshotGateway,
         HistoricalMinutePrice, HistoricalPriceGateway, InstrumentRulesGateway,
         LeverageAcknowledgement, LeverageError, LeverageGateway, LookupError,
-        MarketSnapshotGateway, OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup,
-        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
-        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
-        TradingFeeRates,
+        MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
+        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         aster::{AsterAdapter, AsterSignatureError, LocalEip712Signer},
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
@@ -342,6 +342,21 @@ impl OrderLookupGateway for ConfiguredExchangeGateway {
                     .lookup_order_by_client_id(exchange, symbol, client_order_id)
                     .await
             }
+        }
+    }
+}
+
+#[async_trait]
+impl OpenOrderSnapshotGateway for ConfiguredExchangeGateway {
+    async fn open_orders_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Vec<crate::exchange::AuthoritativeOrder>, SnapshotError> {
+        match self {
+            Self::Binance(gateway) => gateway.open_orders_snapshot(exchange, symbol).await,
+            Self::Aster(gateway) => gateway.open_orders_snapshot(exchange, symbol).await,
+            Self::Bybit(gateway) => gateway.open_orders_snapshot(exchange, symbol).await,
         }
     }
 }

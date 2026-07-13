@@ -145,6 +145,15 @@ pub trait OrderLookupGateway: Send + Sync {
     ) -> Result<OrderLookup, LookupError>;
 }
 
+#[async_trait]
+pub trait OpenOrderSnapshotGateway: Send + Sync {
+    async fn open_orders_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Vec<AuthoritativeOrder>, SnapshotError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TradeFill {
     /// Opaque exchange-provided execution identity. It must never be parsed as

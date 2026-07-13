@@ -18,6 +18,7 @@ use crate::{
 };
 
 const CATEGORY: &str = "linear";
+const MAX_OPEN_ORDER_PAGE_SIZE: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BybitErrorBody {
@@ -169,6 +170,55 @@ pub(super) fn parse_exact_order_record(
         expected_exchange_order_id,
     )
     .map(Some)
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct OpenOrderPage {
+    pub orders: Vec<AuthoritativeOrder>,
+    pub next_cursor: Option<String>,
+}
+
+pub(super) fn parse_open_order_page(
+    body: &str,
+    expected_symbol: &str,
+) -> Result<OpenOrderPage, BybitCodecError> {
+    let root = success_root(body)?;
+    let result = result_object(&root)?;
+    require_category(result)?;
+    let cursor = optional_string(result, "nextPageCursor")?.unwrap_or_default();
+    if !cursor.is_empty()
+        && (cursor.len() > 2_048 || !cursor.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(BybitCodecError::InvalidField("nextPageCursor"));
+    }
+    let rows = required_array(result, "list")?;
+    if rows.len() > MAX_OPEN_ORDER_PAGE_SIZE {
+        return Err(BybitCodecError::InvalidField("list"));
+    }
+    let mut client_order_ids = BTreeSet::new();
+    let mut exchange_order_ids = BTreeSet::new();
+    let mut orders = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(raw_client_order_id) = row.get("orderLinkId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(client_order_id) = ClientOrderId::parse(raw_client_order_id) else {
+            continue;
+        };
+        let header = parse_order_row(row, expected_symbol, &client_order_id, None)?;
+        if !matches!(header.order.lifecycle, OrderLifecycle::Active(_))
+            || !client_order_ids.insert(header.order.client_order_id.clone())
+            || !exchange_order_ids.insert(header.order.exchange_order_id.clone())
+        {
+            return Err(BybitCodecError::DuplicateRecord);
+        }
+        orders.push(header.order);
+    }
+    orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
+    Ok(OpenOrderPage {
+        orders,
+        next_cursor: (!cursor.is_empty()).then_some(cursor),
+    })
 }
 
 fn parse_order_row(
@@ -728,6 +778,50 @@ fn scalar_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_order_page_preserves_exact_shapes_and_cursor() {
+        let page = parse_open_order_page(
+            r#"{"retCode":0,"result":{"category":"linear","nextPageCursor":"next%3A2","list":[
+                {"symbol":"MUUSDT","orderId":"2","orderLinkId":"g_RUN00001_2_S_2","side":"Sell","orderType":"Limit","qty":"100","price":"1012","timeInForce":"GTC","positionIdx":0,"orderStatus":"PartiallyFilled","cumExecQty":"30","cumExecValue":"30360","reduceOnly":false,"createdTime":"1000","updatedTime":"1100"},
+                {"symbol":"MUUSDT","orderId":"1","orderLinkId":"g_RUN00001_1_B_1","side":"Buy","orderType":"Limit","qty":"100","price":"1010","timeInForce":"PostOnly","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","reduceOnly":true,"createdTime":"1000","updatedTime":"1000"}
+            ]}}"#,
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(page.next_cursor.as_deref(), Some("next%3A2"));
+        assert_eq!(page.orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
+        assert_eq!(page.orders[0].shape.time_in_force, TimeInForce::PostOnly);
+        assert_eq!(page.orders[1].shape.quantity, Decimal::new(100, 0));
+    }
+
+    #[test]
+    fn open_order_page_rejects_terminal_duplicate_and_bad_cursor_rows() {
+        let row = r#"{"symbol":"MUUSDT","orderId":"1","orderLinkId":"g_RUN00001_1_B_1","side":"Buy","orderType":"Limit","qty":"1","price":"1010","timeInForce":"GTC","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","reduceOnly":true,"createdTime":"1000","updatedTime":"1000"}"#;
+        let terminal = row.replace("\"New\"", "\"Filled\"").replace(
+            "\"0\",\"cumExecValue\":\"0\"",
+            "\"1\",\"cumExecValue\":\"1010\"",
+        );
+        assert!(parse_open_order_page(&format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{row},{row}]}}}}"#), "MUUSDT").is_err());
+        assert!(parse_open_order_page(&format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{terminal}]}}}}"#), "MUUSDT").is_err());
+        assert!(parse_open_order_page(&format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"bad cursor","list":[{row}]}}}}"#), "MUUSDT").is_err());
+    }
+
+    #[test]
+    fn unrelated_empty_or_extended_manual_link_ids_are_ignored() {
+        let owned = r#"{"symbol":"MUUSDT","orderId":"1","orderLinkId":"g_RUN00001_1_B_1","side":"Buy","orderType":"Limit","qty":"1","price":"1010","timeInForce":"GTC","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","reduceOnly":true,"createdTime":"1000","updatedTime":"1000"}"#;
+        let empty = owned.replace("g_RUN00001_1_B_1", "");
+        let extended = owned.replace("g_RUN00001_1_B_1", "manual:id/with.dots");
+        let page = parse_open_order_page(
+            &format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{empty},{extended},{owned}]}}}}"#),
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(page.orders.len(), 1);
+        assert_eq!(page.orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
+    }
 
     fn client_id() -> ClientOrderId {
         ClientOrderId::parse("g_0_S_bybit-test").unwrap()

@@ -10,16 +10,16 @@ use crate::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
         HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
-        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
+        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
             parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
-            validate_snapshot_request,
+            parse_open_orders, parse_placement_acknowledgement, parse_position_snapshot,
+            parse_trading_fee_rates, validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -617,6 +617,36 @@ where
 }
 
 #[async_trait]
+impl<T, S, N> OpenOrderSnapshotGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    async fn open_orders_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Vec<crate::exchange::AuthoritativeOrder>, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v3/openOrders",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Aster open-order snapshot")
+            .await?;
+        parse_open_orders(&body, Exchange::Aster, &symbol).map_err(|error| {
+            SnapshotError::new(format!("invalid Aster open-order snapshot: {error}"))
+        })
+    }
+}
+
+#[async_trait]
 impl<T, S, N> OrderCancellationGateway for AsterAdapter<T, S, N>
 where
     T: HttpTransport,
@@ -1097,6 +1127,34 @@ mod tests {
             )
         );
         assert!(!format!("{signer:?}").contains(&"1".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn open_order_snapshot_uses_signed_v3_query_and_preserves_exact_shape() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[
+                {"symbol":"ANSEMUSDT","orderId":4770039,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"0.38","origQty":"70","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
+            ]"#
+                .into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+        let orders = adapter(transport.clone(), signer.clone())
+            .open_orders_snapshot(Exchange::Aster, "ANSEMUSDT")
+            .await
+            .unwrap();
+        let request = transport.request();
+        let signed_message = signer.messages.lock().unwrap()[0].clone();
+
+        assert_eq!(request.path, "/fapi/v3/openOrders");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert!(request.body.is_empty());
+        assert!(signed_message.starts_with("symbol=ANSEMUSDT&nonce="));
+        assert!(signed_message.contains("&user=0x1111111111111111111111111111111111111111"));
+        assert!(signed_message.contains("&signer=0x2222222222222222222222222222222222222222"));
+        assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
+        assert!(orders[0].shape.reduce_only);
     }
 
     #[test]

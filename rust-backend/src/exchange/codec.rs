@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use rust_decimal::Decimal;
 use serde_json::Value;
 use thiserror::Error;
@@ -374,21 +376,75 @@ pub(super) fn parse_authoritative_order(
     expected_symbol: &str,
     expected_client_order_id: &ClientOrderId,
 ) -> Result<AuthoritativeOrder, CodecError> {
-    let value: Value =
-        serde_json::from_str(body).map_err(|error| CodecError::InvalidJson(error.to_string()))?;
-    let symbol = required_string(&value, "symbol")?.to_ascii_uppercase();
+    let value = parse_json(body)?;
+    parse_authoritative_order_value(
+        &value,
+        exchange,
+        expected_symbol,
+        Some(expected_client_order_id),
+    )
+}
+
+pub(super) fn parse_open_orders(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+) -> Result<Vec<AuthoritativeOrder>, CodecError> {
+    const MAX_OPEN_ORDERS: usize = 1_000;
+
+    let value = parse_json(body)?;
+    let rows = value
+        .as_array()
+        .ok_or(CodecError::InvalidField("openOrders"))?;
+    if rows.len() > MAX_OPEN_ORDERS {
+        return Err(CodecError::InvalidField("openOrders"));
+    }
+    let mut client_order_ids = BTreeSet::new();
+    let mut exchange_order_ids = BTreeSet::new();
+    let mut orders = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(raw_client_order_id) = row
+            .get("clientOrderId")
+            .and_then(json_scalar_text)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        if ClientOrderId::parse(raw_client_order_id).is_err() {
+            continue;
+        }
+        let order = parse_authoritative_order_value(row, exchange, expected_symbol, None)?;
+        if !matches!(order.lifecycle, OrderLifecycle::Active(_))
+            || !client_order_ids.insert(order.client_order_id.clone())
+            || !exchange_order_ids.insert(order.exchange_order_id.clone())
+        {
+            return Err(CodecError::InvalidField("openOrders"));
+        }
+        orders.push(order);
+    }
+    orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
+    Ok(orders)
+}
+
+fn parse_authoritative_order_value(
+    value: &Value,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_client_order_id: Option<&ClientOrderId>,
+) -> Result<AuthoritativeOrder, CodecError> {
+    let symbol = required_string(value, "symbol")?.to_ascii_uppercase();
     if symbol != expected_symbol.to_ascii_uppercase() {
         return Err(CodecError::SymbolMismatch);
     }
 
-    let returned_client_id = required_scalar_text(&value, "clientOrderId")?;
-    if returned_client_id != expected_client_order_id.as_str() {
+    let returned_client_id = required_scalar_text(value, "clientOrderId")?;
+    if expected_client_order_id.is_some_and(|expected| returned_client_id != expected.as_str()) {
         return Err(CodecError::ClientOrderIdMismatch);
     }
     let client_order_id = ClientOrderId::parse(returned_client_id)
         .map_err(|_| CodecError::InvalidField("clientOrderId"))?;
-    let exchange_order_id = required_scalar_text(&value, "orderId")?;
-    let side = match required_string(&value, "side")?
+    let exchange_order_id = required_scalar_text(value, "orderId")?;
+    let side = match required_string(value, "side")?
         .to_ascii_uppercase()
         .as_str()
     {
@@ -396,7 +452,7 @@ pub(super) fn parse_authoritative_order(
         "SELL" => OrderSide::Sell,
         _ => return Err(CodecError::InvalidField("side")),
     };
-    let kind = match required_string(&value, "type")?
+    let kind = match required_string(value, "type")?
         .to_ascii_uppercase()
         .as_str()
     {
@@ -404,12 +460,12 @@ pub(super) fn parse_authoritative_order(
         "MARKET" => OrderKind::Market,
         _ => return Err(CodecError::InvalidField("type")),
     };
-    let quantity = required_decimal(&value, "origQty")?;
-    let reduce_only = required_bool(&value, "reduceOnly")?;
+    let quantity = required_decimal(value, "origQty")?;
+    let reduce_only = required_bool(value, "reduceOnly")?;
     let (price, time_in_force) = match kind {
         OrderKind::Limit => {
-            let price = required_decimal(&value, "price")?;
-            let time_in_force = match required_string(&value, "timeInForce")?
+            let price = required_decimal(value, "price")?;
+            let time_in_force = match required_string(value, "timeInForce")?
                 .to_ascii_uppercase()
                 .as_str()
             {
@@ -439,7 +495,7 @@ pub(super) fn parse_authoritative_order(
         exchange_order_id,
         exchange,
         shape,
-        lifecycle: parse_lifecycle(required_string(&value, "status")?)?,
+        lifecycle: parse_lifecycle(required_string(value, "status")?)?,
     })
 }
 
@@ -598,6 +654,55 @@ mod tests {
             order.lifecycle,
             OrderLifecycle::Active(ActiveOrderStatus::New)
         );
+    }
+
+    #[test]
+    fn open_order_snapshot_is_complete_sorted_and_active_only() {
+        let orders = parse_open_orders(
+            r#"[
+                {"symbol":"ANSEMUSDT","orderId":2,"clientOrderId":"g_RUN00001_2_S_2","side":"SELL","price":"0.382","origQty":"100","status":"PARTIALLY_FILLED","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
+                {"symbol":"ANSEMUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"0.380","origQty":"100","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
+            ]"#,
+            Exchange::Aster,
+            "ANSEMUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
+        assert_eq!(orders[1].shape.quantity, Decimal::new(100, 0));
+        assert_eq!(
+            orders[1].lifecycle,
+            OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+        );
+    }
+
+    #[test]
+    fn open_order_snapshot_rejects_terminal_duplicate_and_foreign_rows() {
+        let base = r#"{"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"1","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}"#;
+        let terminal = base.replace("\"NEW\"", "\"FILLED\"");
+        let foreign = base.replace("MUUSDT", "ANSEMUSDT");
+        assert!(parse_open_orders(&format!("[{terminal}]"), Exchange::Binance, "MUUSDT").is_err());
+        assert!(
+            parse_open_orders(&format!("[{base},{base}]"), Exchange::Binance, "MUUSDT").is_err()
+        );
+        assert!(parse_open_orders(&format!("[{foreign}]"), Exchange::Binance, "MUUSDT").is_err());
+    }
+
+    #[test]
+    fn unrelated_manual_order_ids_do_not_block_owned_order_snapshot() {
+        let orders = parse_open_orders(
+            r#"[
+                {"symbol":"MUUSDT","orderId":9,"clientOrderId":"manual:id/with.dots","side":"BUY","price":"1000","origQty":"1","status":"NEW","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
+                {"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"1","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
+            ]"#,
+            Exchange::Binance,
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
     }
 
     #[test]

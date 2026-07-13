@@ -13,15 +13,15 @@ use crate::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
         HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
-        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
+        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         bybit_codec::{
             parse_cancellation_acknowledgement, parse_error, parse_exact_order_record,
             parse_execution_page, parse_historical_minute_open, parse_instrument_rules,
-            parse_leverage_acknowledgement, parse_market_snapshot, parse_placement_acknowledgement,
-            parse_position_snapshot, parse_trading_fee_rates,
+            parse_leverage_acknowledgement, parse_market_snapshot, parse_open_order_page,
+            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
         },
         codec::validate_snapshot_request,
         execution::assemble_execution_snapshot,
@@ -37,6 +37,8 @@ const TESTNET_BASE_URL: &str = "https://api-testnet.bybit.com";
 const CATEGORY: &str = "linear";
 const EXECUTION_PAGE_LIMIT: usize = 100;
 const MAX_EXECUTION_PAGES: usize = 100;
+const OPEN_ORDER_PAGE_LIMIT: usize = 50;
+const MAX_OPEN_ORDER_PAGES: usize = 100;
 
 pub trait BybitRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, BybitSignatureError>;
@@ -571,6 +573,71 @@ where
 }
 
 #[async_trait]
+impl<T, S, C> OpenOrderSnapshotGateway for BybitAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BybitRequestSigner,
+    C: MillisecondClock,
+{
+    async fn open_orders_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Vec<crate::exchange::AuthoritativeOrder>, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Bybit, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = BTreeSet::new();
+        let mut client_order_ids = BTreeSet::new();
+        let mut exchange_order_ids = BTreeSet::new();
+        let mut orders = Vec::new();
+        for _ in 0..MAX_OPEN_ORDER_PAGES {
+            let mut query = vec![
+                ("category".into(), CATEGORY.into()),
+                ("symbol".into(), symbol.clone()),
+                ("openOnly".into(), "0".into()),
+                ("limit".into(), OPEN_ORDER_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(value) = &cursor {
+                query.push(("cursor".into(), value.clone()));
+            }
+            let request = self
+                .signed_get("/v5/order/realtime", query)
+                .map_err(|error| SnapshotError::new(error.to_string()))?;
+            let body = self
+                .execute_snapshot(request, "Bybit open-order snapshot")
+                .await?;
+            let page = parse_open_order_page(&body, &symbol).map_err(|error| {
+                SnapshotError::new(format!("invalid Bybit open-order snapshot: {error}"))
+            })?;
+            for order in page.orders {
+                if !client_order_ids.insert(order.client_order_id.clone())
+                    || !exchange_order_ids.insert(order.exchange_order_id.clone())
+                {
+                    return Err(SnapshotError::new(
+                        "Bybit open-order pages contain duplicate identities",
+                    ));
+                }
+                orders.push(order);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
+                return Ok(orders);
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(SnapshotError::new(
+                    "Bybit open-order cursor did not advance",
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(SnapshotError::new(
+            "Bybit open orders exceeded bounded pagination",
+        ))
+    }
+}
+
+#[async_trait]
 impl<T, S, C> ExecutionSnapshotGateway for BybitAdapter<T, S, C>
 where
     T: HttpTransport,
@@ -985,6 +1052,108 @@ mod tests {
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
         assert!(!format!("{signer:?}").contains("key"));
+    }
+
+    fn open_order_page(
+        order_id: &str,
+        client_order_id: &str,
+        price: &str,
+        quantity: &str,
+        cursor: &str,
+    ) -> String {
+        format!(
+            r#"{{"retCode":0,"retMsg":"OK","result":{{"category":"linear","list":[{{"orderId":"{order_id}","orderLinkId":"{client_order_id}","symbol":"MUUSDT","price":"{price}","qty":"{quantity}","side":"Buy","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","timeInForce":"GTC","orderType":"Limit","reduceOnly":true,"createdTime":"1700000000000","updatedTime":"1700000000000"}}],"nextPageCursor":"{cursor}"}},"time":1700000001001}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn open_order_snapshot_exhausts_cursor_pages_before_returning() {
+        let transport = MockTransport::default();
+        transport.push(ok(open_order_page(
+            "order-2",
+            "g_RUN00001_2_B_2",
+            "1012",
+            "100",
+            "cursor:2",
+        )));
+        transport.push(ok(open_order_page(
+            "order-1",
+            "g_RUN00001_1_B_1",
+            "1010",
+            "70",
+            "",
+        )));
+
+        let orders = adapter(transport.clone())
+            .open_orders_snapshot(Exchange::Bybit, "MUUSDT")
+            .await
+            .unwrap();
+        let requests = transport.requests();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/v5/order/realtime");
+        assert!(
+            requests[0]
+                .query
+                .iter()
+                .any(|item| item == &("openOnly".into(), "0".into()))
+        );
+        assert!(
+            requests[1]
+                .query
+                .iter()
+                .any(|item| item == &("cursor".into(), "cursor:2".into()))
+        );
+        assert_eq!(orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
+        assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
+        assert_eq!(orders[1].shape.quantity, Decimal::new(100, 0));
+    }
+
+    #[tokio::test]
+    async fn repeated_cursor_and_cross_page_duplicate_never_return_partial_open_orders() {
+        let repeated = MockTransport::default();
+        repeated.push(ok(open_order_page(
+            "order-1",
+            "g_RUN00001_1_B_1",
+            "1010",
+            "100",
+            "same",
+        )));
+        repeated.push(ok(open_order_page(
+            "order-2",
+            "g_RUN00001_2_B_2",
+            "1012",
+            "100",
+            "same",
+        )));
+        assert!(
+            adapter(repeated)
+                .open_orders_snapshot(Exchange::Bybit, "MUUSDT")
+                .await
+                .is_err()
+        );
+
+        let duplicate = MockTransport::default();
+        duplicate.push(ok(open_order_page(
+            "order-1",
+            "g_RUN00001_1_B_1",
+            "1010",
+            "100",
+            "next",
+        )));
+        duplicate.push(ok(open_order_page(
+            "order-1",
+            "g_RUN00001_1_B_1",
+            "1010",
+            "100",
+            "",
+        )));
+        assert!(
+            adapter(duplicate)
+                .open_orders_snapshot(Exchange::Bybit, "MUUSDT")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -137,6 +137,10 @@ the OpenAPI schema.
 - Running-grid coverage is counted by unique planned level, not raw order count. Two valid
   opposite-side orders may coexist at one level, but every configured level must still have
   at least one exact active authoritative order before the audit can be clean.
+- Live shadow collection uses only read gateway traits. It brackets position and per-order
+  lookups with two complete open-order reads; any changed second read, repeated page cursor,
+  duplicate identity, or active lookup absent from the complete list is inconclusive and
+  produces no audit result. Orders from another run and manual orders are never adopted.
 
 ## Grid behavior
 

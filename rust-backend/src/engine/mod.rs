@@ -10,6 +10,7 @@ mod leverage;
 mod reconciliation;
 mod runtime;
 mod shadow_audit;
+mod shadow_collector;
 mod strategy_machine;
 mod submission;
 mod supervisor;
@@ -53,6 +54,7 @@ pub use shadow_audit::{
     ShadowAuditIssue, ShadowAuditReport, ShadowExpectedLifecycle, ShadowLevelCoverage,
     ShadowOrderAuditSummary, ShadowPositionAudit, audit_strategy_shadow,
 };
+pub use shadow_collector::{ShadowCollectionError, collect_strategy_shadow};
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{
     ExecutionReport, LevelLot, MemoryStrategyStateStore, NeutralLot, PositionBaseline,
