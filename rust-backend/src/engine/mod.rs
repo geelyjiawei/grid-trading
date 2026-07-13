@@ -1,13 +1,18 @@
+mod armed_strategy;
 mod grid_plan;
 mod reconciliation;
 mod strategy_machine;
 mod submission;
 
+pub use armed_strategy::{
+    ArmedStrategyError, ArmedStrategyLifecycle, ArmedStrategyState, TriggerCondition,
+};
 pub use grid_plan::{
     GridOrderRole, GridPlan, GridPlanError, MarketSnapshot, PlannedGridOrder, PlannedOpeningOrder,
     build_grid_plan,
 };
 pub use reconciliation::{ReconciliationError, ReconciliationResult, ReconciliationService};
+pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{
     ExecutionReport, LevelLot, MemoryStrategyStateStore, NeutralLot, PositionBaseline,
     ReplacementObligation, ReplacementObligationKind, RiskExitReason, StrategyLifecycle,

@@ -214,6 +214,12 @@ pub struct StrategyState {
     pub risk_exit_reason: Option<RiskExitReason>,
     #[serde(default)]
     pub risk_trigger_mark_price: Option<Decimal>,
+    #[serde(default)]
+    pub trigger_armed_price: Option<Decimal>,
+    #[serde(default)]
+    pub trigger_observed_price: Option<Decimal>,
+    #[serde(default)]
+    pub triggered_at_ms: Option<u64>,
     pub completed_pairs: u64,
     pub gross_realized_profit: Decimal,
     pub total_volume: Decimal,
@@ -223,6 +229,13 @@ pub struct StrategyState {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TriggerActivation {
+    pub(crate) armed_price: Decimal,
+    pub(crate) observed_price: Decimal,
+    pub(crate) triggered_at_ms: u64,
+}
+
 impl StrategyState {
     pub fn from_plan(
         run_id: StrategyRunId,
@@ -230,6 +243,46 @@ impl StrategyState {
         instrument_rules: InstrumentRules,
         plan: GridPlan,
         baseline: PositionBaseline,
+        now_ms: u64,
+    ) -> Result<Self, StrategyStateError> {
+        Self::from_plan_internal(
+            run_id,
+            config,
+            instrument_rules,
+            plan,
+            baseline,
+            None,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn from_triggered_plan(
+        run_id: StrategyRunId,
+        config: GridConfig,
+        instrument_rules: InstrumentRules,
+        plan: GridPlan,
+        baseline: PositionBaseline,
+        trigger_activation: TriggerActivation,
+    ) -> Result<Self, StrategyStateError> {
+        let now_ms = trigger_activation.triggered_at_ms;
+        Self::from_plan_internal(
+            run_id,
+            config,
+            instrument_rules,
+            plan,
+            baseline,
+            Some(trigger_activation),
+            now_ms,
+        )
+    }
+
+    fn from_plan_internal(
+        run_id: StrategyRunId,
+        config: GridConfig,
+        instrument_rules: InstrumentRules,
+        plan: GridPlan,
+        baseline: PositionBaseline,
+        trigger_activation: Option<TriggerActivation>,
         now_ms: u64,
     ) -> Result<Self, StrategyStateError> {
         config
@@ -245,6 +298,13 @@ impl StrategyState {
         baseline.validate()?;
         baseline.validate_for_direction(direction)?;
         validate_risk_prices(&config, plan.reference_price)?;
+        match (config.trigger_price, trigger_activation) {
+            (None, None) => {}
+            (Some(_), Some(activation))
+                if activation.armed_price > Decimal::ZERO
+                    && activation.observed_price > Decimal::ZERO => {}
+            _ => return Err(StrategyStateError::InvalidTriggerActivation),
+        }
         if plan.grid_orders.is_empty() || plan.participating_level_count == 0 {
             return Err(StrategyStateError::InvalidPlan);
         }
@@ -279,6 +339,9 @@ impl StrategyState {
             initial_deployment_complete: false,
             risk_exit_reason: None,
             risk_trigger_mark_price: None,
+            trigger_armed_price: trigger_activation.map(|activation| activation.armed_price),
+            trigger_observed_price: trigger_activation.map(|activation| activation.observed_price),
+            triggered_at_ms: trigger_activation.map(|activation| activation.triggered_at_ms),
             completed_pairs: 0,
             gross_realized_profit: Decimal::ZERO,
             total_volume: Decimal::ZERO,
@@ -358,6 +421,22 @@ impl StrategyState {
                 && (self.risk_exit_reason.is_none() || self.risk_trigger_mark_price.is_none()))
         {
             return Err(StrategyStateError::InvalidRiskExitState);
+        }
+        let trigger_metadata_complete = self.trigger_armed_price.is_some()
+            && self.trigger_observed_price.is_some()
+            && self.triggered_at_ms.is_some();
+        if self.config.trigger_price.is_some() != trigger_metadata_complete
+            || self
+                .trigger_armed_price
+                .is_some_and(|price| price <= Decimal::ZERO)
+            || self
+                .trigger_observed_price
+                .is_some_and(|price| price <= Decimal::ZERO)
+            || self
+                .triggered_at_ms
+                .is_some_and(|triggered_at| triggered_at > self.updated_at_ms)
+        {
+            return Err(StrategyStateError::InvalidTriggerActivation);
         }
         if self.lifecycle == StrategyLifecycle::Closed
             && (!self.grid_position_net_quantity.is_zero()
@@ -2248,6 +2327,8 @@ pub enum StrategyStateError {
     InvalidRiskPriceDirection,
     #[error("risk exit state is incomplete or invalid")]
     InvalidRiskExitState,
+    #[error("triggered strategy activation metadata is incomplete or invalid")]
+    InvalidTriggerActivation,
     #[error("market price must be positive")]
     InvalidMarketPrice,
     #[error("grid-owned risk close quantity cannot be represented by market rules")]
@@ -2302,6 +2383,8 @@ pub enum StrategyStateError {
 pub enum StrategyStoreError {
     #[error("strategy state failed validation: {0}")]
     InvalidState(StrategyStateError),
+    #[error("armed strategy state failed validation or activation: {0}")]
+    ArmedStrategy(#[from] super::ArmedStrategyError),
     #[error("injected strategy state write failure")]
     InjectedWriteFailure,
     #[error("strategy state write attempt counter overflowed")]
@@ -2310,6 +2393,10 @@ pub enum StrategyStoreError {
     RevisionMismatch,
     #[error("strategy state file already exists")]
     AlreadyExists,
+    #[error("expected an active strategy file but found an armed strategy")]
+    UnexpectedArmedState,
+    #[error("expected an armed strategy file but found an active strategy")]
+    UnexpectedActiveState,
     #[error("failed to read strategy state: {0}")]
     Read(std::io::Error),
     #[error("strategy state contains invalid JSON: {0}")]

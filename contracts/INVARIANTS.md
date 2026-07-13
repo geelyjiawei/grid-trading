@@ -72,6 +72,12 @@ the OpenAPI schema.
 ## Persistence and recovery
 
 - State/history updates are atomic and durable.
+- A waiting trigger has no grid plan, baseline, or order intent. Trigger activation uses
+  fresh market data, fresh exchange rules, and the authoritative position at trigger time.
+- Armed-to-active activation replaces one durable runtime state atomically. Any planning,
+  rule, or baseline failure leaves the armed bytes unchanged and creates no order.
+- Trigger direction is derived from the trigger price relative to the arming market, not
+  guessed from long, short, or neutral grid direction.
 - Initial deployment ownership is retained until every linked exchange order is
   reconciled and terminal.
 - Failed, closed, stopped, and saved are distinct lifecycle states.
