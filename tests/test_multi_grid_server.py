@@ -1272,6 +1272,7 @@ class MultiGridServerTests(unittest.TestCase):
         main._client = client
         main._clients["binance"] = client
 
+        request_started_at = time.time()
         response = self.client.post(
             "/api/grid/start",
             json=self._payload("LIMITWAITUSDT"),
@@ -1287,7 +1288,11 @@ class MultiGridServerTests(unittest.TestCase):
         self.assertFalse(engine.manual_stop_pending)
         self.assertTrue(engine.opening_order.get("submission_pending"))
         self.assertTrue(engine.opening_order.get("submission_retry_safe"))
-        self.assertGreater(engine._rate_limit_remaining(), 59)
+        self.assertGreaterEqual(
+            engine._exchange_rate_limit_until,
+            request_started_at + 60,
+        )
+        self.assertLessEqual(engine._exchange_rate_limit_until, time.time() + 60)
         self.assertEqual(client.market_calls, 1)
         self.assertEqual(client.orders, [])
         self.assertEqual(client.positions, [])
