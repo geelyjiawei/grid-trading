@@ -4,6 +4,11 @@ use thiserror::Error;
 
 use crate::domain::{ClientOrderId, Exchange, OrderIntent, OrderShape, TerminalOrderStatus};
 
+pub mod aster;
+pub mod binance;
+mod codec;
+pub mod protocol;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementAcknowledgement {
     pub client_order_id: ClientOrderId,

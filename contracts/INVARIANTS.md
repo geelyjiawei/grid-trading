@@ -30,6 +30,25 @@ the OpenAPI schema.
 - A terminal exchange label without cumulative execution accounting remains unresolved
   and blocks final strategy shutdown.
 
+## Exchange protocols
+
+- Binance order writes are HMAC-SHA256 signed, carry the immutable client order ID,
+  and use the same canonical parameter bytes for signing and transport.
+- Aster V3 order writes use one production wallet/private key. The wallet address is
+  derived locally and used as both `user` and `signer`; only the EIP-712 signature is
+  transmitted.
+- Aster EIP-712 signs the canonical form body with domain `AsterSignTransaction`,
+  version `1`, chain ID `1666`, and the zero verifying-contract address.
+- Private keys and API secrets are never serialized, logged, included in request debug
+  output, or stored in strategy state.
+- Signed requests never follow HTTP redirects, because redirects could disclose signed
+  parameters or authentication headers to another origin.
+- A write transport error, HTTP timeout/rate limit/server error, redirect response,
+  unknown-execution exchange code, malformed success body, or mismatched acknowledgement
+  is an unknown outcome. The same client order ID must be reconciled before any retry.
+- Only the exchange's definitive order-not-found code is `NotFound`; transport and
+  malformed lookup responses remain inconclusive.
+
 ## Position ownership
 
 - Position at grid start is the baseline and is never silently absorbed by the grid.
