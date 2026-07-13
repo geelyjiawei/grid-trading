@@ -1,24 +1,28 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    domain::{CancellationIntent, CancellationState, ClientOrderId, IntentState},
+    domain::{CancellationIntent, CancellationState, ClientOrderId, GridConfig, IntentState},
     engine::{
         ArmedStrategyState, CancellationResult, CancellationServiceError, ExecutionAccountingError,
         ExecutionSyncService, ReconciliationError, ReconciliationResult, StrategyBootstrapError,
         StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
-        StrategyOrderTracking, StrategyStateError, StrategyStateStore, StrategyStoreError,
-        StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
-        cancel_with, load_strategy_inputs, reconcile_with, resolve_cancellation_with, submit_with,
+        StrategyOrderTracking, StrategyRunId, StrategyStateError, StrategyStateStore,
+        StrategyStoreError, StrategyTransition, SubmissionError, SubmissionResult,
+        activate_armed_strategy, cancel_with, load_strategy_inputs, prepare_new_strategy,
+        reconcile_with, resolve_cancellation_with, submit_with,
     },
     exchange::{
-        ExecutionSnapshotGateway, HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway,
-        MarketSnapshotGateway, OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway,
-        PositionSnapshotGateway, TradingFeeRateGateway,
+        ExchangeIdentityGateway, ExecutionSnapshotGateway, HistoricalPriceGateway,
+        InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway, OrderCancellationGateway,
+        OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
     },
     persistence::{
-        FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
-        LedgerError, RuntimeLeaseError, StrategyFilePaths, StrategyRuntimeLease,
+        FileArmedStrategyStateStore, FileOrderIntentStore, FilePreparedStrategyStore,
+        FileStrategyStateStore, IntentStore, LedgerError, RuntimeLeaseError, StrategyFilePathError,
+        StrategyFilePaths, StrategyRuntimeLease,
     },
 };
 
@@ -94,6 +98,51 @@ pub enum RuntimeBuildError {
     ExecutionAccounting(#[from] ExecutionAccountingError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSettings {
+    quote_asset: String,
+    maximum_market_age_ms: u64,
+    maximum_future_skew_ms: u64,
+    maximum_submissions_per_tick: usize,
+}
+
+impl RuntimeSettings {
+    pub fn new(
+        quote_asset: &str,
+        maximum_market_age_ms: u64,
+        maximum_future_skew_ms: u64,
+        maximum_submissions_per_tick: usize,
+    ) -> Result<Self, RuntimeBuildError> {
+        validate_runtime_settings(
+            quote_asset,
+            maximum_market_age_ms,
+            maximum_submissions_per_tick,
+        )?;
+        Ok(Self {
+            quote_asset: quote_asset.to_owned(),
+            maximum_market_age_ms,
+            maximum_future_skew_ms,
+            maximum_submissions_per_tick,
+        })
+    }
+
+    pub fn quote_asset(&self) -> &str {
+        &self.quote_asset
+    }
+
+    pub fn maximum_market_age_ms(&self) -> u64 {
+        self.maximum_market_age_ms
+    }
+
+    pub fn maximum_future_skew_ms(&self) -> u64 {
+        self.maximum_future_skew_ms
+    }
+
+    pub fn maximum_submissions_per_tick(&self) -> usize {
+        self.maximum_submissions_per_tick
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeTickError {
     #[error("strategy and order-intent ledgers disagree")]
@@ -126,14 +175,162 @@ pub struct LeasedFileStrategyRuntime<G> {
     runtime: StrategyRuntime<G, FileOrderIntentStore, FileStrategyStateStore>,
 }
 
+pub enum PreparedLeasedFileStrategy<G> {
+    Armed {
+        strategy: Box<LeasedFileArmedStrategy>,
+        gateway: Box<G>,
+    },
+    Active(Box<LeasedFileStrategyRuntime<G>>),
+}
+
+impl<G> PreparedLeasedFileStrategy<G> {
+    pub fn paths(&self) -> &StrategyFilePaths {
+        match self {
+            Self::Armed { strategy, .. } => strategy.paths(),
+            Self::Active(runtime) => runtime.paths(),
+        }
+    }
+}
+
+pub async fn prepare_leased_file_strategy<G>(
+    gateway: G,
+    root: impl Into<PathBuf>,
+    run_id: StrategyRunId,
+    config: GridConfig,
+    now_ms: u64,
+    settings: RuntimeSettings,
+) -> Result<PreparedLeasedFileStrategy<G>, FileStrategyStartError>
+where
+    G: ExchangeIdentityGateway
+        + TradingFeeRateGateway
+        + LeverageGateway
+        + PositionSnapshotGateway
+        + MarketSnapshotGateway
+        + InstrumentRulesGateway,
+{
+    config
+        .validate()
+        .map_err(FileStrategyStartError::InvalidConfig)?;
+    let expected_exchange = config
+        .exchange
+        .ok_or(FileStrategyStartError::MissingExchange)?;
+    let actual_exchange = gateway.exchange();
+    if actual_exchange != expected_exchange {
+        return Err(FileStrategyStartError::GatewayMismatch {
+            expected: expected_exchange,
+            actual: actual_exchange,
+        });
+    }
+    let paths = StrategyFilePaths::new(root, run_id.clone())?;
+    let lease = StrategyRuntimeLease::acquire(paths.lease())?;
+    if paths
+        .state()
+        .try_exists()
+        .map_err(FileStrategyStartError::InspectPath)?
+    {
+        return Err(FileStrategyStartError::StateAlreadyExists);
+    }
+    if paths
+        .intents()
+        .try_exists()
+        .map_err(FileStrategyStartError::InspectPath)?
+    {
+        return Err(FileStrategyStartError::UnexpectedIntentLedger);
+    }
+
+    let prepared = prepare_new_strategy(
+        &gateway,
+        run_id,
+        config,
+        now_ms,
+        settings.maximum_market_age_ms,
+        settings.maximum_future_skew_ms,
+    )
+    .await?;
+    let persisted = FilePreparedStrategyStore::create(paths.state(), prepared)?;
+    match persisted {
+        FilePreparedStrategyStore::Armed(store) => {
+            let strategy = LeasedFileArmedStrategy {
+                paths,
+                lease,
+                store: *store,
+                settings,
+            };
+            Ok(PreparedLeasedFileStrategy::Armed {
+                strategy: Box::new(strategy),
+                gateway: Box::new(gateway),
+            })
+        }
+        FilePreparedStrategyStore::Active(store) => {
+            let intent_store = FileOrderIntentStore::load(paths.intents())?;
+            let runtime = StrategyRuntime::new(
+                gateway,
+                intent_store,
+                StrategyMachine::new(*store),
+                &settings.quote_asset,
+                settings.maximum_market_age_ms,
+                settings.maximum_future_skew_ms,
+                settings.maximum_submissions_per_tick,
+            )?;
+            runtime
+                .verify_ledger_ownership()
+                .map_err(|_| FileStrategyStartError::IntentLedgerMismatch)?;
+            Ok(PreparedLeasedFileStrategy::Active(Box::new(
+                LeasedFileStrategyRuntime {
+                    paths,
+                    _lease: lease,
+                    runtime,
+                },
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FileStrategyStartError {
+    #[error("grid configuration is invalid: {0}")]
+    InvalidConfig(crate::domain::GridConfigError),
+    #[error("grid configuration must identify an exchange")]
+    MissingExchange,
+    #[error("configured gateway is for {actual:?}, but strategy requires {expected:?}")]
+    GatewayMismatch {
+        expected: crate::domain::Exchange,
+        actual: crate::domain::Exchange,
+    },
+    #[error("strategy state already exists for this run ID")]
+    StateAlreadyExists,
+    #[error("an intent ledger exists without its strategy state")]
+    UnexpectedIntentLedger,
+    #[error("failed to inspect strategy files: {0}")]
+    InspectPath(std::io::Error),
+    #[error("strategy and order-intent ledgers disagree after creation")]
+    IntentLedgerMismatch,
+    #[error(transparent)]
+    Paths(#[from] StrategyFilePathError),
+    #[error(transparent)]
+    Lease(#[from] RuntimeLeaseError),
+    #[error(transparent)]
+    Bootstrap(#[from] StrategyBootstrapError),
+    #[error(transparent)]
+    StrategyState(#[from] StrategyStoreError),
+    #[error(transparent)]
+    IntentLedger(#[from] LedgerError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeBuildError),
+}
+
 pub struct LeasedFileArmedStrategy {
     paths: StrategyFilePaths,
     lease: StrategyRuntimeLease,
     store: FileArmedStrategyStateStore,
+    settings: RuntimeSettings,
 }
 
 impl LeasedFileArmedStrategy {
-    pub fn load(paths: StrategyFilePaths) -> Result<Self, FileArmedLoadError> {
+    pub fn load(
+        paths: StrategyFilePaths,
+        settings: RuntimeSettings,
+    ) -> Result<Self, FileArmedLoadError> {
         let lease = StrategyRuntimeLease::acquire(paths.lease())?;
         let store = FileArmedStrategyStateStore::load(paths.state())?;
         if &store.snapshot().run_id != paths.run_id() {
@@ -143,6 +340,7 @@ impl LeasedFileArmedStrategy {
             paths,
             lease,
             store,
+            settings,
         })
     }
 
@@ -154,6 +352,10 @@ impl LeasedFileArmedStrategy {
         self.store.snapshot()
     }
 
+    pub fn settings(&self) -> &RuntimeSettings {
+        &self.settings
+    }
+
     pub fn cancel(&mut self, now_ms: u64) -> Result<(), StrategyStoreError> {
         self.store.cancel(now_ms)
     }
@@ -162,10 +364,6 @@ impl LeasedFileArmedStrategy {
         self,
         gateway: G,
         now_ms: u64,
-        quote_asset: &str,
-        maximum_market_age_ms: u64,
-        maximum_future_skew_ms: u64,
-        maximum_submissions_per_tick: usize,
     ) -> Result<LeasedFileStrategyRuntime<G>, FileArmedActivationError>
     where
         G: TradingFeeRateGateway
@@ -174,11 +372,6 @@ impl LeasedFileArmedStrategy {
             + MarketSnapshotGateway
             + InstrumentRulesGateway,
     {
-        validate_runtime_settings(
-            quote_asset,
-            maximum_market_age_ms,
-            maximum_submissions_per_tick,
-        )?;
         let intent_store = FileOrderIntentStore::load(self.paths.intents())?;
         if !intent_store.snapshot().intents.is_empty()
             || !intent_store.snapshot().cancellations.is_empty()
@@ -189,24 +382,25 @@ impl LeasedFileArmedStrategy {
             &gateway,
             self.store.snapshot(),
             now_ms,
-            maximum_market_age_ms,
-            maximum_future_skew_ms,
+            self.settings.maximum_market_age_ms,
+            self.settings.maximum_future_skew_ms,
         )
         .await?;
         let Self {
             paths,
             lease,
             store,
+            settings,
         } = self;
         let state_store = store.activate_prepared(active)?;
         let runtime = StrategyRuntime::new(
             gateway,
             intent_store,
             StrategyMachine::new(state_store),
-            quote_asset,
-            maximum_market_age_ms,
-            maximum_future_skew_ms,
-            maximum_submissions_per_tick,
+            &settings.quote_asset,
+            settings.maximum_market_age_ms,
+            settings.maximum_future_skew_ms,
+            settings.maximum_submissions_per_tick,
         )?;
         runtime
             .verify_ledger_ownership()
@@ -247,10 +441,7 @@ impl<G> LeasedFileStrategyRuntime<G> {
     pub fn load(
         gateway: G,
         paths: StrategyFilePaths,
-        quote_asset: &str,
-        maximum_market_age_ms: u64,
-        maximum_future_skew_ms: u64,
-        maximum_submissions_per_tick: usize,
+        settings: RuntimeSettings,
     ) -> Result<Self, FileRuntimeLoadError> {
         let lease = StrategyRuntimeLease::acquire(paths.lease())?;
         let state_store = FileStrategyStateStore::load(paths.state())?;
@@ -262,10 +453,10 @@ impl<G> LeasedFileStrategyRuntime<G> {
             gateway,
             intent_store,
             StrategyMachine::new(state_store),
-            quote_asset,
-            maximum_market_age_ms,
-            maximum_future_skew_ms,
-            maximum_submissions_per_tick,
+            &settings.quote_asset,
+            settings.maximum_market_age_ms,
+            settings.maximum_future_skew_ms,
+            settings.maximum_submissions_per_tick,
         )?;
         runtime
             .verify_ledger_ownership()
@@ -943,6 +1134,7 @@ mod tests {
 
     #[derive(Clone)]
     struct MockGateway {
+        exchange: Exchange,
         state: Arc<Mutex<MockGatewayState>>,
     }
 
@@ -968,6 +1160,7 @@ mod tests {
     impl MockGateway {
         fn new(rules: InstrumentRules, observed_at_ms: u64) -> Self {
             Self {
+                exchange: Exchange::Binance,
                 state: Arc::new(Mutex::new(MockGatewayState {
                     placement_calls: Vec::new(),
                     next_placement_error: None,
@@ -993,6 +1186,11 @@ mod tests {
                     leverage_write_calls: 0,
                 })),
             }
+        }
+
+        fn with_exchange(mut self, exchange: Exchange) -> Self {
+            self.exchange = exchange;
+            self
         }
 
         fn placement_call_count(&self) -> usize {
@@ -1185,6 +1383,12 @@ mod tests {
                     update_time_ms: trade_time_ms,
                 },
             );
+        }
+    }
+
+    impl ExchangeIdentityGateway for MockGateway {
+        fn exchange(&self) -> Exchange {
+            self.exchange
         }
     }
 
@@ -1516,6 +1720,219 @@ mod tests {
         .unwrap()
     }
 
+    fn triggered_config() -> GridConfig {
+        let mut config = config(None);
+        config.trigger_price = Some(Decimal::new(1014, 0));
+        config
+    }
+
+    fn runtime_settings() -> RuntimeSettings {
+        RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap()
+    }
+
+    #[tokio::test]
+    async fn start_service_persists_active_runtime_without_placing_any_order() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let run_id = StrategyRunId::parse("start001").unwrap();
+
+        let prepared = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            run_id,
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let PreparedLeasedFileStrategy::Active(runtime) = prepared else {
+            panic!("immediate strategy should be active");
+        };
+
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert!(runtime.paths().state().is_file());
+        assert!(
+            runtime
+                .runtime()
+                .intent_store()
+                .snapshot()
+                .intents
+                .is_empty()
+        );
+        assert!(matches!(
+            LeasedFileStrategyRuntime::load(gateway, runtime.paths().clone(), runtime_settings()),
+            Err(FileRuntimeLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_service_arms_with_only_one_public_market_read() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        gateway.set_market_price(Decimal::new(1010, 0), 1_100);
+        let run_id = StrategyRunId::parse("start002").unwrap();
+
+        let prepared = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            run_id,
+            triggered_config(),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let PreparedLeasedFileStrategy::Armed { strategy, .. } = prepared else {
+            panic!("triggered strategy should be armed");
+        };
+
+        assert_eq!(gateway.market_snapshot_call_count(), 1);
+        assert_eq!(gateway.account_preflight_call_count(), 0);
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert!(strategy.paths().state().is_file());
+        assert!(matches!(
+            LeasedFileArmedStrategy::load(strategy.paths().clone(), runtime_settings()),
+            Err(FileArmedLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_start_is_rejected_before_any_exchange_call() {
+        let directory = tempdir().unwrap();
+        let first_gateway = MockGateway::new(rules(), 1_100);
+        first_gateway.set_market_price(Decimal::new(1010, 0), 1_100);
+        let run_id = StrategyRunId::parse("start003").unwrap();
+        let first = prepare_leased_file_strategy(
+            first_gateway,
+            directory.path(),
+            run_id.clone(),
+            triggered_config(),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        drop(first);
+        let duplicate_gateway = MockGateway::new(rules(), 1_100);
+
+        assert!(matches!(
+            prepare_leased_file_strategy(
+                duplicate_gateway.clone(),
+                directory.path(),
+                run_id,
+                triggered_config(),
+                1_100,
+                runtime_settings(),
+            )
+            .await,
+            Err(FileStrategyStartError::StateAlreadyExists)
+        ));
+        assert_eq!(duplicate_gateway.all_bootstrap_call_count(), 0);
+        assert_eq!(duplicate_gateway.placement_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_and_orphan_intent_ledger_fail_before_exchange_calls() {
+        let directory = tempdir().unwrap();
+        let wrong_gateway = MockGateway::new(rules(), 1_100).with_exchange(Exchange::Aster);
+        assert!(matches!(
+            prepare_leased_file_strategy(
+                wrong_gateway.clone(),
+                directory.path(),
+                StrategyRunId::parse("start004").unwrap(),
+                triggered_config(),
+                1_100,
+                runtime_settings(),
+            )
+            .await,
+            Err(FileStrategyStartError::GatewayMismatch {
+                expected: Exchange::Binance,
+                actual: Exchange::Aster
+            })
+        ));
+        assert_eq!(wrong_gateway.all_bootstrap_call_count(), 0);
+
+        let run_id = StrategyRunId::parse("start005").unwrap();
+        let paths = StrategyFilePaths::new(directory.path(), run_id.clone()).unwrap();
+        let mut intents = FileOrderIntentStore::load(paths.intents()).unwrap();
+        intents
+            .insert_prepared(
+                OrderIntent::prepare(
+                    ClientOrderId::parse("orphan_01").unwrap(),
+                    Exchange::Binance,
+                    OrderShape {
+                        symbol: "MUUSDT".into(),
+                        side: OrderSide::Sell,
+                        price: Some(Decimal::new(1015, 0)),
+                        quantity: Decimal::new(2, 1),
+                        reduce_only: false,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                    },
+                    1_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        assert!(matches!(
+            prepare_leased_file_strategy(
+                gateway.clone(),
+                directory.path(),
+                run_id,
+                triggered_config(),
+                1_100,
+                runtime_settings(),
+            )
+            .await,
+            Err(FileStrategyStartError::UnexpectedIntentLedger)
+        ));
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_run_start_has_one_durable_winner() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let gateway = MockGateway::new(rules(), 1_100);
+        gateway.set_market_price(Decimal::new(1010, 0), 1_100);
+        let run_id = StrategyRunId::parse("start006").unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let gateway = gateway.clone();
+            let root = root.clone();
+            let run_id = run_id.clone();
+            tasks.spawn(async move {
+                prepare_leased_file_strategy(
+                    gateway,
+                    root,
+                    run_id,
+                    triggered_config(),
+                    1_100,
+                    runtime_settings(),
+                )
+                .await
+            });
+        }
+
+        let mut successes = 0;
+        let mut blocked = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(_) => successes += 1,
+                Err(FileStrategyStartError::Lease(RuntimeLeaseError::AlreadyHeld))
+                | Err(FileStrategyStartError::StateAlreadyExists) => blocked += 1,
+                Err(error) => panic!("unexpected concurrent start result: {error}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(blocked, 11);
+        assert_eq!(gateway.market_snapshot_call_count(), 1);
+        let paths = StrategyFilePaths::new(root, run_id).unwrap();
+        assert!(FileArmedStrategyStateStore::load(paths.state()).is_ok());
+    }
+
     #[test]
     fn leased_file_runtime_has_one_owner_and_releases_on_drop() {
         let directory = tempdir().unwrap();
@@ -1523,16 +1940,15 @@ mod tests {
         let paths = StrategyFilePaths::new(directory.path(), state.run_id.clone()).unwrap();
         FileStrategyStateStore::create(paths.state(), state).unwrap();
 
-        let first =
-            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100).unwrap();
+        let first = LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()).unwrap();
         assert_eq!(first.paths(), &paths);
         assert!(matches!(
-            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100),
+            LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()),
             Err(FileRuntimeLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
         ));
 
         drop(first);
-        assert!(LeasedFileStrategyRuntime::load((), paths, "USDT", 10_000, 100, 100).is_ok());
+        assert!(LeasedFileStrategyRuntime::load((), paths, runtime_settings()).is_ok());
     }
 
     #[test]
@@ -1544,7 +1960,7 @@ mod tests {
         FileStrategyStateStore::create(paths.state(), file_state()).unwrap();
 
         assert!(matches!(
-            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100),
+            LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()),
             Err(FileRuntimeLoadError::RunIdentityMismatch)
         ));
         assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
@@ -1578,7 +1994,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            LeasedFileStrategyRuntime::load((), paths.clone(), "USDT", 10_000, 100, 100),
+            LeasedFileStrategyRuntime::load((), paths.clone(), runtime_settings()),
             Err(FileRuntimeLoadError::IntentLedgerMismatch)
         ));
         assert!(StrategyRuntimeLease::acquire(paths.lease()).is_ok());
@@ -1591,15 +2007,15 @@ mod tests {
         let paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();
         FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
 
-        let mut first = LeasedFileArmedStrategy::load(paths.clone()).unwrap();
+        let mut first = LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()).unwrap();
         assert!(matches!(
-            LeasedFileArmedStrategy::load(paths.clone()),
+            LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()),
             Err(FileArmedLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
         ));
         first.cancel(1_001).unwrap();
         drop(first);
 
-        let restored = LeasedFileArmedStrategy::load(paths).unwrap();
+        let restored = LeasedFileArmedStrategy::load(paths, runtime_settings()).unwrap();
         assert_eq!(
             restored.snapshot().lifecycle,
             crate::engine::ArmedStrategyLifecycle::Cancelled
@@ -1612,13 +2028,10 @@ mod tests {
         let armed = armed_file_state();
         let paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();
         FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
-        let leased = LeasedFileArmedStrategy::load(paths.clone()).unwrap();
+        let leased = LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()).unwrap();
         let gateway = MockGateway::new(rules(), 1_100);
 
-        let active = leased
-            .activate(gateway.clone(), 1_100, "USDT", 10_000, 100, 100)
-            .await
-            .unwrap();
+        let active = leased.activate(gateway.clone(), 1_100).await.unwrap();
 
         assert_eq!(gateway.placement_call_count(), 0);
         assert_eq!(active.runtime().machine().store().snapshot().revision, 1);
@@ -1634,7 +2047,7 @@ mod tests {
         );
         assert!(FileStrategyStateStore::load(paths.state()).is_ok());
         assert!(matches!(
-            LeasedFileStrategyRuntime::load(gateway, paths, "USDT", 10_000, 100, 100),
+            LeasedFileStrategyRuntime::load(gateway, paths, runtime_settings()),
             Err(FileRuntimeLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
         ));
     }
@@ -1646,14 +2059,12 @@ mod tests {
         let paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();
         FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
         let bytes_before = std::fs::read(paths.state()).unwrap();
-        let leased = LeasedFileArmedStrategy::load(paths.clone()).unwrap();
+        let leased = LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()).unwrap();
         let gateway = MockGateway::new(rules(), 1_100);
         gateway.set_market_price(Decimal::new(1013, 0), 1_100);
 
         assert!(matches!(
-            leased
-                .activate(gateway.clone(), 1_100, "USDT", 10_000, 100, 100)
-                .await,
+            leased.activate(gateway.clone(), 1_100).await,
             Err(FileArmedActivationError::Bootstrap(
                 StrategyBootstrapError::TriggerNotReached
             ))
@@ -1662,31 +2073,41 @@ mod tests {
         assert_eq!(gateway.market_snapshot_call_count(), 1);
         assert_eq!(gateway.account_preflight_call_count(), 0);
         assert_eq!(std::fs::read(paths.state()).unwrap(), bytes_before);
-        assert!(LeasedFileArmedStrategy::load(paths).is_ok());
+        assert!(LeasedFileArmedStrategy::load(paths, runtime_settings()).is_ok());
     }
 
-    #[tokio::test]
-    async fn invalid_runtime_settings_block_before_armed_state_transition() {
+    #[test]
+    fn invalid_runtime_settings_cannot_construct_an_armed_runtime() {
         let directory = tempdir().unwrap();
         let armed = armed_file_state();
         let paths = StrategyFilePaths::new(directory.path(), armed.run_id.clone()).unwrap();
         FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
         let bytes_before = std::fs::read(paths.state()).unwrap();
-        let leased = LeasedFileArmedStrategy::load(paths.clone()).unwrap();
         let gateway = MockGateway::new(rules(), 1_100);
 
         assert!(matches!(
-            leased
-                .activate(gateway.clone(), 1_100, "USDT", 0, 100, 100)
-                .await,
-            Err(FileArmedActivationError::Runtime(
-                RuntimeBuildError::InvalidFreshnessWindow
+            RuntimeSettings::new("USDT", 0, 100, 100),
+            Err(RuntimeBuildError::InvalidFreshnessWindow)
+        ));
+        assert!(matches!(
+            RuntimeSettings::new("USDT", 10_000, 100, 0),
+            Err(RuntimeBuildError::InvalidSubmissionLimit)
+        ));
+        assert!(matches!(
+            RuntimeSettings::new("USDT/BNB", 10_000, 100, 100),
+            Err(RuntimeBuildError::ExecutionAccounting(
+                ExecutionAccountingError::InvalidQuoteAsset
             ))
         ));
+        let valid = runtime_settings();
+        assert_eq!(valid.quote_asset(), "USDT");
+        assert_eq!(valid.maximum_market_age_ms(), 10_000);
+        assert_eq!(valid.maximum_future_skew_ms(), 100);
+        assert_eq!(valid.maximum_submissions_per_tick(), 100);
         assert_eq!(gateway.placement_call_count(), 0);
         assert_eq!(gateway.all_bootstrap_call_count(), 0);
         assert_eq!(std::fs::read(paths.state()).unwrap(), bytes_before);
-        assert!(LeasedFileArmedStrategy::load(paths).is_ok());
+        assert!(LeasedFileArmedStrategy::load(paths, runtime_settings()).is_ok());
     }
 
     #[tokio::test]
@@ -1716,19 +2137,17 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let leased = LeasedFileArmedStrategy::load(paths.clone()).unwrap();
+        let leased = LeasedFileArmedStrategy::load(paths.clone(), runtime_settings()).unwrap();
         let gateway = MockGateway::new(rules(), 1_100);
 
         assert!(matches!(
-            leased
-                .activate(gateway.clone(), 1_100, "USDT", 10_000, 100, 100)
-                .await,
+            leased.activate(gateway.clone(), 1_100).await,
             Err(FileArmedActivationError::IntentLedgerMismatch)
         ));
         assert_eq!(gateway.placement_call_count(), 0);
         assert_eq!(gateway.all_bootstrap_call_count(), 0);
         assert_eq!(std::fs::read(paths.state()).unwrap(), bytes_before);
-        assert!(LeasedFileArmedStrategy::load(paths).is_ok());
+        assert!(LeasedFileArmedStrategy::load(paths, runtime_settings()).is_ok());
     }
 
     #[tokio::test]

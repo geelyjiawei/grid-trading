@@ -8,13 +8,14 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, InstrumentRules, OrderIntent},
     exchange::{
-        CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
-        ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
-        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
-        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        CancellationAcknowledgement, CancellationError, ExchangeIdentityGateway,
+        ExchangeMarketSnapshot, ExecutionSnapshotError, ExecutionSnapshotGateway,
+        HistoricalMinutePrice, HistoricalPriceGateway, InstrumentRulesGateway,
+        LeverageAcknowledgement, LeverageError, LeverageGateway, LookupError,
+        MarketSnapshotGateway, OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup,
+        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
+        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
+        TradingFeeRates,
         aster::{AsterAdapter, AsterSignatureError, LocalEip712Signer},
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
@@ -234,6 +235,12 @@ impl ConfiguredExchangeGateway {
             Self::Aster(_) => Exchange::Aster,
             Self::Bybit(_) => Exchange::Bybit,
         }
+    }
+}
+
+impl ExchangeIdentityGateway for ConfiguredExchangeGateway {
+    fn exchange(&self) -> Exchange {
+        ConfiguredExchangeGateway::exchange(self)
     }
 }
 

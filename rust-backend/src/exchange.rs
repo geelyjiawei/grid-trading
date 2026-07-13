@@ -9,6 +9,10 @@ use crate::domain::{
     ClientOrderId, Exchange, InstrumentRules, OrderIntent, OrderShape, TerminalOrderStatus,
 };
 
+pub trait ExchangeIdentityGateway: Send + Sync {
+    fn exchange(&self) -> Exchange;
+}
+
 pub mod aster;
 pub mod binance;
 pub mod bybit;

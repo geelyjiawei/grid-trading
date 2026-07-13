@@ -188,6 +188,12 @@ the OpenAPI schema.
 - Runtime state, order-intent ledger, and lease paths are derived from one validated run ID.
   Loading acquires the lease first, then verifies the persisted run ID and cross-ledger ownership;
   any mismatch prevents the runtime from becoming visible and performs no exchange operation.
+- Runtime settings are validated once into an immutable value, so quote asset, freshness window,
+  clock skew, and submission limit cannot be positionally swapped during start, recovery, or
+  trigger activation. New-strategy orchestration validates gateway exchange identity before
+  acquiring its run lease. Under that lease it rejects an existing state or orphan intent ledger
+  before reading exchange data. Concurrent starts for one run have exactly one durable winner;
+  persistence alone never submits an order.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
   rule, baseline, runtime-setting, or intent-ledger failure leaves the armed bytes unchanged
   and creates no order. Successful activation transfers the same held runtime lease without
