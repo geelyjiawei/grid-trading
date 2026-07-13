@@ -211,6 +211,7 @@ mod tests {
                 entry_price: Some(Decimal::new(101125, 2)),
                 mark_price: Decimal::new(1010, 0),
                 unrealized_profit: Decimal::new(375, 2),
+                leverage: Some(5),
             }],
         }
     }
@@ -266,6 +267,7 @@ mod tests {
                     entry_price: Some(Decimal::new(1000, 0)),
                     mark_price: Decimal::new(1010, 0),
                     unrealized_profit: Decimal::new(20, 0),
+                    leverage: Some(5),
                 },
                 PositionLeg {
                     side: PositionSide::Short,
@@ -273,6 +275,7 @@ mod tests {
                     entry_price: Some(Decimal::new(1020, 0)),
                     mark_price: Decimal::new(1010, 0),
                     unrealized_profit: Decimal::new(10, 0),
+                    leverage: Some(5),
                 },
             ],
         });

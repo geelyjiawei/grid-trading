@@ -12,14 +12,16 @@ use crate::{
     exchange::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
-        HistoricalPriceGateway, InstrumentRulesGateway, LookupError, MarketSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
+        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError,
         bybit_codec::{
             parse_cancellation_acknowledgement, parse_error, parse_exact_order_record,
             parse_execution_page, parse_historical_minute_open, parse_instrument_rules,
-            parse_market_snapshot, parse_placement_acknowledgement, parse_position_snapshot,
+            parse_leverage_acknowledgement, parse_market_snapshot, parse_placement_acknowledgement,
+            parse_position_snapshot,
         },
         codec::validate_snapshot_request,
         execution::assemble_execution_snapshot,
@@ -314,6 +316,86 @@ struct CancelOrderPayload<'a> {
     symbol: &'a str,
     order_id: &'a str,
     order_link_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetLeveragePayload<'a> {
+    category: &'static str,
+    symbol: &'a str,
+    buy_leverage: String,
+    sell_leverage: String,
+}
+
+#[async_trait]
+impl<T, S, C> LeverageGateway for BybitAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BybitRequestSigner,
+    C: MillisecondClock,
+{
+    async fn set_leverage(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        leverage: u16,
+    ) -> Result<LeverageAcknowledgement, LeverageError> {
+        if exchange != Exchange::Bybit {
+            return Err(invalid_leverage("request belongs to another exchange"));
+        }
+        if symbol.trim().is_empty()
+            || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !(1..=125).contains(&leverage)
+        {
+            return Err(invalid_leverage("symbol or leverage is invalid"));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let leverage_text = leverage.to_string();
+        let payload = SetLeveragePayload {
+            category: CATEGORY,
+            symbol: &symbol,
+            buy_leverage: leverage_text.clone(),
+            sell_leverage: leverage_text,
+        };
+        let request = self
+            .signed_post("/v5/position/set-leverage", &payload)
+            .map_err(|error| invalid_leverage(error.to_string()))?;
+        let response =
+            self.transport
+                .execute(request)
+                .await
+                .map_err(|error| LeverageError::Unknown {
+                    message: error.to_string(),
+                })?;
+        let error = parse_error(&response.body);
+        if (200..300).contains(&response.status)
+            && matches!(error.code.as_deref(), Some("0" | "110043"))
+        {
+            return parse_leverage_acknowledgement(&response.body, &symbol, leverage).map_err(
+                |codec_error| LeverageError::Unknown {
+                    message: format!("Bybit leverage acknowledgement is invalid: {codec_error}"),
+                },
+            );
+        }
+        if response.status == 408
+            || response.status == 429
+            || response.status >= 500
+            || error.code.as_deref() == Some("0")
+            || error
+                .code
+                .as_deref()
+                .is_none_or(bybit_write_outcome_is_unknown)
+        {
+            Err(LeverageError::Unknown {
+                message: error.message,
+            })
+        } else {
+            Err(LeverageError::Definitive {
+                code: error.code,
+                message: error.message,
+            })
+        }
+    }
 }
 
 #[async_trait]
@@ -725,6 +807,12 @@ fn definitive_placement(message: impl Into<String>) -> PlacementError {
     }
 }
 
+fn invalid_leverage(message: impl Into<String>) -> LeverageError {
+    LeverageError::Invalid {
+        message: message.into(),
+    }
+}
+
 fn invalid_cancellation(message: impl Into<String>) -> CancellationError {
     CancellationError::Invalid {
         message: message.into(),
@@ -901,6 +989,33 @@ mod tests {
         assert!(!rendered.contains("test-key"));
         assert!(!rendered.contains(&expected_signature));
         assert!(!rendered.contains(exact_body));
+    }
+
+    #[tokio::test]
+    async fn leverage_change_signs_exact_json_and_accepts_already_configured_code() {
+        let transport = MockTransport::with_response(ok(
+            r#"{"retCode":110043,"retMsg":"Set leverage not modified","result":{},"time":1700000000124}"#,
+        ));
+        let acknowledgement = adapter(transport.clone())
+            .set_leverage(Exchange::Bybit, "muusdt", 5)
+            .await
+            .unwrap();
+        let request = &transport.requests()[0];
+        let exact_body =
+            r#"{"category":"linear","symbol":"MUUSDT","buyLeverage":"5","sellLeverage":"5"}"#;
+
+        assert_eq!(acknowledgement.leverage, 5);
+        assert_eq!(request.path, "/v5/position/set-leverage");
+        assert_eq!(request.body_string(), exact_body);
+        let expected_signature = BybitHmacSha256Signer::new("test-secret")
+            .unwrap()
+            .sign(&format!("1700000000123test-key5000{exact_body}"))
+            .unwrap();
+        assert!(
+            request
+                .headers
+                .contains(&("X-BAPI-SIGN".into(), expected_signature))
+        );
     }
 
     #[tokio::test]
@@ -1209,7 +1324,7 @@ mod tests {
             r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"MUUSDT","lastPrice":"1001","markPrice":"1000"}]},"time":1700000000123}"#,
         ));
         short_transport.push(ok(
-            r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"MUUSDT","positionIdx":0,"side":"Sell","size":"3","avgPrice":"1011","markPrice":"1000","unrealisedPnl":"33"}]},"time":1700000000123}"#,
+            r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"MUUSDT","positionIdx":0,"side":"Sell","size":"3","avgPrice":"1011","markPrice":"1000","unrealisedPnl":"33","leverage":"5"}]},"time":1700000000123}"#,
         ));
         let snapshot = adapter(short_transport.clone())
             .position_snapshot(Exchange::Bybit, "MUUSDT")
@@ -1219,6 +1334,7 @@ mod tests {
             snapshot.one_way_position().unwrap(),
             (Decimal::new(-3, 0), Some(Decimal::new(1011, 0)))
         );
+        assert_eq!(snapshot.one_way_leverage().unwrap(), 5);
         assert_eq!(short_transport.requests().len(), 2);
         assert!(short_transport.requests()[0].headers.is_empty());
         assert!(!short_transport.requests()[1].headers.is_empty());

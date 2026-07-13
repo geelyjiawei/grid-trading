@@ -9,8 +9,8 @@ use crate::{
     },
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
-        OrderLifecycle, PlacementAcknowledgement, PositionLeg, PositionSide, PositionSnapshot,
-        SnapshotError, protocol::Parameters,
+        LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
+        PositionSide, PositionSnapshot, SnapshotError, protocol::Parameters,
     },
 };
 
@@ -188,12 +188,14 @@ pub(super) fn parse_position_snapshot(
             row,
             &["unRealizedProfit", "unrealizedProfit", "unrealisedPnl"],
         )?;
+        let leverage = optional_positive_u16(row, "leverage")?;
         legs.push(PositionLeg {
             side,
             signed_quantity,
             entry_price,
             mark_price,
             unrealized_profit,
+            leverage,
         });
     }
     if legs.is_empty() {
@@ -208,6 +210,27 @@ pub(super) fn parse_position_snapshot(
         exchange,
         symbol: expected_symbol.to_ascii_uppercase(),
         legs,
+    })
+}
+
+pub(super) fn parse_leverage_acknowledgement(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_leverage: u16,
+) -> Result<LeverageAcknowledgement, CodecError> {
+    let root = parse_json(body)?;
+    require_symbol(&root, expected_symbol)?;
+    let leverage = required_scalar_text(&root, "leverage")?
+        .parse::<u16>()
+        .map_err(|_| CodecError::InvalidField("leverage"))?;
+    if leverage == 0 || leverage != expected_leverage {
+        return Err(CodecError::InvalidField("leverage"));
+    }
+    Ok(LeverageAcknowledgement {
+        exchange,
+        symbol: expected_symbol.to_ascii_uppercase(),
+        leverage,
     })
 }
 
@@ -517,6 +540,21 @@ fn required_bool(value: &Value, field: &'static str) -> Result<bool, CodecError>
     }
 }
 
+fn optional_positive_u16(value: &Value, field: &'static str) -> Result<Option<u16>, CodecError> {
+    let Some(raw) = value.get(field) else {
+        return Ok(None);
+    };
+    let leverage = json_scalar_text(raw)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or(CodecError::InvalidField(field))?
+        .parse::<u16>()
+        .map_err(|_| CodecError::InvalidField(field))?;
+    if leverage == 0 {
+        return Err(CodecError::InvalidField(field));
+    }
+    Ok(Some(leverage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +578,27 @@ mod tests {
         assert_eq!(
             order.lifecycle,
             OrderLifecycle::Active(ActiveOrderStatus::New)
+        );
+    }
+
+    #[test]
+    fn leverage_acknowledgement_requires_exact_symbol_and_value() {
+        let acknowledgement = parse_leverage_acknowledgement(
+            r#"{"symbol":"MUUSDT","leverage":5,"maxNotionalValue":"100000"}"#,
+            Exchange::Binance,
+            "MUUSDT",
+            5,
+        )
+        .unwrap();
+        assert_eq!(acknowledgement.leverage, 5);
+        assert!(
+            parse_leverage_acknowledgement(
+                r#"{"symbol":"MUUSDT","leverage":3}"#,
+                Exchange::Binance,
+                "MUUSDT",
+                5,
+            )
+            .is_err()
         );
     }
 

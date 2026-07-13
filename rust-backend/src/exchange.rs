@@ -44,6 +44,36 @@ pub trait OrderPlacementGateway: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeverageAcknowledgement {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub leverage: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LeverageError {
+    #[error("leverage request is invalid: {message}")]
+    Invalid { message: String },
+    #[error("exchange definitively rejected leverage: {message}")]
+    Definitive {
+        code: Option<String>,
+        message: String,
+    },
+    #[error("exchange leverage outcome is unknown: {message}")]
+    Unknown { message: String },
+}
+
+#[async_trait]
+pub trait LeverageGateway: Send + Sync {
+    async fn set_leverage(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        leverage: u16,
+    ) -> Result<LeverageAcknowledgement, LeverageError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancellationAcknowledgement {
     pub client_order_id: ClientOrderId,
     pub exchange_order_id: String,
@@ -270,6 +300,8 @@ pub struct PositionLeg {
     pub entry_price: Option<Decimal>,
     pub mark_price: Decimal,
     pub unrealized_profit: Decimal,
+    #[serde(default)]
+    pub leverage: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -287,6 +319,18 @@ impl PositionSnapshot {
             ));
         }
         Ok((self.legs[0].signed_quantity, self.legs[0].entry_price))
+    }
+
+    pub fn one_way_leverage(&self) -> Result<u16, SnapshotError> {
+        if self.legs.len() != 1 || self.legs[0].side != PositionSide::Both {
+            return Err(SnapshotError::new(
+                "hedge-mode position has no single strategy leverage",
+            ));
+        }
+        self.legs[0]
+            .leverage
+            .filter(|leverage| *leverage > 0)
+            .ok_or_else(|| SnapshotError::new("position leverage is unavailable"))
     }
 }
 
@@ -350,5 +394,20 @@ mod snapshot_tests {
         assert!(snapshot(10_000).ensure_fresh(10_500, 1_000, 100).is_ok());
         assert!(snapshot(9_000).ensure_fresh(10_500, 1_000, 100).is_err());
         assert!(snapshot(10_601).ensure_fresh(10_500, 1_000, 100).is_err());
+    }
+
+    #[test]
+    fn legacy_position_leg_without_leverage_remains_readable_but_not_verified() {
+        let leg: PositionLeg = serde_json::from_str(
+            r#"{"side":"Both","signed_quantity":"0","entry_price":null,"mark_price":"1010","unrealized_profit":"0"}"#,
+        )
+        .unwrap();
+        assert_eq!(leg.leverage, None);
+        let position = PositionSnapshot {
+            exchange: Exchange::Binance,
+            symbol: "MUUSDT".into(),
+            legs: vec![leg],
+        };
+        assert!(position.one_way_leverage().is_err());
     }
 }

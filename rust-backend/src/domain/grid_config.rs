@@ -109,7 +109,7 @@ pub enum GridConfigError {
     InvalidRange,
     #[error("grid_count must be between 2 and 100")]
     InvalidGridCount,
-    #[error("leverage must be greater than zero")]
+    #[error("leverage must be between 1 and 125")]
     InvalidLeverage,
     #[error("investment sizing requires positive total_investment")]
     InvalidInvestment,
@@ -135,7 +135,7 @@ impl GridConfig {
         if !(2..=100).contains(&self.grid_count) {
             return Err(GridConfigError::InvalidGridCount);
         }
-        if self.leverage == 0 {
+        if !(1..=125).contains(&self.leverage) {
             return Err(GridConfigError::InvalidLeverage);
         }
         match self.position_sizing_mode {
@@ -204,5 +204,12 @@ mod tests {
         let mut config = fixed_config();
         config.lower_price = config.upper_price;
         assert_eq!(config.validate(), Err(GridConfigError::InvalidRange));
+    }
+
+    #[test]
+    fn rejects_leverage_outside_supported_futures_range() {
+        let mut config = fixed_config();
+        config.leverage = 126;
+        assert_eq!(config.validate(), Err(GridConfigError::InvalidLeverage));
     }
 }

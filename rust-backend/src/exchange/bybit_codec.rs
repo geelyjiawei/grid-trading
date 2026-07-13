@@ -11,8 +11,9 @@ use crate::{
     },
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
-        HistoricalMinutePrice, OrderLifecycle, PlacementAcknowledgement, PositionLeg, PositionSide,
-        PositionSnapshot, TradeFill, execution::OrderExecutionHeader, is_valid_trade_id,
+        HistoricalMinutePrice, LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement,
+        PositionLeg, PositionSide, PositionSnapshot, TradeFill, execution::OrderExecutionHeader,
+        is_valid_trade_id,
     },
 };
 
@@ -88,6 +89,32 @@ pub(super) fn parse_cancellation_acknowledgement(
     Ok(CancellationAcknowledgement {
         client_order_id: expected_client_order_id.clone(),
         exchange_order_id: expected_exchange_order_id.into(),
+    })
+}
+
+pub(super) fn parse_leverage_acknowledgement(
+    body: &str,
+    expected_symbol: &str,
+    expected_leverage: u16,
+) -> Result<LeverageAcknowledgement, BybitCodecError> {
+    let root: Value = serde_json::from_str(body)
+        .map_err(|error| BybitCodecError::InvalidJson(error.to_string()))?;
+    let code = required_i64(&root, "retCode")?;
+    if !matches!(code, 0 | 110043) {
+        return Err(BybitCodecError::ExchangeRejected);
+    }
+    if code == 0 {
+        result_object(&root)?;
+    } else {
+        required_string(&root, "retMsg")?;
+    }
+    if expected_leverage == 0 {
+        return Err(BybitCodecError::InvalidField("leverage"));
+    }
+    Ok(LeverageAcknowledgement {
+        exchange: Exchange::Bybit,
+        symbol: expected_symbol.to_ascii_uppercase(),
+        leverage: expected_leverage,
     })
 }
 
@@ -444,22 +471,18 @@ pub(super) fn parse_position_snapshot(
             _ => return Err(BybitCodecError::InvalidField("markPrice")),
         };
         let unrealized_profit = optional_decimal(row, "unrealisedPnl")?.unwrap_or(Decimal::ZERO);
+        let leverage = optional_positive_u16(row, "leverage")?;
         legs.push(PositionLeg {
             side,
             signed_quantity,
             entry_price,
             mark_price,
             unrealized_profit,
+            leverage,
         });
     }
     if legs.is_empty() {
-        legs.push(PositionLeg {
-            side: PositionSide::Both,
-            signed_quantity: Decimal::ZERO,
-            entry_price: None,
-            mark_price: fallback_mark_price,
-            unrealized_profit: Decimal::ZERO,
-        });
+        return Err(BybitCodecError::InvalidField("positions"));
     }
     if indexes.contains(&0) && indexes.len() != 1 {
         return Err(BybitCodecError::InvalidField("positionIdx"));
@@ -628,6 +651,23 @@ fn optional_decimal(
     }
 }
 
+fn optional_positive_u16(
+    value: &Value,
+    field: &'static str,
+) -> Result<Option<u16>, BybitCodecError> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.is_empty() => Ok(None),
+        Some(item) => {
+            let leverage = scalar_text(item)
+                .and_then(|text| text.parse::<u16>().ok())
+                .filter(|leverage| *leverage > 0)
+                .ok_or(BybitCodecError::InvalidField(field))?;
+            Ok(Some(leverage))
+        }
+    }
+}
+
 fn required_u64(value: &Value, field: &'static str) -> Result<u64, BybitCodecError> {
     value
         .get(field)
@@ -752,7 +792,7 @@ mod tests {
         assert_eq!(rules.market_quantity.max, Some(Decimal::new(50, 0)));
 
         let position = parse_position_snapshot(
-            r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"MUUSDT","positionIdx":0,"side":"Sell","size":"3","avgPrice":"1011","markPrice":"1000","unrealisedPnl":"33"}]}}"#,
+            r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"MUUSDT","positionIdx":0,"side":"Sell","size":"3","avgPrice":"1011","markPrice":"1000","unrealisedPnl":"33","leverage":"5"}]}}"#,
             "MUUSDT",
             Decimal::new(999, 0),
         )
@@ -761,6 +801,7 @@ mod tests {
             position.one_way_position().unwrap(),
             (Decimal::new(-3, 0), Some(Decimal::new(1011, 0)))
         );
+        assert_eq!(position.one_way_leverage().unwrap(), 5);
     }
 
     #[test]
@@ -777,9 +818,8 @@ mod tests {
             r#"{"retCode":0,"result":{"category":"linear","list":[]}}"#,
             "MUUSDT",
             Decimal::new(1000, 0),
-        )
-        .unwrap();
-        assert_eq!(flat.one_way_position().unwrap(), (Decimal::ZERO, None));
+        );
+        assert_eq!(flat, Err(BybitCodecError::InvalidField("positions")));
 
         assert!(parse_position_snapshot(
             r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"MUUSDT","positionIdx":0,"side":"Sell","size":"1","avgPrice":"1011","markPrice":"-1","unrealisedPnl":"0"}]}}"#,
@@ -787,6 +827,31 @@ mod tests {
             Decimal::new(1000, 0),
         )
         .is_err());
+    }
+
+    #[test]
+    fn leverage_acknowledgement_accepts_only_success_or_already_configured() {
+        let changed = parse_leverage_acknowledgement(
+            r#"{"retCode":0,"retMsg":"OK","result":{}}"#,
+            "MUUSDT",
+            5,
+        )
+        .unwrap();
+        let unchanged = parse_leverage_acknowledgement(
+            r#"{"retCode":110043,"retMsg":"Set leverage not modified"}"#,
+            "MUUSDT",
+            5,
+        )
+        .unwrap();
+        assert_eq!(changed, unchanged);
+        assert!(
+            parse_leverage_acknowledgement(
+                r#"{"retCode":10001,"retMsg":"bad leverage"}"#,
+                "MUUSDT",
+                5,
+            )
+            .is_err()
+        );
     }
 
     #[test]

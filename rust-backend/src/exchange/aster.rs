@@ -9,15 +9,16 @@ use crate::{
     exchange::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
-        HistoricalPriceGateway, InstrumentRulesGateway, LookupError, MarketSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
+        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
-            parse_instrument_rules, parse_market_snapshot, parse_placement_acknowledgement,
-            parse_position_snapshot, validate_snapshot_request,
+            parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
+            parse_placement_acknowledgement, parse_position_snapshot, validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -44,6 +45,76 @@ const TRADE_WINDOW_LIMIT_MS: u64 = (7 * 24 * 60 * 60 * 1_000) - 1;
 pub trait AsterMessageSigner: Send + Sync {
     fn signer_address(&self) -> &str;
     fn sign_eip712_message(&self, message: &str) -> Result<String, AsterSignatureError>;
+}
+
+#[async_trait]
+impl<T, S, N> LeverageGateway for AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    async fn set_leverage(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        leverage: u16,
+    ) -> Result<LeverageAcknowledgement, LeverageError> {
+        if exchange != Exchange::Aster {
+            return Err(invalid_leverage("request belongs to another exchange"));
+        }
+        if symbol.trim().is_empty()
+            || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !(1..=125).contains(&leverage)
+        {
+            return Err(invalid_leverage("symbol or leverage is invalid"));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Post,
+                "/fapi/v3/leverage",
+                vec![
+                    ("symbol".into(), symbol.clone()),
+                    ("leverage".into(), leverage.to_string()),
+                ],
+            )
+            .map_err(|error| invalid_leverage(error.to_string()))?;
+        let response =
+            self.transport
+                .execute(request)
+                .await
+                .map_err(|error| LeverageError::Unknown {
+                    message: error.to_string(),
+                })?;
+        if (200..300).contains(&response.status) {
+            return parse_leverage_acknowledgement(
+                &response.body,
+                Exchange::Aster,
+                &symbol,
+                leverage,
+            )
+            .map_err(|error| LeverageError::Unknown {
+                message: format!("Aster leverage acknowledgement is invalid: {error}"),
+            });
+        }
+        let error = parse_exchange_error(&response.body);
+        if response.status < 400
+            || response.status == 408
+            || response.status == 429
+            || response.status >= 500
+            || execution_status_is_unknown(error.code.as_deref())
+        {
+            Err(LeverageError::Unknown {
+                message: error.message,
+            })
+        } else {
+            Err(LeverageError::Definitive {
+                code: error.code,
+                message: error.message,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -812,6 +883,12 @@ fn definitive_local_error(message: &str) -> PlacementError {
     }
 }
 
+fn invalid_leverage(message: impl Into<String>) -> LeverageError {
+    LeverageError::Invalid {
+        message: message.into(),
+    }
+}
+
 fn lookup_error(message: &str) -> LookupError {
     LookupError {
         message: message.into(),
@@ -1133,6 +1210,36 @@ mod tests {
         assert_eq!(
             request.body_string(),
             format!("{expected_message}&signature=0xfixed-signature")
+        );
+    }
+
+    #[tokio::test]
+    async fn leverage_change_uses_exact_signed_v3_body_and_acknowledgement() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"symbol":"ANSEMUSDT","leverage":5,"maxNotionalValue":"100000"}"#.into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let acknowledgement = adapter(transport.clone(), signer.clone())
+            .set_leverage(Exchange::Aster, "ansemusdt", 5)
+            .await
+            .unwrap();
+        let request = transport.request();
+        let expected_message = concat!(
+            "symbol=ANSEMUSDT&leverage=5&nonce=1700000000123456&",
+            "user=0x1111111111111111111111111111111111111111&",
+            "signer=0x2222222222222222222222222222222222222222"
+        );
+
+        assert_eq!(acknowledgement.leverage, 5);
+        assert_eq!(request.path, "/fapi/v3/leverage");
+        assert_eq!(
+            request.body_string(),
+            format!("{expected_message}&signature=0xfixed-signature")
+        );
+        assert_eq!(
+            signer.messages.lock().unwrap().as_slice(),
+            [expected_message]
         );
     }
 

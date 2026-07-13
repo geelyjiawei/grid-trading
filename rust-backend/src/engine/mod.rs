@@ -4,6 +4,7 @@ mod exchange_inputs;
 mod execution_accounting;
 mod execution_sync;
 mod grid_plan;
+mod leverage;
 mod reconciliation;
 mod runtime;
 mod strategy_machine;
@@ -27,6 +28,7 @@ pub use grid_plan::{
     GridOrderRole, GridPlan, GridPlanError, MarketSnapshot, PlannedGridOrder, PlannedOpeningOrder,
     build_grid_plan,
 };
+pub use leverage::{LeveragePreflightError, LeveragePreflightResult, ensure_symbol_leverage};
 pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };

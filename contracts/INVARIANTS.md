@@ -86,6 +86,15 @@ the OpenAPI schema.
 
 ## Position ownership
 
+- Configured leverage is not trusted from the browser request alone. Before activation,
+  the selected exchange and symbol must report the exact requested one-way leverage.
+- Leverage is changed only when the authoritative position snapshot differs. A successful
+  change acknowledgement is followed by another authoritative snapshot before any order
+  may be prepared. A timeout is resolved only by observing the exact requested leverage;
+  otherwise activation remains blocked.
+- An empty Bybit position list for an explicitly requested symbol is malformed, not proof
+  of a flat position. Missing leverage and hedge-mode leverage cannot be silently converted
+  into one-way strategy settings.
 - Position at grid start is the baseline and is never silently absorbed by the grid.
 - Strategy initialization obtains market price, instrument rules, and position directly
   from the selected exchange and accepts the bundle only when exchange and symbol

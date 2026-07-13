@@ -9,15 +9,16 @@ use crate::{
     exchange::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
-        HistoricalPriceGateway, InstrumentRulesGateway, LookupError, MarketSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
+        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
-            parse_instrument_rules, parse_market_snapshot, parse_placement_acknowledgement,
-            parse_position_snapshot, validate_snapshot_request,
+            parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
+            parse_placement_acknowledgement, parse_position_snapshot, validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -37,6 +38,76 @@ const MAX_TRADE_PAGES: usize = 64;
 
 pub trait BinanceRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, SignatureError>;
+}
+
+#[async_trait]
+impl<T, S, C> LeverageGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn set_leverage(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        leverage: u16,
+    ) -> Result<LeverageAcknowledgement, LeverageError> {
+        if exchange != Exchange::Binance {
+            return Err(invalid_leverage("request belongs to another exchange"));
+        }
+        if symbol.trim().is_empty()
+            || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !(1..=125).contains(&leverage)
+        {
+            return Err(invalid_leverage("symbol or leverage is invalid"));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Post,
+                "/fapi/v1/leverage",
+                vec![
+                    ("symbol".into(), symbol.clone()),
+                    ("leverage".into(), leverage.to_string()),
+                ],
+            )
+            .map_err(|error| invalid_leverage(error.to_string()))?;
+        let response =
+            self.transport
+                .execute(request)
+                .await
+                .map_err(|error| LeverageError::Unknown {
+                    message: error.to_string(),
+                })?;
+        if (200..300).contains(&response.status) {
+            return parse_leverage_acknowledgement(
+                &response.body,
+                Exchange::Binance,
+                &symbol,
+                leverage,
+            )
+            .map_err(|error| LeverageError::Unknown {
+                message: format!("Binance leverage acknowledgement is invalid: {error}"),
+            });
+        }
+        let error = parse_exchange_error(&response.body);
+        if response.status < 400
+            || response.status == 408
+            || response.status == 429
+            || response.status >= 500
+            || execution_status_is_unknown(error.code.as_deref())
+        {
+            Err(LeverageError::Unknown {
+                message: error.message,
+            })
+        } else {
+            Err(LeverageError::Definitive {
+                code: error.code,
+                message: error.message,
+            })
+        }
+    }
 }
 
 #[async_trait]
@@ -618,6 +689,12 @@ fn definitive_local_error(message: &str) -> PlacementError {
     }
 }
 
+fn invalid_leverage(message: impl Into<String>) -> LeverageError {
+    LeverageError::Invalid {
+        message: message.into(),
+    }
+}
+
 fn lookup_error(message: &str) -> LookupError {
     LookupError {
         message: message.into(),
@@ -853,7 +930,8 @@ mod tests {
             status: 200,
             body: r#"[{
                 "symbol":"MUUSDT","positionSide":"BOTH","positionAmt":"-3",
-                "entryPrice":"1011.25","markPrice":"1008.10","unRealizedProfit":"9.45"
+                "entryPrice":"1011.25","markPrice":"1008.10","unRealizedProfit":"9.45",
+                "leverage":"5"
             }]"#
             .into(),
         }));
@@ -866,9 +944,41 @@ mod tests {
             snapshot.one_way_position().unwrap(),
             (Decimal::new(-3, 0), Some(Decimal::new(101125, 2)))
         );
+        assert_eq!(snapshot.one_way_leverage().unwrap(), 5);
         let request = transport.request();
         assert_eq!(request.path, "/fapi/v3/positionRisk");
         assert!(request.query_string().contains("signature="));
+    }
+
+    #[tokio::test]
+    async fn leverage_change_is_signed_and_requires_exact_acknowledgement() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"symbol":"MUUSDT","leverage":5,"maxNotionalValue":"100000"}"#.into(),
+        }));
+        let acknowledgement = adapter(transport.clone())
+            .set_leverage(Exchange::Binance, "muusdt", 5)
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(acknowledgement.symbol, "MUUSDT");
+        assert_eq!(acknowledgement.leverage, 5);
+        assert_eq!(request.path, "/fapi/v1/leverage");
+        assert!(request.query_string().starts_with(
+            "symbol=MUUSDT&leverage=5&timestamp=1700000000123&recvWindow=5000&signature="
+        ));
+
+        let malformed = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"symbol":"MUUSDT","leverage":3}"#.into(),
+        }));
+        assert!(matches!(
+            adapter(malformed)
+                .set_leverage(Exchange::Binance, "MUUSDT", 5)
+                .await,
+            Err(LeverageError::Unknown { .. })
+        ));
     }
 
     #[tokio::test]

@@ -10,10 +10,11 @@ use crate::{
     exchange::{
         CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice,
-        HistoricalPriceGateway, InstrumentRulesGateway, LookupError, MarketSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OrderCancellationGateway,
+        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError,
         aster::{AsterAdapter, AsterSignatureError, LocalEip712Signer},
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
@@ -251,6 +252,22 @@ impl OrderPlacementGateway for ConfiguredExchangeGateway {
 }
 
 #[async_trait]
+impl LeverageGateway for ConfiguredExchangeGateway {
+    async fn set_leverage(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        leverage: u16,
+    ) -> Result<LeverageAcknowledgement, LeverageError> {
+        match self {
+            Self::Binance(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
+            Self::Aster(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
+            Self::Bybit(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
+        }
+    }
+}
+
+#[async_trait]
 impl OrderCancellationGateway for ConfiguredExchangeGateway {
     async fn cancel_order(
         &self,
@@ -413,9 +430,6 @@ impl PositionSnapshotGateway for ConfiguredExchangeGateway {
 mod tests {
     use super::*;
 
-    const VALID_ASTER_PRIVATE_KEY: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
     #[test]
     fn credential_debug_never_discloses_secret_material() {
         let credentials =
@@ -447,7 +461,7 @@ mod tests {
             .build(ExchangeCredentials::binance("key", "secret").unwrap())
             .unwrap();
         let aster = factory
-            .build(ExchangeCredentials::aster(VALID_ASTER_PRIVATE_KEY).unwrap())
+            .build(ExchangeCredentials::aster("1".repeat(64)).unwrap())
             .unwrap();
         let bybit = factory
             .build(ExchangeCredentials::bybit("key", "secret").unwrap())
