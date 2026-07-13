@@ -9,6 +9,19 @@ use crate::domain::{
     ClientOrderId, Exchange, InstrumentRules, OrderIntent, OrderShape, TerminalOrderStatus,
 };
 
+pub(crate) fn strategy_client_order_id(
+    value: &str,
+) -> Result<Option<ClientOrderId>, crate::domain::OrderIntentError> {
+    if ["o_", "g_", "c_", "r_"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        ClientOrderId::parse(value).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 pub trait ExchangeIdentityGateway: Send + Sync {
     fn exchange(&self) -> Exchange;
 }

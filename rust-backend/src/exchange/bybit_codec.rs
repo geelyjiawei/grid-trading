@@ -13,7 +13,7 @@ use crate::{
         ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
         HistoricalMinutePrice, LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement,
         PositionLeg, PositionSide, PositionSnapshot, TradeFill, TradingFeeRates,
-        execution::OrderExecutionHeader, is_valid_trade_id,
+        execution::OrderExecutionHeader, is_valid_trade_id, strategy_client_order_id,
     },
 };
 
@@ -202,7 +202,9 @@ pub(super) fn parse_open_order_page(
         let Some(raw_client_order_id) = row.get("orderLinkId").and_then(Value::as_str) else {
             continue;
         };
-        let Ok(client_order_id) = ClientOrderId::parse(raw_client_order_id) else {
+        let Some(client_order_id) = strategy_client_order_id(raw_client_order_id)
+            .map_err(|_| BybitCodecError::InvalidField("orderLinkId"))?
+        else {
             continue;
         };
         let header = parse_order_row(row, expected_symbol, &client_order_id, None)?;
@@ -812,15 +814,28 @@ mod tests {
     fn unrelated_empty_or_extended_manual_link_ids_are_ignored() {
         let owned = r#"{"symbol":"MUUSDT","orderId":"1","orderLinkId":"g_RUN00001_1_B_1","side":"Buy","orderType":"Limit","qty":"1","price":"1010","timeInForce":"GTC","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","reduceOnly":true,"createdTime":"1000","updatedTime":"1000"}"#;
         let empty = owned.replace("g_RUN00001_1_B_1", "");
+        let plain = owned.replace("g_RUN00001_1_B_1", "manual_1");
         let extended = owned.replace("g_RUN00001_1_B_1", "manual:id/with.dots");
         let page = parse_open_order_page(
-            &format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{empty},{extended},{owned}]}}}}"#),
+            &format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{empty},{plain},{extended},{owned}]}}}}"#),
             "MUUSDT",
         )
         .unwrap();
 
         assert_eq!(page.orders.len(), 1);
         assert_eq!(page.orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
+    }
+
+    #[test]
+    fn malformed_strategy_link_id_fails_the_complete_page() {
+        let row = r#"{"symbol":"MUUSDT","orderId":"1","orderLinkId":"g_bad:id","side":"Buy","orderType":"Limit","qty":"1","price":"1010","timeInForce":"GTC","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","reduceOnly":true,"createdTime":"1000","updatedTime":"1000"}"#;
+        assert!(
+            parse_open_order_page(
+                &format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{row}]}}}}"#),
+                "MUUSDT",
+            )
+            .is_err()
+        );
     }
 
     fn client_id() -> ClientOrderId {

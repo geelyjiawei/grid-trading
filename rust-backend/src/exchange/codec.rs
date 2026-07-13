@@ -13,6 +13,7 @@ use crate::{
         ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, ExchangeMarketSnapshot,
         LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
         PositionSide, PositionSnapshot, SnapshotError, TradingFeeRates, protocol::Parameters,
+        strategy_client_order_id,
     },
 };
 
@@ -410,7 +411,10 @@ pub(super) fn parse_open_orders(
         else {
             continue;
         };
-        if ClientOrderId::parse(raw_client_order_id).is_err() {
+        if strategy_client_order_id(&raw_client_order_id)
+            .map_err(|_| CodecError::InvalidField("clientOrderId"))?
+            .is_none()
+        {
             continue;
         }
         let order = parse_authoritative_order_value(row, exchange, expected_symbol, None)?;
@@ -693,6 +697,7 @@ mod tests {
     fn unrelated_manual_order_ids_do_not_block_owned_order_snapshot() {
         let orders = parse_open_orders(
             r#"[
+                {"symbol":"MUUSDT","orderId":8,"clientOrderId":"manual_1","side":"BUY","price":"1000","origQty":"1","status":"NEW","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
                 {"symbol":"MUUSDT","orderId":9,"clientOrderId":"manual:id/with.dots","side":"BUY","price":"1000","origQty":"1","status":"NEW","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
                 {"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"1","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
             ]"#,
@@ -703,6 +708,18 @@ mod tests {
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
+    }
+
+    #[test]
+    fn malformed_strategy_order_id_fails_the_complete_snapshot() {
+        assert!(
+            parse_open_orders(
+                r#"[{"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_bad:id","side":"BUY","price":"1010","origQty":"1","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}]"#,
+                Exchange::Binance,
+                "MUUSDT",
+            )
+            .is_err()
+        );
     }
 
     #[test]
