@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -235,6 +235,35 @@ impl ConfiguredExchangeGateway {
             Self::Aster(_) => Exchange::Aster,
             Self::Bybit(_) => Exchange::Bybit,
         }
+    }
+
+    pub fn shared(self) -> SharedConfiguredExchangeGateway {
+        SharedConfiguredExchangeGateway {
+            inner: Arc::new(self),
+        }
+    }
+}
+
+/// Cloneable handle to one configured adapter instance. Cloning the handle
+/// never duplicates credential material or exchange nonce state.
+#[derive(Clone)]
+pub struct SharedConfiguredExchangeGateway {
+    inner: Arc<ConfiguredExchangeGateway>,
+}
+
+impl SharedConfiguredExchangeGateway {
+    pub fn exchange(&self) -> Exchange {
+        self.inner.exchange()
+    }
+}
+
+impl fmt::Debug for SharedConfiguredExchangeGateway {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedConfiguredExchangeGateway")
+            .field("exchange", &self.exchange())
+            .field("credential_material", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -474,6 +503,157 @@ impl PositionSnapshotGateway for ConfiguredExchangeGateway {
             Self::Aster(gateway) => gateway.position_snapshot(exchange, symbol).await,
             Self::Bybit(gateway) => gateway.position_snapshot(exchange, symbol).await,
         }
+    }
+}
+
+impl ExchangeIdentityGateway for SharedConfiguredExchangeGateway {
+    fn exchange(&self) -> Exchange {
+        self.exchange()
+    }
+}
+
+#[async_trait]
+impl OrderPlacementGateway for SharedConfiguredExchangeGateway {
+    async fn place_order(
+        &self,
+        intent: &OrderIntent,
+    ) -> Result<PlacementAcknowledgement, PlacementError> {
+        self.inner.place_order(intent).await
+    }
+}
+
+#[async_trait]
+impl LeverageGateway for SharedConfiguredExchangeGateway {
+    async fn set_leverage(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        leverage: u16,
+    ) -> Result<LeverageAcknowledgement, LeverageError> {
+        self.inner.set_leverage(exchange, symbol, leverage).await
+    }
+}
+
+#[async_trait]
+impl TradingFeeRateGateway for SharedConfiguredExchangeGateway {
+    async fn trading_fee_rates(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<TradingFeeRates, SnapshotError> {
+        self.inner.trading_fee_rates(exchange, symbol).await
+    }
+}
+
+#[async_trait]
+impl AccountBalanceSnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn account_balance_snapshot(
+        &self,
+        exchange: Exchange,
+    ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+        self.inner.account_balance_snapshot(exchange).await
+    }
+}
+
+#[async_trait]
+impl OrderCancellationGateway for SharedConfiguredExchangeGateway {
+    async fn cancel_order(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<CancellationAcknowledgement, CancellationError> {
+        self.inner
+            .cancel_order(exchange, symbol, client_order_id, exchange_order_id)
+            .await
+    }
+}
+
+#[async_trait]
+impl OrderLookupGateway for SharedConfiguredExchangeGateway {
+    async fn lookup_order_by_client_id(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+    ) -> Result<OrderLookup, LookupError> {
+        self.inner
+            .lookup_order_by_client_id(exchange, symbol, client_order_id)
+            .await
+    }
+}
+
+#[async_trait]
+impl OpenOrderSnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn open_orders_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Vec<crate::exchange::AuthoritativeOrder>, SnapshotError> {
+        self.inner.open_orders_snapshot(exchange, symbol).await
+    }
+}
+
+#[async_trait]
+impl ExecutionSnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn execution_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
+        self.inner
+            .execution_snapshot(exchange, symbol, client_order_id, exchange_order_id)
+            .await
+    }
+}
+
+#[async_trait]
+impl HistoricalPriceGateway for SharedConfiguredExchangeGateway {
+    async fn historical_minute_open(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        minute_start_ms: u64,
+    ) -> Result<HistoricalMinutePrice, SnapshotError> {
+        self.inner
+            .historical_minute_open(exchange, symbol, minute_start_ms)
+            .await
+    }
+}
+
+#[async_trait]
+impl MarketSnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn market_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<ExchangeMarketSnapshot, SnapshotError> {
+        self.inner.market_snapshot(exchange, symbol).await
+    }
+}
+
+#[async_trait]
+impl InstrumentRulesGateway for SharedConfiguredExchangeGateway {
+    async fn instrument_rules(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<InstrumentRules, SnapshotError> {
+        self.inner.instrument_rules(exchange, symbol).await
+    }
+}
+
+#[async_trait]
+impl PositionSnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn position_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<PositionSnapshot, SnapshotError> {
+        self.inner.position_snapshot(exchange, symbol).await
     }
 }
 

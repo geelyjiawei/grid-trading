@@ -13,14 +13,21 @@ use crate::persistence::{StrategyDiscoveryAnomaly, StrategyDiscoveryReport, Stra
 
 use super::{
     FileStrategyRecoveryError, PreparedLeasedFileStrategy, PreparedStrategyKind,
-    PreparedStrategyStep, PreparedStrategyStepError, RuntimeSettings, StrategyRunId,
+    PreparedStrategyLifecycle, PreparedStrategyStep, PreparedStrategyStepError,
+    PreparedStrategyStopError, PreparedStrategyStopOutcome, RuntimeSettings, StrategyRunId,
     claim_leased_file_strategy,
 };
 
-type RuntimeSlot<G> = Arc<Mutex<PreparedLeasedFileStrategy<G>>>;
+struct RuntimeSlot<G> {
+    exchange: Exchange,
+    symbol: String,
+    strategy: Mutex<PreparedLeasedFileStrategy<G>>,
+}
+
+type RuntimeSlotHandle<G> = Arc<RuntimeSlot<G>>;
 
 pub struct RuntimeRegistry<G> {
-    entries: RwLock<BTreeMap<StrategyRunId, RuntimeSlot<G>>>,
+    entries: RwLock<BTreeMap<StrategyRunId, RuntimeSlotHandle<G>>>,
 }
 
 impl<G> Default for RuntimeRegistry<G> {
@@ -34,6 +41,10 @@ impl<G> Default for RuntimeRegistry<G> {
 pub enum RuntimeRegistration<G> {
     Registered,
     Duplicate(PreparedLeasedFileStrategy<G>),
+    MarketAlreadyOwned {
+        owner_run_id: StrategyRunId,
+        rejected: PreparedLeasedFileStrategy<G>,
+    },
 }
 
 pub trait RuntimeRecoveryProvider {
@@ -72,12 +83,21 @@ pub enum RuntimeStartupFailure<E> {
     Duplicate {
         run_id: StrategyRunId,
     },
+    MarketAlreadyOwned {
+        run_id: StrategyRunId,
+        exchange: Exchange,
+        symbol: String,
+        owner_run_id: StrategyRunId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRegistryEntry {
     pub run_id: StrategyRunId,
+    pub exchange: Exchange,
+    pub symbol: String,
     pub kind: Option<PreparedStrategyKind>,
+    pub lifecycle: Option<PreparedStrategyLifecycle>,
     pub advancing: bool,
 }
 
@@ -91,11 +111,30 @@ impl<G> RuntimeRegistry<G> {
         strategy: PreparedLeasedFileStrategy<G>,
     ) -> RuntimeRegistration<G> {
         let run_id = strategy.run_id().clone();
+        let exchange = strategy.exchange();
+        let symbol = strategy.symbol().to_owned();
         let mut entries = self.entries.write().await;
+        prune_terminal_entries(&mut entries);
         if entries.contains_key(&run_id) {
             return RuntimeRegistration::Duplicate(strategy);
         }
-        entries.insert(run_id, Arc::new(Mutex::new(strategy)));
+        if let Some((owner_run_id, _)) = entries
+            .iter()
+            .find(|(_, slot)| slot.exchange == exchange && slot.symbol == symbol)
+        {
+            return RuntimeRegistration::MarketAlreadyOwned {
+                owner_run_id: owner_run_id.clone(),
+                rejected: strategy,
+            };
+        }
+        entries.insert(
+            run_id,
+            Arc::new(RuntimeSlot {
+                exchange,
+                symbol,
+                strategy: Mutex::new(strategy),
+            }),
+        );
         RuntimeRegistration::Registered
     }
 
@@ -111,6 +150,37 @@ impl<G> RuntimeRegistry<G> {
         self.entries.read().await.contains_key(run_id)
     }
 
+    pub async fn owner_for_market(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Option<StrategyRunId> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .find(|(_, slot)| slot.exchange == exchange && slot.symbol == symbol)
+            .map(|(run_id, _)| run_id.clone())
+    }
+
+    pub async fn prune_terminal(&self) -> Vec<StrategyRunId> {
+        let mut entries = self.entries.write().await;
+        let removed = entries
+            .iter()
+            .filter_map(|(run_id, slot)| {
+                slot.strategy
+                    .try_lock()
+                    .ok()
+                    .filter(|strategy| strategy.is_terminal())
+                    .map(|_| run_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for run_id in &removed {
+            entries.remove(run_id);
+        }
+        removed
+    }
+
     pub async fn entries(&self) -> Vec<RuntimeRegistryEntry> {
         let entries = self
             .entries
@@ -121,15 +191,21 @@ impl<G> RuntimeRegistry<G> {
             .collect::<Vec<_>>();
         entries
             .into_iter()
-            .map(|(run_id, slot)| match slot.try_lock() {
+            .map(|(run_id, slot)| match slot.strategy.try_lock() {
                 Ok(strategy) => RuntimeRegistryEntry {
                     run_id,
+                    exchange: slot.exchange,
+                    symbol: slot.symbol.clone(),
                     kind: Some(strategy.kind()),
+                    lifecycle: Some(strategy.lifecycle()),
                     advancing: false,
                 },
                 Err(_) => RuntimeRegistryEntry {
                     run_id,
+                    exchange: slot.exchange,
+                    symbol: slot.symbol.clone(),
                     kind: None,
+                    lifecycle: None,
                     advancing: true,
                 },
             })
@@ -162,9 +238,45 @@ impl<G> RuntimeRegistry<G> {
             .cloned()
             .ok_or_else(|| RuntimeRegistryAdvanceError::NotFound(run_id.clone()))?;
         let mut strategy = slot
+            .strategy
             .try_lock()
             .map_err(|_| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?;
         strategy.advance(now_ms).await.map_err(Into::into)
+    }
+
+    pub async fn request_stop(
+        &self,
+        run_id: &StrategyRunId,
+        now_ms: u64,
+    ) -> Result<PreparedStrategyStopOutcome, RuntimeRegistryStopError> {
+        let slot = self
+            .entries
+            .read()
+            .await
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| RuntimeRegistryStopError::NotFound(run_id.clone()))?;
+        let mut strategy = slot
+            .strategy
+            .try_lock()
+            .map_err(|_| RuntimeRegistryStopError::AlreadyAdvancing(run_id.clone()))?;
+        strategy.request_stop(now_ms).map_err(Into::into)
+    }
+}
+
+fn prune_terminal_entries<G>(entries: &mut BTreeMap<StrategyRunId, RuntimeSlotHandle<G>>) {
+    let removable = entries
+        .iter()
+        .filter_map(|(run_id, slot)| {
+            slot.strategy
+                .try_lock()
+                .ok()
+                .filter(|strategy| strategy.is_terminal())
+                .map(|_| run_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for run_id in removable {
+        entries.remove(&run_id);
     }
 }
 
@@ -221,6 +333,22 @@ where
                     .failures
                     .push(RuntimeStartupFailure::Duplicate { run_id });
             }
+            RuntimeRegistration::MarketAlreadyOwned {
+                owner_run_id,
+                rejected,
+            } => {
+                let exchange = rejected.exchange();
+                let symbol = rejected.symbol().to_owned();
+                drop(rejected);
+                report
+                    .failures
+                    .push(RuntimeStartupFailure::MarketAlreadyOwned {
+                        run_id,
+                        exchange,
+                        symbol,
+                        owner_run_id,
+                    });
+            }
         }
     }
     report.registered.sort();
@@ -235,4 +363,14 @@ pub enum RuntimeRegistryAdvanceError {
     AlreadyAdvancing(StrategyRunId),
     #[error(transparent)]
     Strategy(#[from] PreparedStrategyStepError),
+}
+
+#[derive(Debug, Error)]
+pub enum RuntimeRegistryStopError {
+    #[error("strategy {0:?} is not registered")]
+    NotFound(StrategyRunId),
+    #[error("strategy {0:?} already has a lifecycle operation in progress")]
+    AlreadyAdvancing(StrategyRunId),
+    #[error(transparent)]
+    Strategy(#[from] PreparedStrategyStopError),
 }

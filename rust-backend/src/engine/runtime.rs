@@ -8,13 +8,14 @@ use crate::{
         CancellationIntent, CancellationState, ClientOrderId, Exchange, GridConfig, IntentState,
     },
     engine::{
-        ArmedStrategyState, CancellationResult, CancellationServiceError, ExecutionAccountingError,
-        ExecutionSyncService, ReconciliationError, ReconciliationResult, StrategyBootstrapError,
-        StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
-        StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError,
-        StrategyStateStore, StrategyStoreError, StrategyTransition, SubmissionError,
-        SubmissionResult, activate_armed_strategy, cancel_with, load_strategy_inputs,
-        prepare_new_strategy, reconcile_with, resolve_cancellation_with, submit_with,
+        ArmedStrategyLifecycle, ArmedStrategyState, CancellationResult, CancellationServiceError,
+        ExecutionAccountingError, ExecutionSyncService, ReconciliationError, ReconciliationResult,
+        StrategyBootstrapError, StrategyLifecycle, StrategyMachine, StrategyMachineError,
+        StrategyOrderPurpose, StrategyOrderTracking, StrategyRunId, StrategyState,
+        StrategyStateError, StrategyStateStore, StrategyStoreError, StrategyTransition,
+        SubmissionError, SubmissionResult, activate_armed_strategy, cancel_with,
+        load_strategy_inputs, prepare_new_strategy, reconcile_with, resolve_cancellation_with,
+        submit_with,
     },
     exchange::{
         ExchangeIdentityGateway, ExecutionSnapshotGateway, HistoricalPriceGateway,
@@ -195,6 +196,41 @@ pub enum PreparedStrategyKind {
     Active,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparedStrategyLifecycle {
+    WaitingTrigger,
+    Cancelled,
+    AwaitingOpening,
+    DeployingGrid,
+    Running,
+    RiskExitRequested,
+    StopRequested,
+    Stopped,
+    Failed,
+    Closed,
+}
+
+impl PreparedStrategyLifecycle {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Cancelled | Self::Stopped | Self::Closed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedStrategyStopOutcome {
+    ArmedCancelled,
+    Active(StrategyTransition),
+}
+
+#[derive(Debug, Error)]
+pub enum PreparedStrategyStopError {
+    #[error("failed to persist armed strategy cancellation: {0}")]
+    Armed(StrategyStoreError),
+    #[error("failed to persist active strategy stop request: {0}")]
+    Active(StrategyMachineError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedStrategyStep {
     WaitingForTrigger,
@@ -242,6 +278,85 @@ impl<G> PreparedLeasedFileStrategy<G> {
         match self.inner.as_ref() {
             Some(PreparedLeasedFileStrategyInner::Armed { .. }) => PreparedStrategyKind::Armed,
             Some(PreparedLeasedFileStrategyInner::Active(_)) => PreparedStrategyKind::Active,
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub fn exchange(&self) -> Exchange {
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, .. }) => {
+                strategy.snapshot().exchange
+            }
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => {
+                runtime.runtime().machine().store().snapshot().exchange
+            }
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub fn symbol(&self) -> &str {
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, .. }) => {
+                &strategy.snapshot().symbol
+            }
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => {
+                &runtime.runtime().machine().store().snapshot().symbol
+            }
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub fn lifecycle(&self) -> PreparedStrategyLifecycle {
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, .. }) => {
+                match strategy.snapshot().lifecycle {
+                    ArmedStrategyLifecycle::WaitingTrigger => {
+                        PreparedStrategyLifecycle::WaitingTrigger
+                    }
+                    ArmedStrategyLifecycle::Cancelled => PreparedStrategyLifecycle::Cancelled,
+                }
+            }
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => {
+                match runtime.runtime().machine().store().snapshot().lifecycle {
+                    StrategyLifecycle::AwaitingOpening => {
+                        PreparedStrategyLifecycle::AwaitingOpening
+                    }
+                    StrategyLifecycle::DeployingGrid => PreparedStrategyLifecycle::DeployingGrid,
+                    StrategyLifecycle::Running => PreparedStrategyLifecycle::Running,
+                    StrategyLifecycle::RiskExitRequested => {
+                        PreparedStrategyLifecycle::RiskExitRequested
+                    }
+                    StrategyLifecycle::StopRequested => PreparedStrategyLifecycle::StopRequested,
+                    StrategyLifecycle::Stopped => PreparedStrategyLifecycle::Stopped,
+                    StrategyLifecycle::Failed => PreparedStrategyLifecycle::Failed,
+                    StrategyLifecycle::Closed => PreparedStrategyLifecycle::Closed,
+                }
+            }
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.lifecycle().is_terminal()
+    }
+
+    pub fn request_stop(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<PreparedStrategyStopOutcome, PreparedStrategyStopError> {
+        match self.inner.as_mut() {
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, .. }) => {
+                strategy
+                    .cancel(now_ms)
+                    .map_err(PreparedStrategyStopError::Armed)?;
+                Ok(PreparedStrategyStopOutcome::ArmedCancelled)
+            }
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => runtime
+                .runtime_mut()
+                .machine_mut()
+                .request_stop(now_ms)
+                .map(PreparedStrategyStopOutcome::Active)
+                .map_err(PreparedStrategyStopError::Active),
             None => unreachable!("strategy transition is synchronous"),
         }
     }
@@ -1645,6 +1760,11 @@ mod tests {
             self
         }
 
+        fn with_symbol(self, symbol: &str) -> Self {
+            self.state.lock().unwrap().market.symbol = symbol.to_owned();
+            self
+        }
+
         fn placement_call_count(&self) -> usize {
             self.state.lock().unwrap().placement_calls.len()
         }
@@ -2080,8 +2200,8 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.position_snapshot_calls += 1;
             Ok(PositionSnapshot {
-                exchange: Exchange::Binance,
-                symbol: "MUUSDT".into(),
+                exchange: state.market.exchange,
+                symbol: state.market.symbol.clone(),
                 legs: vec![PositionLeg {
                     side: PositionSide::Both,
                     signed_quantity: state.position_quantity,
@@ -2582,13 +2702,21 @@ mod tests {
         )
         .await;
 
-        let mut expected = vec![active_run.clone(), armed_run.clone()];
-        expected.sort();
-        assert_eq!(report.registered, expected);
+        assert_eq!(report.registered, vec![armed_run.clone()]);
         assert_eq!(report.discovery_anomalies.len(), 1);
-        assert!(report.failures.is_empty());
+        assert!(matches!(
+            report.failures.as_slice(),
+            [RuntimeStartupFailure::MarketAlreadyOwned {
+                run_id,
+                exchange: Exchange::Binance,
+                symbol,
+                owner_run_id,
+            }] if run_id == &active_run
+                && symbol == "MUUSDT"
+                && owner_run_id == &armed_run
+        ));
         assert_eq!(provider.request_count(), 2);
-        assert_eq!(registry.len().await, 2);
+        assert_eq!(registry.len().await, 1);
         assert_eq!(gateway.all_bootstrap_call_count(), 0);
         assert_eq!(gateway.placement_call_count(), 0);
 
@@ -2600,17 +2728,26 @@ mod tests {
         .await;
         assert!(repeated.registered.is_empty());
         assert_eq!(repeated.failures.len(), 2);
-        assert!(repeated.failures.iter().all(|failure| {
-            matches!(
-                failure,
-                RuntimeStartupFailure::Claim {
-                    error: FileStrategyRecoveryError::Lease(RuntimeLeaseError::AlreadyHeld),
-                    ..
-                }
-            )
-        }));
-        assert_eq!(provider.request_count(), 2);
-        assert_eq!(registry.len().await, 2);
+        assert!(repeated.failures.iter().any(|failure| matches!(
+            failure,
+            RuntimeStartupFailure::Claim {
+                paths,
+                error: FileStrategyRecoveryError::Lease(RuntimeLeaseError::AlreadyHeld),
+            } if paths.run_id() == &armed_run
+        )));
+        assert!(repeated.failures.iter().any(|failure| matches!(
+            failure,
+            RuntimeStartupFailure::MarketAlreadyOwned {
+                run_id,
+                exchange: Exchange::Binance,
+                symbol,
+                owner_run_id,
+            } if run_id == &active_run
+                && symbol == "MUUSDT"
+                && owner_run_id == &armed_run
+        )));
+        assert_eq!(provider.request_count(), 3);
+        assert_eq!(registry.len().await, 1);
     }
 
     #[tokio::test]
@@ -2721,7 +2858,7 @@ mod tests {
         let first_directory = tempdir().unwrap();
         let second_directory = tempdir().unwrap();
         let first_gateway = MockGateway::new(rules(), 1_100);
-        let second_gateway = MockGateway::new(rules(), 1_100);
+        let second_gateway = MockGateway::new(rules(), 1_100).with_symbol("ALTUSDT");
         let first_run = StrategyRunId::parse("sched001").unwrap();
         let second_run = StrategyRunId::parse("sched002").unwrap();
         let first = prepare_leased_file_strategy(
@@ -2734,11 +2871,13 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut second_config = config(None);
+        second_config.symbol = "ALTUSDT".into();
         let second = prepare_leased_file_strategy(
             second_gateway.clone(),
             second_directory.path(),
             second_run.clone(),
-            config(None),
+            second_config,
             1_100,
             runtime_settings(),
         )
@@ -2785,6 +2924,150 @@ mod tests {
         };
         assert_eq!(first_report.submissions.len(), 1);
         assert_eq!(first_gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_a_second_live_strategy_for_the_same_market() {
+        let first_directory = tempdir().unwrap();
+        let second_directory = tempdir().unwrap();
+        let first_run = StrategyRunId::parse("market01").unwrap();
+        let second_run = StrategyRunId::parse("market02").unwrap();
+        let first = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            first_directory.path(),
+            first_run.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let second = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            second_directory.path(),
+            second_run.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let registry = RuntimeRegistry::new();
+
+        assert!(matches!(
+            registry.register(first).await,
+            RuntimeRegistration::Registered
+        ));
+        let RuntimeRegistration::MarketAlreadyOwned {
+            owner_run_id,
+            rejected,
+        } = registry.register(second).await
+        else {
+            panic!("one exchange market must have exactly one runtime owner");
+        };
+
+        assert_eq!(owner_run_id, first_run);
+        assert_eq!(rejected.run_id(), &second_run);
+        assert_eq!(registry.len().await, 1);
+        assert_eq!(
+            registry.owner_for_market(Exchange::Binance, "MUUSDT").await,
+            Some(first_run)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_armed_runtime_releases_market_ownership_atomically() {
+        let first_directory = tempdir().unwrap();
+        let second_directory = tempdir().unwrap();
+        let first_run = StrategyRunId::parse("armed101").unwrap();
+        let second_run = StrategyRunId::parse("armed102").unwrap();
+        let mut armed_config = config(None);
+        armed_config.trigger_price = Some(Decimal::new(1015, 0));
+        let first = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            first_directory.path(),
+            first_run.clone(),
+            armed_config.clone(),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let second = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            second_directory.path(),
+            second_run.clone(),
+            armed_config,
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let registry = RuntimeRegistry::new();
+
+        assert!(matches!(
+            registry.register(first).await,
+            RuntimeRegistration::Registered
+        ));
+        assert!(matches!(
+            registry.request_stop(&first_run, 1_101).await.unwrap(),
+            PreparedStrategyStopOutcome::ArmedCancelled
+        ));
+        assert!(matches!(
+            registry.register(second).await,
+            RuntimeRegistration::Registered
+        ));
+
+        assert!(!registry.contains(&first_run).await);
+        assert!(registry.contains(&second_run).await);
+        assert_eq!(
+            registry.owner_for_market(Exchange::Binance, "MUUSDT").await,
+            Some(second_run)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_before_first_tick_never_submits_the_opening_order() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let run_id = StrategyRunId::parse("stop0001").unwrap();
+        let strategy = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            run_id.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let registry = RuntimeRegistry::new();
+        assert!(matches!(
+            registry.register(strategy).await,
+            RuntimeRegistration::Registered
+        ));
+
+        assert!(matches!(
+            registry.request_stop(&run_id, 1_101).await.unwrap(),
+            PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::StopRequested,
+            })
+        ));
+        let PreparedStrategyStep::Active(report) = registry.advance(&run_id, 1_102).await.unwrap()
+        else {
+            panic!("an active runtime must process its durable stop request");
+        };
+
+        assert!(report.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), 0);
+        let entries = registry.entries().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].lifecycle,
+            Some(PreparedStrategyLifecycle::Stopped)
+        );
+        assert_eq!(registry.prune_terminal().await, vec![run_id.clone()]);
+        assert!(!registry.contains(&run_id).await);
     }
 
     #[tokio::test]

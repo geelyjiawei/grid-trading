@@ -46,7 +46,8 @@ pub use runtime::{
     FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, FileStrategyRecoveryError,
     FileStrategyStartError, LeasedFileArmedStrategy, LeasedFileStrategyRecovery,
     LeasedFileStrategyRuntime, PreparedLeasedFileStrategy, PreparedStrategyKind,
-    PreparedStrategyStep, PreparedStrategyStepError, RuntimeBlocker, RuntimeBuildError,
+    PreparedStrategyLifecycle, PreparedStrategyStep, PreparedStrategyStepError,
+    PreparedStrategyStopError, PreparedStrategyStopOutcome, RuntimeBlocker, RuntimeBuildError,
     RuntimeCancellation, RuntimeSettings, RuntimeStage, RuntimeSubmission, RuntimeTickError,
     RuntimeTickReport, StrategyRuntime, claim_leased_file_strategy, prepare_leased_file_strategy,
     recover_leased_file_strategy,
@@ -70,6 +71,6 @@ pub use strategy_machine::{
 pub use submission::{SubmissionError, SubmissionResult, SubmissionService, submit_with};
 pub use supervisor::{
     RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError,
-    RuntimeRegistryEntry, RuntimeStartupFailure, RuntimeStartupReport,
+    RuntimeRegistryEntry, RuntimeRegistryStopError, RuntimeStartupFailure, RuntimeStartupReport,
     recover_discovered_strategies,
 };

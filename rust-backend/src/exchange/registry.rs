@@ -9,7 +9,9 @@ use crate::{
         AccountBalanceSnapshotGateway, ExchangeIdentityGateway, MarketSnapshotGateway,
         OpenOrderSnapshotGateway, OrderLookupGateway, PositionSnapshotGateway,
         TradingFeeRateGateway,
-        configured::{ConfiguredExchangeGateway, ExchangeEnvironment},
+        configured::{
+            ConfiguredExchangeGateway, ExchangeEnvironment, SharedConfiguredExchangeGateway,
+        },
     },
 };
 
@@ -49,6 +51,7 @@ pub struct ExchangeConfigurationSummary {
 #[derive(Clone)]
 struct GatewayEntry {
     gateway: Arc<dyn ReadOnlyExchangeGateway>,
+    trading_gateway: Option<SharedConfiguredExchangeGateway>,
     environment: ExchangeEnvironment,
     source: String,
     masked_identifier: Option<String>,
@@ -98,12 +101,30 @@ impl ExchangeGatewayRegistry {
         source: impl Into<String>,
         masked_identifier: Option<String>,
     ) -> Result<(), RegistryError> {
-        self.register_gateway(Arc::new(gateway), environment, source, masked_identifier)
+        let gateway = gateway.shared();
+        self.register_entry(
+            Arc::new(gateway.clone()),
+            Some(gateway),
+            environment,
+            source,
+            masked_identifier,
+        )
     }
 
     pub fn register_gateway(
         &mut self,
         gateway: Arc<dyn ReadOnlyExchangeGateway>,
+        environment: ExchangeEnvironment,
+        source: impl Into<String>,
+        masked_identifier: Option<String>,
+    ) -> Result<(), RegistryError> {
+        self.register_entry(gateway, None, environment, source, masked_identifier)
+    }
+
+    fn register_entry(
+        &mut self,
+        gateway: Arc<dyn ReadOnlyExchangeGateway>,
+        trading_gateway: Option<SharedConfiguredExchangeGateway>,
         environment: ExchangeEnvironment,
         source: impl Into<String>,
         masked_identifier: Option<String>,
@@ -125,6 +146,7 @@ impl ExchangeGatewayRegistry {
         }
         *slot = Some(GatewayEntry {
             gateway,
+            trading_gateway,
             environment,
             source,
             masked_identifier,
@@ -139,6 +161,19 @@ impl ExchangeGatewayRegistry {
         self.slot(exchange)
             .map(|entry| Arc::clone(&entry.gateway))
             .ok_or(RegistryError::NotConfigured(exchange))
+    }
+
+    pub fn trading_gateway(
+        &self,
+        exchange: Exchange,
+    ) -> Result<SharedConfiguredExchangeGateway, RegistryError> {
+        let entry = self
+            .slot(exchange)
+            .ok_or(RegistryError::NotConfigured(exchange))?;
+        entry
+            .trading_gateway
+            .clone()
+            .ok_or(RegistryError::TradingUnavailable(exchange))
     }
 
     pub fn is_configured(&self, exchange: Exchange) -> bool {
@@ -213,6 +248,8 @@ pub enum RegistryError {
     Duplicate(Exchange),
     #[error("{0:?} exchange gateway is not configured")]
     NotConfigured(Exchange),
+    #[error("{0:?} exchange gateway is read-only")]
+    TradingUnavailable(Exchange),
     #[error("exchange configuration source is invalid")]
     InvalidSource,
     #[error("masked exchange identifier is invalid")]
@@ -249,6 +286,13 @@ mod tests {
         let debug = format!("{registry:?}");
         assert!(!debug.contains("visible-key"));
         assert!(!debug.contains("secret-value"));
+
+        let trading = registry.trading_gateway(Exchange::Binance).unwrap();
+        assert_eq!(trading.exchange(), Exchange::Binance);
+        let trading_debug = format!("{trading:?}");
+        assert!(!trading_debug.contains("visible-key"));
+        assert!(!trading_debug.contains("secret-value"));
+        assert!(trading_debug.contains("[REDACTED]"));
     }
 
     #[test]
