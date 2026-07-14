@@ -92,7 +92,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 ## 2.2 Vue + Rust 候选服务
 
-候选服务与当前生产服务隔离，默认监听服务器本机 `127.0.0.1:8001`，并使用独立目录 `data-rust-preview/`：
+候选服务与当前生产服务隔离，默认监听服务器本机 `127.0.0.1:8001`，并使用独立的 Docker 持久化卷 `rust-preview-data`：
 
 ```bash
 sh scripts/deploy-rust-preview.sh

@@ -54,6 +54,15 @@ docker exec "$container_id" sh -eu -c '
     test "$(id -u)" = "10001"
     test -x /usr/local/bin/grid-trading-server
     test -f /app/web/index.html
+    test -d /app/data/rust-control/idempotency
+    test -d /app/data/rust-control/strategies
+    test -w /app/data
+    test -w /app/data/rust-control/idempotency
+    test -w /app/data/rust-control/strategies
+    probe=/app/data/.preview-write-probe-$$
+    umask 077
+    : >"$probe"
+    rm -f "$probe"
     ! command -v python >/dev/null 2>&1
     ! command -v node >/dev/null 2>&1
 ' || fail "candidate image composition is unsafe"

@@ -17,4 +17,7 @@ services:
     ports:
       - "127.0.0.1:8001:8000"
     volumes:
-      - ./data-rust-preview:/app/data
+      - rust-preview-data:/app/data
+
+volumes:
+  rust-preview-data:
