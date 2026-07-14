@@ -128,6 +128,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Validate isolated deployment guards
+        run: |
+          set -euo pipefail
+          sh -n scripts/deploy-rust-preview.sh scripts/verify-rust-preview.sh
+          cp .env.example .env
+          trap 'rm -f .env' EXIT
+          GRID_RUST_PREVIEW_VALIDATE_ONLY=true sh scripts/deploy-rust-preview.sh
+
       - name: Build locked production image
         run: docker build --file Dockerfile.rust-vue --tag grid-trading-vue-rust:test .
 
@@ -180,3 +188,7 @@ jobs:
           grep --fixed-strings '"code":"api_route_not_found"' /tmp/missing.json
           curl --fail --silent http://127.0.0.1:18000/ > /tmp/index.html
           grep --fixed-strings '<div id="app"></div>' /tmp/index.html
+          GRID_RUST_PREVIEW_CONTAINER_ID="$container_id" \
+          GRID_RUST_PREVIEW_URL=http://127.0.0.1:18000 \
+          GRID_RUST_PREVIEW_EXPECTED_BINDING=127.0.0.1:18000 \
+            sh scripts/verify-rust-preview.sh

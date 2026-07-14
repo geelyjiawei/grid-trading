@@ -95,10 +95,13 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 候选服务与当前生产服务隔离，默认监听服务器本机 `127.0.0.1:8001`，并使用独立目录 `data-rust-preview/`：
 
 ```bash
-docker compose -f docker-compose.rust-vue.yml up -d --build
-curl --fail http://127.0.0.1:8001/healthz
-curl --fail http://127.0.0.1:8001/api/config
-curl --fail http://127.0.0.1:8001/api/grid/status
+sh scripts/deploy-rust-preview.sh
+```
+
+脚本会构建候选容器、确认生产 Compose 的容器 ID 没有变化，并调用 `scripts/verify-rust-preview.sh` 检查本机端口、非 root 用户、运行时文件、认证边界和关闭的交易写入开关。单独复核可执行：
+
+```bash
+sh scripts/verify-rust-preview.sh
 ```
 
 第一阶段必须保持：
