@@ -307,8 +307,8 @@ mod tests {
     use super::*;
     use crate::{
         domain::{
-            Direction, Exchange, GridConfig, GridMode, InitialOrderType, InstrumentRules,
-            PositionSizingMode, QuantityRules,
+            ClientOrderId, Direction, Exchange, GridConfig, GridMode, InitialOrderType,
+            InstrumentRules, PositionSizingMode, QuantityRules,
         },
         engine::{
             MarketSnapshot, PositionBaseline, ReplacementObligation, ReplacementObligationKind,
@@ -538,6 +538,35 @@ mod tests {
             FileStrategyStateStore::load(&path),
             Err(StrategyStoreError::InvalidState(
                 StrategyStateError::InitialGridOrderMismatch
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn drifted_order_identity_is_retained_and_rejected_on_load() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut corrupted = state();
+        let previous = corrupted
+            .orders
+            .values()
+            .find(|order| matches!(order.purpose, StrategyOrderPurpose::InitialGrid { .. }))
+            .unwrap()
+            .client_order_id
+            .clone();
+        let replacement = ClientOrderId::parse(previous.as_str().replacen("g_", "r_", 1)).unwrap();
+        let mut order = corrupted.orders.remove(&previous).unwrap();
+        order.client_order_id = replacement.clone();
+        corrupted.orders.insert(replacement, order);
+        let bytes = serde_json::to_vec_pretty(&PersistedStrategyState::Active(Box::new(corrupted)))
+            .unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            FileStrategyStateStore::load(&path),
+            Err(StrategyStoreError::InvalidState(
+                StrategyStateError::OrderSequenceMismatch
             ))
         ));
         assert_eq!(fs::read(&path).unwrap(), bytes);

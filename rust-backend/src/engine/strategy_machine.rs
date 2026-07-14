@@ -913,18 +913,7 @@ impl StrategyState {
             .next_order_sequence
             .checked_add(1)
             .ok_or(StrategyStateError::NumericOverflow("order sequence"))?;
-        let side = match side {
-            OrderSide::Buy => "B",
-            OrderSide::Sell => "S",
-        };
-        let value = match level_index {
-            Some(level) => format!(
-                "{prefix}_{}_{level}_{side}_{sequence}",
-                self.run_id.as_str()
-            ),
-            None => format!("{prefix}_{}_{side}_{sequence}", self.run_id.as_str()),
-        };
-        ClientOrderId::parse(value).map_err(StrategyStateError::InvalidOrderIntent)
+        generated_client_order_id(&self.run_id, prefix, level_index, side, sequence)
     }
 
     fn insert_order(&mut self, order: StrategyOrderRecord) -> Result<(), StrategyStateError> {
@@ -1024,6 +1013,20 @@ fn validate_append_only_sequences(state: &StrategyState) -> Result<(), StrategyS
     if state.next_order_sequence != expected_order_sequence {
         return Err(StrategyStateError::OrderSequenceMismatch);
     }
+    let mut observed_order_sequences = BTreeSet::new();
+    for order in state.orders.values() {
+        let sequence = validate_order_identity_sequence(state, order)?;
+        if !observed_order_sequences.insert(sequence) {
+            return Err(StrategyStateError::OrderSequenceMismatch);
+        }
+    }
+    if observed_order_sequences
+        .iter()
+        .copied()
+        .ne(1..state.next_order_sequence)
+    {
+        return Err(StrategyStateError::OrderSequenceMismatch);
+    }
     let expected_obligation_sequence = u64::try_from(state.replacement_obligations.len())
         .ok()
         .and_then(|count| count.checked_add(1))
@@ -1042,6 +1045,59 @@ fn validate_append_only_sequences(state: &StrategyState) -> Result<(), StrategyS
         return Err(StrategyStateError::ObligationSequenceMismatch);
     }
     Ok(())
+}
+
+fn validate_order_identity_sequence(
+    state: &StrategyState,
+    order: &StrategyOrderRecord,
+) -> Result<u64, StrategyStateError> {
+    let identity = order.client_order_id.as_str();
+    let sequence_text = identity
+        .rsplit_once('_')
+        .map(|(_, sequence)| sequence)
+        .ok_or(StrategyStateError::OrderSequenceMismatch)?;
+    let sequence = sequence_text
+        .parse::<u64>()
+        .map_err(|_| StrategyStateError::OrderSequenceMismatch)?;
+    if sequence == 0 || sequence.to_string() != sequence_text {
+        return Err(StrategyStateError::OrderSequenceMismatch);
+    }
+    let (prefix, level_index) = match &order.purpose {
+        StrategyOrderPurpose::Opening => ("o", None),
+        StrategyOrderPurpose::RiskClose => ("c", None),
+        StrategyOrderPurpose::InitialGrid { level_index, .. } => ("g", Some(*level_index)),
+        StrategyOrderPurpose::Replacement { level_index, .. } => ("r", Some(*level_index)),
+    };
+    let expected = generated_client_order_id(
+        &state.run_id,
+        prefix,
+        level_index,
+        order.shape.side,
+        sequence,
+    )
+    .map_err(|_| StrategyStateError::OrderSequenceMismatch)?;
+    if order.client_order_id != expected {
+        return Err(StrategyStateError::OrderSequenceMismatch);
+    }
+    Ok(sequence)
+}
+
+fn generated_client_order_id(
+    run_id: &StrategyRunId,
+    prefix: &str,
+    level_index: Option<u16>,
+    side: OrderSide,
+    sequence: u64,
+) -> Result<ClientOrderId, StrategyStateError> {
+    let side = match side {
+        OrderSide::Buy => "B",
+        OrderSide::Sell => "S",
+    };
+    let value = match level_index {
+        Some(level) => format!("{prefix}_{}_{level}_{side}_{sequence}", run_id.as_str()),
+        None => format!("{prefix}_{}_{side}_{sequence}", run_id.as_str()),
+    };
+    ClientOrderId::parse(value).map_err(StrategyStateError::InvalidOrderIntent)
 }
 
 fn validate_symbol(symbol: &str) -> Result<(), StrategyStateError> {
@@ -3501,6 +3557,16 @@ mod tests {
             .clone()
     }
 
+    fn rekey_order(
+        state: &mut StrategyState,
+        previous: &ClientOrderId,
+        replacement: ClientOrderId,
+    ) {
+        let mut order = state.orders.remove(previous).unwrap();
+        order.client_order_id = replacement.clone();
+        assert!(state.orders.insert(replacement, order).is_none());
+    }
+
     fn report(
         client_order_id: ClientOrderId,
         exchange_order_id: &str,
@@ -4751,7 +4817,12 @@ mod tests {
         let mut duplicated = state(Direction::Short, PositionBaseline::flat());
         let original = opening_id(&duplicated);
         let mut duplicate = duplicated.orders.get(&original).unwrap().clone();
-        duplicate.client_order_id = ClientOrderId::parse("o_DUPLICATE1_S_99").unwrap();
+        duplicate.client_order_id = ClientOrderId::parse(format!(
+            "o_{}_S_{}",
+            duplicated.run_id.as_str(),
+            duplicated.next_order_sequence
+        ))
+        .unwrap();
         duplicated
             .orders
             .insert(duplicate.client_order_id.clone(), duplicate);
@@ -5426,6 +5497,135 @@ mod tests {
         assert_eq!(
             obligation_sequence.validate(),
             Err(StrategyStateError::ObligationSequenceMismatch)
+        );
+    }
+
+    #[test]
+    fn every_generated_order_identity_component_and_sequence_is_validated() {
+        let original = state(Direction::Short, PositionBaseline::flat());
+        let victim = original
+            .orders
+            .values()
+            .find(|order| order.purpose.is_initial_grid())
+            .unwrap();
+        let victim_id = victim.client_order_id.clone();
+        let level_index = victim.purpose.level_index().unwrap();
+        let side = match victim.shape.side {
+            OrderSide::Buy => "B",
+            OrderSide::Sell => "S",
+        };
+        let opposite_side = if side == "B" { "S" } else { "B" };
+        let sequence = victim_id.as_str().rsplit_once('_').unwrap().1;
+        let run_id = original.run_id.as_str().to_owned();
+        let malformed_identities = [
+            (
+                "purpose prefix",
+                format!("r_{run_id}_{level_index}_{side}_{sequence}"),
+            ),
+            (
+                "run identity",
+                format!("g_OTHER001_{level_index}_{side}_{sequence}"),
+            ),
+            (
+                "level identity",
+                format!("g_{run_id}_999_{side}_{sequence}"),
+            ),
+            (
+                "side identity",
+                format!("g_{run_id}_{level_index}_{opposite_side}_{sequence}"),
+            ),
+            (
+                "canonical sequence",
+                format!("g_{run_id}_{level_index}_{side}_0{sequence}"),
+            ),
+            (
+                "numeric sequence",
+                format!("g_{run_id}_{level_index}_{side}_notanumber"),
+            ),
+        ];
+
+        for (label, identity) in malformed_identities {
+            let mut corrupted = original.clone();
+            rekey_order(
+                &mut corrupted,
+                &victim_id,
+                ClientOrderId::parse(identity).unwrap(),
+            );
+            assert_eq!(
+                corrupted.validate(),
+                Err(StrategyStateError::OrderSequenceMismatch),
+                "{label} drift must fail closed",
+            );
+        }
+
+        let second = original
+            .orders
+            .values()
+            .find(|order| {
+                order.purpose.is_initial_grid()
+                    && order.client_order_id != victim.client_order_id
+                    && order.purpose.level_index() != Some(level_index)
+            })
+            .unwrap();
+        let second_id = second.client_order_id.clone();
+        let second_level = second.purpose.level_index().unwrap();
+        let second_side = match second.shape.side {
+            OrderSide::Buy => "B",
+            OrderSide::Sell => "S",
+        };
+        let mut duplicated_sequence = original;
+        rekey_order(
+            &mut duplicated_sequence,
+            &second_id,
+            ClientOrderId::parse(format!(
+                "g_{run_id}_{second_level}_{second_side}_{sequence}"
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            duplicated_sequence.validate(),
+            Err(StrategyStateError::OrderSequenceMismatch),
+            "two distinct orders must never share one append-only sequence",
+        );
+    }
+
+    #[test]
+    fn coordinated_order_identity_drift_that_can_block_a_future_replacement_is_rejected() {
+        let mut corrupted = state(Direction::Short, PositionBaseline::flat());
+        let source_client_order_id = grid_id(&corrupted, 13, OrderSide::Buy, true);
+        let source = corrupted
+            .orders
+            .get(&source_client_order_id)
+            .unwrap()
+            .clone();
+        let counter = counter_shape(&corrupted, 13, &source.shape, source.shape.quantity).unwrap();
+        let side = match counter.side {
+            OrderSide::Buy => "B",
+            OrderSide::Sell => "S",
+        };
+        let future_replacement_id = ClientOrderId::parse(format!(
+            "r_{}_13_{side}_{}",
+            corrupted.run_id.as_str(),
+            corrupted.next_order_sequence
+        ))
+        .unwrap();
+        let victim_client_order_id = corrupted
+            .orders
+            .values()
+            .find(|order| {
+                order.purpose.is_initial_grid() && order.client_order_id != source_client_order_id
+            })
+            .unwrap()
+            .client_order_id
+            .clone();
+        let mut victim = corrupted.orders.remove(&victim_client_order_id).unwrap();
+        victim.client_order_id = future_replacement_id.clone();
+        corrupted.orders.insert(future_replacement_id, victim);
+
+        assert_eq!(
+            corrupted.validate(),
+            Err(StrategyStateError::OrderSequenceMismatch),
+            "persisted IDs must not be able to reserve the next replacement identity",
         );
     }
 
