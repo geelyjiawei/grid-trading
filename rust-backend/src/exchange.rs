@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
@@ -194,10 +194,49 @@ pub(crate) fn is_valid_trade_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
+pub(crate) fn compare_trade_ids(left: &str, right: &str) -> Ordering {
+    match (
+        decimal_trade_id_magnitude(left),
+        decimal_trade_id_magnitude(right),
+    ) {
+        (Some(left_magnitude), Some(right_magnitude)) => left_magnitude
+            .len()
+            .cmp(&right_magnitude.len())
+            .then_with(|| left_magnitude.cmp(right_magnitude))
+            .then_with(|| left.cmp(right)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+pub(crate) fn compare_trade_chronology(
+    left_time_ms: u64,
+    left_trade_id: &str,
+    right_time_ms: u64,
+    right_trade_id: &str,
+) -> Ordering {
+    left_time_ms
+        .cmp(&right_time_ms)
+        .then_with(|| compare_trade_ids(left_trade_id, right_trade_id))
+}
+
+fn decimal_trade_id_magnitude(value: &str) -> Option<&str> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = value.trim_start_matches('0');
+    Some(if magnitude.is_empty() { "0" } else { magnitude })
+}
+
 pub(crate) fn trades_are_canonically_ordered(trades: &[TradeFill]) -> bool {
     trades.windows(2).all(|pair| {
-        (pair[0].trade_time_ms, pair[0].trade_id.as_str())
-            <= (pair[1].trade_time_ms, pair[1].trade_id.as_str())
+        compare_trade_chronology(
+            pair[0].trade_time_ms,
+            &pair[0].trade_id,
+            pair[1].trade_time_ms,
+            &pair[1].trade_id,
+        ) != Ordering::Greater
     })
 }
 
@@ -529,5 +568,41 @@ mod snapshot_tests {
         };
 
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn canonical_trade_id_order_handles_numeric_magnitude_without_parsing_identity() {
+        assert_eq!(compare_trade_ids("9", "10"), Ordering::Less);
+        assert_eq!(
+            compare_trade_ids(
+                "99999999999999999999999999999999999999",
+                "100000000000000000000000000000000000000",
+            ),
+            Ordering::Less
+        );
+        assert_eq!(compare_trade_ids("exec-a", "exec-b"), Ordering::Less);
+        assert_eq!(compare_trade_ids("10", "exec-a"), Ordering::Less);
+        assert_eq!(compare_trade_ids("exec-a", "10"), Ordering::Greater);
+        assert_eq!(compare_trade_ids("09", "9"), Ordering::Less);
+    }
+
+    #[test]
+    fn canonical_trade_id_order_is_transitive_across_id_kinds() {
+        let mut ids = ["1a", "10", "2", "exec-b", "exec-a", "09", "9"];
+        ids.sort_by(|left, right| compare_trade_ids(left, right));
+
+        assert_eq!(ids, ["2", "09", "9", "10", "1a", "exec-a", "exec-b"]);
+        for left in 0..ids.len() {
+            for middle in left..ids.len() {
+                for right in middle..ids.len() {
+                    assert_ne!(compare_trade_ids(ids[left], ids[middle]), Ordering::Greater);
+                    assert_ne!(
+                        compare_trade_ids(ids[middle], ids[right]),
+                        Ordering::Greater
+                    );
+                    assert_ne!(compare_trade_ids(ids[left], ids[right]), Ordering::Greater);
+                }
+            }
+        }
     }
 }

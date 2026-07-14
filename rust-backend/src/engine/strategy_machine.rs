@@ -8,7 +8,9 @@ use crate::domain::{
     ClientOrderId, Direction, Exchange, GridConfig, InstrumentRules, IntentState, OrderIntent,
     OrderKind, OrderShape, OrderSide, TerminalOrderStatus,
 };
-use crate::exchange::{OrderLifecycle, is_valid_trade_id, trades_are_canonically_ordered};
+use crate::exchange::{
+    OrderLifecycle, compare_trade_chronology, is_valid_trade_id, trades_are_canonically_ordered,
+};
 
 use super::{
     GridOrderRole, GridPlan, GridPlanError, PlannedGridOrder,
@@ -2843,14 +2845,22 @@ fn inventory_events_in_accounting_order(
     }
     if exact_event_count == events.len() {
         events.sort_by(|left, right| {
-            left.execution_time_ms
-                .cmp(&right.execution_time_ms)
-                .then_with(|| left.exchange_trade_id.cmp(&right.exchange_trade_id))
-                .then_with(|| {
-                    left.source_client_order_id
-                        .cmp(&right.source_client_order_id)
-                })
-                .then_with(|| left.sequence.cmp(&right.sequence))
+            match (
+                left.execution_time_ms,
+                left.exchange_trade_id.as_deref(),
+                right.execution_time_ms,
+                right.exchange_trade_id.as_deref(),
+            ) {
+                (Some(left_time), Some(left_id), Some(right_time), Some(right_id)) => {
+                    compare_trade_chronology(left_time, left_id, right_time, right_id)
+                }
+                _ => left.sequence.cmp(&right.sequence),
+            }
+            .then_with(|| {
+                left.source_client_order_id
+                    .cmp(&right.source_client_order_id)
+            })
+            .then_with(|| left.sequence.cmp(&right.sequence))
         });
     }
     Ok(events)
@@ -6647,7 +6657,7 @@ mod tests {
     }
 
     #[test]
-    fn same_millisecond_cross_order_trades_use_stable_trade_id_order() {
+    fn same_millisecond_numeric_trade_ids_follow_exchange_sequence() {
         let mut machine = cross_order_neutral_machine();
         let low_buy = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, false);
         let high_buy = grid_id(machine.store().snapshot(), 2, OrderSide::Buy, false);
@@ -6661,7 +6671,7 @@ mod tests {
             high_buy,
             ValuedTradeFixture {
                 exchange_order_id: "same-ms-high-order",
-                trade_id: "b-high-buy",
+                trade_id: "10",
                 price: Decimal::new(30, 2),
                 quantity: decimal(10),
                 trade_time_ms: 103,
@@ -6673,7 +6683,7 @@ mod tests {
             low_buy,
             ValuedTradeFixture {
                 exchange_order_id: "same-ms-low-order",
-                trade_id: "a-low-buy",
+                trade_id: "9",
                 price: Decimal::new(20, 2),
                 quantity: decimal(10),
                 trade_time_ms: 103,
@@ -6685,7 +6695,7 @@ mod tests {
             sell,
             ValuedTradeFixture {
                 exchange_order_id: "same-ms-sell-order",
-                trade_id: "c-sell",
+                trade_id: "11",
                 price: Decimal::new(35, 2),
                 quantity: decimal(10),
                 trade_time_ms: 104,

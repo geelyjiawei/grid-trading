@@ -105,8 +105,10 @@ the OpenAPI schema.
   inventory event must exactly match the audited trade ID, time, quantity, and quote;
   aggregate quantity and quote agreement alone are insufficient.
 - Inventory event sequence records durable observation order, but cost lots and realized
-  PnL are rebuilt across all strategy orders by `(trade time, opaque trade ID, client
-  order ID)`. Polling order can never select which lot is consumed.
+  PnL are rebuilt across all strategy orders by `(trade time, canonical trade ID, client
+  order ID)`. Decimal trade IDs compare by numeric magnitude; opaque IDs use stable byte
+  order; decimal IDs sort before opaque IDs if formats are mixed. Polling order can never
+  select which lot is consumed.
 - Exact per-trade inventory evidence and legacy aggregate-only inventory evidence cannot
   coexist in an advancing strategy because no authoritative relative chronology exists.
   A newly observed exact fill is retained and the strategy fails closed instead of

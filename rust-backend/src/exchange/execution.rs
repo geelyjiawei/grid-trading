@@ -8,7 +8,7 @@ use crate::{
     domain::{ClientOrderId, Exchange, OrderSide, TerminalOrderStatus},
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, HistoricalMinutePrice, OrderExecutionSnapshot,
-        OrderLifecycle, TradeFill, codec::parse_authoritative_order,
+        OrderLifecycle, TradeFill, codec::parse_authoritative_order, compare_trade_chronology,
     },
 };
 
@@ -227,8 +227,12 @@ pub(super) fn assemble_execution_snapshot(
     mut trades: Vec<TradeFill>,
 ) -> Result<OrderExecutionSnapshot, ExecutionCodecError> {
     trades.sort_by(|left, right| {
-        (left.trade_time_ms, left.trade_id.as_str())
-            .cmp(&(right.trade_time_ms, right.trade_id.as_str()))
+        compare_trade_chronology(
+            left.trade_time_ms,
+            &left.trade_id,
+            right.trade_time_ms,
+            &right.trade_id,
+        )
     });
     let mut ids = BTreeSet::new();
     let mut quantity = Decimal::ZERO;
@@ -386,6 +390,31 @@ mod tests {
         assert_eq!(snapshot.trades[0].trade_id, "7");
         assert_eq!(snapshot.trades[1].trade_id, "8");
         assert_eq!(numeric_trade_id(&snapshot.trades[0]), Ok(7));
+    }
+
+    #[test]
+    fn same_millisecond_numeric_trade_ids_keep_exchange_sequence() {
+        let trades = parse_trade_page(
+            r#"[
+                {"symbol":"MUUSDT","id":10,"orderId":42,"side":"SELL","price":"15.95","qty":"1.14","quoteQty":"18.183","commission":"0.0036366","commissionAsset":"USDT","realizedPnl":"0","maker":true,"time":1050},
+                {"symbol":"MUUSDT","id":9,"orderId":42,"side":"SELL","price":"15.95","qty":"2","quoteQty":"31.90","commission":"0.00638","commissionAsset":"USDT","realizedPnl":"0","maker":true,"time":1050}
+            ]"#,
+            "MUUSDT",
+            CommissionConvention::PositiveCost,
+        )
+        .unwrap();
+
+        let snapshot =
+            assemble_execution_snapshot(header("FILLED", "3.14", "50.083"), trades).unwrap();
+
+        assert_eq!(
+            snapshot
+                .trades
+                .iter()
+                .map(|trade| trade.trade_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["9", "10"]
+        );
     }
 
     #[test]

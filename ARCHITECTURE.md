@@ -88,9 +88,11 @@ event's trade ID, execution time, quantity, and quote value must exactly match
 the embedded audit. This keeps realized PnL and remaining cost basis correct
 when one synchronization batch both closes old inventory and opens inventory in
 the opposite direction. The append sequence remains an immutable observation
-log, while inventory is rebuilt across all orders in `(trade time, trade ID,
-client order ID)` order. Therefore an earlier exchange trade discovered by a
-later polling pass corrects FIFO cost basis without rewriting audit history.
+log, while inventory is rebuilt across all orders in `(trade time, canonical
+trade ID, client order ID)` order. Decimal trade IDs use numeric magnitude while
+opaque IDs use stable byte order; decimal IDs sort before opaque IDs if formats
+are ever mixed. Therefore an earlier exchange trade discovered by a later polling
+pass corrects FIFO cost basis without rewriting audit history.
 Exact trade events cannot be mixed with legacy aggregate-only inventory evidence
 in an active strategy because their relative chronology is unknowable; that
 condition retains the authoritative fill but fails the strategy closed. The
