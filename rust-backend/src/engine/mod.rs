@@ -69,11 +69,11 @@ pub use shadow_collector::{
 };
 pub(crate) use strategy_machine::TriggerActivation;
 pub use strategy_machine::{
-    ExecutionReport, LevelLot, MemoryStrategyStateStore, NeutralLot, PositionBaseline,
-    ReplacementObligation, ReplacementObligationKind, RiskExitReason, StrategyLifecycle,
-    StrategyMachine, StrategyMachineError, StrategyOrderPurpose, StrategyOrderRecord,
-    StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError, StrategyStateStore,
-    StrategyStoreError, StrategyTransition,
+    ExecutionReport, InventoryExecutionEvent, LevelLot, MemoryStrategyStateStore, NeutralLot,
+    PositionBaseline, ReplacementObligation, ReplacementObligationKind, RiskExitReason,
+    StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
+    StrategyOrderRecord, StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError,
+    StrategyStateStore, StrategyStoreError, StrategyTransition,
 };
 pub use submission::{SubmissionError, SubmissionResult, SubmissionService, submit_with};
 pub use supervisor::{

@@ -184,6 +184,15 @@ pub struct NeutralLot {
     pub entry_value: Decimal,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InventoryExecutionEvent {
+    pub sequence: u64,
+    pub source_client_order_id: ClientOrderId,
+    pub quantity: Decimal,
+    pub quote: Decimal,
+    pub applied_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplacementObligationKind {
@@ -222,11 +231,15 @@ pub struct StrategyState {
     pub lots_by_level: BTreeMap<u16, LevelLot>,
     #[serde(default)]
     pub neutral_lots: BTreeMap<u64, NeutralLot>,
+    #[serde(default)]
+    pub inventory_events: BTreeMap<u64, InventoryExecutionEvent>,
     pub replacement_obligations: BTreeMap<u64, ReplacementObligation>,
     pub next_order_sequence: u64,
     pub next_obligation_sequence: u64,
     #[serde(default = "one_u64")]
     pub next_neutral_lot_sequence: u64,
+    #[serde(default = "one_u64")]
+    pub next_inventory_event_sequence: u64,
     pub initial_deployment_complete: bool,
     #[serde(default)]
     pub risk_exit_reason: Option<RiskExitReason>,
@@ -348,10 +361,12 @@ impl StrategyState {
             orders: BTreeMap::new(),
             lots_by_level: BTreeMap::new(),
             neutral_lots: BTreeMap::new(),
+            inventory_events: BTreeMap::new(),
             replacement_obligations: BTreeMap::new(),
             next_order_sequence: 1,
             next_obligation_sequence: 1,
             next_neutral_lot_sequence: 1,
+            next_inventory_event_sequence: 1,
             initial_deployment_complete: false,
             risk_exit_reason: None,
             risk_trigger_mark_price: None,
@@ -589,6 +604,7 @@ impl StrategyState {
                 || order.cumulative_quantity > order.shape.quantity
                 || order.cumulative_quote < Decimal::ZERO
                 || order.cumulative_fee < Decimal::ZERO
+                || order.cumulative_quantity.is_zero() != order.cumulative_quote.is_zero()
             {
                 return Err(StrategyStateError::InvalidExecutionTotals);
             }
@@ -836,6 +852,7 @@ impl StrategyState {
         }
         validate_replacement_obligation_ledger(self)?;
         validate_aggregate_accounting(self)?;
+        validate_inventory_event_ledger(self)?;
         self.expected_exchange_position()?;
         Ok(())
     }
@@ -1398,6 +1415,108 @@ fn validate_aggregate_accounting(state: &StrategyState) -> Result<(), StrategySt
     ))?;
     if expected_gross_profit != state.gross_realized_profit {
         return Err(StrategyStateError::AggregateAccountingMismatch);
+    }
+    Ok(())
+}
+
+fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), StrategyStateError> {
+    if state.next_inventory_event_sequence == 0
+        || state
+            .inventory_events
+            .keys()
+            .copied()
+            .ne(1..state.next_inventory_event_sequence)
+    {
+        return Err(StrategyStateError::InventoryEventLedgerMismatch);
+    }
+
+    let mut quantities_by_order = BTreeMap::<ClientOrderId, Decimal>::new();
+    let mut quotes_by_order = BTreeMap::<ClientOrderId, Decimal>::new();
+    let mut previous_applied_at_ms = state.created_at_ms;
+    for (sequence, event) in &state.inventory_events {
+        if event.sequence != *sequence
+            || event.quantity <= Decimal::ZERO
+            || event.quote <= Decimal::ZERO
+            || event.applied_at_ms < previous_applied_at_ms
+            || event.applied_at_ms > state.updated_at_ms
+            || !state.orders.contains_key(&event.source_client_order_id)
+        {
+            return Err(StrategyStateError::InventoryEventLedgerMismatch);
+        }
+        previous_applied_at_ms = event.applied_at_ms;
+        let quantity = quantities_by_order
+            .entry(event.source_client_order_id.clone())
+            .or_insert(Decimal::ZERO);
+        *quantity =
+            quantity
+                .checked_add(event.quantity)
+                .ok_or(StrategyStateError::NumericOverflow(
+                    "inventory event quantity",
+                ))?;
+        let quote = quotes_by_order
+            .entry(event.source_client_order_id.clone())
+            .or_insert(Decimal::ZERO);
+        *quote = quote
+            .checked_add(event.quote)
+            .ok_or(StrategyStateError::NumericOverflow("inventory event quote"))?;
+    }
+    if state.orders.values().any(|order| {
+        quantities_by_order
+            .get(&order.client_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+            != order.cumulative_quantity
+            || quotes_by_order
+                .get(&order.client_order_id)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                != order.cumulative_quote
+    }) {
+        return Err(StrategyStateError::InventoryEventLedgerMismatch);
+    }
+
+    // A failed strategy is retained for diagnosis even when the execution that
+    // caused the failure could not be represented by the inventory model.
+    if state.lifecycle == StrategyLifecycle::Failed {
+        return Ok(());
+    }
+
+    let mut replay = state.clone();
+    replay.grid_position_net_quantity = Decimal::ZERO;
+    replay.opening_filled_quantity = Decimal::ZERO;
+    replay.opening_filled_value = Decimal::ZERO;
+    replay.lots_by_level.clear();
+    replay.neutral_lots.clear();
+    replay.next_neutral_lot_sequence = 1;
+    replay.gross_realized_profit = Decimal::ZERO;
+    for event in state.inventory_events.values() {
+        let order = state
+            .orders
+            .get(&event.source_client_order_id)
+            .ok_or(StrategyStateError::InventoryEventLedgerMismatch)?;
+        apply_inventory_accounting(
+            &mut replay,
+            &order.purpose,
+            &order.shape,
+            event.quantity,
+            event.quote,
+        )
+        .map_err(|_| StrategyStateError::InventoryEventLedgerMismatch)?;
+    }
+
+    if replay.grid_position_net_quantity != state.grid_position_net_quantity
+        || replay.opening_filled_quantity != state.opening_filled_quantity
+        || replay.opening_filled_value != state.opening_filled_value
+        || replay.gross_realized_profit != state.gross_realized_profit
+        || replay.next_neutral_lot_sequence != state.next_neutral_lot_sequence
+    {
+        return Err(StrategyStateError::InventoryEventLedgerMismatch);
+    }
+    if replay.lots_by_level != state.lots_by_level {
+        return Err(StrategyStateError::LevelLotLedgerMismatch);
+    }
+    if replay.neutral_lots != state.neutral_lots {
+        return Err(StrategyStateError::NeutralLotLedgerMismatch);
     }
     Ok(())
 }
@@ -2423,13 +2542,30 @@ fn apply_execution_report(
     let delta_quote = report.cumulative_quote - existing.cumulative_quote;
     let delta_fee = report.cumulative_fee - existing.cumulative_fee;
     let terminal_changed = report.terminal_status.is_some() && existing.terminal_status.is_none();
-    if delta_quantity.is_zero() && delta_fee.is_zero() && !terminal_changed {
-        return StrategyTransition::NoChange;
-    }
-
     let purpose = existing.purpose.clone();
     let shape = existing.shape.clone();
     let was_terminal_processed = existing.terminal_processed;
+    if delta_quantity.is_zero() != delta_quote.is_zero() {
+        let message =
+            "execution quantity and quote deltas must become positive together".to_owned();
+        state.fail(message.clone());
+        return StrategyTransition::Failed { message };
+    }
+    if delta_quantity.is_zero() && delta_fee.is_zero() && !terminal_changed {
+        return StrategyTransition::NoChange;
+    }
+    if delta_quantity > Decimal::ZERO
+        && let Err(message) = append_inventory_event(
+            state,
+            report.client_order_id.clone(),
+            delta_quantity,
+            delta_quote,
+            now_ms,
+        )
+    {
+        return fail_transition(state, message);
+    }
+
     {
         let Some(order) = state.orders.get_mut(&report.client_order_id) else {
             return fail_transition(state, "execution order disappeared during processing");
@@ -2509,6 +2645,37 @@ fn apply_execution_report(
     }
 }
 
+fn append_inventory_event(
+    state: &mut StrategyState,
+    source_client_order_id: ClientOrderId,
+    quantity: Decimal,
+    quote: Decimal,
+    applied_at_ms: u64,
+) -> Result<(), String> {
+    if quantity <= Decimal::ZERO || quote <= Decimal::ZERO {
+        return Err("inventory event quantity or quote is invalid".to_owned());
+    }
+    let sequence = state.next_inventory_event_sequence;
+    let next_sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| "inventory event sequence overflowed".to_owned())?;
+    if state.inventory_events.contains_key(&sequence) {
+        return Err("inventory event sequence is duplicated".to_owned());
+    }
+    state.inventory_events.insert(
+        sequence,
+        InventoryExecutionEvent {
+            sequence,
+            source_client_order_id,
+            quantity,
+            quote,
+            applied_at_ms,
+        },
+    );
+    state.next_inventory_event_sequence = next_sequence;
+    Ok(())
+}
+
 struct ExecutionDelta<'a> {
     source_client_order_id: &'a ClientOrderId,
     purpose: &'a StrategyOrderPurpose,
@@ -2523,64 +2690,24 @@ fn apply_execution_delta(
     delta: ExecutionDelta<'_>,
     obligation_ids: &mut Vec<u64>,
 ) -> Result<(), String> {
-    let signed_quantity = match delta.shape.side {
-        OrderSide::Buy => delta.quantity,
-        OrderSide::Sell => -delta.quantity,
-    };
-    state.grid_position_net_quantity = state
-        .grid_position_net_quantity
-        .checked_add(signed_quantity)
-        .ok_or_else(|| "grid position quantity overflowed".to_owned())?;
-
-    if matches!(delta.purpose, StrategyOrderPurpose::Opening) {
-        state.opening_filled_quantity = state
-            .opening_filled_quantity
-            .checked_add(delta.quantity)
-            .ok_or_else(|| "opening quantity overflowed".to_owned())?;
-        state.opening_filled_value = state
-            .opening_filled_value
-            .checked_add(delta.quote)
-            .ok_or_else(|| "opening value overflowed".to_owned())?;
-        allocate_opening_delta(state, delta.quantity, delta.quote)?;
-        return validate_directional_position(state, delta.shape);
-    }
-
-    if matches!(delta.purpose, StrategyOrderPurpose::RiskClose) {
-        validate_directional_position(state, delta.shape)?;
-        let realized =
-            consume_risk_close_lots(state, delta.shape.side, delta.quantity, delta.quote)?;
-        state.gross_realized_profit = state
-            .gross_realized_profit
-            .checked_add(realized)
-            .ok_or_else(|| "risk close realized profit overflowed".to_owned())?;
+    apply_inventory_accounting(
+        state,
+        delta.purpose,
+        delta.shape,
+        delta.quantity,
+        delta.quote,
+    )?;
+    if matches!(
+        delta.purpose,
+        StrategyOrderPurpose::Opening | StrategyOrderPurpose::RiskClose
+    ) || !normal_grid_replacements_enabled(state.lifecycle)
+    {
         return Ok(());
     }
-
-    validate_directional_position(state, delta.shape)?;
     let level_index = delta
         .purpose
         .level_index()
         .ok_or_else(|| "grid execution has no level identity".to_owned())?;
-    if state.direction != Direction::Neutral {
-        if delta.shape.reduce_only {
-            let realized = consume_level_lot(state, level_index, delta.quantity, delta.quote)?;
-            state.gross_realized_profit = state
-                .gross_realized_profit
-                .checked_add(realized)
-                .ok_or_else(|| "realized profit overflowed".to_owned())?;
-        } else {
-            add_level_lot(state, level_index, delta.quantity, delta.quote)?;
-        }
-    } else {
-        let realized = apply_neutral_fill(state, delta.shape.side, delta.quantity, delta.quote)?;
-        state.gross_realized_profit = state
-            .gross_realized_profit
-            .checked_add(realized)
-            .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
-    }
-    if !normal_grid_replacements_enabled(state.lifecycle) {
-        return Ok(());
-    }
     let counter = counter_shape(state, level_index, delta.shape, delta.quantity)?;
     let id = add_obligation(
         state,
@@ -2591,6 +2718,69 @@ fn apply_execution_delta(
         delta.now_ms,
     )?;
     obligation_ids.push(id);
+    Ok(())
+}
+
+fn apply_inventory_accounting(
+    state: &mut StrategyState,
+    purpose: &StrategyOrderPurpose,
+    shape: &OrderShape,
+    quantity: Decimal,
+    quote: Decimal,
+) -> Result<(), String> {
+    let signed_quantity = match shape.side {
+        OrderSide::Buy => quantity,
+        OrderSide::Sell => -quantity,
+    };
+    state.grid_position_net_quantity = state
+        .grid_position_net_quantity
+        .checked_add(signed_quantity)
+        .ok_or_else(|| "grid position quantity overflowed".to_owned())?;
+
+    if matches!(purpose, StrategyOrderPurpose::Opening) {
+        state.opening_filled_quantity = state
+            .opening_filled_quantity
+            .checked_add(quantity)
+            .ok_or_else(|| "opening quantity overflowed".to_owned())?;
+        state.opening_filled_value = state
+            .opening_filled_value
+            .checked_add(quote)
+            .ok_or_else(|| "opening value overflowed".to_owned())?;
+        allocate_opening_delta(state, quantity, quote)?;
+        return validate_directional_position(state, shape);
+    }
+
+    if matches!(purpose, StrategyOrderPurpose::RiskClose) {
+        validate_directional_position(state, shape)?;
+        let realized = consume_risk_close_lots(state, shape.side, quantity, quote)?;
+        state.gross_realized_profit = state
+            .gross_realized_profit
+            .checked_add(realized)
+            .ok_or_else(|| "risk close realized profit overflowed".to_owned())?;
+        return Ok(());
+    }
+
+    validate_directional_position(state, shape)?;
+    let level_index = purpose
+        .level_index()
+        .ok_or_else(|| "grid execution has no level identity".to_owned())?;
+    if state.direction != Direction::Neutral {
+        if shape.reduce_only {
+            let realized = consume_level_lot(state, level_index, quantity, quote)?;
+            state.gross_realized_profit = state
+                .gross_realized_profit
+                .checked_add(realized)
+                .ok_or_else(|| "realized profit overflowed".to_owned())?;
+        } else {
+            add_level_lot(state, level_index, quantity, quote)?;
+        }
+    } else {
+        let realized = apply_neutral_fill(state, shape.side, quantity, quote)?;
+        state.gross_realized_profit = state
+            .gross_realized_profit
+            .checked_add(realized)
+            .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
+    }
     Ok(())
 }
 
@@ -3382,6 +3572,8 @@ pub enum StrategyStateError {
     InvalidExecutionTotals,
     #[error("strategy aggregate accounting does not match its durable order ledger")]
     AggregateAccountingMismatch,
+    #[error("strategy inventory events do not match the durable order ledger")]
+    InventoryEventLedgerMismatch,
     #[error("opening execution totals do not match the durable opening ledger")]
     OpeningAccountingMismatch,
     #[error("opening order chain does not match the immutable opening plan")]
@@ -3396,8 +3588,12 @@ pub enum StrategyStateError {
     InvalidNeutralLot,
     #[error("strategy level lots do not cover the grid-owned position")]
     LevelLotCoverageMismatch,
+    #[error("strategy level lots do not match the durable execution ledger")]
+    LevelLotLedgerMismatch,
     #[error("strategy neutral inventory lots do not cover the grid-owned position")]
     NeutralLotCoverageMismatch,
+    #[error("strategy neutral inventory lots do not match the durable execution ledger")]
+    NeutralLotLedgerMismatch,
     #[error("replacement obligation identity is invalid")]
     ObligationIdentityMismatch,
     #[error("replacement obligation references a missing assigned order")]
@@ -5100,6 +5296,259 @@ mod tests {
                 Err(StrategyStateError::AggregateAccountingMismatch)
             );
         }
+    }
+
+    #[test]
+    fn persisted_level_lot_redistribution_is_rejected() {
+        let machine = short_machine_with_opening();
+        let mut drifted = machine.store().snapshot().clone();
+        let moved_quantity = Decimal::new(1, 1);
+        let moved_entry_value = {
+            let source = drifted.lots_by_level.get(&0).unwrap();
+            source
+                .entry_value
+                .checked_mul(moved_quantity)
+                .and_then(|value| value.checked_div(source.quantity))
+                .unwrap()
+        };
+        {
+            let source = drifted.lots_by_level.get_mut(&0).unwrap();
+            source.quantity -= moved_quantity;
+            source.entry_value -= moved_entry_value;
+        }
+        {
+            let destination = drifted.lots_by_level.get_mut(&1).unwrap();
+            destination.quantity += moved_quantity;
+            destination.entry_value += moved_entry_value;
+        }
+
+        assert_eq!(
+            drifted.validate(),
+            Err(StrategyStateError::LevelLotLedgerMismatch)
+        );
+    }
+
+    #[test]
+    fn missing_or_reordered_inventory_events_are_rejected() {
+        let mut machine = short_machine_with_opening();
+        let reduce = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, true);
+        machine
+            .apply_execution(
+                &report(
+                    reduce,
+                    "reduce-level-zero",
+                    Decimal::new(2, 1),
+                    decimal(200),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                110,
+            )
+            .unwrap();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        machine.materialize_replacements(&rules, 111).unwrap();
+        let add = replacement_orders(machine.store().snapshot())
+            .into_iter()
+            .find(|order| {
+                order.purpose.level_index() == Some(0)
+                    && order.shape.side == OrderSide::Sell
+                    && !order.shape.reduce_only
+            })
+            .unwrap()
+            .client_order_id
+            .clone();
+        machine
+            .apply_execution(
+                &report(
+                    add,
+                    "add-level-zero",
+                    Decimal::new(2, 1),
+                    Decimal::new(2002, 1),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                112,
+            )
+            .unwrap();
+        let valid = machine.store().snapshot().clone();
+        assert_eq!(valid.inventory_events.len(), 3);
+
+        let mut missing = valid.clone();
+        missing.inventory_events.remove(&2);
+        assert_eq!(
+            missing.validate(),
+            Err(StrategyStateError::InventoryEventLedgerMismatch)
+        );
+
+        let mut reordered = valid;
+        let mut second = reordered.inventory_events.remove(&2).unwrap();
+        let mut third = reordered.inventory_events.remove(&3).unwrap();
+        second.sequence = 3;
+        third.sequence = 2;
+        reordered.inventory_events.insert(2, third);
+        reordered.inventory_events.insert(3, second);
+        assert_eq!(
+            reordered.validate(),
+            Err(StrategyStateError::InventoryEventLedgerMismatch)
+        );
+    }
+
+    #[test]
+    fn persisted_neutral_lot_cost_redistribution_is_rejected() {
+        let mut machine = small_neutral_machine();
+        let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        machine
+            .apply_execution(
+                &report(
+                    buy.clone(),
+                    "neutral-two-lots",
+                    decimal(10),
+                    Decimal::new(27, 1),
+                    None,
+                ),
+                101,
+            )
+            .unwrap();
+        machine
+            .apply_execution(
+                &report(
+                    buy,
+                    "neutral-two-lots",
+                    decimal(20),
+                    Decimal::new(55, 1),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                102,
+            )
+            .unwrap();
+        let mut drifted = machine.store().snapshot().clone();
+        assert_eq!(drifted.neutral_lots.len(), 2);
+        drifted.neutral_lots.get_mut(&1).unwrap().entry_value += Decimal::new(1, 1);
+        drifted.neutral_lots.get_mut(&2).unwrap().entry_value -= Decimal::new(1, 1);
+
+        assert_eq!(
+            drifted.validate(),
+            Err(StrategyStateError::NeutralLotLedgerMismatch)
+        );
+    }
+
+    #[test]
+    fn quote_only_execution_delta_fails_without_creating_phantom_volume() {
+        let mut machine = short_machine_with_opening();
+        let before = machine.store().snapshot().clone();
+        let add = grid_id(&before, 14, OrderSide::Sell, false);
+
+        let transition = machine
+            .apply_execution(
+                &report(add, "quote-only", Decimal::ZERO, Decimal::ONE, None),
+                110,
+            )
+            .unwrap();
+
+        assert!(matches!(transition, StrategyTransition::Failed { .. }));
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.total_volume, before.total_volume);
+        assert_eq!(
+            state.grid_position_net_quantity,
+            before.grid_position_net_quantity
+        );
+        assert_eq!(state.inventory_events, before.inventory_events);
+    }
+
+    #[test]
+    fn directional_inventory_replay_survives_two_hundred_counter_cycles() {
+        let mut machine = short_machine_with_opening();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        let mut next_order = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, true);
+        let mut now_ms = 110_u64;
+
+        for index in 0..200 {
+            let shape = machine
+                .store()
+                .snapshot()
+                .orders
+                .get(&next_order)
+                .unwrap()
+                .shape
+                .clone();
+            let quote = shape.price.unwrap().checked_mul(shape.quantity).unwrap();
+            machine
+                .apply_execution(
+                    &report(
+                        next_order,
+                        &format!("directional-cycle-{index}"),
+                        shape.quantity,
+                        quote,
+                        Some(TerminalOrderStatus::Filled),
+                    ),
+                    now_ms,
+                )
+                .unwrap();
+            now_ms += 1;
+            let transition = machine.materialize_replacements(&rules, now_ms).unwrap();
+            next_order = match transition {
+                StrategyTransition::ReplacementOrdersReady { client_order_ids } => {
+                    assert_eq!(client_order_ids.len(), 1);
+                    client_order_ids.into_iter().next().unwrap()
+                }
+                other => panic!("unexpected replacement transition: {other:?}"),
+            };
+            now_ms += 1;
+        }
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.inventory_events.len(), 201);
+        assert_eq!(state.next_inventory_event_sequence, 202);
+        assert_eq!(state.completed_pairs, 100);
+        assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn neutral_inventory_replay_survives_two_hundred_counter_cycles() {
+        let mut machine = small_neutral_machine();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        let mut next_order = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        let mut now_ms = 110_u64;
+
+        for index in 0..200 {
+            let shape = machine
+                .store()
+                .snapshot()
+                .orders
+                .get(&next_order)
+                .unwrap()
+                .shape
+                .clone();
+            let quote = shape.price.unwrap().checked_mul(shape.quantity).unwrap();
+            machine
+                .apply_execution(
+                    &report(
+                        next_order,
+                        &format!("neutral-cycle-{index}"),
+                        shape.quantity,
+                        quote,
+                        Some(TerminalOrderStatus::Filled),
+                    ),
+                    now_ms,
+                )
+                .unwrap();
+            now_ms += 1;
+            let transition = machine.materialize_replacements(&rules, now_ms).unwrap();
+            next_order = match transition {
+                StrategyTransition::ReplacementOrdersReady { client_order_ids } => {
+                    assert_eq!(client_order_ids.len(), 1);
+                    client_order_ids.into_iter().next().unwrap()
+                }
+                other => panic!("unexpected replacement transition: {other:?}"),
+            };
+            now_ms += 1;
+        }
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.inventory_events.len(), 200);
+        assert_eq!(state.next_inventory_event_sequence, 201);
+        assert_eq!(state.grid_position_net_quantity, Decimal::ZERO);
+        assert!(state.neutral_lots.is_empty());
+        assert_eq!(state.validate(), Ok(()));
     }
 
     #[test]

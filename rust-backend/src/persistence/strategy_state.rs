@@ -592,6 +592,25 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_inventory_event_ledger_is_retained_and_rejected_on_load() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut corrupted = state();
+        corrupted.next_inventory_event_sequence = 2;
+        let bytes = serde_json::to_vec_pretty(&PersistedStrategyState::Active(Box::new(corrupted)))
+            .unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            FileStrategyStateStore::load(&path),
+            Err(StrategyStoreError::InvalidState(
+                StrategyStateError::InventoryEventLedgerMismatch
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
     fn fabricated_replacement_obligation_is_retained_and_rejected_on_load() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("strategy.json");

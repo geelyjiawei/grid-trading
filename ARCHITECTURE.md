@@ -80,6 +80,17 @@ exact, the runtime first converges the intent ledger to that accounted terminal
 state and only then materializes the counter order. Any identity or terminal-status
 conflict remains fail-closed.
 
+Inventory accounting is independently replayable. Every positive execution
+delta appends an immutable event containing its strategy order identity,
+quantity, quote value, and application time. Before an active strategy can be
+loaded, these events must exactly reproduce the opening allocation, every
+per-level directional lot, neutral FIFO lots, net grid position, and gross
+realized profit. Aggregate totals alone are never accepted as proof because
+quantity and cost can otherwise drift between levels while the overall sum
+still appears correct. A legacy state that already contains executions but no
+complete event chain is retained for diagnosis and rejected rather than being
+silently reconstructed from guesses.
+
 ## Cutover gates
 
 The legacy production entrypoint may be replaced only when all of these are
