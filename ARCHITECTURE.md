@@ -19,7 +19,7 @@ The candidate stack is isolated:
 Dockerfile.rust-vue
 docker-compose.rust-vue.yml
 127.0.0.1:8001
-data-rust-preview/
+rust-preview-data (Docker named volume)
 ```
 
 It builds Vue in a Node build stage, compiles the Rust server in a Rust build

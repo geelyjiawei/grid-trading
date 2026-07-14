@@ -66,9 +66,12 @@ const settingsOpen = ref(false);
 let statusTimer: number | undefined;
 let marketTimer: number | undefined;
 let statusRefreshRunning = false;
-let marketRefreshRunning = false;
 let previewRequestSequence = 0;
+let marketRequestSequence = 0;
 let detailsRequestSequence = 0;
+let marketContext = "";
+let balanceContext = "";
+let detailsContext = "";
 
 const configured = computed(
   () => Boolean(config.value?.configs[activeExchange.value]?.configured),
@@ -103,6 +106,32 @@ function normalizeSymbol(): void {
   symbol.value = symbol.value.trim().toUpperCase();
 }
 
+function prepareWorkspaceContext(): void {
+  const exchange = activeExchange.value;
+  const context = `${exchange}:${symbol.value}`;
+  if (marketContext !== context) {
+    marketContext = context;
+    marketRequestSequence += 1;
+    price.value = null;
+    fees.value = null;
+    risk.value = null;
+    marketError.value = "";
+  }
+  if (balanceContext !== exchange) {
+    balanceContext = exchange;
+    balance.value = null;
+  }
+  if (detailsContext !== context) {
+    detailsContext = context;
+    detailsRequestSequence += 1;
+    positions.value = [];
+    openOrders.value = [];
+    trades.value = [];
+    detailsError.value = "";
+    detailsLoading.value = false;
+  }
+}
+
 async function loadConfig(): Promise<void> {
   const response = await api.config();
   config.value = response;
@@ -132,10 +161,11 @@ async function refreshStrategies(): Promise<void> {
 }
 
 async function refreshMarket(): Promise<void> {
-  if (marketRefreshRunning || !authenticated.value || !symbol.value) return;
-  marketRefreshRunning = true;
+  if (!authenticated.value || !symbol.value) return;
+  prepareWorkspaceContext();
   const exchange = activeExchange.value;
   const requestedSymbol = symbol.value;
+  const requestSequence = ++marketRequestSequence;
   try {
     const priceRequest = api.price(exchange, requestedSymbol);
     const balanceRequest = configured.value
@@ -154,30 +184,44 @@ async function refreshMarket(): Promise<void> {
       feeRequest,
       riskRequest,
     ]);
-    if (exchange !== activeExchange.value || requestedSymbol !== symbol.value) return;
+    if (
+      requestSequence !== marketRequestSequence
+      || exchange !== activeExchange.value
+      || requestedSymbol !== symbol.value
+    ) {
+      return;
+    }
 
     const [priceResult, balanceResult, feeResult, riskResult] = results;
-    if (priceResult.status === "fulfilled") price.value = priceResult.value;
-    if (balanceResult.status === "fulfilled") balance.value = balanceResult.value;
-    if (feeResult.status === "fulfilled") fees.value = feeResult.value;
-    if (riskResult.status === "fulfilled") risk.value = riskResult.value;
+    price.value = priceResult.status === "fulfilled" ? priceResult.value : null;
+    balance.value = balanceResult.status === "fulfilled" ? balanceResult.value : null;
+    fees.value = feeResult.status === "fulfilled" ? feeResult.value : null;
+    risk.value = riskResult.status === "fulfilled" ? riskResult.value : null;
 
     const failures = results
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => messageFrom(result.reason, "交易所数据读取失败"));
     marketError.value = [...new Set(failures)].join("；");
   } catch (reason) {
-    if (exchange === activeExchange.value && requestedSymbol === symbol.value) {
+    if (
+      requestSequence === marketRequestSequence
+      && exchange === activeExchange.value
+      && requestedSymbol === symbol.value
+    ) {
+      price.value = null;
+      balance.value = null;
+      fees.value = null;
+      risk.value = null;
       marketError.value = messageFrom(reason, "交易所数据读取失败");
     }
   } finally {
-    marketRefreshRunning = false;
-    loading.value = false;
+    if (requestSequence === marketRequestSequence) loading.value = false;
   }
 }
 
 async function refreshWorkspace(): Promise<void> {
   normalizeSymbol();
+  prepareWorkspaceContext();
   loading.value = true;
   try {
     await Promise.all([refreshStrategies(), refreshMarket(), refreshDetails()]);
@@ -187,10 +231,14 @@ async function refreshWorkspace(): Promise<void> {
 }
 
 async function refreshDetails(): Promise<void> {
+  prepareWorkspaceContext();
   if (!authenticated.value || !configured.value || !symbol.value) {
+    detailsRequestSequence += 1;
     positions.value = [];
     openOrders.value = [];
     trades.value = [];
+    detailsLoading.value = false;
+    detailsError.value = "";
     return;
   }
   const exchange = activeExchange.value;
@@ -213,14 +261,20 @@ async function refreshDetails(): Promise<void> {
   }
 
   const [positionResult, orderResult, tradeResult, historyResult] = results;
-  if (positionResult.status === "fulfilled") positions.value = positionResult.value.positions;
+  positions.value = positionResult.status === "fulfilled"
+    ? positionResult.value.positions
+    : [];
   if (orderResult.status === "fulfilled") {
     openOrders.value = orderResult.value.orders ?? orderResult.value.result?.list ?? [];
+  } else {
+    openOrders.value = [];
   }
   if (tradeResult.status === "fulfilled") {
     trades.value = tradeResult.value.trades ?? tradeResult.value.result?.list ?? [];
+  } else {
+    trades.value = [];
   }
-  if (historyResult.status === "fulfilled") history.value = historyResult.value.runs;
+  history.value = historyResult.status === "fulfilled" ? historyResult.value.runs : [];
 
   const failures = results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -350,13 +404,8 @@ async function login(credentials: LoginRequest): Promise<void> {
 
 async function selectExchange(exchange: Exchange): Promise<void> {
   activeExchange.value = exchange;
-  price.value = null;
-  balance.value = null;
-  fees.value = null;
-  risk.value = null;
-  positions.value = [];
-  openOrders.value = [];
-  trades.value = [];
+  selectedStatus.value = null;
+  prepareWorkspaceContext();
   preview.value = null;
   previewConfig.value = null;
   previewKey.value = "";
@@ -370,6 +419,7 @@ async function selectStrategy(grid: GridStatus): Promise<void> {
   activeExchange.value = grid.exchange;
   symbol.value = grid.symbol;
   selectedStatus.value = grid;
+  prepareWorkspaceContext();
   preview.value = null;
   previewConfig.value = null;
   previewKey.value = "";

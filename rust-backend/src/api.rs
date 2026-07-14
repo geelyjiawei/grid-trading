@@ -1940,57 +1940,93 @@ async fn exchange_risk(
                 strategy.lifecycle,
                 StrategyLifecycle::AwaitingOpening | StrategyLifecycle::DeployingGrid
             );
-            no_store_json(
-                StatusCode::OK,
-                json!({
-                    "version": 1,
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "strategy_present": true,
-                    "strategy_kind": "active",
-                    "run_id": strategy.run_id.as_str(),
-                    "strategy_revision": strategy.revision,
-                    "lifecycle": strategy.lifecycle,
-                    "engine_running": false,
-                    "observation_complete": true,
-                    "baseline_pending": false,
-                    "baseline_position": report.position.baseline_quantity.to_string(),
-                    "grid_position_net_qty": report.position.grid_owned_quantity.to_string(),
-                    "expected_position_net_qty": report.position.expected_quantity.map(|value| value.to_string()),
-                    "actual_position_net_qty": report.position.actual_quantity.map(|value| value.to_string()),
-                    "unmanaged_delta_qty": report.position.quantity_delta.map(|value| value.to_string()),
-                    "unmanaged_position": unmanaged_position,
-                    "orphan_order_count": orphan_order_count,
-                    "orphan_orders": orphan_orders,
-                    "pending_submission_count": report.orders.pending_submission_count,
-                    "queued_replacement_count": report.pending_replacement_obligation_ids.len(),
-                    "accepted_shape_mismatch_count": report.orders.mismatched_order_count,
-                    "reduce_protection": {
-                        "has_risk": order_protection_risk,
-                    },
-                    "grid_coverage": {
-                        "has_risk": grid_coverage_risk,
-                        "required": report.level_coverage.required,
-                        "configured_level_count": report.level_coverage.configured_level_count,
-                        "expected_active_levels": report.level_coverage.expected_active_levels,
-                        "observed_exact_active_levels": report.level_coverage.observed_exact_active_levels,
-                        "missing_levels": report.level_coverage.missing_levels,
-                    },
-                    "waiting_trigger": false,
-                    "waiting_initial_order": strategy.lifecycle == StrategyLifecycle::AwaitingOpening,
-                    "risk_shutdown_pending": strategy.lifecycle == StrategyLifecycle::RiskExitRequested,
-                    "manual_stop_pending": strategy.lifecycle == StrategyLifecycle::StopRequested,
-                    "initialization_failed": strategy.lifecycle == StrategyLifecycle::Failed,
-                    "initialization_in_progress": initialization_in_progress,
-                    "initial_grid_deployment_pending": strategy.lifecycle == StrategyLifecycle::DeployingGrid && !strategy.initial_deployment_complete,
-                    "grid_ready": strategy.initial_deployment_complete,
-                    "catalog_anomaly_count": catalog_anomaly_count,
-                    "state_store_error": catalog_problem,
-                    "positions": positions,
-                    "shadow_audit": report,
-                    "has_risk": has_risk,
-                }),
-            )
+            let profit_metrics = match strategy_profit_metrics(&strategy, &collected.position) {
+                Ok(metrics) => Some(metrics),
+                Err(error) => {
+                    tracing::warn!(
+                        ?exchange,
+                        symbol,
+                        run_id = strategy.run_id.as_str(),
+                        error = %error,
+                        "strategy-owned profit metrics are unavailable"
+                    );
+                    None
+                }
+            };
+            let profit_calculation_has_risk = profit_metrics.is_none();
+            let profit_fields = json!({
+                "gross_profit": strategy.gross_realized_profit.to_string(),
+                "realized_net_profit": profit_metrics.map(|metrics| metrics.realized_net_profit.to_string()),
+                "unrealised_pnl": profit_metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
+                "grid_unrealised_pnl": profit_metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
+                "total_equity_profit": profit_metrics.map(|metrics| metrics.total_equity_profit.to_string()),
+                "total_profit": profit_metrics.map(|metrics| metrics.total_equity_profit.to_string()),
+                "profit_mark_price": profit_metrics.map(|metrics| metrics.mark_price.to_string()),
+                "profit_scope": "strategy_owned_inventory",
+                "profit_calculation_error": profit_calculation_has_risk.then_some("strategy_profit_unavailable"),
+                "total_fee": strategy.total_fee.to_string(),
+                "total_volume": strategy.total_volume.to_string(),
+                "completed_pairs": strategy.completed_pairs,
+            });
+            let response = json!({
+                "version": 1,
+                "symbol": symbol,
+                "exchange": exchange,
+                "strategy_present": true,
+                "strategy_kind": "active",
+                "run_id": strategy.run_id.as_str(),
+                "strategy_revision": strategy.revision,
+                "lifecycle": strategy.lifecycle,
+                "engine_running": false,
+                "observation_complete": true,
+                "baseline_pending": false,
+                "baseline_position": report.position.baseline_quantity.to_string(),
+                "grid_position_net_qty": report.position.grid_owned_quantity.to_string(),
+                "expected_position_net_qty": report.position.expected_quantity.map(|value| value.to_string()),
+                "actual_position_net_qty": report.position.actual_quantity.map(|value| value.to_string()),
+                "unmanaged_delta_qty": report.position.quantity_delta.map(|value| value.to_string()),
+                "unmanaged_position": unmanaged_position,
+                "orphan_order_count": orphan_order_count,
+                "orphan_orders": orphan_orders,
+                "pending_submission_count": report.orders.pending_submission_count,
+                "queued_replacement_count": report.pending_replacement_obligation_ids.len(),
+                "accepted_shape_mismatch_count": report.orders.mismatched_order_count,
+                "reduce_protection": {
+                    "has_risk": order_protection_risk,
+                },
+                "grid_coverage": {
+                    "has_risk": grid_coverage_risk,
+                    "required": report.level_coverage.required,
+                    "configured_level_count": report.level_coverage.configured_level_count,
+                    "expected_active_levels": report.level_coverage.expected_active_levels,
+                    "observed_exact_active_levels": report.level_coverage.observed_exact_active_levels,
+                    "missing_levels": report.level_coverage.missing_levels,
+                },
+                "waiting_trigger": false,
+                "waiting_initial_order": strategy.lifecycle == StrategyLifecycle::AwaitingOpening,
+                "risk_shutdown_pending": strategy.lifecycle == StrategyLifecycle::RiskExitRequested,
+                "manual_stop_pending": strategy.lifecycle == StrategyLifecycle::StopRequested,
+                "initialization_failed": strategy.lifecycle == StrategyLifecycle::Failed,
+                "initialization_in_progress": initialization_in_progress,
+                "initial_grid_deployment_pending": strategy.lifecycle == StrategyLifecycle::DeployingGrid && !strategy.initial_deployment_complete,
+                "grid_ready": strategy.initial_deployment_complete,
+                "catalog_anomaly_count": catalog_anomaly_count,
+                "state_store_error": catalog_problem,
+                "positions": positions,
+                "shadow_audit": report,
+                "has_risk": has_risk || profit_calculation_has_risk,
+            });
+            let (Value::Object(mut response), Value::Object(profit_fields)) =
+                (response, profit_fields)
+            else {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "risk_response_failed",
+                    "The strategy risk response could not be constructed safely",
+                );
+            };
+            response.extend(profit_fields);
+            no_store_json(StatusCode::OK, Value::Object(response))
         }
         Some(StrategyCatalogSnapshot::Armed(strategy)) => {
             let collected =
@@ -2164,6 +2200,42 @@ fn validated_one_way_quantity(
         ));
     }
     Ok(quantity)
+}
+
+#[derive(Clone, Copy)]
+struct StrategyProfitMetrics {
+    realized_net_profit: Decimal,
+    grid_unrealized_profit: Decimal,
+    total_equity_profit: Decimal,
+    mark_price: Decimal,
+}
+
+fn strategy_profit_metrics(
+    strategy: &StrategyState,
+    position: &PositionSnapshot,
+) -> Result<StrategyProfitMetrics, SnapshotError> {
+    validated_one_way_quantity(position, strategy.exchange, &strategy.symbol)?;
+    let mark_price = position
+        .legs
+        .first()
+        .map(|leg| leg.mark_price)
+        .ok_or_else(|| SnapshotError::new("position snapshot has no one-way mark price"))?;
+    let realized_net_profit = strategy
+        .gross_realized_profit
+        .checked_sub(strategy.total_fee)
+        .ok_or_else(|| SnapshotError::new("strategy realized profit arithmetic overflowed"))?;
+    let grid_unrealized_profit = strategy
+        .grid_unrealized_profit(mark_price)
+        .map_err(|_| SnapshotError::new("strategy-owned inventory cannot be valued exactly"))?;
+    let total_equity_profit = realized_net_profit
+        .checked_add(grid_unrealized_profit)
+        .ok_or_else(|| SnapshotError::new("strategy equity profit arithmetic overflowed"))?;
+    Ok(StrategyProfitMetrics {
+        realized_net_profit,
+        grid_unrealized_profit,
+        total_equity_profit,
+        mark_price,
+    })
 }
 
 fn risk_order_response(order: &AuthoritativeOrder) -> Value {
@@ -2397,9 +2469,9 @@ mod tests {
             TimeInForce,
         },
         engine::{
-            ArmedStrategyState, ExecutionAuditRecord, FeeValuation, MarketSnapshot,
+            ArmedStrategyState, ExecutionAuditRecord, FeeValuation, MarketSnapshot, NeutralLot,
             PositionBaseline, StrategyLifecycle, StrategyOrderTracking, StrategyRunId,
-            StrategyState, build_grid_plan,
+            StrategyState, StrategyStateStore, build_grid_plan,
         },
         exchange::{
             AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
@@ -3295,6 +3367,86 @@ mod tests {
         assert_eq!(risk["orphan_order_count"], 0);
         assert_eq!(risk["grid_coverage"]["missing_levels"], json!([]));
         assert_eq!(risk["shadow_audit"]["clean"], true);
+        assert_eq!(risk["realized_net_profit"], "0");
+        assert_eq!(risk["grid_unrealised_pnl"], "0");
+        assert_eq!(risk["total_equity_profit"], "0");
+        assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
+        assert_eq!(risk["profit_calculation_error"], Value::Null);
+        assert_eq!(risk["has_risk"], false);
+    }
+
+    #[tokio::test]
+    async fn active_strategy_risk_values_only_grid_owned_inventory_at_the_live_mark() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (mut strategy, mut gateway) = persist_clean_running_strategy(&strategy_root);
+        strategy.grid_position_net_quantity = Decimal::from(-100);
+        strategy.neutral_lots.insert(
+            1,
+            NeutralLot {
+                id: 1,
+                signed_quantity: Decimal::from(-100),
+                entry_value: Decimal::from(40),
+            },
+        );
+        strategy.next_neutral_lot_sequence = 2;
+        strategy.gross_realized_profit = Decimal::from_str_exact("1.5").unwrap();
+        strategy.total_fee = Decimal::from_str_exact("0.5").unwrap();
+        strategy.revision += 1;
+        strategy.updated_at_ms += 1;
+        strategy.validate().unwrap();
+        let paths = StrategyFilePaths::new(&strategy_root, strategy.run_id.clone()).unwrap();
+        let mut store = FileStrategyStateStore::load(paths.state()).unwrap();
+        store.replace(strategy.clone()).unwrap();
+
+        gateway.position.legs[0].signed_quantity = Decimal::from(-100);
+        gateway.position.legs[0].entry_price = Some(Decimal::from_str_exact("0.40000").unwrap());
+        gateway.position.legs[0].mark_price = Decimal::from_str_exact("0.38000").unwrap();
+        // The account-level field is deliberately inconsistent: grid PnL must
+        // be recomputed from owned lots instead of copied from this merged value.
+        gateway.position.legs[0].unrealized_profit = Decimal::from(999);
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["realized_net_profit"], "1.0");
+        assert_eq!(risk["grid_unrealised_pnl"], "2.00000");
+        assert_eq!(risk["unrealised_pnl"], "2.00000");
+        assert_eq!(risk["total_equity_profit"], "3.00000");
+        assert_eq!(risk["total_profit"], "3.00000");
+        assert_eq!(risk["profit_mark_price"], "0.38000");
+        assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
+        assert_eq!(risk["profit_calculation_error"], Value::Null);
         assert_eq!(risk["has_risk"], false);
     }
 

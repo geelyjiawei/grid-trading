@@ -1,6 +1,6 @@
 import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
-import type { ApiConfigResponse, GridStatus } from "../api/types";
+import type { ApiConfigResponse, GridStatus, RiskSnapshot } from "../api/types";
 import AuthDialog from "./AuthDialog.vue";
 import ExchangeSettingsDialog from "./ExchangeSettingsDialog.vue";
 import GridConfigurationPanel from "./GridConfigurationPanel.vue";
@@ -83,6 +83,29 @@ describe("Vue migration components", () => {
     await wrapper.find("button.strategy-row").trigger("click");
 
     expect(wrapper.emitted("select")?.[0]?.[0]).toEqual(grid);
+  });
+
+  it("labels strategy-list profit as realized rather than total equity", () => {
+    const wrapper = mount(StrategyList, {
+      props: {
+        grids: [{
+          run_id: "run-profit-list",
+          exchange: "aster",
+          symbol: "ANSEMUSDT",
+          running: true,
+          realized_net_profit: "1.25",
+          total_equity_profit: "9.75",
+          completed_pairs: 3,
+        }],
+        activeExchange: "aster",
+        activeSymbol: "ANSEMUSDT",
+        loading: false,
+      },
+    });
+
+    expect(wrapper.find(".strategy-profit strong").text()).toBe("1.25");
+    expect(wrapper.text()).not.toContain("9.75");
+    expect(wrapper.text()).toContain("已实现净利润 · 完成 3 次");
   });
 
   it("keeps fixed per-grid quantity separate from investment sizing", async () => {
@@ -214,6 +237,61 @@ describe("Vue migration components", () => {
     expect(stopButton.text()).toContain("确认停止");
     await stopButton.trigger("click");
     expect(wrapper.emitted("stop")).toHaveLength(1);
+  });
+
+  it("shows total equity only from the matching authoritative risk snapshot", () => {
+    const status: GridStatus = {
+      run_id: "run-profit-1",
+      exchange: "aster",
+      symbol: "ANSEMUSDT",
+      running: true,
+      realized_net_profit: "1.0",
+      total_profit: "1.0",
+    };
+    const risk: RiskSnapshot = {
+      run_id: "run-profit-1",
+      exchange: "aster",
+      symbol: "ANSEMUSDT",
+      realized_net_profit: "1.0",
+      grid_unrealised_pnl: "2.0",
+      total_equity_profit: "3.0",
+      profit_scope: "strategy_owned_inventory",
+      has_risk: false,
+    };
+    const wrapper = mount(StrategyOverview, { props: { status, risk } });
+
+    const metrics = wrapper.findAll(".metric-grid > div").map((metric) => metric.text());
+    expect(metrics).toContain("总权益利润3 USDT");
+    expect(metrics).toContain("已实现净利润1 USDT");
+    expect(metrics).toContain("网格未实现盈亏2 USDT");
+    expect(wrapper.text()).not.toContain("等待当前策略");
+  });
+
+  it("rejects a stale profit snapshot from another strategy context", () => {
+    const wrapper = mount(StrategyOverview, {
+      props: {
+        status: {
+          run_id: "run-current",
+          exchange: "binance",
+          symbol: "MUUSDT",
+          running: true,
+          realized_net_profit: "1.0",
+        },
+        risk: {
+          run_id: "run-old",
+          exchange: "aster",
+          symbol: "ANSEMUSDT",
+          total_equity_profit: "999.0",
+          grid_unrealised_pnl: "998.0",
+          has_risk: true,
+        },
+      },
+    });
+
+    expect(wrapper.text()).not.toContain("999.0000");
+    expect(wrapper.text()).not.toContain("998.0000");
+    expect(wrapper.text()).not.toContain("风险核对未通过");
+    expect(wrapper.text()).toContain("总权益利润等待当前策略的交易所权威风险快照");
   });
 
   it("exposes three distinct opening order semantics", () => {

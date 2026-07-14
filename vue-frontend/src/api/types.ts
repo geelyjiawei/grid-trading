@@ -189,6 +189,10 @@ export interface TradesResponse {
 }
 
 export interface RiskSnapshot {
+  run_id?: string | null;
+  exchange?: Exchange;
+  symbol?: string;
+  strategy_present?: boolean;
   has_risk?: boolean;
   unmanaged_position?: boolean;
   unmanaged_delta_qty?: string | number | null;
@@ -196,6 +200,17 @@ export interface RiskSnapshot {
   actual_position_net_qty?: string | number | null;
   orphan_order_count?: number;
   queued_replacement_count?: number;
+  gross_profit?: DecimalValue;
+  realized_net_profit?: DecimalValue | null;
+  unrealised_pnl?: DecimalValue | null;
+  grid_unrealised_pnl?: DecimalValue | null;
+  total_equity_profit?: DecimalValue | null;
+  total_profit?: DecimalValue | null;
+  total_fee?: DecimalValue;
+  total_volume?: DecimalValue;
+  completed_pairs?: number;
+  profit_scope?: "strategy_owned_inventory" | string;
+  profit_calculation_error?: string | null;
   [key: string]: unknown;
 }
 

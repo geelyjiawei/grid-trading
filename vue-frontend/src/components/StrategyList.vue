@@ -39,10 +39,10 @@ const emit = defineEmits<{
         <small>{{ exchangeName(grid.exchange) }} · {{ directionName(grid.direction) }} · {{ grid.grid_mode === "geometric" ? "等比" : "等差" }}</small>
       </span>
       <span class="strategy-profit">
-        <strong :class="Number(grid.total_equity_profit ?? grid.total_profit ?? 0) >= 0 ? 'positive' : 'negative'">
-          {{ formatNumber(grid.total_equity_profit ?? grid.total_profit, 4) }}
+        <strong :class="Number(grid.realized_net_profit ?? grid.total_profit ?? 0) >= 0 ? 'positive' : 'negative'">
+          {{ formatNumber(grid.realized_net_profit ?? grid.total_profit, 4) }}
         </strong>
-        <small>完成 {{ grid.completed_pairs ?? 0 }} 次</small>
+        <small>已实现净利润 · 完成 {{ grid.completed_pairs ?? 0 }} 次</small>
       </span>
     </button>
   </section>

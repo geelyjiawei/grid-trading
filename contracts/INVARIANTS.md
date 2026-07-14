@@ -116,6 +116,12 @@ the OpenAPI schema.
   lots first, realize exact PnL, and only an excess quantity opens a new direction.
 - Neutral inventory may never retain long and short lots at the same time; its signed lot
   sum must exactly equal the exchange-facing grid-owned net quantity.
+- Grid unrealized PnL is valued from the strategy's exact durable cost lots at the
+  authoritative exchange mark price. The pre-existing baseline and the exchange's merged
+  one-way account PnL are never attributed to the grid.
+- Strategy realized net profit equals gross realized profit minus fully valued exchange
+  fees. Total equity profit equals that realized net profit plus grid-owned unrealized PnL;
+  if exact lot coverage or the authoritative mark is unavailable, the value fails closed.
 - Grid-owned position equals confirmed opening fills minus confirmed reducing fills.
 - Manual or unexplained exchange position changes fail closed and never rewrite the
   local ledger.

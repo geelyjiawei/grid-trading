@@ -382,6 +382,99 @@ impl StrategyState {
             ))
     }
 
+    /// Values only inventory created by this strategy. The pre-existing account
+    /// baseline is deliberately excluded because one-way exchanges merge both
+    /// positions into one exchange-level average entry price.
+    pub fn grid_unrealized_profit(
+        &self,
+        mark_price: Decimal,
+    ) -> Result<Decimal, StrategyStateError> {
+        if mark_price <= Decimal::ZERO {
+            return Err(StrategyStateError::InvalidMarketPrice);
+        }
+        match self.direction {
+            Direction::Long | Direction::Short => {
+                if (self.direction == Direction::Long
+                    && self.grid_position_net_quantity < Decimal::ZERO)
+                    || (self.direction == Direction::Short
+                        && self.grid_position_net_quantity > Decimal::ZERO)
+                {
+                    return Err(StrategyStateError::GridPositionDirectionMismatch);
+                }
+                let mut quantity = Decimal::ZERO;
+                let mut entry_value = Decimal::ZERO;
+                for lot in self.lots_by_level.values() {
+                    if lot.quantity <= Decimal::ZERO || lot.entry_value <= Decimal::ZERO {
+                        return Err(StrategyStateError::InvalidLevelLot);
+                    }
+                    quantity = quantity.checked_add(lot.quantity).ok_or(
+                        StrategyStateError::NumericOverflow("grid unrealized quantity"),
+                    )?;
+                    entry_value = entry_value.checked_add(lot.entry_value).ok_or(
+                        StrategyStateError::NumericOverflow("grid unrealized entry value"),
+                    )?;
+                }
+                if quantity != self.grid_position_net_quantity.abs() {
+                    return Err(StrategyStateError::LevelLotCoverageMismatch);
+                }
+                let mark_value =
+                    mark_price
+                        .checked_mul(quantity)
+                        .ok_or(StrategyStateError::NumericOverflow(
+                            "grid unrealized mark value",
+                        ))?;
+                if self.direction == Direction::Long {
+                    mark_value.checked_sub(entry_value)
+                } else {
+                    entry_value.checked_sub(mark_value)
+                }
+                .ok_or(StrategyStateError::NumericOverflow(
+                    "grid unrealized profit",
+                ))
+            }
+            Direction::Neutral => {
+                if self.grid_position_net_quantity.is_zero() && !self.neutral_lots.is_empty() {
+                    return Err(StrategyStateError::NeutralLotCoverageMismatch);
+                }
+                let mut signed_quantity = Decimal::ZERO;
+                let mut unrealized_profit = Decimal::ZERO;
+                for lot in self.neutral_lots.values() {
+                    if lot.signed_quantity.is_zero() || lot.entry_value <= Decimal::ZERO {
+                        return Err(StrategyStateError::InvalidNeutralLot);
+                    }
+                    if (self.grid_position_net_quantity > Decimal::ZERO
+                        && lot.signed_quantity <= Decimal::ZERO)
+                        || (self.grid_position_net_quantity < Decimal::ZERO
+                            && lot.signed_quantity >= Decimal::ZERO)
+                    {
+                        return Err(StrategyStateError::NeutralLotCoverageMismatch);
+                    }
+                    signed_quantity = signed_quantity.checked_add(lot.signed_quantity).ok_or(
+                        StrategyStateError::NumericOverflow("neutral unrealized quantity"),
+                    )?;
+                    let mark_value = mark_price.checked_mul(lot.signed_quantity.abs()).ok_or(
+                        StrategyStateError::NumericOverflow("neutral unrealized mark value"),
+                    )?;
+                    let lot_profit = if lot.signed_quantity > Decimal::ZERO {
+                        mark_value.checked_sub(lot.entry_value)
+                    } else {
+                        lot.entry_value.checked_sub(mark_value)
+                    }
+                    .ok_or(StrategyStateError::NumericOverflow(
+                        "neutral unrealized lot profit",
+                    ))?;
+                    unrealized_profit = unrealized_profit.checked_add(lot_profit).ok_or(
+                        StrategyStateError::NumericOverflow("neutral unrealized profit"),
+                    )?;
+                }
+                if signed_quantity != self.grid_position_net_quantity {
+                    return Err(StrategyStateError::NeutralLotCoverageMismatch);
+                }
+                Ok(unrealized_profit)
+            }
+        }
+    }
+
     pub fn ready_intents(&self, now_ms: u64) -> Result<Vec<OrderIntent>, StrategyStateError> {
         if matches!(
             self.lifecycle,
@@ -2852,6 +2945,86 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn grid_unrealized_profit_uses_owned_lots_and_excludes_the_old_baseline() {
+        let mut long = state(
+            Direction::Long,
+            PositionBaseline::from_authoritative_position(decimal(3), Some(decimal(900))).unwrap(),
+        );
+        long.grid_position_net_quantity = decimal(2);
+        long.lots_by_level.insert(
+            1,
+            LevelLot {
+                quantity: decimal(2),
+                entry_value: decimal(2000),
+            },
+        );
+        assert_eq!(
+            long.grid_unrealized_profit(decimal(1010)).unwrap(),
+            decimal(20)
+        );
+
+        let mut short = state(
+            Direction::Short,
+            PositionBaseline::from_authoritative_position(decimal(-7), Some(decimal(1100)))
+                .unwrap(),
+        );
+        short.grid_position_net_quantity = decimal(-3);
+        short.lots_by_level.insert(
+            2,
+            LevelLot {
+                quantity: decimal(3),
+                entry_value: decimal(3060),
+            },
+        );
+        assert_eq!(
+            short.grid_unrealized_profit(decimal(1000)).unwrap(),
+            decimal(60)
+        );
+    }
+
+    #[test]
+    fn neutral_grid_unrealized_profit_values_the_exact_remaining_side() {
+        let mut neutral = state(Direction::Neutral, PositionBaseline::flat());
+        neutral.grid_position_net_quantity = decimal(-2);
+        neutral.neutral_lots.insert(
+            1,
+            NeutralLot {
+                id: 1,
+                signed_quantity: decimal(-2),
+                entry_value: decimal(2040),
+            },
+        );
+        neutral.next_neutral_lot_sequence = 2;
+
+        assert_eq!(
+            neutral.grid_unrealized_profit(decimal(1000)).unwrap(),
+            decimal(40)
+        );
+        assert!(matches!(
+            neutral.grid_unrealized_profit(Decimal::ZERO),
+            Err(StrategyStateError::InvalidMarketPrice)
+        ));
+    }
+
+    #[test]
+    fn grid_unrealized_profit_fails_closed_on_inventory_coverage_damage() {
+        let mut short = state(Direction::Short, PositionBaseline::flat());
+        short.grid_position_net_quantity = decimal(-3);
+        short.lots_by_level.insert(
+            2,
+            LevelLot {
+                quantity: decimal(2),
+                entry_value: decimal(2040),
+            },
+        );
+
+        assert!(matches!(
+            short.grid_unrealized_profit(decimal(1000)),
+            Err(StrategyStateError::LevelLotCoverageMismatch)
+        ));
     }
 
     fn opening_id(state: &StrategyState) -> ClientOrderId {
