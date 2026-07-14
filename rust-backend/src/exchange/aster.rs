@@ -1006,7 +1006,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{IntentState, OrderKind, OrderShape, OrderSide, TimeInForce},
+        domain::{IntentState, OrderKind, OrderShape, OrderSide, TerminalOrderStatus, TimeInForce},
         exchange::{
             ActiveOrderStatus, OrderLifecycle,
             protocol::{HttpResponse, TransportError},
@@ -1561,6 +1561,49 @@ mod tests {
         assert_eq!(requests[1].path, "/fapi/v3/userTrades");
         assert!(requests[1].query_string().contains("startTime=700000"));
         assert!(requests[1].query_string().contains("endTime=1400000"));
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_orders_preserve_filled_and_unfilled_quantities() {
+        for (status, expected_terminal) in [
+            ("CANCELED", TerminalOrderStatus::Cancelled),
+            ("EXPIRED_IN_MATCH", TerminalOrderStatus::Expired),
+        ] {
+            let transport = MockTransport::default();
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("70", "26.6", status, 1_000_000, 1_100_000),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!("[{}]", aster_trade(7, "70", "26.6", 1_050_000)),
+                }),
+            ]);
+            let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+            let snapshot = adapter(transport, signer)
+                .execution_snapshot(
+                    Exchange::Aster,
+                    "ANSEMUSDT",
+                    &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                    "4770039",
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                snapshot.order.lifecycle,
+                OrderLifecycle::Terminal(expected_terminal)
+            );
+            assert_eq!(snapshot.cumulative_quantity, Decimal::new(70, 0));
+            assert_eq!(
+                snapshot.order.shape.quantity - snapshot.cumulative_quantity,
+                Decimal::new(30, 0)
+            );
+            assert_eq!(snapshot.trades.len(), 1);
+            assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::new(1, 3));
+        }
     }
 
     #[tokio::test]

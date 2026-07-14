@@ -208,7 +208,8 @@ mod tests {
             PositionSizingMode, QuantityRules,
         },
         engine::{
-            MarketSnapshot, PositionBaseline, StrategyOrderTracking, StrategyRunId, build_grid_plan,
+            MarketSnapshot, PositionBaseline, StrategyOrderPurpose, StrategyOrderTracking,
+            StrategyRunId, build_grid_plan,
         },
         persistence::{FileArmedStrategyStateStore, FileStrategyStateStore, StrategyFilePaths},
     };
@@ -402,7 +403,11 @@ mod tests {
     fn strategy_and_intent_ledger_mismatch_is_never_selected() {
         let directory = tempdir().unwrap();
         let mut state = active("ASTER001", "ANSEMUSDT");
-        let order = state.orders.values_mut().next().unwrap();
+        let order = state
+            .orders
+            .values_mut()
+            .find(|order| order.purpose == StrategyOrderPurpose::Opening)
+            .unwrap();
         order.tracking = StrategyOrderTracking::Intent {
             state: IntentState::Accepted {
                 exchange_order_id: "accepted-without-ledger".into(),

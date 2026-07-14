@@ -1931,6 +1931,10 @@ mod tests {
                 .collect()
         }
 
+        fn placement_intents(&self) -> Vec<OrderIntent> {
+            self.state.lock().unwrap().placement_calls.clone()
+        }
+
         fn fail_next_placement(&self, error: PlacementError) {
             self.state.lock().unwrap().next_placement_error = Some(error);
         }
@@ -4062,6 +4066,172 @@ mod tests {
             Decimal::new(2, 2)
         );
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_opening_remainder_is_exact_and_never_resubmitted_after_commit_failure()
+     {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let partial_quantity = opening_quantity / Decimal::new(2, 0);
+        let expected_remainder = opening_quantity - partial_quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+
+        runtime.tick(1_100).await.unwrap();
+        gateway.partially_fill_order(
+            &opening_id,
+            partial_quantity,
+            Decimal::new(1014, 0),
+            Decimal::new(2, 2),
+        );
+        gateway.set_position(-partial_quantity, Some(Decimal::new(1014, 0)));
+        runtime.tick(1_200).await.unwrap();
+        assert_eq!(gateway.placement_call_count(), 1);
+
+        runtime.maximum_submissions_per_tick = 0;
+        gateway.mark_order_cancelled(&opening_id);
+        runtime.tick(1_300).await.unwrap();
+        let remainder = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| {
+                order.purpose == StrategyOrderPurpose::Opening
+                    && order.tracking == StrategyOrderTracking::Ready
+            })
+            .unwrap()
+            .clone();
+        assert_eq!(remainder.shape.quantity, expected_remainder);
+        assert_eq!(gateway.placement_call_count(), 1);
+
+        runtime.maximum_submissions_per_tick = 100;
+        runtime.machine_mut().store_mut().fail_next_write();
+        assert!(matches!(
+            runtime.tick(1_400).await,
+            Err(RuntimeTickError::Strategy(
+                StrategyMachineError::Persistence(_)
+            ))
+        ));
+        assert_eq!(gateway.placement_call_count(), 2);
+        assert_eq!(
+            gateway.placement_intents()[1].client_order_id,
+            remainder.client_order_id
+        );
+        assert_eq!(
+            gateway.placement_intents()[1].shape.quantity,
+            expected_remainder
+        );
+
+        let recovered = runtime.tick(1_500).await.unwrap();
+        assert!(!recovered.is_blocked());
+        assert!(recovered.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), 2);
+        assert!(matches!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .orders
+                .get(&remainder.client_order_id)
+                .unwrap()
+                .tracking,
+            StrategyOrderTracking::Intent {
+                state: IntentState::Accepted { .. }
+            }
+        ));
+
+        gateway.fill_order(
+            &remainder.client_order_id,
+            Decimal::new(1014, 0),
+            Decimal::new(2, 2),
+        );
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        let completed = runtime.tick(1_600).await.unwrap();
+
+        assert!(!completed.is_blocked());
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
+        assert_eq!(
+            runtime.machine().store().snapshot().opening_filled_quantity,
+            opening_quantity
+        );
+        assert_eq!(gateway.placement_call_count(), 22);
+        assert_eq!(
+            gateway
+                .placement_ids()
+                .iter()
+                .filter(|client_order_id| **client_order_id == remainder.client_order_id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_opening_waits_for_position_snapshot_before_remainder_submission() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let partial_quantity = opening_quantity / Decimal::new(2, 0);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+
+        runtime.tick(1_100).await.unwrap();
+        gateway.partially_fill_order(
+            &opening_id,
+            partial_quantity,
+            Decimal::new(1014, 0),
+            Decimal::new(2, 2),
+        );
+        gateway.mark_order_cancelled(&opening_id);
+
+        let lagged = runtime.tick(1_200).await.unwrap();
+
+        assert_eq!(
+            lagged.blockers[0].stage,
+            RuntimeStage::PositionReconciliation
+        );
+        assert_eq!(gateway.placement_call_count(), 1);
+        let ready = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .ready_intents(1_201)
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].shape.quantity, opening_quantity - partial_quantity);
+
+        gateway.set_position(-partial_quantity, Some(Decimal::new(1014, 0)));
+        let recovered = runtime.tick(1_300).await.unwrap();
+
+        assert!(!recovered.is_blocked());
+        assert_eq!(recovered.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), 2);
+        assert_eq!(
+            gateway.placement_intents()[1].shape.quantity,
+            opening_quantity - partial_quantity
+        );
     }
 
     #[tokio::test]

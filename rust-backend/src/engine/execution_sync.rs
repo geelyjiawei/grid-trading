@@ -112,8 +112,9 @@ mod tests {
             TerminalOrderStatus,
         },
         engine::{
-            MarketSnapshot, MemoryStrategyStateStore, PositionBaseline, StrategyLifecycle,
-            StrategyOrderPurpose, StrategyState, StrategyStateStore, build_grid_plan,
+            ExecutionReport, MarketSnapshot, MemoryStrategyStateStore, PositionBaseline,
+            ReplacementObligationKind, StrategyLifecycle, StrategyOrderPurpose, StrategyState,
+            StrategyStateStore, build_grid_plan,
         },
         exchange::{
             ActiveOrderStatus, AuthoritativeOrder, ExecutionSnapshotError, HistoricalMinutePrice,
@@ -283,6 +284,101 @@ mod tests {
         }
     }
 
+    fn accepted_grid_machine() -> (StrategyMachine<MemoryStrategyStateStore>, ClientOrderId) {
+        let (mut machine, opening_id) = accepted_machine();
+        let opening = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .clone();
+        let opening_price = opening.shape.price.unwrap();
+        machine
+            .apply_execution(
+                &ExecutionReport {
+                    client_order_id: opening_id,
+                    exchange_order_id: "opening-42".into(),
+                    cumulative_quantity: opening.shape.quantity,
+                    cumulative_quote: opening.shape.quantity * opening_price,
+                    cumulative_fee: Decimal::ZERO,
+                    terminal_status: Some(TerminalOrderStatus::Filled),
+                },
+                1_150,
+            )
+            .unwrap();
+
+        let grid_order = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| {
+                matches!(order.purpose, StrategyOrderPurpose::InitialGrid { .. })
+                    && !order.shape.reduce_only
+            })
+            .unwrap()
+            .clone();
+        let client_order_id = grid_order.client_order_id.clone();
+        machine
+            .synchronize_intent(
+                &OrderIntent {
+                    client_order_id: client_order_id.clone(),
+                    exchange: Exchange::Binance,
+                    shape: grid_order.shape,
+                    state: IntentState::Accepted {
+                        exchange_order_id: "grid-partial-42".into(),
+                    },
+                    created_at_ms: 1_150,
+                    updated_at_ms: 1_160,
+                },
+                1_160,
+            )
+            .unwrap();
+        (machine, client_order_id)
+    }
+
+    fn partial_cancel_execution_for(
+        machine: &StrategyMachine<MemoryStrategyStateStore>,
+        id: &ClientOrderId,
+    ) -> OrderExecutionSnapshot {
+        let record = machine.store().snapshot().orders.get(id).unwrap();
+        let quantity = Decimal::new(1, 1);
+        let price = record.shape.price.unwrap();
+        let quote = quantity * price;
+        let fee = Decimal::new(1, 2);
+        let trade = TradeFill {
+            trade_id: "partial-cancel-7".into(),
+            exchange_order_id: "grid-partial-42".into(),
+            symbol: record.shape.symbol.clone(),
+            side: record.shape.side,
+            price,
+            quantity,
+            quote_quantity: quote,
+            raw_commission: fee,
+            commission_cost: fee,
+            commission_asset: "USDT".into(),
+            realized_profit: Decimal::ZERO,
+            is_maker: true,
+            trade_time_ms: 1_170,
+        };
+        OrderExecutionSnapshot {
+            order: AuthoritativeOrder {
+                client_order_id: id.clone(),
+                exchange_order_id: "grid-partial-42".into(),
+                exchange: Exchange::Binance,
+                shape: record.shape.clone(),
+                lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled),
+            },
+            cumulative_quantity: quantity,
+            cumulative_quote: quote,
+            fees_by_asset: [("USDT".into(), fee)].into_iter().collect(),
+            trades: vec![trade],
+            order_time_ms: 1_165,
+            update_time_ms: 1_180,
+        }
+    }
+
     fn gateway(execution: Result<OrderExecutionSnapshot, ExecutionSnapshotError>) -> MockGateway {
         MockGateway {
             execution_calls: Arc::new(Mutex::new(0)),
@@ -335,6 +431,56 @@ mod tests {
         assert_eq!(second.transition, StrategyTransition::NoChange);
         assert_eq!(*gateway.execution_calls.lock().unwrap(), 2);
         assert_eq!(*gateway.price_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_sync_creates_exact_counter_and_remainder_only_once() {
+        let (mut machine, id) = accepted_grid_machine();
+        let snapshot = partial_cancel_execution_for(&machine, &id);
+        let original_quantity = snapshot.order.shape.quantity;
+        let filled_quantity = snapshot.cumulative_quantity;
+        let gateway = gateway(Ok(snapshot));
+        let service = ExecutionSyncService::new("USDT").unwrap();
+
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let after_first = machine.store().snapshot().clone();
+        let duplicate = service
+            .synchronize(&gateway, &mut machine, &id, 1_300)
+            .await
+            .unwrap();
+        let obligations = machine
+            .store()
+            .snapshot()
+            .replacement_obligations
+            .values()
+            .filter(|obligation| obligation.source_client_order_id == id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(obligations.len(), 2);
+        assert!(obligations.iter().any(|obligation| {
+            obligation.kind == ReplacementObligationKind::Counter
+                && obligation.shape.quantity == filled_quantity
+        }));
+        assert!(obligations.iter().any(|obligation| {
+            obligation.kind == ReplacementObligationKind::RestoreCancelledRemainder
+                && obligation.shape.quantity == original_quantity - filled_quantity
+        }));
+        assert_eq!(
+            obligations
+                .iter()
+                .map(|obligation| obligation.shape.quantity)
+                .sum::<Decimal>(),
+            original_quantity
+        );
+        assert_eq!(duplicate.transition, StrategyTransition::NoChange);
+        assert_eq!(machine.store().snapshot().total_fee, Decimal::new(1, 2));
+        assert_eq!(
+            machine.store().snapshot().replacement_obligations,
+            after_first.replacement_obligations
+        );
     }
 
     #[tokio::test]

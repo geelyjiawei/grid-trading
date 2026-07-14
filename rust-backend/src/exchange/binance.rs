@@ -812,7 +812,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{IntentState, OrderKind, OrderShape, OrderSide, TimeInForce},
+        domain::{IntentState, OrderKind, OrderShape, OrderSide, TerminalOrderStatus, TimeInForce},
         exchange::{
             ActiveOrderStatus, OrderLifecycle,
             protocol::{HttpResponse, TransportError},
@@ -1404,6 +1404,47 @@ mod tests {
         assert_eq!(requests[0].path, "/fapi/v1/order");
         assert_eq!(requests[1].path, "/fapi/v1/userTrades");
         assert!(requests[1].query_string().contains("orderId=91"));
+    }
+
+    #[tokio::test]
+    async fn partial_terminal_orders_preserve_filled_and_unfilled_quantities() {
+        for (status, expected_terminal) in [
+            ("CANCELED", TerminalOrderStatus::Cancelled),
+            ("EXPIRED_IN_MATCH", TerminalOrderStatus::Expired),
+        ] {
+            let transport = MockTransport::default();
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "1.14", "1.14", status),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!("[{}]", binance_trade(7, "1.14", "1.14")),
+                }),
+            ]);
+
+            let snapshot = adapter(transport)
+                .execution_snapshot(
+                    Exchange::Binance,
+                    "MUUSDT",
+                    &ClientOrderId::parse("g_7_S_fixed").unwrap(),
+                    "91",
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                snapshot.order.lifecycle,
+                OrderLifecycle::Terminal(expected_terminal)
+            );
+            assert_eq!(snapshot.cumulative_quantity, Decimal::new(114, 2));
+            assert_eq!(
+                snapshot.order.shape.quantity - snapshot.cumulative_quantity,
+                Decimal::new(2, 0)
+            );
+            assert_eq!(snapshot.trades.len(), 1);
+        }
     }
 
     #[tokio::test]

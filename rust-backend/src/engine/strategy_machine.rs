@@ -676,6 +676,87 @@ impl StrategyState {
                 return Err(StrategyStateError::ReplacementOrderMismatch);
             }
         }
+        let opening_orders = self
+            .orders
+            .values()
+            .filter(|order| order.purpose == StrategyOrderPurpose::Opening)
+            .collect::<Vec<_>>();
+        let opening_quantity = opening_orders
+            .iter()
+            .map(|order| order.cumulative_quantity)
+            .try_fold(Decimal::ZERO, |total, quantity| total.checked_add(quantity))
+            .ok_or(StrategyStateError::NumericOverflow(
+                "opening execution quantity",
+            ))?;
+        let opening_value = opening_orders
+            .iter()
+            .map(|order| order.cumulative_quote)
+            .try_fold(Decimal::ZERO, |total, value| total.checked_add(value))
+            .ok_or(StrategyStateError::NumericOverflow(
+                "opening execution value",
+            ))?;
+        if opening_quantity != self.opening_filled_quantity
+            || opening_value != self.opening_filled_value
+            || self.opening_filled_quantity.is_zero() != self.opening_filled_value.is_zero()
+        {
+            return Err(StrategyStateError::OpeningAccountingMismatch);
+        }
+        match &self.plan.opening_order {
+            None if !opening_orders.is_empty()
+                || !self.opening_filled_quantity.is_zero()
+                || !self.opening_filled_value.is_zero() =>
+            {
+                return Err(StrategyStateError::OpeningAccountingMismatch);
+            }
+            None => {}
+            Some(planned) => {
+                if opening_orders.is_empty()
+                    || opening_orders.iter().any(|order| {
+                        order.shape.side != planned.side
+                            || order.shape.price != planned.price
+                            || order.shape.quantity > planned.quantity
+                            || order.shape.reduce_only
+                            || order.shape.kind != planned.kind
+                            || order.shape.time_in_force != planned.time_in_force
+                    })
+                {
+                    return Err(StrategyStateError::OpeningOrderMismatch);
+                }
+                let unresolved = opening_orders
+                    .iter()
+                    .filter(|order| order.terminal_status.is_none())
+                    .count();
+                if unresolved > 1
+                    || (self.lifecycle != StrategyLifecycle::Failed
+                        && self.opening_filled_quantity > planned.quantity)
+                {
+                    return Err(StrategyStateError::OpeningAccountingMismatch);
+                }
+                if self.lifecycle == StrategyLifecycle::AwaitingOpening
+                    && (self.opening_filled_quantity >= planned.quantity
+                        || unresolved != 1
+                        || self.initial_deployment_complete
+                        || self.orders.values().any(|order| {
+                            order.purpose.is_initial_grid()
+                                && order.tracking != StrategyOrderTracking::Dormant
+                        }))
+                {
+                    return Err(StrategyStateError::OpeningAccountingMismatch);
+                }
+                if matches!(
+                    self.lifecycle,
+                    StrategyLifecycle::DeployingGrid | StrategyLifecycle::Running
+                ) && (self.opening_filled_quantity != planned.quantity
+                    || unresolved != 0
+                    || self.orders.values().any(|order| {
+                        order.purpose.is_initial_grid()
+                            && order.tracking == StrategyOrderTracking::Dormant
+                    }))
+                {
+                    return Err(StrategyStateError::OpeningAccountingMismatch);
+                }
+            }
+        }
         for lot in self.lots_by_level.values() {
             if lot.quantity <= Decimal::ZERO || lot.entry_value <= Decimal::ZERO {
                 return Err(StrategyStateError::InvalidLevelLot);
@@ -2409,19 +2490,22 @@ fn process_terminal_order(
     obligation_ids: &mut Vec<u64>,
 ) -> Result<(), String> {
     if matches!(purpose, StrategyOrderPurpose::Opening) {
-        if report.cumulative_quantity != shape.quantity {
-            if matches!(
-                state.lifecycle,
-                StrategyLifecycle::RiskExitRequested | StrategyLifecycle::StopRequested
-            ) {
-                return Ok(());
-            }
+        let target_quantity = state
+            .plan
+            .opening_order
+            .as_ref()
+            .ok_or_else(|| "opening execution has no planned opening target".to_owned())?
+            .quantity;
+        if state.opening_filled_quantity > target_quantity {
             return Err(format!(
-                "opening order ended with retained grid quantity {} of {}",
-                report.cumulative_quantity, shape.quantity
+                "opening executions exceeded the planned target: {} of {}",
+                state.opening_filled_quantity, target_quantity
             ));
         }
-        if state.lifecycle == StrategyLifecycle::AwaitingOpening {
+        if state.opening_filled_quantity == target_quantity {
+            if state.lifecycle != StrategyLifecycle::AwaitingOpening {
+                return Ok(());
+            }
             for order in state.orders.values_mut() {
                 if order.purpose.is_initial_grid()
                     && order.tracking == StrategyOrderTracking::Dormant
@@ -2430,8 +2514,47 @@ fn process_terminal_order(
                 }
             }
             state.lifecycle = StrategyLifecycle::DeployingGrid;
+            return Ok(());
         }
-        return Ok(());
+
+        if state.lifecycle != StrategyLifecycle::AwaitingOpening {
+            return Ok(());
+        }
+        if matches!(
+            report.terminal_status,
+            Some(TerminalOrderStatus::Cancelled | TerminalOrderStatus::Expired)
+        ) {
+            let mut remainder_shape = shape.clone();
+            remainder_shape.quantity = target_quantity - state.opening_filled_quantity;
+            let mut remainder = StrategyOrderRecord {
+                client_order_id: source_client_order_id.clone(),
+                shape: remainder_shape,
+                purpose: StrategyOrderPurpose::Opening,
+                tracking: StrategyOrderTracking::Ready,
+                exchange_order_id: None,
+                cumulative_quantity: Decimal::ZERO,
+                cumulative_quote: Decimal::ZERO,
+                cumulative_fee: Decimal::ZERO,
+                execution_audit: None,
+                terminal_status: None,
+                terminal_processed: false,
+                completed_pair_counted: false,
+            };
+            validate_order_against_instrument(&remainder, &state.instrument_rules).map_err(
+                |error| format!("opening remainder cannot be submitted safely: {error}"),
+            )?;
+            remainder.client_order_id = state
+                .next_client_order_id("o", None, remainder.shape.side)
+                .map_err(|error| error.to_string())?;
+            state
+                .insert_order(remainder)
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        return Err(format!(
+            "opening order ended as {:?} with retained grid quantity {} of {}",
+            report.terminal_status, state.opening_filled_quantity, target_quantity
+        ));
     }
 
     if matches!(purpose, StrategyOrderPurpose::RiskClose) {
@@ -2834,6 +2957,10 @@ pub enum StrategyStateError {
     OrderViolatesInstrumentRules,
     #[error("strategy execution totals are invalid")]
     InvalidExecutionTotals,
+    #[error("opening execution totals do not match the durable opening ledger")]
+    OpeningAccountingMismatch,
+    #[error("opening order chain does not match the immutable opening plan")]
+    OpeningOrderMismatch,
     #[error("strategy execution audit evidence is invalid")]
     InvalidExecutionAudit,
     #[error("terminal order processing state is inconsistent")]
@@ -2921,7 +3048,9 @@ mod tests {
             QuantityRules,
         },
         engine::{MarketSnapshot, build_grid_plan},
+        persistence::FileStrategyStateStore,
     };
+    use tempfile::tempdir;
 
     fn decimal(value: i64) -> Decimal {
         Decimal::from(value)
@@ -3810,6 +3939,554 @@ mod tests {
         assert_eq!(transition, StrategyTransition::NoChange);
         assert_eq!(machine.store().snapshot().revision, revision);
         assert_eq!(machine.store().snapshot().lots_by_level.len(), 14);
+    }
+
+    #[test]
+    fn partial_terminal_opening_creates_one_exact_remainder_before_grid_deployment() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let opening = opening_id(&initial);
+        let opening_shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = Decimal::new(11, 1);
+        let partial_quote = opening_shape
+            .price
+            .unwrap()
+            .checked_mul(partial_quantity)
+            .unwrap();
+        let expected_remainder = opening_shape.quantity - partial_quantity;
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        let cancelled = report(
+            opening.clone(),
+            "opening-partial",
+            partial_quantity,
+            partial_quote,
+            Some(TerminalOrderStatus::Cancelled),
+        );
+
+        machine.apply_execution(&cancelled, 101).unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::AwaitingOpening);
+        assert_eq!(state.opening_filled_quantity, partial_quantity);
+        assert_eq!(state.grid_position_net_quantity, -partial_quantity);
+        let remainder_orders = state
+            .orders
+            .values()
+            .filter(|order| {
+                order.purpose == StrategyOrderPurpose::Opening
+                    && order.tracking == StrategyOrderTracking::Ready
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remainder_orders.len(), 1);
+        assert_ne!(remainder_orders[0].client_order_id, opening);
+        assert_eq!(remainder_orders[0].shape.quantity, expected_remainder);
+        assert_eq!(remainder_orders[0].shape.price, opening_shape.price);
+        let remainder = remainder_orders[0].client_order_id.clone();
+        assert_eq!(state.ready_intents(102).unwrap().len(), 1);
+        assert!(
+            state
+                .orders
+                .values()
+                .filter(|order| order.purpose.is_initial_grid())
+                .all(|order| order.tracking == StrategyOrderTracking::Dormant)
+        );
+
+        let revision = state.revision;
+        assert_eq!(
+            machine.apply_execution(&cancelled, 102).unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(machine.store().snapshot().revision, revision);
+        assert_eq!(
+            machine
+                .store()
+                .snapshot()
+                .orders
+                .values()
+                .filter(|order| {
+                    order.purpose == StrategyOrderPurpose::Opening
+                        && order.tracking == StrategyOrderTracking::Ready
+                })
+                .count(),
+            1
+        );
+
+        let remainder_quote = opening_shape
+            .price
+            .unwrap()
+            .checked_mul(expected_remainder)
+            .unwrap();
+        machine
+            .apply_execution(
+                &report(
+                    remainder,
+                    "opening-remainder",
+                    expected_remainder,
+                    remainder_quote,
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                103,
+            )
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::DeployingGrid);
+        assert_eq!(state.opening_filled_quantity, opening_shape.quantity);
+        assert_eq!(state.grid_position_net_quantity, -opening_shape.quantity);
+        assert_eq!(state.ready_intents(104).unwrap().len(), 20);
+        assert!(
+            state
+                .orders
+                .values()
+                .filter(|order| order.purpose == StrategyOrderPurpose::Opening)
+                .all(|order| !order_may_still_be_live(order))
+        );
+    }
+
+    #[test]
+    fn repeated_partial_terminal_opening_chain_recomputes_remainder_from_confirmed_total() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let first = opening_id(&initial);
+        let shape = initial.orders.get(&first).unwrap().shape.clone();
+        let price = shape.price.unwrap();
+        let first_fill = Decimal::new(10, 1);
+        let second_fill = Decimal::new(7, 1);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+
+        machine
+            .apply_execution(
+                &report(
+                    first,
+                    "opening-partial-1",
+                    first_fill,
+                    price * first_fill,
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+        let second = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| {
+                order.purpose == StrategyOrderPurpose::Opening
+                    && order.tracking == StrategyOrderTracking::Ready
+            })
+            .unwrap()
+            .clone();
+        assert_eq!(second.shape.quantity, shape.quantity - first_fill);
+
+        machine
+            .apply_execution(
+                &report(
+                    second.client_order_id,
+                    "opening-partial-2",
+                    second_fill,
+                    price * second_fill,
+                    Some(TerminalOrderStatus::Expired),
+                ),
+                102,
+            )
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        let remaining = shape.quantity - first_fill - second_fill;
+        assert_eq!(
+            state.lifecycle,
+            StrategyLifecycle::AwaitingOpening,
+            "{:?}",
+            state.failure
+        );
+        assert_eq!(state.opening_filled_quantity, first_fill + second_fill);
+        assert_eq!(
+            state.grid_position_net_quantity,
+            -(first_fill + second_fill)
+        );
+        let ready = state.ready_intents(103).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].shape.quantity, remaining);
+        assert_eq!(
+            state
+                .orders
+                .values()
+                .filter(|order| {
+                    order.purpose == StrategyOrderPurpose::Opening
+                        && order.terminal_status.is_none()
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn partial_opening_remainder_is_atomic_across_state_write_failure() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = Decimal::new(11, 1);
+        let cancelled = report(
+            opening,
+            "opening-partial",
+            partial_quantity,
+            shape.price.unwrap() * partial_quantity,
+            Some(TerminalOrderStatus::Cancelled),
+        );
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial.clone()));
+        machine.store_mut().fail_next_write();
+
+        assert!(matches!(
+            machine.apply_execution(&cancelled, 101),
+            Err(StrategyMachineError::Persistence(
+                StrategyStoreError::InjectedWriteFailure
+            ))
+        ));
+        assert_eq!(machine.store().snapshot(), &initial);
+
+        machine.apply_execution(&cancelled, 102).unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.opening_filled_quantity, partial_quantity);
+        assert_eq!(
+            state
+                .orders
+                .values()
+                .filter(|order| {
+                    order.purpose == StrategyOrderPurpose::Opening
+                        && order.terminal_status.is_none()
+                })
+                .count(),
+            1
+        );
+        assert_eq!(state.ready_intents(103).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn partial_opening_remainder_round_trips_with_exact_quantity() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = Decimal::new(11, 1);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "opening-partial",
+                    partial_quantity,
+                    shape.price.unwrap() * partial_quantity,
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+        let expected = machine.store().snapshot().clone();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("opening-remainder.json");
+
+        FileStrategyStateStore::create(&path, expected.clone()).unwrap();
+        let restored = FileStrategyStateStore::load(&path).unwrap();
+
+        assert_eq!(restored.snapshot(), &expected);
+        let ready = restored.snapshot().ready_intents(102).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].shape.quantity, shape.quantity - partial_quantity);
+    }
+
+    #[test]
+    fn rejected_opening_remainder_preserves_confirmed_owned_position() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = Decimal::new(11, 1);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "opening-partial",
+                    partial_quantity,
+                    shape.price.unwrap() * partial_quantity,
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+        let mut remainder = machine
+            .store()
+            .snapshot()
+            .ready_intents(102)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        remainder.state = IntentState::Rejected {
+            code: Some("MIN_NOTIONAL".into()),
+            message: "opening remainder rejected".into(),
+        };
+
+        let transition = machine.synchronize_intent(&remainder, 102).unwrap();
+
+        assert!(matches!(transition, StrategyTransition::Failed { .. }));
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.opening_filled_quantity, partial_quantity);
+        assert_eq!(state.grid_position_net_quantity, -partial_quantity);
+        assert_eq!(
+            state
+                .lots_by_level
+                .values()
+                .map(|lot| lot.quantity)
+                .sum::<Decimal>(),
+            partial_quantity
+        );
+        assert!(
+            state
+                .orders
+                .values()
+                .filter(|order| order.purpose.is_initial_grid())
+                .all(|order| order.tracking == StrategyOrderTracking::Dormant)
+        );
+    }
+
+    #[test]
+    fn sub_minimum_opening_remainder_fails_closed_without_losing_the_fill() {
+        let mut initial = state(Direction::Short, PositionBaseline::flat());
+        initial.instrument_rules.limit_quantity.min = Decimal::new(2, 1);
+        initial.validate().unwrap();
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = shape.quantity - Decimal::new(1, 1);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+
+        let transition = machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "opening-dust",
+                    partial_quantity,
+                    shape.price.unwrap() * partial_quantity,
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+
+        assert!(matches!(transition, StrategyTransition::Failed { .. }));
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.opening_filled_quantity, partial_quantity);
+        assert_eq!(state.grid_position_net_quantity, -partial_quantity);
+        assert!(
+            state
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("cannot be submitted safely")
+        );
+        assert_eq!(
+            state
+                .orders
+                .values()
+                .filter(|order| {
+                    order.purpose == StrategyOrderPurpose::Opening
+                        && order.terminal_status.is_none()
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn every_aligned_partial_opening_split_converges_exactly_for_long_and_short() {
+        for direction in [Direction::Long, Direction::Short] {
+            let template = state(direction, PositionBaseline::flat());
+            let opening = opening_id(&template);
+            let shape = template.orders.get(&opening).unwrap().shape.clone();
+            let price = shape.price.unwrap();
+            let step = template.instrument_rules.limit_quantity.step;
+            let mut partial_quantity = step;
+            while partial_quantity < shape.quantity {
+                let mut machine =
+                    StrategyMachine::new(MemoryStrategyStateStore::new(template.clone()));
+                machine
+                    .apply_execution(
+                        &report(
+                            opening.clone(),
+                            "opening-partial",
+                            partial_quantity,
+                            price * partial_quantity,
+                            Some(TerminalOrderStatus::Cancelled),
+                        ),
+                        101,
+                    )
+                    .unwrap();
+                let remainder = machine
+                    .store()
+                    .snapshot()
+                    .ready_intents(102)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                assert_eq!(remainder.shape.quantity, shape.quantity - partial_quantity);
+                let remainder_quantity = remainder.shape.quantity;
+                machine
+                    .apply_execution(
+                        &report(
+                            remainder.client_order_id,
+                            "opening-remainder",
+                            remainder_quantity,
+                            price * remainder_quantity,
+                            Some(TerminalOrderStatus::Filled),
+                        ),
+                        103,
+                    )
+                    .unwrap();
+
+                let completed = machine.store().snapshot();
+                let expected_signed = match shape.side {
+                    OrderSide::Buy => shape.quantity,
+                    OrderSide::Sell => -shape.quantity,
+                };
+                assert_eq!(completed.lifecycle, StrategyLifecycle::DeployingGrid);
+                assert_eq!(completed.opening_filled_quantity, shape.quantity);
+                assert_eq!(completed.grid_position_net_quantity, expected_signed);
+                assert_eq!(completed.ready_intents(104).unwrap().len(), 20);
+                partial_quantity += step;
+            }
+        }
+    }
+
+    #[test]
+    fn partial_terminal_market_opening_retries_only_the_exact_market_remainder() {
+        let mut config = config(Direction::Short);
+        config.initial_order_type = InitialOrderType::Market;
+        config.initial_order_price = None;
+        let rules = instrument();
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: decimal(1012),
+                mark_price: decimal(1012),
+            },
+            &rules,
+        )
+        .unwrap();
+        let initial = StrategyState::from_plan(
+            StrategyRunId::parse("MARKET01").unwrap(),
+            config,
+            rules,
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = shape.quantity / Decimal::new(2, 0);
+        let remainder_quantity = shape.quantity - partial_quantity;
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "market-partial",
+                    partial_quantity,
+                    decimal(1012) * partial_quantity,
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+
+        let remainder = machine
+            .store()
+            .snapshot()
+            .ready_intents(102)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(remainder.shape.kind, OrderKind::Market);
+        assert_eq!(remainder.shape.price, None);
+        assert_eq!(remainder.shape.quantity, remainder_quantity);
+        machine
+            .apply_execution(
+                &report(
+                    remainder.client_order_id,
+                    "market-remainder",
+                    remainder_quantity,
+                    decimal(1013) * remainder_quantity,
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                103,
+            )
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::DeployingGrid);
+        assert_eq!(state.opening_filled_quantity, shape.quantity);
+        assert_eq!(state.grid_position_net_quantity, -shape.quantity);
+        assert_eq!(state.ready_intents(104).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn partial_opening_remainder_never_changes_the_existing_position_baseline() {
+        let baseline = PositionBaseline {
+            signed_quantity: Decimal::new(-3, 0),
+            entry_price: Some(Decimal::new(1015, 0)),
+        };
+        let initial = state(Direction::Short, baseline.clone());
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = Decimal::new(11, 1);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "opening-partial",
+                    partial_quantity,
+                    shape.price.unwrap() * partial_quantity,
+                    Some(TerminalOrderStatus::Expired),
+                ),
+                101,
+            )
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.baseline, baseline);
+        assert_eq!(state.grid_position_net_quantity, -partial_quantity);
+        assert_eq!(
+            state.expected_exchange_position().unwrap(),
+            Decimal::new(-41, 1)
+        );
+        assert_eq!(state.ready_intents(102).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn opening_ledger_validation_rejects_mismatched_totals_and_two_pending_orders() {
+        let mut mismatched = state(Direction::Short, PositionBaseline::flat());
+        mismatched.opening_filled_quantity = Decimal::new(1, 1);
+        assert_eq!(
+            mismatched.validate(),
+            Err(StrategyStateError::OpeningAccountingMismatch)
+        );
+
+        let mut duplicated = state(Direction::Short, PositionBaseline::flat());
+        let original = opening_id(&duplicated);
+        let mut duplicate = duplicated.orders.get(&original).unwrap().clone();
+        duplicate.client_order_id = ClientOrderId::parse("o_DUPLICATE1_S_99").unwrap();
+        duplicated
+            .orders
+            .insert(duplicate.client_order_id.clone(), duplicate);
+        assert_eq!(
+            duplicated.validate(),
+            Err(StrategyStateError::OpeningAccountingMismatch)
+        );
     }
 
     #[test]

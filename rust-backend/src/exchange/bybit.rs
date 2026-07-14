@@ -971,7 +971,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{IntentState, OrderShape},
+        domain::{IntentState, OrderShape, TerminalOrderStatus},
         exchange::{ActiveOrderStatus, OrderLifecycle, protocol::TransportError},
     };
 
@@ -1516,6 +1516,40 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some(expected_signature.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn partially_filled_cancellation_preserves_exact_remainder_end_to_end() {
+        let transport = MockTransport::default();
+        transport.push(ok(order_result("PartiallyFilledCanceled", "0.07", "70.77")));
+        transport.push(ok(execution_result(
+            "partial-cancel-fill",
+            "0.07",
+            "70.77",
+            1_700_000_000_500,
+            "",
+        )));
+
+        let snapshot = adapter(transport)
+            .execution_snapshot(
+                Exchange::Bybit,
+                "MUUSDT",
+                &ClientOrderId::parse("g_7_S_fixed").unwrap(),
+                "order-91",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.order.lifecycle,
+            OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled)
+        );
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(7, 2));
+        assert_eq!(
+            snapshot.order.shape.quantity - snapshot.cumulative_quantity,
+            Decimal::new(13, 2)
+        );
+        assert_eq!(snapshot.trades.len(), 1);
     }
 
     #[tokio::test]
