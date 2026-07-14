@@ -40,6 +40,11 @@ the OpenAPI schema.
   status before strategy synchronization or execution accounting can advance.
 - A terminal exchange label without cumulative execution accounting remains unresolved
   and blocks final strategy shutdown.
+- A temporary order-lookup `NotFound` cannot regress a terminal execution that has
+  already passed complete cumulative trade accounting. With exact immutable order
+  identity and terminal status, the accounted strategy state durably converges the
+  intent ledger before any counter or remainder order is submitted. A conflicting
+  status or exchange order ID fails closed and is never overwritten.
 
 ## Exchange protocols
 
@@ -197,6 +202,9 @@ the OpenAPI schema.
   the terminal ledger transition stores the exchange order ID before strategy state is
   advanced. A second crash between those commits must still recover and account the same
   order exactly once without resubmitting it.
+- If execution accounting becomes terminal while client-ID lookup is temporarily
+  inconclusive, intent-ledger convergence is independently durable. A failed convergence
+  write submits nothing; retry converges and materializes the exact replacement once.
 - Fresh exchange instrument rules must exactly match the rules that produced the durable
   plan. Any change fails the strategy before a new order is placed; an existing plan is
   never silently requantized under new rules.

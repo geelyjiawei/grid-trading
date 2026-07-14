@@ -152,6 +152,8 @@ pub enum RuntimeTickError {
     #[error("strategy and order-intent ledgers disagree")]
     IntentLedgerMismatch,
     #[error(transparent)]
+    IntentLedger(#[from] LedgerError),
+    #[error(transparent)]
     Reconciliation(#[from] ReconciliationError),
     #[error(transparent)]
     Strategy(#[from] StrategyMachineError),
@@ -1102,6 +1104,63 @@ where
             self.intent_store.snapshot(),
         )
     }
+
+    fn converge_accounted_terminal_intents(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Vec<ClientOrderId>, RuntimeTickError> {
+        let candidates = self
+            .machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter_map(|order| {
+                let status = order.terminal_status?;
+                let exchange_order_id = order.exchange_order_id.clone()?;
+                order.terminal_processed.then_some((
+                    order.client_order_id.clone(),
+                    status,
+                    exchange_order_id,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut converged = Vec::new();
+        for (client_order_id, status, exchange_order_id) in candidates {
+            let intent = self
+                .intent_store
+                .snapshot()
+                .intents
+                .get(&client_order_id)
+                .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+            let target = IntentState::Terminal {
+                status,
+                exchange_order_id: Some(exchange_order_id.clone()),
+            };
+            if intent.state == target {
+                continue;
+            }
+            let can_converge = matches!(
+                &intent.state,
+                IntentState::Accepted {
+                    exchange_order_id: accepted_id,
+                } if accepted_id == &exchange_order_id
+            ) || matches!(
+                &intent.state,
+                IntentState::Terminal {
+                    status: legacy_status,
+                    exchange_order_id: None,
+                } if *legacy_status == status
+            );
+            if !can_converge {
+                return Err(RuntimeTickError::IntentLedgerMismatch);
+            }
+            self.intent_store
+                .transition(&client_order_id, target, now_ms)?;
+            converged.push(client_order_id);
+        }
+        Ok(converged)
+    }
 }
 
 pub(crate) fn validate_cross_ledger_ownership(
@@ -1221,6 +1280,8 @@ where
 {
     pub async fn tick(&mut self, now_ms: u64) -> Result<RuntimeTickReport, RuntimeTickError> {
         self.validate_ledger_ownership()?;
+        self.converge_accounted_terminal_intents(now_ms)?;
+        self.validate_ledger_ownership()?;
         let mut report = RuntimeTickReport::new();
         let ledger_ids = self
             .intent_store
@@ -1324,6 +1385,19 @@ where
                 }),
             }
         }
+        let converged_terminal_ids = self.converge_accounted_terminal_intents(now_ms)?;
+        if !converged_terminal_ids.is_empty() {
+            report.blockers.retain(|blocker| {
+                blocker.stage != RuntimeStage::LedgerReconciliation
+                    || blocker
+                        .client_order_id
+                        .as_ref()
+                        .is_none_or(|client_order_id| {
+                            !converged_terminal_ids.contains(client_order_id)
+                        })
+            });
+        }
+        self.validate_ledger_ownership()?;
         if report.is_blocked() {
             return Ok(report);
         }
@@ -2411,6 +2485,65 @@ mod tests {
             .unwrap()
             .client_order_id
             .clone()
+    }
+
+    async fn deploy_running_short_grid(
+        runtime: &mut StrategyRuntime<
+            MockGateway,
+            MemoryOrderIntentStore,
+            MemoryStrategyStateStore,
+        >,
+        gateway: &MockGateway,
+    ) -> Decimal {
+        let opening_id = opening_id(runtime.machine());
+        let opening_quantity = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        let deployment = runtime.tick(1_200).await.unwrap();
+
+        assert!(!deployment.is_blocked(), "{deployment:?}");
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
+        opening_quantity
+    }
+
+    fn accepted_add_order<S: StrategyStateStore>(
+        machine: &StrategyMachine<S>,
+    ) -> (ClientOrderId, OrderShape, u16) {
+        machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find_map(|order| match (&order.purpose, &order.tracking) {
+                (
+                    StrategyOrderPurpose::InitialGrid {
+                        level_index,
+                        role: GridOrderRole::Add,
+                    },
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. },
+                    },
+                ) => Some((
+                    order.client_order_id.clone(),
+                    order.shape.clone(),
+                    *level_index,
+                )),
+                _ => None,
+            })
+            .expect("running short grid must have an accepted add order")
     }
 
     fn file_state() -> StrategyState {
@@ -3929,6 +4062,471 @@ mod tests {
             Decimal::new(2, 2)
         );
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_grid_partial_commit_creates_one_exact_counter_only_after_retry() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let (source_id, source_shape, level_index) = accepted_add_order(runtime.machine());
+        let partial_quantity = source_shape.quantity / Decimal::new(2, 0);
+        let source_price = source_shape.price.unwrap();
+        let placements_before_fill = gateway.placement_call_count();
+        gateway.partially_fill_order(
+            &source_id,
+            partial_quantity,
+            source_price,
+            Decimal::new(1, 2),
+        );
+        gateway.set_position(
+            -(opening_quantity + partial_quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        runtime.machine_mut().store_mut().fail_next_write();
+
+        let failed = runtime.tick(1_300).await.unwrap();
+
+        assert!(
+            failed
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::ExecutionAccounting)
+        );
+        assert_eq!(gateway.placement_call_count(), placements_before_fill);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            -opening_quantity
+        );
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .replacement_obligations
+                .is_empty()
+        );
+
+        let recovered = runtime.tick(1_400).await.unwrap();
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+        let counter = gateway
+            .state
+            .lock()
+            .unwrap()
+            .placement_calls
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(counter.shape.side, OrderSide::Buy);
+        assert_eq!(counter.shape.quantity, partial_quantity);
+        assert!(counter.shape.reduce_only);
+        assert_eq!(
+            counter.shape.price,
+            Some(runtime.machine().store().snapshot().plan.levels[usize::from(level_index)])
+        );
+
+        let stable = runtime.tick(1_500).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+        assert!(stable.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_materialization_keeps_obligation_unassigned_until_exact_retry() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let partial_quantity = source_shape.quantity / Decimal::new(2, 0);
+        gateway.partially_fill_order(
+            &source_id,
+            partial_quantity,
+            source_shape.price.unwrap(),
+            Decimal::new(1, 2),
+        );
+        gateway.set_position(
+            -(opening_quantity + partial_quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        let sync = ExecutionSyncService::new("USDT").unwrap();
+        sync.synchronize(&gateway, runtime.machine_mut(), &source_id, 1_300)
+            .await
+            .unwrap();
+        let placements_before_retry = gateway.placement_call_count();
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .replacement_obligations
+                .values()
+                .filter(|obligation| obligation.assigned_client_order_id.is_none())
+                .count(),
+            1
+        );
+        runtime.machine_mut().store_mut().fail_next_write();
+
+        assert!(matches!(
+            runtime.tick(1_400).await,
+            Err(RuntimeTickError::Strategy(
+                StrategyMachineError::Persistence(_)
+            ))
+        ));
+        assert_eq!(gateway.placement_call_count(), placements_before_retry);
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .replacement_obligations
+                .values()
+                .all(|obligation| obligation.assigned_client_order_id.is_none())
+        );
+
+        let recovered = runtime.tick(1_500).await.unwrap();
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(recovered.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), placements_before_retry + 1);
+        assert_eq!(
+            recovered.submissions[0].client_order_id,
+            gateway.placement_ids().last().unwrap().clone()
+        );
+    }
+
+    #[tokio::test]
+    async fn immediately_filled_counter_after_failed_strategy_commit_recovers_full_cycle_once() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let (source_id, source_shape, level_index) = accepted_add_order(runtime.machine());
+        let partial_quantity = source_shape.quantity / Decimal::new(2, 0);
+        gateway.partially_fill_order(
+            &source_id,
+            partial_quantity,
+            source_shape.price.unwrap(),
+            Decimal::new(1, 2),
+        );
+        gateway.set_position(
+            -(opening_quantity + partial_quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        let sync = ExecutionSyncService::new("USDT").unwrap();
+        sync.synchronize(&gateway, runtime.machine_mut(), &source_id, 1_300)
+            .await
+            .unwrap();
+        runtime
+            .machine_mut()
+            .materialize_replacements(&rules, 1_350)
+            .unwrap();
+        let placements_before_counter = gateway.placement_call_count();
+        runtime.machine_mut().store_mut().fail_next_write();
+
+        assert!(matches!(
+            runtime.tick(1_400).await,
+            Err(RuntimeTickError::Strategy(
+                StrategyMachineError::Persistence(_)
+            ))
+        ));
+        assert_eq!(
+            gateway.placement_call_count(),
+            placements_before_counter + 1
+        );
+        let first_counter_id = gateway.placement_ids().last().unwrap().clone();
+        let first_counter = gateway
+            .state
+            .lock()
+            .unwrap()
+            .orders
+            .get(&first_counter_id)
+            .unwrap()
+            .clone();
+        assert_eq!(first_counter.shape.side, OrderSide::Buy);
+        assert_eq!(first_counter.shape.quantity, partial_quantity);
+        assert!(first_counter.shape.reduce_only);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .orders
+                .get(&first_counter_id)
+                .unwrap()
+                .tracking,
+            StrategyOrderTracking::Ready
+        );
+
+        gateway.fill_order(
+            &first_counter_id,
+            first_counter.shape.price.unwrap(),
+            Decimal::new(1, 2),
+        );
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        let recovered = runtime.tick(1_500).await.unwrap();
+
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(recovered.submissions.len(), 1);
+        assert_eq!(
+            gateway.placement_call_count(),
+            placements_before_counter + 2
+        );
+        assert_eq!(
+            gateway
+                .placement_ids()
+                .iter()
+                .filter(|client_order_id| **client_order_id == first_counter_id)
+                .count(),
+            1
+        );
+        let reopened = gateway
+            .state
+            .lock()
+            .unwrap()
+            .placement_calls
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(reopened.shape.side, OrderSide::Sell);
+        assert_eq!(reopened.shape.quantity, partial_quantity);
+        assert!(!reopened.shape.reduce_only);
+        assert_eq!(
+            reopened.shape.price,
+            Some(runtime.machine().store().snapshot().plan.levels[usize::from(level_index) + 1])
+        );
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            -opening_quantity
+        );
+
+        let stable = runtime.tick(1_600).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+        assert!(stable.submissions.is_empty());
+        assert_eq!(
+            gateway.placement_call_count(),
+            placements_before_counter + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_execution_supersedes_temporary_not_found_without_state_regression() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let placements_before_fill = gateway.placement_call_count();
+        gateway.fill_order(&source_id, source_shape.price.unwrap(), Decimal::new(1, 2));
+        gateway.set_position(
+            -(opening_quantity + source_shape.quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        gateway.hide_order_from_lookup(&source_id);
+
+        let first = runtime.tick(1_300).await.unwrap();
+
+        assert!(!first.is_blocked(), "{first:?}");
+        assert_eq!(first.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+        assert!(matches!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .get(&source_id)
+                .unwrap()
+                .state,
+            IntentState::Terminal {
+                status: TerminalOrderStatus::Filled,
+                exchange_order_id: Some(_),
+            }
+        ));
+        let accounted = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .get(&source_id)
+            .unwrap();
+        assert_eq!(accounted.terminal_status, Some(TerminalOrderStatus::Filled));
+        assert!(accounted.terminal_processed);
+
+        let stable = runtime.tick(1_400).await.unwrap();
+
+        assert!(!stable.is_blocked(), "{stable:?}");
+        assert!(stable.submissions.is_empty());
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
+        assert!(matches!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .get(&source_id)
+                .unwrap()
+                .state,
+            IntentState::Terminal {
+                status: TerminalOrderStatus::Filled,
+                exchange_order_id: Some(_),
+            }
+        ));
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_ledger_convergence_places_nothing_and_retries_exactly_once() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let placements_before_fill = gateway.placement_call_count();
+        gateway.fill_order(&source_id, source_shape.price.unwrap(), Decimal::new(1, 2));
+        gateway.set_position(
+            -(opening_quantity + source_shape.quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        let sync = ExecutionSyncService::new("USDT").unwrap();
+        sync.synchronize(&gateway, runtime.machine_mut(), &source_id, 1_300)
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .get(&source_id)
+                .unwrap()
+                .state,
+            IntentState::Accepted { .. }
+        ));
+        runtime.intent_store.fail_next_write();
+
+        assert!(matches!(
+            runtime.tick(1_400).await,
+            Err(RuntimeTickError::IntentLedger(
+                LedgerError::InjectedWriteFailure
+            ))
+        ));
+        assert_eq!(gateway.placement_call_count(), placements_before_fill);
+        assert!(matches!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .get(&source_id)
+                .unwrap()
+                .state,
+            IntentState::Accepted { .. }
+        ));
+
+        let recovered = runtime.tick(1_500).await.unwrap();
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(recovered.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+
+        let stable = runtime.tick(1_600).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+        assert!(stable.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+    }
+
+    #[tokio::test]
+    async fn conflicting_terminal_ledgers_fail_closed_without_any_replacement() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let placements_before_fill = gateway.placement_call_count();
+        gateway.fill_order(&source_id, source_shape.price.unwrap(), Decimal::new(1, 2));
+        gateway.set_position(
+            -(opening_quantity + source_shape.quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        let sync = ExecutionSyncService::new("USDT").unwrap();
+        sync.synchronize(&gateway, runtime.machine_mut(), &source_id, 1_300)
+            .await
+            .unwrap();
+        let exchange_order_id = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .get(&source_id)
+            .unwrap()
+            .exchange_order_id
+            .clone()
+            .unwrap();
+        runtime
+            .intent_store
+            .transition(
+                &source_id,
+                IntentState::Terminal {
+                    status: TerminalOrderStatus::Cancelled,
+                    exchange_order_id: Some(exchange_order_id),
+                },
+                1_350,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            runtime.tick(1_400).await,
+            Err(RuntimeTickError::IntentLedgerMismatch)
+        ));
+        assert_eq!(gateway.placement_call_count(), placements_before_fill);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
     }
 
     #[tokio::test]

@@ -73,7 +73,12 @@ without that ID remain readable for migration, but the runtime must
 authoritatively enrich them before it can account a fill or advance the grid.
 Every tick reconciles intents and executions before position comparison or new
 placement, so a crash cannot turn an accepted or filled order into a duplicate
-submission or an unbooked position change.
+submission or an unbooked position change. A temporary `NotFound` from the order
+lookup cannot regress a terminal execution that has already passed complete trade
+accounting. When client ID, exchange order ID, shape, and terminal status remain
+exact, the runtime first converges the intent ledger to that accounted terminal
+state and only then materializes the counter order. Any identity or terminal-status
+conflict remains fail-closed.
 
 ## Cutover gates
 
