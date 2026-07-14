@@ -834,6 +834,7 @@ impl StrategyState {
                 }
             }
         }
+        validate_replacement_obligation_ledger(self)?;
         self.expected_exchange_position()?;
         Ok(())
     }
@@ -1032,6 +1033,14 @@ fn validate_append_only_sequences(state: &StrategyState) -> Result<(), StrategyS
     if state.next_obligation_sequence != expected_obligation_sequence {
         return Err(StrategyStateError::ObligationSequenceMismatch);
     }
+    if state
+        .replacement_obligations
+        .keys()
+        .copied()
+        .ne(1..state.next_obligation_sequence)
+    {
+        return Err(StrategyStateError::ObligationSequenceMismatch);
+    }
     Ok(())
 }
 
@@ -1124,6 +1133,160 @@ fn validate_obligation_against_instrument(
         return Err(StrategyStateError::OrderViolatesInstrumentRules);
     }
     Ok(())
+}
+
+fn validate_replacement_obligation_ledger(state: &StrategyState) -> Result<(), StrategyStateError> {
+    let mut counter_quantities = BTreeMap::<ClientOrderId, Decimal>::new();
+    let mut cancelled_remainder_sources = BTreeSet::<ClientOrderId>::new();
+
+    for obligation in state.replacement_obligations.values() {
+        if obligation.created_at_ms < state.created_at_ms
+            || obligation.created_at_ms > state.updated_at_ms
+        {
+            return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+        }
+        let source = state
+            .orders
+            .get(&obligation.source_client_order_id)
+            .ok_or(StrategyStateError::ReplacementObligationLedgerMismatch)?;
+        let source_level = source
+            .purpose
+            .level_index()
+            .ok_or(StrategyStateError::ReplacementObligationLedgerMismatch)?;
+        if source_level != obligation.level_index {
+            return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+        }
+
+        match obligation.kind {
+            ReplacementObligationKind::Counter => {
+                let expected = counter_shape(
+                    state,
+                    source_level,
+                    &source.shape,
+                    obligation.shape.quantity,
+                )
+                .map_err(|_| StrategyStateError::ReplacementObligationLedgerMismatch)?;
+                if obligation.shape != expected {
+                    return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+                }
+                let total = counter_quantities
+                    .entry(obligation.source_client_order_id.clone())
+                    .or_insert(Decimal::ZERO);
+                *total = total.checked_add(obligation.shape.quantity).ok_or(
+                    StrategyStateError::NumericOverflow("replacement counter quantity"),
+                )?;
+            }
+            ReplacementObligationKind::RestoreCancelledRemainder => {
+                if !matches!(
+                    source.terminal_status,
+                    Some(TerminalOrderStatus::Cancelled | TerminalOrderStatus::Expired)
+                ) || !cancelled_remainder_sources
+                    .insert(obligation.source_client_order_id.clone())
+                {
+                    return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+                }
+                let remaining = source
+                    .shape
+                    .quantity
+                    .checked_sub(source.cumulative_quantity)
+                    .filter(|quantity| *quantity > Decimal::ZERO)
+                    .ok_or(StrategyStateError::ReplacementObligationLedgerMismatch)?;
+                let mut expected = source.shape.clone();
+                expected.quantity = remaining;
+                if obligation.shape != expected {
+                    return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+                }
+            }
+        }
+    }
+
+    let complete_normal_ledger = normal_grid_replacements_enabled(state.lifecycle);
+    for order in state
+        .orders
+        .values()
+        .filter(|order| order.purpose.level_index().is_some())
+    {
+        let counter_quantity = counter_quantities
+            .get(&order.client_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        if counter_quantity > order.cumulative_quantity
+            || (complete_normal_ledger && counter_quantity != order.cumulative_quantity)
+        {
+            return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+        }
+        if complete_normal_ledger {
+            let needs_remainder = matches!(
+                order.terminal_status,
+                Some(TerminalOrderStatus::Cancelled | TerminalOrderStatus::Expired)
+            ) && order.cumulative_quantity < order.shape.quantity;
+            if cancelled_remainder_sources.contains(&order.client_order_id) != needs_remainder {
+                return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+            }
+        }
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut verified = BTreeSet::new();
+    for order in state
+        .orders
+        .values()
+        .filter(|order| matches!(order.purpose, StrategyOrderPurpose::Replacement { .. }))
+    {
+        if !replacement_order_has_initial_provenance(
+            state,
+            &order.client_order_id,
+            &mut visiting,
+            &mut verified,
+        ) {
+            return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn replacement_order_has_initial_provenance(
+    state: &StrategyState,
+    client_order_id: &ClientOrderId,
+    visiting: &mut BTreeSet<ClientOrderId>,
+    verified: &mut BTreeSet<ClientOrderId>,
+) -> bool {
+    if verified.contains(client_order_id) {
+        return true;
+    }
+    if !visiting.insert(client_order_id.clone()) {
+        return false;
+    }
+    let valid = state
+        .orders
+        .get(client_order_id)
+        .is_some_and(|order| match &order.purpose {
+            StrategyOrderPurpose::InitialGrid { .. } => true,
+            StrategyOrderPurpose::Replacement { obligation_ids, .. } => {
+                !obligation_ids.is_empty()
+                    && obligation_ids.iter().all(|id| {
+                        state
+                            .replacement_obligations
+                            .get(id)
+                            .is_some_and(|obligation| {
+                                obligation.assigned_client_order_id.as_ref()
+                                    == Some(client_order_id)
+                                    && replacement_order_has_initial_provenance(
+                                        state,
+                                        &obligation.source_client_order_id,
+                                        visiting,
+                                        verified,
+                                    )
+                            })
+                    })
+            }
+            StrategyOrderPurpose::Opening | StrategyOrderPurpose::RiskClose => false,
+        });
+    visiting.remove(client_order_id);
+    if valid {
+        verified.insert(client_order_id.clone());
+    }
+    valid
 }
 
 fn validate_execution_audit_payload(
@@ -3082,6 +3245,8 @@ pub enum StrategyStateError {
     MissingAssignedReplacement,
     #[error("replacement order does not exactly match its assigned obligations")]
     ReplacementOrderMismatch,
+    #[error("replacement obligations are not fully proven by their source order executions")]
+    ReplacementObligationLedgerMismatch,
     #[error("strategy generated a duplicate order identity")]
     DuplicateOrderIdentity,
     #[error("strategy order sequence does not follow the append-only order ledger")]
@@ -5260,6 +5425,133 @@ mod tests {
         obligation_sequence.next_obligation_sequence = 2;
         assert_eq!(
             obligation_sequence.validate(),
+            Err(StrategyStateError::ObligationSequenceMismatch)
+        );
+    }
+
+    #[test]
+    fn fabricated_replacement_obligation_is_rejected_before_restart() {
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+            Direction::Short,
+            PositionBaseline::flat(),
+        )));
+        complete_initial_deployment(&mut machine, 200);
+        let mut corrupted = machine.store().snapshot().clone();
+        let source_client_order_id = grid_id(&corrupted, 13, OrderSide::Buy, true);
+        let source = corrupted
+            .orders
+            .get(&source_client_order_id)
+            .unwrap()
+            .clone();
+        assert_eq!(source.cumulative_quantity, Decimal::ZERO);
+
+        let id = corrupted.next_obligation_sequence;
+        corrupted.next_obligation_sequence += 1;
+        corrupted.replacement_obligations.insert(
+            id,
+            ReplacementObligation {
+                id,
+                kind: ReplacementObligationKind::Counter,
+                source_client_order_id,
+                level_index: 13,
+                shape: counter_shape(&corrupted, 13, &source.shape, source.shape.quantity).unwrap(),
+                created_at_ms: corrupted.updated_at_ms,
+                assigned_client_order_id: None,
+            },
+        );
+
+        assert_eq!(
+            corrupted.validate(),
+            Err(StrategyStateError::ReplacementObligationLedgerMismatch),
+            "a zero-fill source must not authorize an extra replacement order",
+        );
+    }
+
+    #[test]
+    fn missing_or_drifted_replacement_evidence_is_rejected_before_restart() {
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+            Direction::Short,
+            PositionBaseline::flat(),
+        )));
+        complete_initial_deployment(&mut machine, 200);
+        let source_client_order_id = grid_id(machine.store().snapshot(), 13, OrderSide::Buy, true);
+        let source = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&source_client_order_id)
+            .unwrap()
+            .clone();
+        let filled = Decimal::new(1, 1);
+        machine
+            .apply_execution(
+                &report(
+                    source_client_order_id.clone(),
+                    source.exchange_order_id.as_deref().unwrap(),
+                    filled,
+                    source.shape.price.unwrap() * filled,
+                    None,
+                ),
+                300,
+            )
+            .unwrap();
+        let valid = machine.store().snapshot().clone();
+        assert_eq!(valid.validate(), Ok(()));
+        assert_eq!(valid.replacement_obligations.len(), 1);
+
+        let mut missing = valid.clone();
+        missing.replacement_obligations.clear();
+        missing.next_obligation_sequence = 1;
+
+        let mut unknown_source = valid.clone();
+        unknown_source
+            .replacement_obligations
+            .get_mut(&1)
+            .unwrap()
+            .source_client_order_id = ClientOrderId::parse("g_RUN00001_99_B_999").unwrap();
+
+        let mut wrong_level = valid.clone();
+        wrong_level
+            .replacement_obligations
+            .get_mut(&1)
+            .unwrap()
+            .level_index = 12;
+
+        let mut over_allocated = valid.clone();
+        let oversized = Decimal::new(2, 1);
+        over_allocated
+            .replacement_obligations
+            .get_mut(&1)
+            .unwrap()
+            .shape = counter_shape(&over_allocated, 13, &source.shape, oversized).unwrap();
+
+        let mut future_timestamp = valid.clone();
+        future_timestamp
+            .replacement_obligations
+            .get_mut(&1)
+            .unwrap()
+            .created_at_ms = future_timestamp.updated_at_ms + 1;
+
+        for (label, corrupted) in [
+            ("missing", missing),
+            ("unknown source", unknown_source),
+            ("wrong level", wrong_level),
+            ("over-allocated", over_allocated),
+            ("future timestamp", future_timestamp),
+        ] {
+            assert_eq!(
+                corrupted.validate(),
+                Err(StrategyStateError::ReplacementObligationLedgerMismatch),
+                "{label} replacement evidence must fail closed"
+            );
+        }
+
+        let mut non_contiguous = valid;
+        let mut obligation = non_contiguous.replacement_obligations.remove(&1).unwrap();
+        obligation.id = 2;
+        non_contiguous.replacement_obligations.insert(2, obligation);
+        assert_eq!(
+            non_contiguous.validate(),
             Err(StrategyStateError::ObligationSequenceMismatch)
         );
     }

@@ -311,8 +311,8 @@ mod tests {
             PositionSizingMode, QuantityRules,
         },
         engine::{
-            MarketSnapshot, PositionBaseline, StrategyOrderPurpose, StrategyRunId,
-            StrategyStateError, build_grid_plan,
+            MarketSnapshot, PositionBaseline, ReplacementObligation, ReplacementObligationKind,
+            StrategyOrderPurpose, StrategyRunId, StrategyStateError, build_grid_plan,
         },
     };
 
@@ -538,6 +538,49 @@ mod tests {
             FileStrategyStateStore::load(&path),
             Err(StrategyStoreError::InvalidState(
                 StrategyStateError::InitialGridOrderMismatch
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn fabricated_replacement_obligation_is_retained_and_rejected_on_load() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut corrupted = state();
+        let source = corrupted
+            .orders
+            .values()
+            .find_map(|order| match order.purpose {
+                StrategyOrderPurpose::InitialGrid { level_index, .. } => Some((
+                    order.client_order_id.clone(),
+                    level_index,
+                    order.shape.clone(),
+                )),
+                _ => None,
+            })
+            .unwrap();
+        corrupted.replacement_obligations.insert(
+            1,
+            ReplacementObligation {
+                id: 1,
+                kind: ReplacementObligationKind::Counter,
+                source_client_order_id: source.0,
+                level_index: source.1,
+                shape: source.2,
+                created_at_ms: corrupted.updated_at_ms,
+                assigned_client_order_id: None,
+            },
+        );
+        corrupted.next_obligation_sequence = 2;
+        let bytes = serde_json::to_vec_pretty(&PersistedStrategyState::Active(Box::new(corrupted)))
+            .unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            FileStrategyStateStore::load(&path),
+            Err(StrategyStoreError::InvalidState(
+                StrategyStateError::ReplacementObligationLedgerMismatch
             ))
         ));
         assert_eq!(fs::read(&path).unwrap(), bytes);

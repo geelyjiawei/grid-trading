@@ -714,8 +714,11 @@ mod tests {
             Direction, GridConfig, GridMode, InitialOrderType, InstrumentRules, OrderKind,
             OrderSide, PositionSizingMode, QuantityRules, TimeInForce,
         },
+        engine::{
+            ExecutionReport, MemoryStrategyStateStore, NeutralLot, StrategyMachine,
+            StrategyStateStore,
+        },
         engine::{GridOrderRole, MarketSnapshot, PositionBaseline, StrategyRunId, build_grid_plan},
-        engine::{NeutralLot, ReplacementObligation, ReplacementObligationKind},
         exchange::{ActiveOrderStatus, PositionLeg, PositionSide},
     };
 
@@ -1071,27 +1074,35 @@ mod tests {
 
     #[test]
     fn active_unassigned_replacement_obligation_is_never_hidden() {
-        let mut state = running_neutral_state(Decimal::new(100, 0));
+        let state = running_neutral_state(Decimal::new(100, 0));
         let source = state.orders.values().next().unwrap().clone();
-        let level_index = order_level(&source).unwrap();
-        state.replacement_obligations.insert(
-            1,
-            ReplacementObligation {
-                id: 1,
-                kind: ReplacementObligationKind::Counter,
-                source_client_order_id: source.client_order_id,
-                level_index,
-                shape: source.shape,
-                created_at_ms: 101,
-                assigned_client_order_id: None,
-            },
+        let quantity = Decimal::new(10, 0);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state));
+        machine
+            .apply_execution(
+                &ExecutionReport {
+                    client_order_id: source.client_order_id,
+                    exchange_order_id: source.exchange_order_id.unwrap(),
+                    cumulative_quantity: quantity,
+                    cumulative_quote: source.shape.price.unwrap() * quantity,
+                    cumulative_fee: Decimal::ZERO,
+                    terminal_status: None,
+                },
+                101,
+            )
+            .unwrap();
+        let state = machine.store().snapshot().clone();
+        assert_eq!(state.replacement_obligations.len(), 1);
+        assert!(
+            state
+                .replacement_obligations
+                .values()
+                .all(|obligation| obligation.assigned_client_order_id.is_none())
         );
-        state.next_obligation_sequence = 2;
-        state.validate().unwrap();
 
         let report = audit_strategy_shadow(
             &state,
-            &position(&state, Decimal::ZERO),
+            &position(&state, state.expected_exchange_position().unwrap()),
             &observations(&state),
         );
 
