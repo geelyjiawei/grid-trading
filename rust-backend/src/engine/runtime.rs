@@ -2038,9 +2038,10 @@ mod tests {
             let quantity = order.shape.quantity;
             let quote_quantity = quantity * price;
             let exchange_order_id = order.exchange_order_id.clone();
+            let trade_id = format!("trade-{exchange_order_id}");
             let trade_time_ms = previous.update_time_ms + 1;
             let trade = TradeFill {
-                trade_id: "1".into(),
+                trade_id,
                 exchange_order_id,
                 symbol: order.shape.symbol.clone(),
                 side: order.shape.side,
@@ -2089,9 +2090,10 @@ mod tests {
             order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
             let order = order.clone();
             let quote_quantity = quantity * price;
+            let trade_id = format!("trade-{}", order.exchange_order_id);
             let trade_time_ms = previous.update_time_ms + 1;
             let trade = TradeFill {
-                trade_id: "1".into(),
+                trade_id,
                 exchange_order_id: order.exchange_order_id.clone(),
                 symbol: order.shape.symbol.clone(),
                 side: order.shape.side,

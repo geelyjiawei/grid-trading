@@ -699,6 +699,7 @@ impl StrategyState {
                 return Err(StrategyStateError::ReplacementOrderMismatch);
             }
         }
+        validate_strategy_trade_id_ownership(self, None)?;
         validate_initial_grid_ledger(self)?;
         validate_initial_deployment_state(self)?;
         validate_append_only_sequences(self)?;
@@ -1813,6 +1814,40 @@ fn validate_execution_audit_extension(
     Ok(())
 }
 
+fn validate_strategy_trade_id_ownership(
+    state: &StrategyState,
+    candidate: Option<(&ClientOrderId, &ExecutionAuditRecord)>,
+) -> Result<(), StrategyStateError> {
+    let mut owners = BTreeMap::<String, ClientOrderId>::new();
+    let mut candidate_seen = candidate.is_none();
+    for (client_order_id, order) in &state.orders {
+        let audit = match candidate {
+            Some((candidate_order_id, candidate_audit))
+                if client_order_id == candidate_order_id =>
+            {
+                candidate_seen = true;
+                Some(candidate_audit)
+            }
+            _ => order.execution_audit.as_ref(),
+        };
+        let Some(audit) = audit else {
+            continue;
+        };
+        for trade in &audit.snapshot.trades {
+            if owners
+                .insert(trade.trade_id.clone(), client_order_id.clone())
+                .is_some()
+            {
+                return Err(StrategyStateError::InvalidExecutionAudit);
+            }
+        }
+    }
+    if !candidate_seen {
+        return Err(StrategyStateError::InvalidExecutionAudit);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionReport {
     pub client_order_id: ClientOrderId,
@@ -1967,6 +2002,12 @@ where
                     validate_execution_audit_extension(previous, &candidate)?;
                 }
                 Ok(())
+            })
+            .and_then(|()| {
+                validate_strategy_trade_id_ownership(
+                    &next,
+                    Some((&valued.report.client_order_id, &candidate)),
+                )
             });
         if audit_validation.is_err() {
             let transition = fail_transition(&mut next, "valued execution audit is invalid");
@@ -6176,6 +6217,45 @@ mod tests {
     }
 
     #[test]
+    fn late_terminal_fill_cannot_rewrite_a_processed_cancelled_remainder() {
+        let mut machine = short_machine_with_opening();
+        let add = grid_id(machine.store().snapshot(), 14, OrderSide::Sell, false);
+        let late_quantity = Decimal::new(1, 1);
+
+        machine
+            .apply_execution(
+                &report(
+                    add.clone(),
+                    "late-cancel-14",
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                110,
+            )
+            .unwrap();
+        let before = machine.store().snapshot().clone();
+        let result = machine.apply_execution(
+            &report(
+                add,
+                "late-cancel-14",
+                late_quantity,
+                Decimal::new(1015, 1),
+                Some(TerminalOrderStatus::Cancelled),
+            ),
+            111,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StrategyMachineError::InvalidState(
+                StrategyStateError::ReplacementObligationLedgerMismatch
+            ))
+        ));
+        assert_eq!(machine.store().snapshot(), &before);
+    }
+
+    #[test]
     fn duplicate_terminal_snapshot_never_duplicates_obligations_or_pairs() {
         let mut machine = short_machine_with_opening();
         let reduce = grid_id(machine.store().snapshot(), 13, OrderSide::Buy, true);
@@ -6708,6 +6788,108 @@ mod tests {
         assert_eq!(
             state.neutral_lots.values().next().unwrap().entry_value,
             decimal(3)
+        );
+    }
+
+    #[test]
+    fn duplicate_exchange_trade_id_across_opposite_orders_fails_closed() {
+        let mut machine = cross_order_neutral_machine();
+        let buy = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, false);
+        let sell = grid_id(machine.store().snapshot(), 2, OrderSide::Sell, false);
+        accept_strategy_order(&mut machine, &buy, "duplicate-buy-order", 101);
+        accept_strategy_order(&mut machine, &sell, "duplicate-sell-order", 101);
+
+        apply_single_valued_trade(
+            &mut machine,
+            buy,
+            ValuedTradeFixture {
+                exchange_order_id: "duplicate-buy-order",
+                trade_id: "duplicate-trade-7",
+                price: Decimal::new(20, 2),
+                quantity: decimal(10),
+                trade_time_ms: 103,
+                applied_at_ms: 106,
+            },
+        );
+        apply_single_valued_trade(
+            &mut machine,
+            sell,
+            ValuedTradeFixture {
+                exchange_order_id: "duplicate-sell-order",
+                trade_id: "duplicate-trade-7",
+                price: Decimal::new(30, 2),
+                quantity: decimal(10),
+                trade_time_ms: 104,
+                applied_at_ms: 107,
+            },
+        );
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.grid_position_net_quantity, decimal(10));
+        assert!(
+            state
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("execution audit is invalid"))
+        );
+    }
+
+    #[test]
+    fn persisted_state_rejects_trade_id_owned_by_two_orders() {
+        let mut machine = cross_order_neutral_machine();
+        let buy = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, false);
+        let sell = grid_id(machine.store().snapshot(), 2, OrderSide::Sell, false);
+        accept_strategy_order(&mut machine, &buy, "persisted-buy-order", 101);
+        accept_strategy_order(&mut machine, &sell, "persisted-sell-order", 101);
+
+        apply_single_valued_trade(
+            &mut machine,
+            buy.clone(),
+            ValuedTradeFixture {
+                exchange_order_id: "persisted-buy-order",
+                trade_id: "persisted-buy-trade",
+                price: Decimal::new(20, 2),
+                quantity: decimal(10),
+                trade_time_ms: 103,
+                applied_at_ms: 106,
+            },
+        );
+        apply_single_valued_trade(
+            &mut machine,
+            sell.clone(),
+            ValuedTradeFixture {
+                exchange_order_id: "persisted-sell-order",
+                trade_id: "persisted-sell-trade",
+                price: Decimal::new(30, 2),
+                quantity: decimal(10),
+                trade_time_ms: 104,
+                applied_at_ms: 107,
+            },
+        );
+
+        let mut corrupted = machine.store().snapshot().clone();
+        let duplicate_trade_id = corrupted.orders[&buy]
+            .execution_audit
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .trades[0]
+            .trade_id
+            .clone();
+        let sell_audit = corrupted
+            .orders
+            .get_mut(&sell)
+            .unwrap()
+            .execution_audit
+            .as_mut()
+            .unwrap();
+        sell_audit.snapshot.trades[0].trade_id = duplicate_trade_id.clone();
+        sell_audit.fee_valuations[0].trade_id = duplicate_trade_id;
+
+        assert_eq!(
+            corrupted.validate(),
+            Err(StrategyStateError::InvalidExecutionAudit)
         );
     }
 

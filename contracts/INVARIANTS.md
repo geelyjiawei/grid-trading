@@ -99,8 +99,12 @@ the OpenAPI schema.
 - A later snapshot may append new trade IDs but can never alter or remove an already
   audited trade or valuation. Evidence mutation fails the strategy closed while retaining
   the last valid audit record.
-- Snapshot trades are canonical by `(trade time, opaque trade ID)`, and every later
+- Snapshot trades are canonical by `(trade time, canonical trade ID)`, and every later
   snapshot must preserve the prior trade and valuation vectors as exact prefixes.
+- One exact exchange trade ID belongs to exactly one client order ID within a strategy.
+  A candidate snapshot that reuses another order's trade ID fails before accounting,
+  and a persisted strategy containing cross-order reuse is invalid. Opposite-side
+  duplicates can never evade detection merely because their position deltas net to zero.
 - Every newly audited trade is applied to inventory and PnL separately. Its durable
   inventory event must exactly match the audited trade ID, time, quantity, and quote;
   aggregate quantity and quote agreement alone are insufficient.

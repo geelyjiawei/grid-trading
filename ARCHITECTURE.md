@@ -85,7 +85,11 @@ appends immutable events containing its strategy order identity, quantity,
 quote value, and application time. An audited exchange snapshot appends one
 event per newly observed trade in canonical `(trade time, trade ID)` order; the
 event's trade ID, execution time, quantity, and quote value must exactly match
-the embedded audit. This keeps realized PnL and remaining cost basis correct
+the embedded audit. One exact exchange trade ID may belong to only one client
+order across the entire strategy. Candidate snapshots are checked against every
+other order before accounting, and restored state is checked again before use;
+opposite-side duplicate evidence therefore cannot hide behind a zero net position.
+This keeps realized PnL and remaining cost basis correct
 when one synchronization batch both closes old inventory and opens inventory in
 the opposite direction. The append sequence remains an immutable observation
 log, while inventory is rebuilt across all orders in `(trade time, canonical
