@@ -1151,7 +1151,7 @@ fn strategy_trade_rows(
             continue;
         };
         for trade in &audit.snapshot.trades {
-            if !seen.insert((trade.exchange_order_id.clone(), trade.trade_id.clone())) {
+            if !seen.insert(trade.trade_id.clone()) {
                 return Err(Box::new(api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "duplicate_trade_audit",
@@ -3349,6 +3349,34 @@ mod tests {
             .find_map(|order| order.execution_audit.as_mut())
             .unwrap();
         audit.snapshot.trades.push(audit.snapshot.trades[0].clone());
+
+        let response = strategy_trade_rows(&strategy, 100).unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn cross_order_duplicate_trade_identity_fails_closed_in_trade_rows() {
+        let directory = tempdir().unwrap();
+        let mut strategy = strategy_with_trade_audit(directory.path());
+        let source_audit = strategy
+            .orders
+            .values()
+            .find_map(|order| order.execution_audit.clone())
+            .unwrap();
+        let target = strategy
+            .orders
+            .values_mut()
+            .find(|order| order.execution_audit.is_none())
+            .unwrap();
+        let mut duplicate = source_audit;
+        duplicate.snapshot.order.client_order_id = target.client_order_id.clone();
+        duplicate.snapshot.order.exchange_order_id = target.exchange_order_id.clone().unwrap();
+        duplicate.snapshot.order.shape = target.shape.clone();
+        duplicate.snapshot.trades[0].exchange_order_id = target.exchange_order_id.clone().unwrap();
+        duplicate.snapshot.trades[0].side = target.shape.side;
+        duplicate.snapshot.trades[0].symbol = target.shape.symbol.clone();
+        target.execution_audit = Some(duplicate);
 
         let response = strategy_trade_rows(&strategy, 100).unwrap_err();
 

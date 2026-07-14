@@ -3679,20 +3679,10 @@ fn materialize_replacement_orders(
             continue;
         }
 
-        let mut bucket = Vec::new();
-        for id in compatible_ids {
-            bucket.push(id);
-            let Some(shape) = combined_obligation_shape(state, &bucket) else {
-                return fail_transition(state, "replacement obligation bucket is inconsistent");
-            };
-            if replacement_quantity_is_valid(&shape, fresh_rules) {
-                if let Err(message) =
-                    materialize_obligation_bucket(state, &bucket, fresh_rules, &mut created)
-                {
-                    return fail_transition(state, message);
-                }
-                bucket.clear();
-            }
+        if let Err(message) =
+            materialize_non_reduce_obligations(state, compatible_ids, fresh_rules, &mut created)
+        {
+            return fail_transition(state, message);
         }
     }
 
@@ -3703,6 +3693,63 @@ fn materialize_replacement_orders(
             client_order_ids: created,
         }
     }
+}
+
+fn materialize_non_reduce_obligations(
+    state: &mut StrategyState,
+    obligation_ids: Vec<u64>,
+    rules: &InstrumentRules,
+    created: &mut Vec<ClientOrderId>,
+) -> Result<(), String> {
+    let mut residual_buckets = Vec::<Vec<u64>>::new();
+    for id in obligation_ids {
+        let mut submit_bucket = None;
+        for (index, residual) in residual_buckets.iter().enumerate() {
+            let mut candidate = residual.clone();
+            candidate.push(id);
+            let shape = combined_obligation_shape(state, &candidate)
+                .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?;
+            if replacement_quantity_is_valid(&shape, rules) {
+                submit_bucket = Some((index, candidate));
+                break;
+            }
+        }
+        if let Some((index, candidate)) = submit_bucket {
+            residual_buckets.remove(index);
+            materialize_obligation_bucket(state, &candidate, rules, created)?;
+            continue;
+        }
+
+        if replacement_quantity_is_valid(
+            &combined_obligation_shape(state, &[id])
+                .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?,
+            rules,
+        ) {
+            materialize_obligation_bucket(state, &[id], rules, created)?;
+            continue;
+        }
+
+        let mut appended = false;
+        for residual in &mut residual_buckets {
+            let mut candidate = residual.clone();
+            candidate.push(id);
+            let shape = combined_obligation_shape(state, &candidate)
+                .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?;
+            if rules
+                .limit_quantity
+                .max
+                .is_none_or(|maximum| shape.quantity <= maximum)
+            {
+                *residual = candidate;
+                appended = true;
+                break;
+            }
+        }
+        if !appended {
+            residual_buckets.push(vec![id]);
+        }
+    }
+    Ok(())
 }
 
 fn obligations_are_compatible(
@@ -4284,6 +4331,12 @@ mod tests {
     }
 
     fn small_neutral_machine() -> StrategyMachine<MemoryStrategyStateStore> {
+        small_neutral_machine_with_max(None)
+    }
+
+    fn small_neutral_machine_with_max(
+        maximum_quantity: Option<Decimal>,
+    ) -> StrategyMachine<MemoryStrategyStateStore> {
         let config = GridConfig {
             exchange: Some(Exchange::Aster),
             symbol: "ANSEMUSDT".into(),
@@ -4311,12 +4364,12 @@ mod tests {
             limit_quantity: QuantityRules {
                 step: Decimal::ONE,
                 min: Decimal::ONE,
-                max: None,
+                max: maximum_quantity,
             },
             market_quantity: QuantityRules {
                 step: Decimal::ONE,
                 min: Decimal::ONE,
-                max: None,
+                max: maximum_quantity,
             },
             min_notional: decimal(5),
         };
@@ -7595,6 +7648,132 @@ mod tests {
                 .values()
                 .all(|obligation| obligation.assigned_client_order_id.is_some())
         );
+    }
+
+    fn machine_with_small_and_submit_safe_sell_obligations(
+        maximum_quantity: Decimal,
+    ) -> StrategyMachine<MemoryStrategyStateStore> {
+        let mut machine = small_neutral_machine_with_max(Some(maximum_quantity));
+        let initial_sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
+        machine
+            .apply_execution(
+                &report(
+                    initial_sell,
+                    "initial-sell",
+                    decimal(20),
+                    decimal(6),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                101,
+            )
+            .unwrap();
+        machine
+            .materialize_replacements(&machine.store().snapshot().instrument_rules.clone(), 102)
+            .unwrap();
+        let replacement_buy = replacement_orders(machine.store().snapshot())
+            .into_iter()
+            .find(|order| order.shape.side == OrderSide::Buy)
+            .unwrap()
+            .client_order_id
+            .clone();
+        accept_strategy_order(&mut machine, &replacement_buy, "replacement-buy", 103);
+
+        let initial_buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        machine
+            .apply_execution(
+                &report(
+                    initial_buy,
+                    "initial-buy",
+                    decimal(8),
+                    Decimal::new(224, 2),
+                    None,
+                ),
+                104,
+            )
+            .unwrap();
+        assert_eq!(
+            machine
+                .materialize_replacements(
+                    &machine.store().snapshot().instrument_rules.clone(),
+                    105,
+                )
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+
+        machine
+            .apply_execution(
+                &report(
+                    replacement_buy,
+                    "replacement-buy",
+                    decimal(17),
+                    Decimal::new(476, 2),
+                    None,
+                ),
+                106,
+            )
+            .unwrap();
+        machine
+    }
+
+    #[test]
+    fn sub_minimum_residual_cannot_block_a_later_submit_safe_obligation() {
+        let mut machine = machine_with_small_and_submit_safe_sell_obligations(decimal(20));
+        let transition = machine
+            .materialize_replacements(&machine.store().snapshot().instrument_rules.clone(), 107)
+            .unwrap();
+
+        assert!(matches!(
+            transition,
+            StrategyTransition::ReplacementOrdersReady { ref client_order_ids }
+                if client_order_ids.len() == 1
+        ));
+        let state = machine.store().snapshot();
+        let new_sell = replacement_orders(state)
+            .into_iter()
+            .filter(|order| {
+                order.shape.side == OrderSide::Sell && order.shape.quantity == decimal(17)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(new_sell.len(), 1);
+        let unassigned = state
+            .replacement_obligations
+            .values()
+            .filter(|obligation| obligation.assigned_client_order_id.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0].shape.quantity, decimal(8));
+        assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn sub_minimum_residual_combines_when_the_result_stays_within_maximum() {
+        let mut machine = machine_with_small_and_submit_safe_sell_obligations(decimal(30));
+
+        let transition = machine
+            .materialize_replacements(&machine.store().snapshot().instrument_rules.clone(), 107)
+            .unwrap();
+
+        assert!(matches!(
+            transition,
+            StrategyTransition::ReplacementOrdersReady { ref client_order_ids }
+                if client_order_ids.len() == 1
+        ));
+        let state = machine.store().snapshot();
+        let combined = replacement_orders(state)
+            .into_iter()
+            .filter(|order| {
+                order.shape.side == OrderSide::Sell && order.shape.quantity == decimal(25)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(combined.len(), 1);
+        assert!(
+            state
+                .replacement_obligations
+                .values()
+                .all(|obligation| obligation.assigned_client_order_id.is_some())
+        );
+        assert_eq!(state.validate(), Ok(()));
     }
 
     #[test]
