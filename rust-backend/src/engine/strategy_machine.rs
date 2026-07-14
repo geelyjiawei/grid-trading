@@ -11,7 +11,7 @@ use crate::domain::{
 use crate::exchange::{OrderLifecycle, is_valid_trade_id};
 
 use super::{
-    GridOrderRole, GridPlan,
+    GridOrderRole, GridPlan, PlannedGridOrder,
     execution_accounting::{ExecutionAuditRecord, FeeValuationSource, ValuedExecutionReport},
 };
 
@@ -560,6 +560,9 @@ impl StrategyState {
         if self.updated_at_ms < self.created_at_ms {
             return Err(StrategyStateError::TimestampRegression);
         }
+        if self.plan.grid_orders.is_empty() || self.plan.participating_level_count == 0 {
+            return Err(StrategyStateError::InvalidPlan);
+        }
         match self.direction {
             Direction::Long if self.grid_position_net_quantity < Decimal::ZERO => {
                 return Err(StrategyStateError::GridPositionDirectionMismatch);
@@ -676,6 +679,9 @@ impl StrategyState {
                 return Err(StrategyStateError::ReplacementOrderMismatch);
             }
         }
+        validate_initial_grid_ledger(self)?;
+        validate_initial_deployment_state(self)?;
+        validate_append_only_sequences(self)?;
         let opening_orders = self
             .orders
             .values()
@@ -934,6 +940,101 @@ impl StrategyState {
         self.lifecycle = StrategyLifecycle::Failed;
         self.failure = Some(message.into());
     }
+}
+
+fn validate_initial_grid_ledger(state: &StrategyState) -> Result<(), StrategyStateError> {
+    let initial_orders = state
+        .orders
+        .values()
+        .filter(|order| order.purpose.is_initial_grid())
+        .collect::<Vec<_>>();
+    if initial_orders.len() != state.plan.grid_orders.len()
+        || initial_orders.iter().any(|order| {
+            state
+                .plan
+                .grid_orders
+                .iter()
+                .filter(|planned| initial_grid_order_matches(state, order, planned))
+                .count()
+                != 1
+        })
+        || state.plan.grid_orders.iter().any(|planned| {
+            initial_orders
+                .iter()
+                .filter(|order| initial_grid_order_matches(state, order, planned))
+                .count()
+                != 1
+        })
+    {
+        return Err(StrategyStateError::InitialGridOrderMismatch);
+    }
+    Ok(())
+}
+
+fn initial_grid_order_matches(
+    state: &StrategyState,
+    order: &StrategyOrderRecord,
+    planned: &PlannedGridOrder,
+) -> bool {
+    matches!(
+        order.purpose,
+        StrategyOrderPurpose::InitialGrid { level_index, role }
+            if level_index == planned.level_index && role == planned.role
+    ) && order.shape.symbol == state.symbol
+        && order.shape.side == planned.side
+        && order.shape.price == Some(planned.price)
+        && order.shape.quantity == planned.quantity
+        && order.shape.reduce_only == planned.reduce_only
+        && order.shape.kind == OrderKind::Limit
+        && order.shape.time_in_force == planned.time_in_force
+}
+
+fn validate_initial_deployment_state(state: &StrategyState) -> Result<(), StrategyStateError> {
+    let lifecycle_flag_mismatch = match state.lifecycle {
+        StrategyLifecycle::AwaitingOpening | StrategyLifecycle::DeployingGrid => {
+            state.initial_deployment_complete
+        }
+        StrategyLifecycle::Running => !state.initial_deployment_complete,
+        StrategyLifecycle::RiskExitRequested
+        | StrategyLifecycle::StopRequested
+        | StrategyLifecycle::Stopped
+        | StrategyLifecycle::Failed
+        | StrategyLifecycle::Closed => false,
+    };
+    let lifecycle_order_mismatch = (state.lifecycle == StrategyLifecycle::AwaitingOpening
+        && state.plan.opening_order.is_none())
+        || (state.lifecycle == StrategyLifecycle::Running
+            && state.orders.values().any(|order| {
+                order.purpose.is_initial_grid()
+                    && matches!(
+                        order.tracking,
+                        StrategyOrderTracking::Dormant | StrategyOrderTracking::Ready
+                    )
+            }));
+    if lifecycle_flag_mismatch || lifecycle_order_mismatch {
+        return Err(StrategyStateError::InitialDeploymentStateMismatch);
+    }
+    Ok(())
+}
+
+fn validate_append_only_sequences(state: &StrategyState) -> Result<(), StrategyStateError> {
+    let expected_order_sequence = u64::try_from(state.orders.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or(StrategyStateError::NumericOverflow("order ledger length"))?;
+    if state.next_order_sequence != expected_order_sequence {
+        return Err(StrategyStateError::OrderSequenceMismatch);
+    }
+    let expected_obligation_sequence = u64::try_from(state.replacement_obligations.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or(StrategyStateError::NumericOverflow(
+            "replacement obligation ledger length",
+        ))?;
+    if state.next_obligation_sequence != expected_obligation_sequence {
+        return Err(StrategyStateError::ObligationSequenceMismatch);
+    }
+    Ok(())
 }
 
 fn validate_symbol(symbol: &str) -> Result<(), StrategyStateError> {
@@ -2941,6 +3042,10 @@ pub enum StrategyStateError {
     RiskCloseQuantityInvalid,
     #[error("strategy plan is empty or incomplete")]
     InvalidPlan,
+    #[error("initial grid order ledger does not exactly match the immutable grid plan")]
+    InitialGridOrderMismatch,
+    #[error("initial grid deployment flag does not match the strategy lifecycle")]
+    InitialDeploymentStateMismatch,
     #[error("unsupported strategy state version {0}")]
     UnsupportedVersion(u8),
     #[error("strategy timestamp regressed")]
@@ -2981,6 +3086,10 @@ pub enum StrategyStateError {
     ReplacementOrderMismatch,
     #[error("strategy generated a duplicate order identity")]
     DuplicateOrderIdentity,
+    #[error("strategy order sequence does not follow the append-only order ledger")]
+    OrderSequenceMismatch,
+    #[error("replacement obligation sequence does not follow the append-only obligation ledger")]
+    ObligationSequenceMismatch,
     #[error("strategy lifecycle transition is not allowed")]
     InvalidLifecycleTransition,
     #[error("strategy still has accepted or uncertain exchange orders")]
@@ -4483,6 +4592,7 @@ mod tests {
         duplicated
             .orders
             .insert(duplicate.client_order_id.clone(), duplicate);
+        duplicated.next_order_sequence += 1;
         assert_eq!(
             duplicated.validate(),
             Err(StrategyStateError::OpeningAccountingMismatch)
@@ -4963,6 +5073,130 @@ mod tests {
         assert_eq!(
             corrupted.validate(),
             Err(StrategyStateError::LevelLotCoverageMismatch)
+        );
+    }
+
+    #[test]
+    fn corrupted_initial_grid_ledger_is_rejected_before_restart() {
+        let original = state(Direction::Short, PositionBaseline::flat());
+        let initial_id = original
+            .orders
+            .values()
+            .find(|order| order.purpose.is_initial_grid())
+            .unwrap()
+            .client_order_id
+            .clone();
+        let step = original.instrument_rules.limit_quantity.step;
+        let tick = original.instrument_rules.tick_size;
+        let mut corruptions = Vec::new();
+
+        let mut quantity = original.clone();
+        quantity.orders.get_mut(&initial_id).unwrap().shape.quantity += step;
+        corruptions.push(("quantity", quantity));
+
+        let mut price = original.clone();
+        *price
+            .orders
+            .get_mut(&initial_id)
+            .unwrap()
+            .shape
+            .price
+            .as_mut()
+            .unwrap() += tick;
+        corruptions.push(("price", price));
+
+        let mut side = original.clone();
+        let shape = &mut side.orders.get_mut(&initial_id).unwrap().shape;
+        shape.side = match shape.side {
+            OrderSide::Buy => OrderSide::Sell,
+            OrderSide::Sell => OrderSide::Buy,
+        };
+        corruptions.push(("side", side));
+
+        let mut reduce_only = original.clone();
+        let shape = &mut reduce_only.orders.get_mut(&initial_id).unwrap().shape;
+        shape.reduce_only = !shape.reduce_only;
+        corruptions.push(("reduce-only", reduce_only));
+
+        let mut level = original.clone();
+        if let StrategyOrderPurpose::InitialGrid { level_index, .. } =
+            &mut level.orders.get_mut(&initial_id).unwrap().purpose
+        {
+            *level_index += 1;
+        }
+        corruptions.push(("level", level));
+
+        let mut role = original.clone();
+        if let StrategyOrderPurpose::InitialGrid { role, .. } =
+            &mut role.orders.get_mut(&initial_id).unwrap().purpose
+        {
+            *role = match *role {
+                GridOrderRole::Profit => GridOrderRole::Add,
+                GridOrderRole::Add => GridOrderRole::Profit,
+            };
+        }
+        corruptions.push(("role", role));
+
+        let mut missing = original.clone();
+        missing.orders.remove(&initial_id);
+        corruptions.push(("missing", missing));
+
+        let mut duplicate = original.clone();
+        let mut duplicate_order = duplicate.orders.get(&initial_id).unwrap().clone();
+        duplicate_order.client_order_id = ClientOrderId::parse("g_RUN00001_99_S_999").unwrap();
+        duplicate
+            .orders
+            .insert(duplicate_order.client_order_id.clone(), duplicate_order);
+        corruptions.push(("duplicate", duplicate));
+
+        for (label, corrupted) in corruptions {
+            assert_eq!(
+                corrupted.validate(),
+                Err(StrategyStateError::InitialGridOrderMismatch),
+                "{label} drift must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupted_initial_deployment_flag_is_rejected_before_restart() {
+        let mut running_machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+            Direction::Short,
+            PositionBaseline::flat(),
+        )));
+        complete_initial_deployment(&mut running_machine, 200);
+        let mut running = running_machine.store().snapshot().clone();
+        running.initial_deployment_complete = false;
+        assert_eq!(
+            running.validate(),
+            Err(StrategyStateError::InitialDeploymentStateMismatch)
+        );
+
+        let mut deploying = short_machine_with_opening().store().snapshot().clone();
+        assert_eq!(deploying.lifecycle, StrategyLifecycle::DeployingGrid);
+        deploying.initial_deployment_complete = true;
+        assert_eq!(
+            deploying.validate(),
+            Err(StrategyStateError::InitialDeploymentStateMismatch)
+        );
+    }
+
+    #[test]
+    fn corrupted_append_only_sequences_are_rejected_before_restart() {
+        let original = state(Direction::Short, PositionBaseline::flat());
+
+        let mut order_sequence = original.clone();
+        order_sequence.next_order_sequence = 1;
+        assert_eq!(
+            order_sequence.validate(),
+            Err(StrategyStateError::OrderSequenceMismatch)
+        );
+
+        let mut obligation_sequence = original;
+        obligation_sequence.next_obligation_sequence = 2;
+        assert_eq!(
+            obligation_sequence.validate(),
+            Err(StrategyStateError::ObligationSequenceMismatch)
         );
     }
 

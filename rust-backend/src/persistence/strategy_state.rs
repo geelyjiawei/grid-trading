@@ -310,7 +310,10 @@ mod tests {
             Direction, Exchange, GridConfig, GridMode, InitialOrderType, InstrumentRules,
             PositionSizingMode, QuantityRules,
         },
-        engine::{MarketSnapshot, PositionBaseline, StrategyRunId, build_grid_plan},
+        engine::{
+            MarketSnapshot, PositionBaseline, StrategyOrderPurpose, StrategyRunId,
+            StrategyStateError, build_grid_plan,
+        },
     };
 
     fn instrument_rules() -> InstrumentRules {
@@ -512,6 +515,32 @@ mod tests {
             Err(StrategyStoreError::InvalidJson(_))
         ));
         assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn drifted_initial_grid_ledger_is_retained_and_rejected_on_load() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut corrupted = state();
+        let quantity_step = corrupted.instrument_rules.limit_quantity.step;
+        corrupted
+            .orders
+            .values_mut()
+            .find(|order| matches!(order.purpose, StrategyOrderPurpose::InitialGrid { .. }))
+            .unwrap()
+            .shape
+            .quantity += quantity_step;
+        let bytes = serde_json::to_vec_pretty(&PersistedStrategyState::Active(Box::new(corrupted)))
+            .unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            FileStrategyStateStore::load(&path),
+            Err(StrategyStoreError::InvalidState(
+                StrategyStateError::InitialGridOrderMismatch
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
