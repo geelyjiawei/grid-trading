@@ -12,13 +12,14 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let app = grid_trading_server::app_from_environment()
+        .await
+        .context("invalid Rust server configuration")?;
     let address = std::env::var("GRID_BIND").unwrap_or_else(|_| "127.0.0.1:8001".into());
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("failed to bind Rust server to {address}"))?;
-    let app =
-        grid_trading_server::app_from_environment().context("invalid Rust server configuration")?;
-    tracing::info!(%address, "Rust server listening with trading writes disabled");
+    tracing::info!(%address, "Rust server listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

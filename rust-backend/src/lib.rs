@@ -6,7 +6,12 @@ pub mod persistence;
 pub mod security;
 pub mod web_auth;
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::Router;
 use thiserror::Error;
@@ -16,10 +21,14 @@ use zeroize::Zeroizing;
 use crate::web_auth::{WebAuthConfiguration, WebAuthConfigurationError, WebAuthService};
 use crate::{
     domain::Exchange,
+    engine::{
+        PreparedStrategyStep, RuntimeBuildError, RuntimeCoordinator, RuntimeRecoveryError,
+        RuntimeRecoveryProvider, RuntimeSettings,
+    },
     exchange::{
         configured::{
             ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayBuildError,
-            ExchangeGatewayFactory,
+            ExchangeGatewayFactory, SharedConfiguredExchangeGateway,
         },
         registry::{ExchangeGatewayRegistry, RegistryError},
     },
@@ -29,6 +38,10 @@ use crate::{
 const DEFAULT_CONTROL_ROOT: &str = "/app/data/rust-control/idempotency";
 const DEFAULT_STRATEGY_ROOT: &str = "/app/data/rust-control/strategies";
 const DEFAULT_WEB_ROOT: &str = "/app/web";
+const DEFAULT_RUNTIME_TICK_MS: u64 = 1_000;
+const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
+const DEFAULT_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
+const DEFAULT_SUBMISSIONS_PER_TICK: usize = 100;
 
 pub fn app() -> Router {
     build_app(
@@ -38,13 +51,12 @@ pub fn app() -> Router {
         PathBuf::from(DEFAULT_CONTROL_ROOT),
         PathBuf::from(DEFAULT_STRATEGY_ROOT),
         PathBuf::from(DEFAULT_WEB_ROOT),
+        None,
     )
 }
 
-pub fn app_from_environment() -> Result<Router, AppConfigurationError> {
-    if parse_env_flag("GRID_RUST_TRADING_ENABLED")? {
-        return Err(AppConfigurationError::TradingWritesUnavailable);
-    }
+pub async fn app_from_environment() -> Result<Router, AppConfigurationError> {
+    let trading_enabled = parse_env_flag("GRID_RUST_TRADING_ENABLED")?;
 
     let admin_token = match env::var("GRID_RUST_ADMIN_TOKEN") {
         Ok(secret) => Some(AdminTokenVerifier::from_secret(Zeroizing::new(secret))?),
@@ -60,6 +72,9 @@ pub fn app_from_environment() -> Result<Router, AppConfigurationError> {
         totp_secret: Zeroizing::new(read_env_text("TOTP_SECRET")?.unwrap_or_default()),
         cookie_secure: parse_env_flag("AUTH_COOKIE_SECURE")?,
     })?;
+    if trading_enabled && (!web_authentication.required() || !web_authentication.configured()) {
+        return Err(AppConfigurationError::TradingRequiresWebAuthentication);
+    }
     let control_root = match env::var("GRID_RUST_CONTROL_ROOT") {
         Ok(value) if value.trim().is_empty() => {
             return Err(AppConfigurationError::EmptyControlRoot);
@@ -98,6 +113,38 @@ pub fn app_from_environment() -> Result<Router, AppConfigurationError> {
         return Err(AppConfigurationError::RelativeWebRoot);
     }
     let exchange_gateways = exchange_gateways_from_environment()?;
+    let runtime = if trading_enabled {
+        let settings = RuntimeSettings::new(
+            "USDT",
+            DEFAULT_MARKET_MAX_AGE_MS,
+            DEFAULT_MARKET_FUTURE_SKEW_MS,
+            DEFAULT_SUBMISSIONS_PER_TICK,
+        )?;
+        let runtime = Arc::new(RuntimeCoordinator::new(
+            strategy_root.clone(),
+            settings.clone(),
+        ));
+        let provider = ConfiguredRuntimeProvider {
+            exchange_gateways: exchange_gateways.clone(),
+            settings,
+        };
+        let report = runtime.recover(&provider).await?;
+        if !report.discovery_anomalies.is_empty() || !report.failures.is_empty() {
+            return Err(AppConfigurationError::UnsafeRuntimeRecovery {
+                anomaly_count: report.discovery_anomalies.len(),
+                failure_count: report.failures.len(),
+            });
+        }
+        tracing::info!(
+            recovered = report.registered.len(),
+            skipped_terminal = report.skipped_terminal.len(),
+            "Rust trading runtime recovery completed"
+        );
+        spawn_runtime_scheduler(Arc::clone(&runtime));
+        Some(runtime)
+    } else {
+        None
+    };
     Ok(build_app(
         admin_token,
         web_authentication,
@@ -105,6 +152,7 @@ pub fn app_from_environment() -> Result<Router, AppConfigurationError> {
         control_root,
         strategy_root,
         web_root,
+        runtime,
     ))
 }
 
@@ -115,6 +163,7 @@ fn build_app(
     control_root: PathBuf,
     strategy_root: PathBuf,
     web_root: PathBuf,
+    runtime: Option<Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>>,
 ) -> Router {
     Router::new()
         .merge(api::router(
@@ -123,9 +172,75 @@ fn build_app(
             exchange_gateways,
             control_root,
             strategy_root,
+            runtime,
         ))
         .fallback_service(ServeDir::new(web_root))
         .layer(TraceLayer::new_for_http())
+}
+
+#[derive(Clone)]
+struct ConfiguredRuntimeProvider {
+    exchange_gateways: ExchangeGatewayRegistry,
+    settings: RuntimeSettings,
+}
+
+impl RuntimeRecoveryProvider for ConfiguredRuntimeProvider {
+    type Gateway = SharedConfiguredExchangeGateway;
+    type Error = RegistryError;
+
+    fn runtime_for(
+        &self,
+        exchange: Exchange,
+        _run_id: &engine::StrategyRunId,
+    ) -> Result<(Self::Gateway, RuntimeSettings), Self::Error> {
+        Ok((
+            self.exchange_gateways.trading_gateway(exchange)?,
+            self.settings.clone(),
+        ))
+    }
+}
+
+fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_RUNTIME_TICK_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let Some(now_ms) = system_time_ms() else {
+                tracing::error!("system clock is unavailable; runtime tick skipped");
+                continue;
+            };
+            for advance in runtime.advance_all(now_ms).await {
+                match advance.result {
+                    Ok(PreparedStrategyStep::WaitingForTrigger) => {}
+                    Ok(PreparedStrategyStep::Activated) => {
+                        tracing::info!(run_id = advance.run_id.as_str(), "strategy activated");
+                    }
+                    Ok(PreparedStrategyStep::Active(report)) => {
+                        if report.is_blocked() {
+                            tracing::warn!(
+                                run_id = advance.run_id.as_str(),
+                                blocker_count = report.blockers.len(),
+                                "strategy tick is blocked pending authoritative reconciliation"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            run_id = advance.run_id.as_str(),
+                            error = %error,
+                            "strategy tick failed closed"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn system_time_ms() -> Option<u64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(duration.as_millis()).ok()
 }
 
 fn exchange_gateways_from_environment() -> Result<ExchangeGatewayRegistry, AppConfigurationError> {
@@ -336,8 +451,19 @@ pub enum AppConfigurationError {
     ExchangeGateway(#[from] ExchangeGatewayBuildError),
     #[error("exchange gateway registry is invalid: {0}")]
     ExchangeRegistry(#[from] RegistryError),
-    #[error("Rust trading writes are not available in this migration build")]
-    TradingWritesUnavailable,
+    #[error("Rust trading requires configured, mandatory web authentication")]
+    TradingRequiresWebAuthentication,
+    #[error("Rust trading runtime settings are invalid: {0}")]
+    InvalidRuntimeSettings(#[from] RuntimeBuildError),
+    #[error("Rust trading runtime recovery failed: {0}")]
+    RuntimeRecovery(#[from] RuntimeRecoveryError),
+    #[error(
+        "Rust trading recovery is unsafe: {anomaly_count} discovery anomalies and {failure_count} recovery failures"
+    )]
+    UnsafeRuntimeRecovery {
+        anomaly_count: usize,
+        failure_count: usize,
+    },
 }
 
 #[cfg(test)]
@@ -364,6 +490,7 @@ mod tests {
             PathBuf::from(DEFAULT_CONTROL_ROOT),
             PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
+            None,
         )
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
         .await
@@ -388,6 +515,7 @@ mod tests {
             PathBuf::from(DEFAULT_CONTROL_ROOT),
             PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
+            None,
         )
         .oneshot(
             Request::builder()
@@ -412,6 +540,7 @@ mod tests {
             PathBuf::from(DEFAULT_CONTROL_ROOT),
             PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
+            None,
         )
         .oneshot(
             Request::builder()

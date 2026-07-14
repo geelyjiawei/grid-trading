@@ -261,10 +261,9 @@ impl<G> RuntimeRegistry<G> {
             .get(run_id)
             .cloned()
             .ok_or_else(|| RuntimeRegistryStopError::NotFound(run_id.clone()))?;
-        let mut strategy = slot
-            .strategy
-            .try_lock()
-            .map_err(|_| RuntimeRegistryStopError::AlreadyAdvancing(run_id.clone()))?;
+        // A stop request is safety-critical: wait for the current atomic tick instead of
+        // returning a transient busy error that would force the caller to guess or retry.
+        let mut strategy = slot.strategy.lock().await;
         strategy.request_stop(now_ms).map_err(Into::into)
     }
 }
@@ -385,8 +384,6 @@ pub enum RuntimeRegistryAdvanceError {
 pub enum RuntimeRegistryStopError {
     #[error("strategy {0:?} is not registered")]
     NotFound(StrategyRunId),
-    #[error("strategy {0:?} already has a lifecycle operation in progress")]
-    AlreadyAdvancing(StrategyRunId),
     #[error(transparent)]
     Strategy(#[from] PreparedStrategyStopError),
 }

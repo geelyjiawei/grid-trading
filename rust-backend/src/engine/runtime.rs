@@ -3091,12 +3091,28 @@ mod tests {
         assert_eq!(second_report.submissions.len(), 1);
         assert_eq!(second_gateway.placement_call_count(), 1);
 
+        let stopping_registry = Arc::clone(&registry);
+        let stopping_run = first_run.clone();
+        let stop =
+            tokio::spawn(async move { stopping_registry.request_stop(&stopping_run, 1_201).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !stop.is_finished(),
+            "stop must wait for the in-flight atomic tick instead of failing transiently"
+        );
+
         gate.release();
         let PreparedStrategyStep::Active(first_report) = first_tick.await.unwrap().unwrap() else {
             panic!("the blocked runtime must finish after release");
         };
         assert_eq!(first_report.submissions.len(), 1);
         assert_eq!(first_gateway.placement_call_count(), 1);
+        assert!(matches!(
+            stop.await.unwrap().unwrap(),
+            PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::StopRequested,
+            })
+        ));
     }
 
     #[tokio::test]

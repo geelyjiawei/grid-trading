@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -25,19 +26,24 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::{
-    domain::{Exchange, OrderSide},
+    domain::{Exchange, GridConfig, OrderSide},
     engine::{
-        ArmedStrategyLifecycle, ShadowCollectionError, StrategyLifecycle,
-        collect_stable_exchange_view, collect_strategy_shadow_view,
+        ArmedStrategyLifecycle, MarketSnapshot, PreparedStrategyLifecycle,
+        PreparedStrategyStopOutcome, RuntimeCoordinator, RuntimeCoordinatorError,
+        RuntimeRegistryEntry, ShadowCollectionError, StrategyLifecycle, StrategyTransition,
+        build_grid_preview, collect_stable_exchange_view, collect_strategy_shadow_view,
+        load_authoritative_fee_config,
     },
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, OrderLifecycle, PositionLeg, PositionSnapshot,
-        SnapshotError,
+        ActiveOrderStatus, AuthoritativeOrder, InstrumentRulesGateway, MarketSnapshotGateway,
+        OrderLifecycle, PositionLeg, PositionSnapshot, SnapshotError,
+        configured::SharedConfiguredExchangeGateway,
         registry::{ExchangeGatewayRegistry, ReadOnlyExchangeGateway, RegistryError},
     },
     persistence::{
         BeginIdempotency, FileIdempotencyStore, IdempotencyError, IdempotencyKey, IdempotencyStore,
-        RequestFingerprint, StoredCommandResponse, StrategyCatalogSnapshot, load_strategy_catalog,
+        RequestFingerprint, StoredCommandResponse, StrategyCatalog, StrategyCatalogSnapshot,
+        load_strategy_catalog,
     },
     security::AdminTokenVerifier,
     web_auth::{
@@ -47,6 +53,8 @@ use crate::{
 };
 
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1_024;
+const PREVIEW_MARKET_MAX_AGE_MS: u64 = 15_000;
+const PREVIEW_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "idempotency-replayed";
 
@@ -58,11 +66,11 @@ struct HealthResponse {
     contract_version: u8,
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         runtime: "rust",
-        trading_enabled: false,
+        trading_enabled: state.trading_enabled,
         contract_version: 1,
     })
 }
@@ -80,6 +88,7 @@ struct ApiState {
     trading_enabled: bool,
     idempotency: Arc<dyn IdempotencyStore>,
     start_command: Arc<dyn StartGridCommand>,
+    runtime: Option<Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>>,
     exchange_gateways: ExchangeGatewayRegistry,
     strategy_root: PathBuf,
 }
@@ -101,6 +110,7 @@ impl ApiState {
             trading_enabled: false,
             idempotency: Arc::new(FileIdempotencyStore::new(idempotency_root)),
             start_command: Arc::new(DisabledStartGridCommand),
+            runtime: None,
             exchange_gateways,
             strategy_root,
         }
@@ -120,6 +130,7 @@ impl ApiState {
             trading_enabled,
             idempotency,
             start_command,
+            runtime: None,
             exchange_gateways: ExchangeGatewayRegistry::default(),
             strategy_root,
         }
@@ -141,6 +152,33 @@ impl ApiState {
     fn with_strategy_root(mut self, strategy_root: PathBuf) -> Self {
         self.strategy_root = strategy_root;
         self
+    }
+
+    fn enabled(
+        admin_token: Option<AdminTokenVerifier>,
+        web_authentication: WebAuthService,
+        exchange_gateways: ExchangeGatewayRegistry,
+        idempotency_root: PathBuf,
+        strategy_root: PathBuf,
+        runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    ) -> Self {
+        let start_command = Arc::new(RuntimeStartGridCommand {
+            runtime: Arc::clone(&runtime),
+            exchange_gateways: exchange_gateways.clone(),
+        });
+        Self {
+            authentication: admin_token.map_or(
+                AdminAuthentication::Unconfigured,
+                AdminAuthentication::Configured,
+            ),
+            web_authentication,
+            trading_enabled: true,
+            idempotency: Arc::new(FileIdempotencyStore::new(idempotency_root)),
+            start_command,
+            runtime: Some(runtime),
+            exchange_gateways,
+            strategy_root,
+        }
     }
 }
 
@@ -164,6 +202,98 @@ impl StartGridCommand for DisabledStartGridCommand {
 
 #[derive(Debug)]
 struct CommandOutcomeUnknown;
+
+struct RuntimeStartGridCommand {
+    runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    exchange_gateways: ExchangeGatewayRegistry,
+}
+
+#[async_trait]
+impl StartGridCommand for RuntimeStartGridCommand {
+    async fn execute(
+        &self,
+        payload: Value,
+    ) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
+        let config = match serde_json::from_value::<GridConfig>(payload) {
+            Ok(config) => config,
+            Err(_) => {
+                return command_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_grid_config",
+                    "The grid configuration is invalid",
+                );
+            }
+        };
+        let Some(exchange) = config.exchange else {
+            return command_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "missing_exchange",
+                "The grid exchange is required",
+            );
+        };
+        let gateway = match self.exchange_gateways.trading_gateway(exchange) {
+            Ok(gateway) => gateway,
+            Err(_) => {
+                return command_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "exchange_trading_unavailable",
+                    "The selected exchange trading gateway is not configured",
+                );
+            }
+        };
+        let now_ms = unix_time_ms().map_err(|_| CommandOutcomeUnknown)?;
+        match self.runtime.start(gateway, config, now_ms).await {
+            Ok(receipt) => StoredCommandResponse::new(
+                StatusCode::ACCEPTED.as_u16(),
+                json!({
+                    "ok": true,
+                    "message": "The strategy is durably persisted and scheduled",
+                    "run_id": receipt.run_id.as_str(),
+                    "exchange": receipt.exchange,
+                    "symbol": receipt.symbol,
+                    "lifecycle": receipt.lifecycle,
+                }),
+            )
+            .map_err(|_| CommandOutcomeUnknown),
+            Err(
+                RuntimeCoordinatorError::InvalidConfig(_)
+                | RuntimeCoordinatorError::MissingExchange
+                | RuntimeCoordinatorError::GatewayMismatch { .. }
+                | RuntimeCoordinatorError::UnsupportedQuoteAsset { .. },
+            ) => command_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_grid_config",
+                "The grid configuration is invalid or unsupported",
+            ),
+            Err(RuntimeCoordinatorError::MarketAlreadyOwned { .. }) => command_response(
+                StatusCode::CONFLICT,
+                "grid_already_running",
+                "A strategy already owns this exchange and symbol",
+            ),
+            Err(
+                RuntimeCoordinatorError::RegistrationInvariant
+                | RuntimeCoordinatorError::ConcurrentMarketOwner { .. },
+            ) => Err(CommandOutcomeUnknown),
+            Err(_) => command_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grid_start_unavailable",
+                "The strategy could not be started safely",
+            ),
+        }
+    }
+}
+
+fn command_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
+    StoredCommandResponse::new(
+        status.as_u16(),
+        json!({"ok": false, "error": {"code": code, "message": message}}),
+    )
+    .map_err(|_| CommandOutcomeUnknown)
+}
 
 struct AuthenticatedAdmin;
 
@@ -397,7 +527,7 @@ impl FromRequestParts<ApiState> for JsonContentType {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start_grid(
+async fn start_grid_admin(
     _admin: AuthenticatedAdmin,
     _trading: TradingEnabled,
     IdempotencyHeader(key): IdempotencyHeader,
@@ -407,24 +537,73 @@ async fn start_grid(
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Response {
-    let payload: Value = match serde_json::from_slice(&body) {
+    execute_start_grid(state, key, method, uri, body).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_grid_web(
+    _session: AuthenticatedWebSession,
+    _trading: TradingEnabled,
+    IdempotencyHeader(key): IdempotencyHeader,
+    _content_type: JsonContentType,
+    State(state): State<ApiState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    execute_start_grid(state, key, method, uri, body).await
+}
+
+async fn execute_start_grid(
+    state: ApiState,
+    key: IdempotencyKey,
+    method: Method,
+    uri: axum::http::Uri,
+    body: Bytes,
+) -> Response {
+    let payload = match parse_json_object(&body) {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    let command = Arc::clone(&state.start_command);
+    run_idempotent_command(state, key, method, uri, body, async move {
+        command.execute(payload).await
+    })
+    .await
+}
+
+fn parse_json_object(body: &[u8]) -> Result<Value, Box<Response>> {
+    let payload = match serde_json::from_slice(body) {
         Ok(Value::Object(object)) => Value::Object(object),
         Ok(_) => {
-            return api_error(
+            return Err(Box::new(api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "The request body must be a JSON object",
-            );
+            )));
         }
         Err(_) => {
-            return api_error(
+            return Err(Box::new(api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_json",
                 "The request body is not valid JSON",
-            );
+            )));
         }
     };
+    Ok(payload)
+}
 
+async fn run_idempotent_command<F>(
+    state: ApiState,
+    key: IdempotencyKey,
+    method: Method,
+    uri: axum::http::Uri,
+    body: Bytes,
+    command: F,
+) -> Response
+where
+    F: Future<Output = Result<StoredCommandResponse, CommandOutcomeUnknown>>,
+{
     let target = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -478,7 +657,7 @@ async fn start_grid(
         BeginIdempotency::Started => {}
     }
 
-    let response = match state.start_command.execute(payload).await {
+    let response = match command.await {
         Ok(response) => response,
         Err(CommandOutcomeUnknown) => {
             return api_error(
@@ -510,6 +689,525 @@ async fn start_grid(
             "idempotency_completion_failed",
             "The command ran but its durable response could not be finalized",
         ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stop_grid_web(
+    _session: AuthenticatedWebSession,
+    _trading: TradingEnabled,
+    IdempotencyHeader(key): IdempotencyHeader,
+    _content_type: JsonContentType,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = parse_json_object(&body) {
+        return *response;
+    }
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let Some(runtime) = state.runtime.clone() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_unavailable",
+            "The Rust trading runtime is unavailable",
+        );
+    };
+    let now_ms = match unix_time_ms() {
+        Ok(now_ms) => now_ms,
+        Err(ClockUnavailable) => return clock_unavailable(),
+    };
+    run_idempotent_command(state, key, method, uri, body, async move {
+        match runtime.request_stop(exchange, &symbol, now_ms).await {
+            Ok(receipt) => stop_response(receipt),
+            Err(RuntimeCoordinatorError::MarketNotRunning { .. }) => command_response(
+                StatusCode::NOT_FOUND,
+                "grid_not_running",
+                "No running strategy owns the selected exchange and symbol",
+            ),
+            Err(
+                RuntimeCoordinatorError::CatalogTask
+                | RuntimeCoordinatorError::Catalog(_)
+                | RuntimeCoordinatorError::CatalogAnomalies { .. }
+                | RuntimeCoordinatorError::CatalogSelection(_)
+                | RuntimeCoordinatorError::RegistryCatalogMismatch { .. },
+            ) => command_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_state_inconsistent",
+                "The strategy state could not be reconciled safely",
+            ),
+            Err(_) => Err(CommandOutcomeUnknown),
+        }
+    })
+    .await
+}
+
+fn stop_response(
+    receipt: crate::engine::RuntimeStopReceipt,
+) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
+    let lifecycle = match receipt.outcome {
+        PreparedStrategyStopOutcome::ArmedCancelled => "cancelled",
+        PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
+            lifecycle: StrategyLifecycle::StopRequested,
+        }) => "stop_requested",
+        PreparedStrategyStopOutcome::Active(StrategyTransition::NoChange) => "unchanged",
+        PreparedStrategyStopOutcome::Active(_) => return Err(CommandOutcomeUnknown),
+    };
+    StoredCommandResponse::new(
+        StatusCode::ACCEPTED.as_u16(),
+        json!({
+            "ok": true,
+            "message": "The stop request is durable; strategy orders will be cancelled without closing positions",
+            "run_id": receipt.run_id.as_str(),
+            "exchange": receipt.exchange,
+            "symbol": receipt.symbol,
+            "lifecycle": lifecycle,
+        }),
+    )
+    .map_err(|_| CommandOutcomeUnknown)
+}
+
+async fn grid_status(_session: AuthenticatedWebSession, State(state): State<ApiState>) -> Response {
+    let (catalog, runtime_entries) = match stable_runtime_catalog(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let mut grids = Vec::new();
+    for snapshot in catalog.entries().iter().filter(|entry| entry.is_live()) {
+        let runtime_entry = runtime_entries
+            .iter()
+            .find(|entry| entry.run_id.as_str() == snapshot.run_id());
+        match strategy_status_response(snapshot, runtime_entry) {
+            Ok(response) => grids.push(response),
+            Err(response) => return *response,
+        }
+    }
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "running": !grids.is_empty(),
+            "count": grids.len(),
+            "running_count": grids.len(),
+            "trading_enabled": state.trading_enabled,
+            "grids": grids,
+        }),
+    )
+}
+
+async fn grid_preview(
+    _session: AuthenticatedWebSession,
+    _content_type: JsonContentType,
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Response {
+    let payload = match parse_json_object(&body) {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    let config = match serde_json::from_value::<GridConfig>(payload) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::debug!(error = %error, "grid preview request could not be decoded");
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_grid_config",
+                "The grid configuration is invalid",
+            );
+        }
+    };
+    if let Err(error) = config.validate() {
+        tracing::debug!(error = %error, "grid preview configuration failed validation");
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_grid_config",
+            "The grid configuration is invalid",
+        );
+    }
+    let Some(exchange) = config.exchange else {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "missing_exchange",
+            "The grid exchange is required",
+        );
+    };
+    let gateway = match state.exchange_gateways.trading_gateway(exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            tracing::warn!(?exchange, error = %error, "grid preview gateway is unavailable");
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "exchange_preview_unavailable",
+                "The selected exchange is not configured for an authoritative preview",
+            );
+        }
+    };
+    let now_ms = match unix_time_ms() {
+        Ok(now_ms) => now_ms,
+        Err(ClockUnavailable) => return clock_unavailable(),
+    };
+    let (authoritative, market, rules) = tokio::join!(
+        load_authoritative_fee_config(&gateway, &config),
+        gateway.market_snapshot(exchange, &config.symbol),
+        gateway.instrument_rules(exchange, &config.symbol),
+    );
+    let authoritative = match authoritative {
+        Ok(authoritative) => authoritative,
+        Err(error) => {
+            tracing::warn!(?exchange, symbol = config.symbol, error = %error, "authoritative preview fee rates failed");
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                "fee_snapshot_unavailable",
+                "The exchange fee-rate snapshot is unavailable or invalid",
+            );
+        }
+    };
+    let market = match market {
+        Ok(market) => market,
+        Err(error) => return snapshot_failure("grid preview market", exchange, error),
+    };
+    if market.exchange != exchange || market.symbol != config.symbol {
+        return snapshot_failure(
+            "grid preview market",
+            exchange,
+            SnapshotError::new("market snapshot identity mismatch"),
+        );
+    }
+    if let Err(error) = market.ensure_fresh(
+        now_ms,
+        PREVIEW_MARKET_MAX_AGE_MS,
+        PREVIEW_MARKET_FUTURE_SKEW_MS,
+    ) {
+        return snapshot_failure("grid preview market", exchange, error);
+    }
+    let rules = match rules {
+        Ok(rules) => rules,
+        Err(error) => return snapshot_failure("grid preview instrument", exchange, error),
+    };
+    let preview = match build_grid_preview(
+        &authoritative.config,
+        &MarketSnapshot {
+            last_price: market.last_price,
+            mark_price: market.mark_price,
+        },
+        &rules,
+        authoritative.rates.maker_rate,
+        authoritative.rates.taker_rate,
+    ) {
+        Ok(preview) => preview,
+        Err(error) => {
+            tracing::debug!(?exchange, symbol = config.symbol, error = %error, "grid preview could not produce an exchange-valid plan");
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "grid_plan_invalid",
+                "The requested grid cannot produce an exchange-valid order plan",
+            );
+        }
+    };
+    let representative = &preview.representative_cycle;
+    let per_grid_fee = match representative
+        .open_fee
+        .checked_add(representative.close_fee)
+    {
+        Some(fee) => fee,
+        None => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "preview_numeric_overflow",
+                "The grid preview arithmetic overflowed",
+            );
+        }
+    };
+    let opening_order = preview.plan.opening_order.as_ref().map(|order| {
+        json!({
+            "side": order_side_name(order.side),
+            "price": order.price.map(|price| price.to_string()),
+            "qty": order.quantity.to_string(),
+            "kind": order.kind,
+            "time_in_force": order.time_in_force,
+        })
+    });
+    let grid_orders = preview
+        .plan
+        .grid_orders
+        .iter()
+        .map(|order| {
+            json!({
+                "level_index": order.level_index,
+                "side": order_side_name(order.side),
+                "price": order.price.to_string(),
+                "qty": order.quantity.to_string(),
+                "reduce_only": order.reduce_only,
+                "time_in_force": order.time_in_force,
+                "role": order.role,
+            })
+        })
+        .collect::<Vec<_>>();
+    let cycles = preview
+        .cycles
+        .iter()
+        .map(|cycle| {
+            json!({
+                "level_index": cycle.level_index,
+                "qty": cycle.quantity.to_string(),
+                "entry_price": cycle.entry_price.to_string(),
+                "exit_price": cycle.exit_price.to_string(),
+                "gross_profit": cycle.gross_profit.to_string(),
+                "open_fee": cycle.open_fee.to_string(),
+                "close_fee": cycle.close_fee.to_string(),
+                "net_profit": cycle.net_profit.to_string(),
+                "gross_profit_pct": cycle.gross_profit_percent.to_string(),
+                "fee_rate": cycle.fee_rate.to_string(),
+                "liquidity_estimate": if cycle.maker_only { "maker" } else { "taker_conservative" },
+            })
+        })
+        .collect::<Vec<_>>();
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "exchange": exchange,
+            "symbol": config.symbol,
+            "reference_price": preview.plan.reference_price.to_string(),
+            "grid_step": representative.grid_step.to_string(),
+            "grid_step_min": preview.grid_step_min.to_string(),
+            "grid_step_max": preview.grid_step_max.to_string(),
+            "grid_profit_pct": representative.gross_profit_percent.to_string(),
+            "grid_profit_pct_min": preview.gross_profit_percent_min.to_string(),
+            "grid_profit_pct_max": preview.gross_profit_percent_max.to_string(),
+            "per_grid_gross_profit": representative.gross_profit.to_string(),
+            "per_grid_open_fee": representative.open_fee.to_string(),
+            "per_grid_close_fee": representative.close_fee.to_string(),
+            "per_grid_fee": per_grid_fee.to_string(),
+            "per_grid_net_profit": representative.net_profit.to_string(),
+            "per_grid_net_profit_min": preview.net_profit_min.to_string(),
+            "per_grid_net_profit_max": preview.net_profit_max.to_string(),
+            "active_grid_count": preview.plan.active_grid_count,
+            "participating_level_count": preview.plan.participating_level_count,
+            "grid_count": config.grid_count,
+            "qty_per_grid_min": preview.quantity_min.to_string(),
+            "qty_per_grid_max": preview.quantity_max.to_string(),
+            "qty_per_grid_avg": preview.quantity_average.to_string(),
+            "total_qty": preview.plan.total_quantity.to_string(),
+            "min_notional": rules.min_notional.to_string(),
+            "maker_fee_rate": authoritative.rates.maker_rate.to_string(),
+            "taker_fee_rate": authoritative.rates.taker_rate.to_string(),
+            "fee_rate_source": "exchange",
+            "fee_estimate_liquidity": if representative.maker_only { "maker" } else { "taker_conservative" },
+            "initial_open_fee_rate": preview.initial_open_fee_rate.map(|rate| rate.to_string()),
+            "initial_open_fee": preview.initial_open_fee.map(|fee| fee.to_string()),
+            "opening_order": opening_order,
+            "grid_orders": grid_orders,
+            "cycles": cycles,
+        }),
+    )
+}
+
+async fn stable_runtime_catalog(
+    state: &ApiState,
+) -> Result<(StrategyCatalog, Vec<RuntimeRegistryEntry>), Response> {
+    for _ in 0..3 {
+        let before = load_catalog_snapshot(state.strategy_root.clone()).await?;
+        let runtime_entries = match &state.runtime {
+            Some(runtime) => runtime.entries().await,
+            None => Vec::new(),
+        };
+        let after = load_catalog_snapshot(state.strategy_root.clone()).await?;
+        if before != after {
+            continue;
+        }
+        if !after.anomalies().is_empty() {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_anomaly",
+                "The strategy catalog contains unresolved anomalies",
+            ));
+        }
+        if state.runtime.is_some() && !runtime_catalog_matches(&after, &runtime_entries) {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_catalog_mismatch",
+                "The runtime registry and durable strategy catalog do not agree",
+            ));
+        }
+        return Ok((after, runtime_entries));
+    }
+    Err(api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "strategy_status_changed",
+        "The strategy state changed while it was being read; retry the status request",
+    ))
+}
+
+async fn load_catalog_snapshot(root: PathBuf) -> Result<StrategyCatalog, Response> {
+    match tokio::task::spawn_blocking(move || load_strategy_catalog(root)).await {
+        Ok(Ok(catalog)) => Ok(catalog),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "strategy catalog could not be read");
+            Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_unavailable",
+                "The strategy catalog is unavailable",
+            ))
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "strategy catalog task failed");
+            Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_unavailable",
+                "The strategy catalog is unavailable",
+            ))
+        }
+    }
+}
+
+fn runtime_catalog_matches(
+    catalog: &StrategyCatalog,
+    runtime_entries: &[RuntimeRegistryEntry],
+) -> bool {
+    let live = catalog
+        .entries()
+        .iter()
+        .filter(|entry| entry.is_live())
+        .collect::<Vec<_>>();
+    if live.len() != runtime_entries.len() {
+        return false;
+    }
+    live.iter().all(|snapshot| {
+        runtime_entries.iter().any(|entry| {
+            entry.run_id.as_str() == snapshot.run_id()
+                && entry.exchange == snapshot.exchange()
+                && entry.symbol == snapshot.symbol()
+                && (entry.advancing || entry.lifecycle == Some(prepared_lifecycle(snapshot)))
+        })
+    })
+}
+
+fn prepared_lifecycle(snapshot: &StrategyCatalogSnapshot) -> PreparedStrategyLifecycle {
+    match snapshot {
+        StrategyCatalogSnapshot::Armed(state) => match state.lifecycle {
+            ArmedStrategyLifecycle::WaitingTrigger => PreparedStrategyLifecycle::WaitingTrigger,
+            ArmedStrategyLifecycle::Cancelled => PreparedStrategyLifecycle::Cancelled,
+        },
+        StrategyCatalogSnapshot::Active(state) => match state.lifecycle {
+            StrategyLifecycle::AwaitingOpening => PreparedStrategyLifecycle::AwaitingOpening,
+            StrategyLifecycle::DeployingGrid => PreparedStrategyLifecycle::DeployingGrid,
+            StrategyLifecycle::Running => PreparedStrategyLifecycle::Running,
+            StrategyLifecycle::RiskExitRequested => PreparedStrategyLifecycle::RiskExitRequested,
+            StrategyLifecycle::StopRequested => PreparedStrategyLifecycle::StopRequested,
+            StrategyLifecycle::Stopped => PreparedStrategyLifecycle::Stopped,
+            StrategyLifecycle::Failed => PreparedStrategyLifecycle::Failed,
+            StrategyLifecycle::Closed => PreparedStrategyLifecycle::Closed,
+        },
+    }
+}
+
+fn strategy_status_response(
+    snapshot: &StrategyCatalogSnapshot,
+    runtime_entry: Option<&RuntimeRegistryEntry>,
+) -> Result<Value, Box<Response>> {
+    let engine_running = runtime_entry.is_some();
+    let runtime_advancing = runtime_entry.is_some_and(|entry| entry.advancing);
+    match snapshot {
+        StrategyCatalogSnapshot::Armed(state) => Ok(json!({
+            "run_id": state.run_id.as_str(),
+            "exchange": state.exchange,
+            "symbol": state.symbol,
+            "running": state.lifecycle == ArmedStrategyLifecycle::WaitingTrigger,
+            "engine_running": engine_running,
+            "runtime_advancing": runtime_advancing,
+            "lifecycle": state.lifecycle,
+            "direction": state.config.direction,
+            "grid_mode": state.config.grid_mode,
+            "grid_count": state.config.grid_count,
+            "lower_price": state.config.lower_price.to_string(),
+            "upper_price": state.config.upper_price.to_string(),
+            "waiting_trigger": true,
+            "waiting_initial_order": false,
+            "trigger_price": state.trigger_price.to_string(),
+            "trigger_message": "Waiting for the configured trigger price",
+            "grid_ready": false,
+            "completed_pairs": 0,
+            "gross_profit": "0",
+            "total_fee": "0",
+            "realized_net_profit": "0",
+            "total_profit": "0",
+            "total_volume": "0",
+            "grid_position_net_qty": "0",
+            "created_at_ms": state.created_at_ms,
+            "updated_at_ms": state.updated_at_ms,
+        })),
+        StrategyCatalogSnapshot::Active(state) => {
+            let expected_position = state.expected_exchange_position().map_err(|error| {
+                tracing::error!(run_id = state.run_id.as_str(), error = %error, "persisted strategy position arithmetic failed");
+                Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "strategy_state_invalid",
+                    "The persisted strategy state is invalid",
+                ))
+            })?;
+            let realized_net = state
+                .gross_realized_profit
+                .checked_sub(state.total_fee)
+                .ok_or_else(|| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "strategy_state_invalid",
+                        "The persisted strategy profit arithmetic overflowed",
+                    ))
+                })?;
+            let baseline_side = if state.baseline.signed_quantity.is_sign_positive() {
+                Some("Buy")
+            } else if state.baseline.signed_quantity.is_sign_negative() {
+                Some("Sell")
+            } else {
+                None
+            };
+            Ok(json!({
+                "run_id": state.run_id.as_str(),
+                "exchange": state.exchange,
+                "symbol": state.symbol,
+                "running": !matches!(state.lifecycle, StrategyLifecycle::Stopped | StrategyLifecycle::Closed),
+                "engine_running": engine_running,
+                "runtime_advancing": runtime_advancing,
+                "lifecycle": state.lifecycle,
+                "direction": state.direction,
+                "grid_mode": state.config.grid_mode,
+                "grid_count": state.config.grid_count,
+                "active_grid_count": state.plan.active_grid_count,
+                "participating_level_count": state.plan.participating_level_count,
+                "lower_price": state.config.lower_price.to_string(),
+                "upper_price": state.config.upper_price.to_string(),
+                "reference_price": state.plan.reference_price.to_string(),
+                "waiting_trigger": false,
+                "waiting_initial_order": state.lifecycle == StrategyLifecycle::AwaitingOpening,
+                "grid_ready": state.initial_deployment_complete,
+                "completed_pairs": state.completed_pairs,
+                "gross_profit": state.gross_realized_profit.to_string(),
+                "total_fee": state.total_fee.to_string(),
+                "realized_net_profit": realized_net.to_string(),
+                "total_profit": realized_net.to_string(),
+                "total_volume": state.total_volume.to_string(),
+                "baseline_position": {
+                    "side": baseline_side,
+                    "qty": state.baseline.signed_quantity.abs().to_string(),
+                    "signed_qty": state.baseline.signed_quantity.to_string(),
+                    "entry_price": state.baseline.entry_price.map(|price| price.to_string()),
+                },
+                "grid_position_net_qty": state.grid_position_net_quantity.to_string(),
+                "expected_position_net_qty": expected_position.to_string(),
+                "opening_filled_qty": state.opening_filled_quantity.to_string(),
+                "planned_total_qty": state.plan.total_quantity.to_string(),
+                "failure": state.failure,
+                "created_at_ms": state.created_at_ms,
+                "updated_at_ms": state.updated_at_ms,
+            }))
+        }
     }
 }
 
@@ -1315,14 +2013,26 @@ pub(crate) fn router(
     exchange_gateways: ExchangeGatewayRegistry,
     idempotency_root: PathBuf,
     strategy_root: PathBuf,
+    runtime: Option<Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>>,
 ) -> Router {
-    router_with_state(ApiState::disabled(
-        admin_token,
-        web_authentication,
-        exchange_gateways,
-        idempotency_root,
-        strategy_root,
-    ))
+    let state = match runtime {
+        Some(runtime) => ApiState::enabled(
+            admin_token,
+            web_authentication,
+            exchange_gateways,
+            idempotency_root,
+            strategy_root,
+            runtime,
+        ),
+        None => ApiState::disabled(
+            admin_token,
+            web_authentication,
+            exchange_gateways,
+            idempotency_root,
+            strategy_root,
+        ),
+    };
+    router_with_state(state)
 }
 
 fn router_with_state(state: ApiState) -> Router {
@@ -1338,7 +2048,11 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/positions/{symbol}", get(exchange_positions))
         .route("/api/orders/open/{symbol}", get(exchange_open_orders))
         .route("/api/risk/{symbol}", get(exchange_risk))
-        .route("/api/v1/grid/start", post(start_grid))
+        .route("/api/grid/status", get(grid_status))
+        .route("/api/grid/preview", post(grid_preview))
+        .route("/api/grid/start", post(start_grid_web))
+        .route("/api/grid/stop/{symbol}", post(stop_grid_web))
+        .route("/api/v1/grid/start", post(start_grid_admin))
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
         .layer(DefaultBodyLimit::max(MAX_CONTROL_BODY_BYTES))
@@ -1416,6 +2130,31 @@ mod tests {
             builder = builder.header(IDEMPOTENCY_KEY_HEADER, key);
         }
         builder.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    fn valid_preview_config() -> GridConfig {
+        GridConfig {
+            exchange: Some(Exchange::Binance),
+            symbol: "MUUSDT".into(),
+            direction: Direction::Short,
+            upper_price: Decimal::from_str_exact("1020").unwrap(),
+            lower_price: Decimal::from_str_exact("1000").unwrap(),
+            grid_count: 20,
+            total_investment: Decimal::ZERO,
+            leverage: 5,
+            position_sizing_mode: PositionSizingMode::FixedGridQty,
+            grid_order_qty: Some(Decimal::from_str_exact("0.2").unwrap()),
+            fee_rate: Some(Decimal::from_str_exact("0.0005").unwrap()),
+            maker_fee_rate: Some(Decimal::from_str_exact("0.0002").unwrap()),
+            taker_fee_rate: Some(Decimal::from_str_exact("0.0005").unwrap()),
+            initial_order_type: InitialOrderType::Limit,
+            initial_order_price: Some(Decimal::from_str_exact("1014").unwrap()),
+            grid_order_post_only: false,
+            grid_mode: GridMode::Arithmetic,
+            trigger_price: None,
+            stop_loss_price: None,
+            take_profit_price: None,
+        }
     }
 
     async fn response_json(response: Response) -> Value {
@@ -2086,6 +2825,25 @@ mod tests {
             .with_strategy_root(strategy_root),
         );
 
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = response_json(status).await;
+        assert_eq!(status["running_count"], 1);
+        assert_eq!(status["grids"][0]["run_id"], strategy.run_id.as_str());
+        assert_eq!(status["grids"][0]["waiting_trigger"], false);
+        assert_eq!(status["grids"][0]["engine_running"], false);
+        assert_eq!(status["grids"][0]["grid_position_net_qty"], "0");
+        assert_eq!(status["grids"][0]["expected_position_net_qty"], "0");
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -2659,6 +3417,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_web_start_uses_the_same_durable_idempotency_gate() {
+        let directory = tempdir().unwrap();
+        let command = Arc::new(CountingCommand::new());
+        let (web_auth, code) = configured_service(59, false);
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                true,
+                Arc::new(FileIdempotencyStore::new(directory.path())),
+                command.clone(),
+            )
+            .with_web_authentication(web_auth),
+        );
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/grid/start")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(IDEMPOTENCY_KEY_HEADER, KEY)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/login")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"username": USERNAME, "password": PASSWORD, "code": code})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let web_request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/grid/start")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .header(IDEMPOTENCY_KEY_HEADER, KEY)
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(web_request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        assert!(first.headers().get(IDEMPOTENCY_REPLAYED_HEADER).is_none());
+
+        let replay = app.oneshot(web_request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(replay.headers()[IDEMPOTENCY_REPLAYED_HEADER], "true");
+        assert_eq!(command.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn failed_web_login_is_generic_and_never_sets_a_cookie() {
         let directory = tempdir().unwrap();
         let (web_auth, code) = configured_service(59, false);
@@ -2730,7 +3563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_mutating_route_remains_absent_until_compatible() {
+    async fn web_start_route_exists_but_remains_fail_closed_when_trading_is_disabled() {
         let response = super::super::app()
             .oneshot(
                 Request::builder()
@@ -2741,7 +3574,68 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), 404);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "rust_trading_disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_fails_closed_before_using_unconfigured_exchange_data() {
+        let app = super::super::app();
+        let no_content_type = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/grid/preview")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_content_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            response_json(no_content_type).await["error"]["code"],
+            "json_content_type_required"
+        );
+
+        let invalid_config = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/grid/preview")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_config.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(invalid_config).await["error"]["code"],
+            "invalid_grid_config"
+        );
+
+        let valid_config = serde_json::to_vec(&valid_preview_config()).unwrap();
+        let unavailable = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/grid/preview")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(valid_config))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(unavailable).await["error"]["code"],
+            "exchange_preview_unavailable"
+        );
     }
 
     #[tokio::test]

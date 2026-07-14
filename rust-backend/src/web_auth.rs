@@ -234,6 +234,14 @@ impl WebAuthService {
         self.inner.cookie_secure
     }
 
+    pub fn required(&self) -> bool {
+        self.inner.required
+    }
+
+    pub fn configured(&self) -> bool {
+        self.inner.credentials.is_some()
+    }
+
     pub fn status(&self, headers: &HeaderMap) -> Result<WebAuthStatus, WebAuthUnavailable> {
         let configured = self.inner.credentials.is_some();
         if !configured {
