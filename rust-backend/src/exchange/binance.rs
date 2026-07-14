@@ -504,7 +504,7 @@ where
         let request = self
             .signed_request(
                 HttpMethod::Get,
-                "/fapi/v3/positionRisk",
+                "/fapi/v2/positionRisk",
                 vec![("symbol".into(), symbol.clone())],
             )
             .map_err(|error| SnapshotError::new(error.to_string()))?;
@@ -1067,7 +1067,32 @@ mod tests {
         );
         assert_eq!(snapshot.one_way_leverage().unwrap(), 5);
         let request = transport.request();
-        assert_eq!(request.path, "/fapi/v3/positionRisk");
+        assert_eq!(request.path, "/fapi/v2/positionRisk");
+        assert!(request.query_string().contains("signature="));
+    }
+
+    #[tokio::test]
+    async fn signed_position_snapshot_preserves_an_authoritative_flat_position() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[{
+                "symbol":"MUUSDT","positionSide":"BOTH","positionAmt":"0.00",
+                "entryPrice":"0.00000","markPrice":"956.42792409",
+                "unRealizedProfit":"0.00000000","leverage":"10"
+            }]"#
+            .into(),
+        }));
+        let snapshot = adapter(transport.clone())
+            .position_snapshot(Exchange::Binance, "MUUSDT")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
+        assert_eq!(snapshot.one_way_leverage().unwrap(), 10);
+        assert_eq!(snapshot.legs[0].mark_price, Decimal::new(95642792409, 8));
+        let request = transport.request();
+        assert_eq!(request.path, "/fapi/v2/positionRisk");
+        assert!(request.query_string().contains("symbol=MUUSDT"));
         assert!(request.query_string().contains("signature="));
     }
 
