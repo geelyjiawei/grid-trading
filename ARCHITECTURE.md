@@ -87,9 +87,16 @@ event per newly observed trade in canonical `(trade time, trade ID)` order; the
 event's trade ID, execution time, quantity, and quote value must exactly match
 the embedded audit. This keeps realized PnL and remaining cost basis correct
 when one synchronization batch both closes old inventory and opens inventory in
-the opposite direction. The whole cumulative delta still creates at most one
-counter-order obligation, so per-trade accounting cannot multiply replacement
-orders. Before an active strategy can be loaded, the events must exactly
+the opposite direction. The append sequence remains an immutable observation
+log, while inventory is rebuilt across all orders in `(trade time, trade ID,
+client order ID)` order. Therefore an earlier exchange trade discovered by a
+later polling pass corrects FIFO cost basis without rewriting audit history.
+Exact trade events cannot be mixed with legacy aggregate-only inventory evidence
+in an active strategy because their relative chronology is unknowable; that
+condition retains the authoritative fill but fails the strategy closed. The
+whole cumulative delta still creates at most one counter-order obligation, so
+per-trade accounting cannot multiply replacement orders. Before an active
+strategy can be loaded, the events must exactly
 reproduce the opening allocation, every per-level directional lot, neutral FIFO
 lots, net grid position, and gross realized profit. Aggregate totals alone are
 never accepted as proof because quantity and cost can otherwise drift between

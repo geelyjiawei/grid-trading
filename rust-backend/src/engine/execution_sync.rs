@@ -112,9 +112,9 @@ mod tests {
             TerminalOrderStatus,
         },
         engine::{
-            ExecutionReport, MarketSnapshot, MemoryStrategyStateStore, PositionBaseline,
-            ReplacementObligationKind, StrategyLifecycle, StrategyOrderPurpose, StrategyState,
-            StrategyStateStore, build_grid_plan,
+            MarketSnapshot, MemoryStrategyStateStore, PositionBaseline, ReplacementObligationKind,
+            StrategyLifecycle, StrategyOrderPurpose, StrategyState, StrategyStateStore,
+            build_grid_plan,
         },
         exchange::{
             ActiveOrderStatus, AuthoritativeOrder, ExecutionSnapshotError, HistoricalMinutePrice,
@@ -284,28 +284,18 @@ mod tests {
         }
     }
 
-    fn accepted_grid_machine() -> (StrategyMachine<MemoryStrategyStateStore>, ClientOrderId) {
+    async fn accepted_grid_machine() -> (StrategyMachine<MemoryStrategyStateStore>, ClientOrderId) {
         let (mut machine, opening_id) = accepted_machine();
-        let opening = machine
-            .store()
-            .snapshot()
-            .orders
-            .get(&opening_id)
+        let opening_snapshot = execution_for(&machine, &opening_id);
+        ExecutionSyncService::new("USDT")
             .unwrap()
-            .clone();
-        let opening_price = opening.shape.price.unwrap();
-        machine
-            .apply_execution(
-                &ExecutionReport {
-                    client_order_id: opening_id,
-                    exchange_order_id: "opening-42".into(),
-                    cumulative_quantity: opening.shape.quantity,
-                    cumulative_quote: opening.shape.quantity * opening_price,
-                    cumulative_fee: Decimal::ZERO,
-                    terminal_status: Some(TerminalOrderStatus::Filled),
-                },
+            .synchronize(
+                &gateway(Ok(opening_snapshot)),
+                &mut machine,
+                &opening_id,
                 1_150,
             )
+            .await
             .unwrap();
 
         let grid_order = machine
@@ -435,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_terminal_sync_creates_exact_counter_and_remainder_only_once() {
-        let (mut machine, id) = accepted_grid_machine();
+        let (mut machine, id) = accepted_grid_machine().await;
         let snapshot = partial_cancel_execution_for(&machine, &id);
         let original_quantity = snapshot.order.shape.quantity;
         let filled_quantity = snapshot.cumulative_quantity;
@@ -476,7 +466,7 @@ mod tests {
             original_quantity
         );
         assert_eq!(duplicate.transition, StrategyTransition::NoChange);
-        assert_eq!(machine.store().snapshot().total_fee, Decimal::new(1, 2));
+        assert_eq!(machine.store().snapshot().total_fee, Decimal::new(6, 2));
         assert_eq!(
             machine.store().snapshot().replacement_obligations,
             after_first.replacement_obligations

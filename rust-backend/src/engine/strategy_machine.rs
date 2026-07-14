@@ -1524,15 +1524,11 @@ fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), Strategy
         return Ok(());
     }
 
+    let accounting_events = inventory_events_in_accounting_order(state)
+        .map_err(|_| StrategyStateError::InventoryEventLedgerMismatch)?;
     let mut replay = state.clone();
-    replay.grid_position_net_quantity = Decimal::ZERO;
-    replay.opening_filled_quantity = Decimal::ZERO;
-    replay.opening_filled_value = Decimal::ZERO;
-    replay.lots_by_level.clear();
-    replay.neutral_lots.clear();
-    replay.next_neutral_lot_sequence = 1;
-    replay.gross_realized_profit = Decimal::ZERO;
-    for event in state.inventory_events.values() {
+    InventoryAccountingSnapshot::empty().restore(&mut replay);
+    for event in &accounting_events {
         let order = state
             .orders
             .get(&event.source_client_order_id)
@@ -2618,6 +2614,7 @@ fn apply_execution_report(
     let purpose = existing.purpose.clone();
     let shape = existing.shape.clone();
     let was_terminal_processed = existing.terminal_processed;
+    let previous_inventory = InventoryAccountingSnapshot::capture(state);
     if delta_quantity.is_zero() != delta_quote.is_zero() {
         let message =
             "execution quantity and quote deltas must become positive together".to_owned();
@@ -2674,12 +2671,19 @@ fn apply_execution_report(
     };
 
     let mut obligation_ids = Vec::new();
-    for delta in &inventory_deltas {
-        if let Err(message) =
-            apply_inventory_accounting(state, &purpose, &shape, delta.quantity, delta.quote)
-        {
-            return fail_transition(state, message);
+    if let Err(replay_message) = rebuild_inventory_accounting(state) {
+        // Preserve the prior fail-closed diagnostic shape when exact global
+        // chronology cannot be reconstructed (for example, legacy aggregate
+        // evidence mixed with exact trades).
+        previous_inventory.restore(state);
+        for delta in &inventory_deltas {
+            if let Err(message) =
+                apply_inventory_accounting(state, &purpose, &shape, delta.quantity, delta.quote)
+            {
+                return fail_transition(state, message);
+            }
         }
+        return fail_transition(state, replay_message);
     }
     if delta_quantity > Decimal::ZERO
         && let Err(message) = add_execution_counter_obligation(
@@ -2774,6 +2778,103 @@ struct InventoryDeltaEvidence {
     quote: Decimal,
     exchange_trade_id: Option<String>,
     execution_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct InventoryAccountingSnapshot {
+    grid_position_net_quantity: Decimal,
+    opening_filled_quantity: Decimal,
+    opening_filled_value: Decimal,
+    lots_by_level: BTreeMap<u16, LevelLot>,
+    neutral_lots: BTreeMap<u64, NeutralLot>,
+    next_neutral_lot_sequence: u64,
+    gross_realized_profit: Decimal,
+}
+
+impl InventoryAccountingSnapshot {
+    fn capture(state: &StrategyState) -> Self {
+        Self {
+            grid_position_net_quantity: state.grid_position_net_quantity,
+            opening_filled_quantity: state.opening_filled_quantity,
+            opening_filled_value: state.opening_filled_value,
+            lots_by_level: state.lots_by_level.clone(),
+            neutral_lots: state.neutral_lots.clone(),
+            next_neutral_lot_sequence: state.next_neutral_lot_sequence,
+            gross_realized_profit: state.gross_realized_profit,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            grid_position_net_quantity: Decimal::ZERO,
+            opening_filled_quantity: Decimal::ZERO,
+            opening_filled_value: Decimal::ZERO,
+            lots_by_level: BTreeMap::new(),
+            neutral_lots: BTreeMap::new(),
+            next_neutral_lot_sequence: 1,
+            gross_realized_profit: Decimal::ZERO,
+        }
+    }
+
+    fn restore(self, state: &mut StrategyState) {
+        state.grid_position_net_quantity = self.grid_position_net_quantity;
+        state.opening_filled_quantity = self.opening_filled_quantity;
+        state.opening_filled_value = self.opening_filled_value;
+        state.lots_by_level = self.lots_by_level;
+        state.neutral_lots = self.neutral_lots;
+        state.next_neutral_lot_sequence = self.next_neutral_lot_sequence;
+        state.gross_realized_profit = self.gross_realized_profit;
+    }
+}
+
+fn inventory_events_in_accounting_order(
+    state: &StrategyState,
+) -> Result<Vec<InventoryExecutionEvent>, String> {
+    let mut events = state.inventory_events.values().cloned().collect::<Vec<_>>();
+    let exact_event_count = events
+        .iter()
+        .filter(|event| event.exchange_trade_id.is_some() && event.execution_time_ms.is_some())
+        .count();
+    if exact_event_count != 0 && exact_event_count != events.len() {
+        return Err(
+            "exact exchange trades cannot be mixed with legacy aggregate inventory evidence"
+                .to_owned(),
+        );
+    }
+    if exact_event_count == events.len() {
+        events.sort_by(|left, right| {
+            left.execution_time_ms
+                .cmp(&right.execution_time_ms)
+                .then_with(|| left.exchange_trade_id.cmp(&right.exchange_trade_id))
+                .then_with(|| {
+                    left.source_client_order_id
+                        .cmp(&right.source_client_order_id)
+                })
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+    }
+    Ok(events)
+}
+
+fn rebuild_inventory_accounting(state: &mut StrategyState) -> Result<(), String> {
+    let events = inventory_events_in_accounting_order(state)?;
+    let mut replay = state.clone();
+    InventoryAccountingSnapshot::empty().restore(&mut replay);
+    for event in &events {
+        let order = state
+            .orders
+            .get(&event.source_client_order_id)
+            .ok_or_else(|| "inventory event references an unknown order".to_owned())?;
+        apply_inventory_accounting(
+            &mut replay,
+            &order.purpose,
+            &order.shape,
+            event.quantity,
+            event.quote,
+        )?;
+    }
+    InventoryAccountingSnapshot::capture(&replay).restore(state);
+    Ok(())
 }
 
 fn normalize_inventory_deltas(
@@ -4187,6 +4288,138 @@ mod tests {
         )
         .unwrap();
         StrategyMachine::new(MemoryStrategyStateStore::new(state))
+    }
+
+    fn cross_order_neutral_machine() -> StrategyMachine<MemoryStrategyStateStore> {
+        let mut config = small_neutral_machine().store().snapshot().config.clone();
+        config.lower_price = Decimal::new(20, 2);
+        config.upper_price = Decimal::new(40, 2);
+        config.grid_count = 4;
+        let mut instrument = small_neutral_machine()
+            .store()
+            .snapshot()
+            .instrument_rules
+            .clone();
+        instrument.min_notional = Decimal::ZERO;
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: Decimal::new(33, 2),
+                mark_price: Decimal::new(33, 2),
+            },
+            &instrument,
+        )
+        .unwrap();
+        let state = StrategyState::from_plan(
+            StrategyRunId::parse("ANSEM002").unwrap(),
+            config,
+            instrument,
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        StrategyMachine::new(MemoryStrategyStateStore::new(state))
+    }
+
+    fn accept_strategy_order(
+        machine: &mut StrategyMachine<MemoryStrategyStateStore>,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+        accepted_at_ms: u64,
+    ) {
+        let mut accepted = machine
+            .store()
+            .snapshot()
+            .ready_intents(accepted_at_ms)
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.client_order_id == *client_order_id)
+            .unwrap();
+        accepted.state = IntentState::Accepted {
+            exchange_order_id: exchange_order_id.into(),
+        };
+        machine
+            .synchronize_intent(&accepted, accepted_at_ms)
+            .unwrap();
+    }
+
+    struct ValuedTradeFixture<'a> {
+        exchange_order_id: &'a str,
+        trade_id: &'a str,
+        price: Decimal,
+        quantity: Decimal,
+        trade_time_ms: u64,
+        applied_at_ms: u64,
+    }
+
+    fn apply_single_valued_trade(
+        machine: &mut StrategyMachine<MemoryStrategyStateStore>,
+        client_order_id: ClientOrderId,
+        fixture: ValuedTradeFixture<'_>,
+    ) {
+        let shape = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&client_order_id)
+            .unwrap()
+            .shape
+            .clone();
+        let quote = fixture.price * fixture.quantity;
+        let trade = TradeFill {
+            trade_id: fixture.trade_id.into(),
+            exchange_order_id: fixture.exchange_order_id.into(),
+            symbol: shape.symbol.clone(),
+            side: shape.side,
+            price: fixture.price,
+            quantity: fixture.quantity,
+            quote_quantity: quote,
+            raw_commission: Decimal::ZERO,
+            commission_cost: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            realized_profit: Decimal::ZERO,
+            is_maker: true,
+            trade_time_ms: fixture.trade_time_ms,
+        };
+        let snapshot = OrderExecutionSnapshot {
+            order: AuthoritativeOrder {
+                client_order_id: client_order_id.clone(),
+                exchange_order_id: fixture.exchange_order_id.into(),
+                exchange: Exchange::Aster,
+                shape,
+                lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled),
+            },
+            cumulative_quantity: fixture.quantity,
+            cumulative_quote: quote,
+            fees_by_asset: [("USDT".into(), Decimal::ZERO)].into_iter().collect(),
+            trades: vec![trade],
+            order_time_ms: fixture.trade_time_ms - 1,
+            update_time_ms: fixture.trade_time_ms,
+        };
+        let valued = ValuedExecutionReport {
+            report: report(
+                client_order_id,
+                fixture.exchange_order_id,
+                fixture.quantity,
+                quote,
+                Some(TerminalOrderStatus::Cancelled),
+            ),
+            fee_valuations: vec![FeeValuation {
+                trade_id: fixture.trade_id.into(),
+                fee_asset: "USDT".into(),
+                fee_amount: Decimal::ZERO,
+                quote_asset: "USDT".into(),
+                quote_value: Decimal::ZERO,
+                source: FeeValuationSource::ExchangeZero,
+                valuation_symbol: None,
+                valuation_minute_start_ms: None,
+                valuation_price: None,
+            }],
+        };
+        machine
+            .apply_valued_execution(&snapshot, &valued, fixture.applied_at_ms)
+            .unwrap();
     }
 
     fn small_neutral_risk_machine() -> StrategyMachine<MemoryStrategyStateStore> {
@@ -6139,18 +6372,19 @@ mod tests {
     fn neutral_multi_trade_snapshot_uses_each_execution_price_across_zero() {
         let mut machine = small_neutral_machine();
         let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
-        machine
-            .apply_execution(
-                &report(
-                    buy,
-                    "neutral-existing-long",
-                    decimal(10),
-                    decimal(2),
-                    Some(TerminalOrderStatus::Cancelled),
-                ),
-                101,
-            )
-            .unwrap();
+        accept_strategy_order(&mut machine, &buy, "neutral-existing-long", 101);
+        apply_single_valued_trade(
+            &mut machine,
+            buy,
+            ValuedTradeFixture {
+                exchange_order_id: "neutral-existing-long",
+                trade_id: "neutral-existing-long-trade",
+                price: Decimal::new(20, 2),
+                quantity: decimal(10),
+                trade_time_ms: 102,
+                applied_at_ms: 103,
+            },
+        );
 
         let sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
         let shape = machine
@@ -6164,7 +6398,7 @@ mod tests {
         let mut accepted = machine
             .store()
             .snapshot()
-            .ready_intents(102)
+            .ready_intents(103)
             .unwrap()
             .into_iter()
             .find(|intent| intent.client_order_id == sell)
@@ -6172,7 +6406,7 @@ mod tests {
         accepted.state = IntentState::Accepted {
             exchange_order_id: "neutral-multi-sell".into(),
         };
-        machine.synchronize_intent(&accepted, 102).unwrap();
+        machine.synchronize_intent(&accepted, 103).unwrap();
 
         let trades = vec![
             TradeFill {
@@ -6262,7 +6496,11 @@ mod tests {
                 .values()
                 .filter_map(|event| event.exchange_trade_id.as_deref())
                 .collect::<Vec<_>>(),
-            vec!["neutral-close", "neutral-open"]
+            vec![
+                "neutral-existing-long-trade",
+                "neutral-close",
+                "neutral-open"
+            ]
         );
         let sell_obligations = state
             .replacement_obligations
@@ -6294,6 +6532,238 @@ mod tests {
             reordered_audit.validate(),
             Err(StrategyStateError::InvalidExecutionAudit)
         );
+    }
+
+    #[test]
+    fn neutral_inventory_uses_exchange_time_across_different_orders() {
+        let chronological = cross_order_neutral_machine();
+        let low_buy = grid_id(chronological.store().snapshot(), 0, OrderSide::Buy, false);
+        let high_buy = grid_id(chronological.store().snapshot(), 2, OrderSide::Buy, false);
+        let sell = grid_id(chronological.store().snapshot(), 2, OrderSide::Sell, false);
+
+        let exercise = |mut machine: StrategyMachine<MemoryStrategyStateStore>, reversed: bool| {
+            accept_strategy_order(&mut machine, &low_buy, "low-buy-order", 101);
+            accept_strategy_order(&mut machine, &high_buy, "high-buy-order", 101);
+            accept_strategy_order(&mut machine, &sell, "sell-order", 101);
+            if reversed {
+                apply_single_valued_trade(
+                    &mut machine,
+                    high_buy.clone(),
+                    ValuedTradeFixture {
+                        exchange_order_id: "high-buy-order",
+                        trade_id: "high-buy-trade",
+                        price: Decimal::new(30, 2),
+                        quantity: decimal(10),
+                        trade_time_ms: 104,
+                        applied_at_ms: 106,
+                    },
+                );
+                apply_single_valued_trade(
+                    &mut machine,
+                    low_buy.clone(),
+                    ValuedTradeFixture {
+                        exchange_order_id: "low-buy-order",
+                        trade_id: "low-buy-trade",
+                        price: Decimal::new(20, 2),
+                        quantity: decimal(10),
+                        trade_time_ms: 103,
+                        applied_at_ms: 107,
+                    },
+                );
+            } else {
+                apply_single_valued_trade(
+                    &mut machine,
+                    low_buy.clone(),
+                    ValuedTradeFixture {
+                        exchange_order_id: "low-buy-order",
+                        trade_id: "low-buy-trade",
+                        price: Decimal::new(20, 2),
+                        quantity: decimal(10),
+                        trade_time_ms: 103,
+                        applied_at_ms: 106,
+                    },
+                );
+                apply_single_valued_trade(
+                    &mut machine,
+                    high_buy.clone(),
+                    ValuedTradeFixture {
+                        exchange_order_id: "high-buy-order",
+                        trade_id: "high-buy-trade",
+                        price: Decimal::new(30, 2),
+                        quantity: decimal(10),
+                        trade_time_ms: 104,
+                        applied_at_ms: 107,
+                    },
+                );
+            }
+            apply_single_valued_trade(
+                &mut machine,
+                sell.clone(),
+                ValuedTradeFixture {
+                    exchange_order_id: "sell-order",
+                    trade_id: "sell-trade",
+                    price: Decimal::new(35, 2),
+                    quantity: decimal(10),
+                    trade_time_ms: 105,
+                    applied_at_ms: 108,
+                },
+            );
+            machine
+        };
+
+        let chronological = exercise(chronological, false);
+        let reversed = exercise(cross_order_neutral_machine(), true);
+        for state in [
+            chronological.store().snapshot(),
+            reversed.store().snapshot(),
+        ] {
+            assert_eq!(state.grid_position_net_quantity, decimal(10));
+            assert_eq!(state.gross_realized_profit, Decimal::new(15, 1));
+            assert_eq!(state.neutral_lots.len(), 1);
+            assert_eq!(
+                state.neutral_lots.values().next().unwrap().entry_value,
+                decimal(3)
+            );
+        }
+        assert_eq!(
+            reversed
+                .store()
+                .snapshot()
+                .inventory_events
+                .values()
+                .filter_map(|event| event.exchange_trade_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["high-buy-trade", "low-buy-trade", "sell-trade"]
+        );
+        let restored: StrategyState =
+            serde_json::from_slice(&serde_json::to_vec(reversed.store().snapshot()).unwrap())
+                .unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.gross_realized_profit, Decimal::new(15, 1));
+        assert_eq!(
+            restored.neutral_lots.values().next().unwrap().entry_value,
+            decimal(3)
+        );
+    }
+
+    #[test]
+    fn same_millisecond_cross_order_trades_use_stable_trade_id_order() {
+        let mut machine = cross_order_neutral_machine();
+        let low_buy = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, false);
+        let high_buy = grid_id(machine.store().snapshot(), 2, OrderSide::Buy, false);
+        let sell = grid_id(machine.store().snapshot(), 2, OrderSide::Sell, false);
+        accept_strategy_order(&mut machine, &low_buy, "same-ms-low-order", 101);
+        accept_strategy_order(&mut machine, &high_buy, "same-ms-high-order", 101);
+        accept_strategy_order(&mut machine, &sell, "same-ms-sell-order", 101);
+
+        apply_single_valued_trade(
+            &mut machine,
+            high_buy,
+            ValuedTradeFixture {
+                exchange_order_id: "same-ms-high-order",
+                trade_id: "b-high-buy",
+                price: Decimal::new(30, 2),
+                quantity: decimal(10),
+                trade_time_ms: 103,
+                applied_at_ms: 106,
+            },
+        );
+        apply_single_valued_trade(
+            &mut machine,
+            low_buy,
+            ValuedTradeFixture {
+                exchange_order_id: "same-ms-low-order",
+                trade_id: "a-low-buy",
+                price: Decimal::new(20, 2),
+                quantity: decimal(10),
+                trade_time_ms: 103,
+                applied_at_ms: 107,
+            },
+        );
+        apply_single_valued_trade(
+            &mut machine,
+            sell,
+            ValuedTradeFixture {
+                exchange_order_id: "same-ms-sell-order",
+                trade_id: "c-sell",
+                price: Decimal::new(35, 2),
+                quantity: decimal(10),
+                trade_time_ms: 104,
+                applied_at_ms: 108,
+            },
+        );
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.gross_realized_profit, Decimal::new(15, 1));
+        assert_eq!(
+            state.neutral_lots.values().next().unwrap().entry_value,
+            decimal(3)
+        );
+    }
+
+    #[test]
+    fn exact_trade_after_legacy_aggregate_inventory_fails_closed() {
+        let mut machine = cross_order_neutral_machine();
+        let low_buy = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, false);
+        machine
+            .apply_execution(
+                &report(
+                    low_buy,
+                    "legacy-low-order",
+                    decimal(10),
+                    decimal(2),
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+
+        let high_buy = grid_id(machine.store().snapshot(), 2, OrderSide::Buy, false);
+        accept_strategy_order(&mut machine, &high_buy, "exact-high-order", 102);
+        apply_single_valued_trade(
+            &mut machine,
+            high_buy.clone(),
+            ValuedTradeFixture {
+                exchange_order_id: "exact-high-order",
+                trade_id: "exact-high-trade",
+                price: Decimal::new(30, 2),
+                quantity: decimal(10),
+                trade_time_ms: 103,
+                applied_at_ms: 104,
+            },
+        );
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert!(
+            state
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains("cannot be mixed")
+        );
+        assert_eq!(state.grid_position_net_quantity, decimal(20));
+        assert_eq!(state.inventory_events.len(), 2);
+        assert!(
+            state
+                .inventory_events
+                .values()
+                .any(|event| event.exchange_trade_id.is_none())
+        );
+        assert!(
+            state
+                .inventory_events
+                .values()
+                .any(|event| { event.exchange_trade_id.as_deref() == Some("exact-high-trade") })
+        );
+        assert!(
+            state
+                .orders
+                .get(&high_buy)
+                .and_then(|order| order.execution_audit.as_ref())
+                .is_some()
+        );
+        state.validate().unwrap();
     }
 
     #[test]

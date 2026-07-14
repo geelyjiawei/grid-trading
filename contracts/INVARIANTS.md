@@ -104,6 +104,13 @@ the OpenAPI schema.
 - Every newly audited trade is applied to inventory and PnL separately. Its durable
   inventory event must exactly match the audited trade ID, time, quantity, and quote;
   aggregate quantity and quote agreement alone are insufficient.
+- Inventory event sequence records durable observation order, but cost lots and realized
+  PnL are rebuilt across all strategy orders by `(trade time, opaque trade ID, client
+  order ID)`. Polling order can never select which lot is consumed.
+- Exact per-trade inventory evidence and legacy aggregate-only inventory evidence cannot
+  coexist in an advancing strategy because no authoritative relative chronology exists.
+  A newly observed exact fill is retained and the strategy fails closed instead of
+  guessing an order.
 - Multiple new trades in one cumulative snapshot create at most one aggregate counter
   obligation. Exact per-trade accounting must never multiply replacement orders.
 - If an authoritative fill is durably bookable but its remainder or inventory transition
