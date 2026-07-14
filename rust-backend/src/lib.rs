@@ -59,7 +59,7 @@ pub async fn app_from_environment() -> Result<Router, AppConfigurationError> {
     let trading_enabled = parse_env_flag("GRID_RUST_TRADING_ENABLED")?;
 
     let admin_token = match env::var("GRID_RUST_ADMIN_TOKEN") {
-        Ok(secret) => Some(AdminTokenVerifier::from_secret(Zeroizing::new(secret))?),
+        Ok(secret) => optional_admin_token(secret)?,
         Err(env::VarError::NotPresent) => None,
         Err(env::VarError::NotUnicode(_)) => {
             return Err(AppConfigurationError::NonUnicodeAdminToken);
@@ -154,6 +154,13 @@ pub async fn app_from_environment() -> Result<Router, AppConfigurationError> {
         web_root,
         runtime,
     ))
+}
+
+fn optional_admin_token(secret: String) -> Result<Option<AdminTokenVerifier>, AdminTokenError> {
+    if secret.is_empty() {
+        return Ok(None);
+    }
+    AdminTokenVerifier::from_secret(Zeroizing::new(secret)).map(Some)
 }
 
 fn build_app(
@@ -478,6 +485,23 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn an_exactly_empty_optional_admin_token_is_unconfigured() {
+        assert!(optional_admin_token(String::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn whitespace_or_weak_optional_admin_tokens_remain_invalid() {
+        assert!(matches!(
+            optional_admin_token("too-short".to_owned()),
+            Err(AdminTokenError::TooShort)
+        ));
+        assert!(matches!(
+            optional_admin_token(format!("{} ", "a".repeat(31))),
+            Err(AdminTokenError::InvalidCharacter)
+        ));
+    }
 
     #[tokio::test]
     async fn rust_app_serves_the_built_vue_assets_without_a_python_runtime() {
