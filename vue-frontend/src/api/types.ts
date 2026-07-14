@@ -193,6 +193,12 @@ export interface RiskSnapshot {
   exchange?: Exchange;
   symbol?: string;
   strategy_present?: boolean;
+  engine_running?: boolean;
+  runtime_advancing?: boolean;
+  runtime_configured?: boolean;
+  runtime_market_entry_count?: number;
+  runtime_run_id?: string | null;
+  runtime_state_error?: string | null;
   has_risk?: boolean;
   unmanaged_position?: boolean;
   unmanaged_delta_qty?: string | number | null;

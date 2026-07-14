@@ -29,11 +29,11 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{Exchange, GridConfig, OrderSide},
     engine::{
-        ArmedStrategyLifecycle, FeeValuationSource, MarketSnapshot, PreparedStrategyLifecycle,
-        PreparedStrategyStopOutcome, RuntimeCoordinator, RuntimeCoordinatorError,
-        RuntimeRegistryEntry, ShadowCollectionError, StrategyLifecycle, StrategyOrderPurpose,
-        StrategyState, StrategyTransition, build_grid_preview, collect_stable_exchange_view,
-        collect_strategy_shadow_view, load_authoritative_fee_config,
+        ArmedStrategyLifecycle, FeeValuationSource, MarketSnapshot, PreparedStrategyKind,
+        PreparedStrategyLifecycle, PreparedStrategyStopOutcome, RuntimeCoordinator,
+        RuntimeCoordinatorError, RuntimeRegistryEntry, ShadowCollectionError, StrategyLifecycle,
+        StrategyOrderPurpose, StrategyState, StrategyTransition, build_grid_preview,
+        collect_stable_exchange_view, collect_strategy_shadow_view, load_authoritative_fee_config,
     },
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, InstrumentRulesGateway, MarketSnapshotGateway,
@@ -152,6 +152,16 @@ impl ApiState {
     #[cfg(test)]
     fn with_strategy_root(mut self, strategy_root: PathBuf) -> Self {
         self.strategy_root = strategy_root;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_runtime(
+        mut self,
+        runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    ) -> Self {
+        self.trading_enabled = true;
+        self.runtime = Some(runtime);
         self
     }
 
@@ -1350,12 +1360,35 @@ fn runtime_catalog_matches(
     }
     live.iter().all(|snapshot| {
         runtime_entries.iter().any(|entry| {
-            entry.run_id.as_str() == snapshot.run_id()
-                && entry.exchange == snapshot.exchange()
-                && entry.symbol == snapshot.symbol()
-                && (entry.advancing || entry.lifecycle == Some(prepared_lifecycle(snapshot)))
+            runtime_entry_identity_matches(snapshot, entry)
+                && runtime_entry_snapshot_matches(snapshot, entry)
         })
     })
+}
+
+fn runtime_entry_identity_matches(
+    snapshot: &StrategyCatalogSnapshot,
+    entry: &RuntimeRegistryEntry,
+) -> bool {
+    entry.run_id.as_str() == snapshot.run_id()
+        && entry.exchange == snapshot.exchange()
+        && entry.symbol == snapshot.symbol()
+}
+
+fn runtime_entry_snapshot_matches(
+    snapshot: &StrategyCatalogSnapshot,
+    entry: &RuntimeRegistryEntry,
+) -> bool {
+    entry.advancing
+        || (entry.kind == Some(prepared_kind(snapshot))
+            && entry.lifecycle == Some(prepared_lifecycle(snapshot)))
+}
+
+fn prepared_kind(snapshot: &StrategyCatalogSnapshot) -> PreparedStrategyKind {
+    match snapshot {
+        StrategyCatalogSnapshot::Armed(_) => PreparedStrategyKind::Armed,
+        StrategyCatalogSnapshot::Active(_) => PreparedStrategyKind::Active,
+    }
 }
 
 fn prepared_lifecycle(snapshot: &StrategyCatalogSnapshot) -> PreparedStrategyLifecycle {
@@ -1862,6 +1895,220 @@ async fn exchange_open_orders(
     }
 }
 
+#[derive(Debug)]
+struct RiskStrategyObservation {
+    selected: Option<StrategyCatalogSnapshot>,
+    catalog_anomaly_count: usize,
+    catalog_problem: Option<&'static str>,
+    runtime: RuntimeMarketObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeMarketObservation {
+    configured: bool,
+    engine_running: bool,
+    advancing: bool,
+    market_entry_count: usize,
+    run_id: Option<String>,
+    state_error: Option<&'static str>,
+}
+
+async fn observe_risk_strategy(
+    state: &ApiState,
+    exchange: Exchange,
+    symbol: &str,
+) -> RiskStrategyObservation {
+    let Some(runtime) = state.runtime.as_ref() else {
+        let catalog = load_risk_catalog(state.strategy_root.clone()).await.ok();
+        return build_risk_strategy_observation(catalog, Vec::new(), false, exchange, symbol, None);
+    };
+
+    for _ in 0..3 {
+        let before_runtime = runtime.entries().await;
+        let catalog = match load_risk_catalog(state.strategy_root.clone()).await {
+            Ok(catalog) => catalog,
+            Err(()) => {
+                return build_risk_strategy_observation(
+                    None,
+                    runtime.entries().await,
+                    true,
+                    exchange,
+                    symbol,
+                    Some("strategy_catalog_unavailable"),
+                );
+            }
+        };
+        let after_runtime = runtime.entries().await;
+        if before_runtime == after_runtime {
+            return build_risk_strategy_observation(
+                Some(catalog),
+                after_runtime,
+                true,
+                exchange,
+                symbol,
+                None,
+            );
+        }
+    }
+
+    let runtime_entries = runtime.entries().await;
+    let catalog = load_risk_catalog(state.strategy_root.clone()).await.ok();
+    build_risk_strategy_observation(
+        catalog,
+        runtime_entries,
+        true,
+        exchange,
+        symbol,
+        Some("strategy_status_changed"),
+    )
+}
+
+async fn load_risk_catalog(root: PathBuf) -> Result<StrategyCatalog, ()> {
+    match tokio::task::spawn_blocking(move || load_strategy_catalog(root)).await {
+        Ok(Ok(catalog)) => Ok(catalog),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "strategy catalog could not be read for risk observation");
+            Err(())
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "strategy catalog risk observation task failed");
+            Err(())
+        }
+    }
+}
+
+fn build_risk_strategy_observation(
+    catalog: Option<StrategyCatalog>,
+    runtime_entries: Vec<RuntimeRegistryEntry>,
+    runtime_configured: bool,
+    exchange: Exchange,
+    symbol: &str,
+    forced_catalog_problem: Option<&'static str>,
+) -> RiskStrategyObservation {
+    let (selected, catalog_anomaly_count, catalog_problem) = match catalog {
+        Some(catalog) => {
+            let anomaly_count = catalog.anomalies().len();
+            let mut problem = forced_catalog_problem;
+            if anomaly_count > 0 {
+                problem = Some("strategy_catalog_anomaly");
+            }
+            let selected = match catalog.select_live(exchange, symbol) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    tracing::warn!(?exchange, symbol, error = %error, "multiple live strategy states prevent deterministic risk attribution");
+                    problem = Some("multiple_live_strategies");
+                    None
+                }
+            };
+            (selected, anomaly_count, problem)
+        }
+        None => (
+            None,
+            0,
+            forced_catalog_problem.or(Some("strategy_catalog_unavailable")),
+        ),
+    };
+    let runtime = scoped_runtime_observation(
+        runtime_configured,
+        selected.as_ref(),
+        &runtime_entries,
+        exchange,
+        symbol,
+    );
+    RiskStrategyObservation {
+        selected,
+        catalog_anomaly_count,
+        catalog_problem,
+        runtime,
+    }
+}
+
+fn scoped_runtime_observation(
+    runtime_configured: bool,
+    selected: Option<&StrategyCatalogSnapshot>,
+    runtime_entries: &[RuntimeRegistryEntry],
+    exchange: Exchange,
+    symbol: &str,
+) -> RuntimeMarketObservation {
+    if !runtime_configured {
+        return RuntimeMarketObservation {
+            configured: false,
+            engine_running: false,
+            advancing: false,
+            market_entry_count: 0,
+            run_id: None,
+            state_error: None,
+        };
+    }
+
+    let market_entries = runtime_entries
+        .iter()
+        .filter(|entry| entry.exchange == exchange && entry.symbol == symbol)
+        .collect::<Vec<_>>();
+    let selected_entry = selected.and_then(|snapshot| {
+        market_entries
+            .iter()
+            .copied()
+            .find(|entry| runtime_entry_identity_matches(snapshot, entry))
+    });
+    let engine_running =
+        selected.map_or_else(|| !market_entries.is_empty(), |_| selected_entry.is_some());
+    let advancing = selected.map_or_else(
+        || market_entries.iter().any(|entry| entry.advancing),
+        |_| selected_entry.is_some_and(|entry| entry.advancing),
+    );
+    let run_id = selected_entry
+        .map(|entry| entry.run_id.as_str().to_owned())
+        .or_else(|| {
+            (market_entries.len() == 1).then(|| market_entries[0].run_id.as_str().to_owned())
+        });
+    let state_error = match selected {
+        Some(snapshot)
+            if market_entries.len() != 1
+                || selected_entry
+                    .is_none_or(|entry| !runtime_entry_snapshot_matches(snapshot, entry)) =>
+        {
+            Some("runtime_catalog_mismatch")
+        }
+        None if !market_entries.is_empty() => Some("runtime_catalog_mismatch"),
+        Some(_) | None => None,
+    };
+
+    RuntimeMarketObservation {
+        configured: true,
+        engine_running,
+        advancing,
+        market_entry_count: market_entries.len(),
+        run_id,
+        state_error,
+    }
+}
+
+fn runtime_risk_fields(runtime: &RuntimeMarketObservation) -> Value {
+    json!({
+        "engine_running": runtime.engine_running,
+        "runtime_advancing": runtime.advancing,
+        "runtime_configured": runtime.configured,
+        "runtime_market_entry_count": runtime.market_entry_count,
+        "runtime_run_id": runtime.run_id,
+        "runtime_state_error": runtime.state_error,
+    })
+}
+
+fn no_store_runtime_risk_json(response: Value, runtime: &RuntimeMarketObservation) -> Response {
+    let (Value::Object(mut response), Value::Object(runtime_fields)) =
+        (response, runtime_risk_fields(runtime))
+    else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "risk_response_failed",
+            "The strategy risk response could not be constructed safely",
+        );
+    };
+    response.extend(runtime_fields);
+    no_store_json(StatusCode::OK, Value::Object(response))
+}
+
 async fn exchange_risk(
     _session: AuthenticatedWebSession,
     State(state): State<ApiState>,
@@ -1878,33 +2125,14 @@ async fn exchange_risk(
         Err(error) => return error.response(),
     };
 
-    let strategy_root = state.strategy_root.clone();
-    let catalog = tokio::task::spawn_blocking(move || load_strategy_catalog(strategy_root)).await;
-    let (selected, catalog_anomaly_count, catalog_problem) = match catalog {
-        Ok(Ok(catalog)) => {
-            let anomaly_count = catalog.anomalies().len();
-            match catalog.select_live(exchange, &symbol) {
-                Ok(selected) => (
-                    selected,
-                    anomaly_count,
-                    (anomaly_count > 0).then_some("strategy_catalog_anomaly"),
-                ),
-                Err(error) => {
-                    tracing::warn!(?exchange, symbol, error = %error, "multiple live strategy states prevent deterministic risk attribution");
-                    (None, anomaly_count, Some("multiple_live_strategies"))
-                }
-            }
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(?exchange, symbol, error = %error, "strategy catalog could not be read");
-            (None, 0, Some("strategy_catalog_unavailable"))
-        }
-        Err(error) => {
-            tracing::error!(?exchange, symbol, error = %error, "strategy catalog task failed");
-            (None, 0, Some("strategy_catalog_unavailable"))
-        }
-    };
+    let RiskStrategyObservation {
+        selected,
+        catalog_anomaly_count,
+        catalog_problem,
+        runtime,
+    } = observe_risk_strategy(&state, exchange, &symbol).await;
     let catalog_has_risk = catalog_problem.is_some();
+    let runtime_has_risk = runtime.state_error.is_some();
 
     match selected {
         Some(StrategyCatalogSnapshot::Active(strategy)) => {
@@ -1929,7 +2157,8 @@ async fn exchange_risk(
                 || report.orders.mismatched_order_count > 0
                 || report.orders.partial_execution_pending_count > 0
                 || report.orders.terminal_accounting_pending_count > 0;
-            let has_risk = !report.clean || orphan_order_count > 0 || catalog_has_risk;
+            let has_risk =
+                !report.clean || orphan_order_count > 0 || catalog_has_risk || runtime_has_risk;
             let positions = collected
                 .position
                 .legs
@@ -1977,7 +2206,6 @@ async fn exchange_risk(
                 "run_id": strategy.run_id.as_str(),
                 "strategy_revision": strategy.revision,
                 "lifecycle": strategy.lifecycle,
-                "engine_running": false,
                 "observation_complete": true,
                 "baseline_pending": false,
                 "baseline_position": report.position.baseline_quantity.to_string(),
@@ -2026,7 +2254,7 @@ async fn exchange_risk(
                 );
             };
             response.extend(profit_fields);
-            no_store_json(StatusCode::OK, Value::Object(response))
+            no_store_runtime_risk_json(Value::Object(response), &runtime)
         }
         Some(StrategyCatalogSnapshot::Armed(strategy)) => {
             let collected =
@@ -2051,8 +2279,7 @@ async fn exchange_risk(
                 .iter()
                 .filter_map(position_response)
                 .collect::<Vec<_>>();
-            no_store_json(
-                StatusCode::OK,
+            no_store_runtime_risk_json(
                 json!({
                     "version": 1,
                     "symbol": symbol,
@@ -2062,7 +2289,6 @@ async fn exchange_risk(
                     "run_id": strategy.run_id.as_str(),
                     "strategy_revision": strategy.revision,
                     "lifecycle": strategy.lifecycle,
-                    "engine_running": false,
                     "observation_complete": true,
                     "baseline_pending": true,
                     "baseline_position": null,
@@ -2097,8 +2323,9 @@ async fn exchange_risk(
                     "state_store_error": catalog_problem,
                     "positions": positions,
                     "shadow_audit": null,
-                    "has_risk": orphan_order_count > 0 || catalog_has_risk,
+                    "has_risk": orphan_order_count > 0 || catalog_has_risk || runtime_has_risk,
                 }),
+                &runtime,
             )
         }
         None => {
@@ -2125,8 +2352,7 @@ async fn exchange_risk(
                 .iter()
                 .filter_map(position_response)
                 .collect::<Vec<_>>();
-            no_store_json(
-                StatusCode::OK,
+            no_store_runtime_risk_json(
                 json!({
                     "version": 1,
                     "symbol": symbol,
@@ -2136,7 +2362,6 @@ async fn exchange_risk(
                     "run_id": null,
                     "strategy_revision": null,
                     "lifecycle": null,
-                    "engine_running": false,
                     "observation_complete": true,
                     "baseline_pending": false,
                     "baseline_position": null,
@@ -2171,8 +2396,9 @@ async fn exchange_risk(
                     "state_store_error": catalog_problem,
                     "positions": positions,
                     "shadow_audit": null,
-                    "has_risk": unmanaged_position || orphan_order_count > 0 || catalog_has_risk,
+                    "has_risk": unmanaged_position || orphan_order_count > 0 || catalog_has_risk || runtime_has_risk,
                 }),
+                &runtime,
             )
         }
     }
@@ -2470,15 +2696,20 @@ mod tests {
         },
         engine::{
             ArmedStrategyState, ExecutionAuditRecord, FeeValuation, MarketSnapshot, NeutralLot,
-            PositionBaseline, StrategyLifecycle, StrategyOrderTracking, StrategyRunId,
-            StrategyState, StrategyStateStore, build_grid_plan,
+            PositionBaseline, RuntimeRecoveryProvider, RuntimeSettings, StrategyLifecycle,
+            StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateStore,
+            build_grid_plan,
         },
         exchange::{
             AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
             AuthoritativeOrder, ExchangeIdentityGateway, ExchangeMarketSnapshot, LookupError,
             MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderExecutionSnapshot, OrderLookup,
             OrderLookupGateway, PositionSide, PositionSnapshot, PositionSnapshotGateway, TradeFill,
-            TradingFeeRateGateway, TradingFeeRates, configured::ExchangeEnvironment,
+            TradingFeeRateGateway, TradingFeeRates,
+            configured::{
+                ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayFactory,
+                SharedConfiguredExchangeGateway,
+            },
         },
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
@@ -2901,6 +3132,25 @@ mod tests {
         }
     }
 
+    struct ConfiguredTestRuntimeProvider {
+        gateway: SharedConfiguredExchangeGateway,
+        settings: RuntimeSettings,
+    }
+
+    impl RuntimeRecoveryProvider for ConfiguredTestRuntimeProvider {
+        type Gateway = SharedConfiguredExchangeGateway;
+        type Error = std::convert::Infallible;
+
+        fn runtime_for(
+            &self,
+            exchange: Exchange,
+            _run_id: &StrategyRunId,
+        ) -> Result<(Self::Gateway, RuntimeSettings), Self::Error> {
+            assert_eq!(exchange, self.gateway.exchange());
+            Ok((self.gateway.clone(), self.settings.clone()))
+        }
+    }
+
     fn persist_clean_running_strategy(
         root: &std::path::Path,
     ) -> (StrategyState, StrategyRiskGateway) {
@@ -3263,6 +3513,112 @@ mod tests {
         assert_eq!(orders["orders"][0]["reduce_only"], true);
     }
 
+    #[test]
+    fn scoped_runtime_observation_requires_exact_identity_kind_and_lifecycle() {
+        let directory = tempdir().unwrap();
+        let (strategy, _) = persist_clean_running_strategy(directory.path());
+        let snapshot = StrategyCatalogSnapshot::Active(Box::new(strategy.clone()));
+        let exact = RuntimeRegistryEntry {
+            run_id: strategy.run_id.clone(),
+            exchange: strategy.exchange,
+            symbol: strategy.symbol.clone(),
+            kind: Some(PreparedStrategyKind::Active),
+            lifecycle: Some(PreparedStrategyLifecycle::Running),
+            advancing: false,
+        };
+
+        let healthy = scoped_runtime_observation(
+            true,
+            Some(&snapshot),
+            std::slice::from_ref(&exact),
+            strategy.exchange,
+            &strategy.symbol,
+        );
+        assert_eq!(
+            healthy,
+            RuntimeMarketObservation {
+                configured: true,
+                engine_running: true,
+                advancing: false,
+                market_entry_count: 1,
+                run_id: Some(strategy.run_id.as_str().to_owned()),
+                state_error: None,
+            }
+        );
+
+        let wrong_kind = RuntimeRegistryEntry {
+            kind: Some(PreparedStrategyKind::Armed),
+            ..exact.clone()
+        };
+        let mismatched = scoped_runtime_observation(
+            true,
+            Some(&snapshot),
+            &[wrong_kind],
+            strategy.exchange,
+            &strategy.symbol,
+        );
+        assert!(mismatched.engine_running);
+        assert_eq!(mismatched.state_error, Some("runtime_catalog_mismatch"));
+
+        let advancing = RuntimeRegistryEntry {
+            kind: None,
+            lifecycle: None,
+            advancing: true,
+            ..exact
+        };
+        let transient = scoped_runtime_observation(
+            true,
+            Some(&snapshot),
+            &[advancing],
+            strategy.exchange,
+            &strategy.symbol,
+        );
+        assert!(transient.engine_running);
+        assert!(transient.advancing);
+        assert_eq!(transient.state_error, None);
+    }
+
+    #[test]
+    fn scoped_runtime_observation_fails_closed_for_missing_or_unowned_runtime() {
+        let directory = tempdir().unwrap();
+        let (strategy, _) = persist_clean_running_strategy(directory.path());
+        let snapshot = StrategyCatalogSnapshot::Active(Box::new(strategy.clone()));
+
+        let missing = scoped_runtime_observation(
+            true,
+            Some(&snapshot),
+            &[],
+            strategy.exchange,
+            &strategy.symbol,
+        );
+        assert!(!missing.engine_running);
+        assert_eq!(missing.state_error, Some("runtime_catalog_mismatch"));
+
+        let orphan = RuntimeRegistryEntry {
+            run_id: StrategyRunId::parse("OTHER001").unwrap(),
+            exchange: strategy.exchange,
+            symbol: strategy.symbol.clone(),
+            kind: Some(PreparedStrategyKind::Active),
+            lifecycle: Some(PreparedStrategyLifecycle::Running),
+            advancing: false,
+        };
+        let unowned =
+            scoped_runtime_observation(true, None, &[orphan], strategy.exchange, &strategy.symbol);
+        assert!(unowned.engine_running);
+        assert_eq!(unowned.market_entry_count, 1);
+        assert_eq!(unowned.state_error, Some("runtime_catalog_mismatch"));
+
+        let disabled = scoped_runtime_observation(
+            false,
+            Some(&snapshot),
+            &[],
+            strategy.exchange,
+            &strategy.symbol,
+        );
+        assert!(!disabled.configured);
+        assert_eq!(disabled.state_error, None);
+    }
+
     #[tokio::test]
     async fn active_strategy_risk_endpoint_requires_exact_state_ledger_and_exchange_agreement() {
         let directory = tempdir().unwrap();
@@ -3372,6 +3728,157 @@ mod tests {
         assert_eq!(risk["total_equity_profit"], "0");
         assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
         assert_eq!(risk["profit_calculation_error"], Value::Null);
+        assert_eq!(risk["has_risk"], false);
+    }
+
+    #[tokio::test]
+    async fn active_strategy_risk_reports_a_missing_enabled_runtime_as_unsafe() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (strategy, gateway) = persist_clean_running_strategy(&strategy_root);
+        let runtime = Arc::new(RuntimeCoordinator::new(
+            strategy_root.clone(),
+            RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap(),
+        ));
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root)
+            .with_runtime(runtime),
+        );
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let status = response_json(status).await;
+        assert_eq!(status["error"]["code"], "runtime_catalog_mismatch");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["run_id"], strategy.run_id.as_str());
+        assert_eq!(risk["engine_running"], false);
+        assert_eq!(risk["runtime_configured"], true);
+        assert_eq!(risk["runtime_market_entry_count"], 0);
+        assert_eq!(risk["runtime_run_id"], Value::Null);
+        assert_eq!(risk["runtime_state_error"], "runtime_catalog_mismatch");
+        assert_eq!(risk["has_risk"], true);
+    }
+
+    #[tokio::test]
+    async fn recovered_runtime_is_reported_consistently_by_status_and_risk() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (strategy, gateway) = persist_clean_running_strategy(&strategy_root);
+        let settings = RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap();
+        let runtime = Arc::new(RuntimeCoordinator::new(
+            strategy_root.clone(),
+            settings.clone(),
+        ));
+        let configured_gateway = ExchangeGatewayFactory::standard(ExchangeEnvironment::Testnet)
+            .unwrap()
+            .build(ExchangeCredentials::aster("1".repeat(64)).unwrap())
+            .unwrap()
+            .shared();
+        let report = runtime
+            .recover(&ConfiguredTestRuntimeProvider {
+                gateway: configured_gateway,
+                settings,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.registered, vec![strategy.run_id.clone()]);
+        assert!(report.discovery_anomalies.is_empty());
+        assert!(report.failures.is_empty());
+
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root)
+            .with_runtime(runtime),
+        );
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = response_json(status).await;
+        assert_eq!(status["grids"][0]["run_id"], strategy.run_id.as_str());
+        assert_eq!(status["grids"][0]["engine_running"], true);
+        assert_eq!(status["grids"][0]["runtime_advancing"], false);
+
+        let risk = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(risk.status(), StatusCode::OK);
+        let risk = response_json(risk).await;
+        assert_eq!(risk["run_id"], strategy.run_id.as_str());
+        assert_eq!(risk["engine_running"], true);
+        assert_eq!(risk["runtime_advancing"], false);
+        assert_eq!(risk["runtime_run_id"], strategy.run_id.as_str());
+        assert_eq!(risk["runtime_state_error"], Value::Null);
         assert_eq!(risk["has_risk"], false);
     }
 

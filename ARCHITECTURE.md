@@ -57,6 +57,14 @@ the candidate container. This avoids transmitting production private keys
 through browser requests before encrypted dynamic configuration and safe
 gateway hot-reload exist end to end.
 
+Runtime status is attributed by exact strategy identity. A durable strategy and
+an in-memory runtime must agree on exchange, symbol, run ID, armed/active kind,
+and lifecycle. `/api/grid/status` fails closed when they disagree. `/api/risk`
+continues to return a read-only exchange snapshot for diagnosis, but sets
+`has_risk=true` and `runtime_state_error=runtime_catalog_mismatch`; it never
+repairs, places, or cancels an order. When trading is intentionally disabled,
+the absent runtime is reported as unconfigured rather than as a mismatch.
+
 ## Cutover gates
 
 The legacy production entrypoint may be replaced only when all of these are
