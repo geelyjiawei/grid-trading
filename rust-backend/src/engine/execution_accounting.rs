@@ -212,6 +212,7 @@ impl ExecutionAccountingService {
         if snapshot.order.shape.validate().is_err()
             || snapshot.order_time_ms == 0
             || snapshot.update_time_ms < snapshot.order_time_ms
+            || !crate::exchange::trades_are_canonically_ordered(&snapshot.trades)
             || snapshot.cumulative_quantity < Decimal::ZERO
             || snapshot.cumulative_quote < Decimal::ZERO
             || (snapshot.cumulative_quantity.is_zero() && !snapshot.cumulative_quote.is_zero())
@@ -576,6 +577,41 @@ mod tests {
             1_020_001,
         )]);
         snapshot.cumulative_quantity = Decimal::new(313, 2);
+
+        assert_eq!(
+            service.value_snapshot(&gateway, &snapshot).await,
+            Err(ExecutionAccountingError::InvalidExecutionSnapshot)
+        );
+        assert!(gateway.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_canonical_trade_order_is_rejected_before_accounting() {
+        let gateway = gateway(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_020_000,
+            open_price: Decimal::new(600, 0),
+        });
+        let service = ExecutionAccountingService::new("USDT").unwrap();
+        let snapshot = snapshot(vec![
+            trade(
+                2,
+                Decimal::ONE,
+                Decimal::new(1595, 2),
+                Decimal::ZERO,
+                "USDT",
+                1_020_002,
+            ),
+            trade(
+                1,
+                Decimal::new(214, 2),
+                Decimal::new(34133, 3),
+                Decimal::ZERO,
+                "USDT",
+                1_020_001,
+            ),
+        ]);
 
         assert_eq!(
             service.value_snapshot(&gateway, &snapshot).await,

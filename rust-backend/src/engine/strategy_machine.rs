@@ -8,7 +8,7 @@ use crate::domain::{
     ClientOrderId, Direction, Exchange, GridConfig, InstrumentRules, IntentState, OrderIntent,
     OrderKind, OrderShape, OrderSide, TerminalOrderStatus,
 };
-use crate::exchange::{OrderLifecycle, is_valid_trade_id};
+use crate::exchange::{OrderLifecycle, is_valid_trade_id, trades_are_canonically_ordered};
 
 use super::{
     GridOrderRole, GridPlan, GridPlanError, PlannedGridOrder,
@@ -190,6 +190,10 @@ pub struct InventoryExecutionEvent {
     pub source_client_order_id: ClientOrderId,
     pub quantity: Decimal,
     pub quote: Decimal,
+    #[serde(default)]
+    pub exchange_trade_id: Option<String>,
+    #[serde(default)]
+    pub execution_time_ms: Option<u64>,
     pub applied_at_ms: u64,
 }
 
@@ -1432,11 +1436,20 @@ fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), Strategy
 
     let mut quantities_by_order = BTreeMap::<ClientOrderId, Decimal>::new();
     let mut quotes_by_order = BTreeMap::<ClientOrderId, Decimal>::new();
+    let mut events_by_order = BTreeMap::<ClientOrderId, Vec<&InventoryExecutionEvent>>::new();
     let mut previous_applied_at_ms = state.created_at_ms;
     for (sequence, event) in &state.inventory_events {
+        let evidence_is_valid = match (&event.exchange_trade_id, event.execution_time_ms) {
+            (None, None) => true,
+            (Some(trade_id), Some(execution_time_ms)) => {
+                is_valid_trade_id(trade_id) && execution_time_ms > 0
+            }
+            _ => false,
+        };
         if event.sequence != *sequence
             || event.quantity <= Decimal::ZERO
             || event.quote <= Decimal::ZERO
+            || !evidence_is_valid
             || event.applied_at_ms < previous_applied_at_ms
             || event.applied_at_ms > state.updated_at_ms
             || !state.orders.contains_key(&event.source_client_order_id)
@@ -1459,6 +1472,10 @@ fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), Strategy
         *quote = quote
             .checked_add(event.quote)
             .ok_or(StrategyStateError::NumericOverflow("inventory event quote"))?;
+        events_by_order
+            .entry(event.source_client_order_id.clone())
+            .or_default()
+            .push(event);
     }
     if state.orders.values().any(|order| {
         quantities_by_order
@@ -1473,6 +1490,32 @@ fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), Strategy
                 != order.cumulative_quote
     }) {
         return Err(StrategyStateError::InventoryEventLedgerMismatch);
+    }
+    for order in state.orders.values() {
+        let events = events_by_order
+            .get(&order.client_order_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let Some(audit) = &order.execution_audit {
+            if events.len() != audit.snapshot.trades.len()
+                || events
+                    .iter()
+                    .zip(&audit.snapshot.trades)
+                    .any(|(event, trade)| {
+                        event.exchange_trade_id.as_deref() != Some(trade.trade_id.as_str())
+                            || event.execution_time_ms != Some(trade.trade_time_ms)
+                            || event.quantity != trade.quantity
+                            || event.quote != trade.quote_quantity
+                    })
+            {
+                return Err(StrategyStateError::InventoryEventLedgerMismatch);
+            }
+        } else if events
+            .iter()
+            .any(|event| event.exchange_trade_id.is_some() || event.execution_time_ms.is_some())
+        {
+            return Err(StrategyStateError::InventoryEventLedgerMismatch);
+        }
     }
 
     // A failed strategy is retained for diagnosis even when the execution that
@@ -1588,6 +1631,7 @@ fn validate_execution_audit_payload(
         || expected_quantity < Decimal::ZERO
         || expected_quote < Decimal::ZERO
         || expected_fee < Decimal::ZERO
+        || !trades_are_canonically_ordered(&snapshot.trades)
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
@@ -1659,6 +1703,11 @@ fn validate_execution_audit_payload(
         || trade_quote != expected_quote
         || fees_by_asset != snapshot.fees_by_asset
         || audit.fee_valuations.len() != trades.len()
+        || audit
+            .fee_valuations
+            .iter()
+            .zip(&snapshot.trades)
+            .any(|(valuation, trade)| valuation.trade_id != trade.trade_id)
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
@@ -1743,31 +1792,17 @@ fn validate_execution_audit_extension(
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
-    let candidate_trades = candidate
+    if !candidate
         .snapshot
         .trades
-        .iter()
-        .map(|trade| (trade.trade_id.as_str(), trade))
-        .collect::<BTreeMap<_, _>>();
-    if previous
-        .snapshot
-        .trades
-        .iter()
-        .any(|trade| candidate_trades.get(trade.trade_id.as_str()).copied() != Some(trade))
+        .starts_with(&previous.snapshot.trades)
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
-    let candidate_valuations = candidate
+    if !candidate
         .fee_valuations
-        .iter()
-        .map(|valuation| (valuation.trade_id.as_str(), valuation))
-        .collect::<BTreeMap<_, _>>();
-    if previous.fee_valuations.iter().any(|valuation| {
-        candidate_valuations
-            .get(valuation.trade_id.as_str())
-            .copied()
-            != Some(valuation)
-    }) {
+        .starts_with(&previous.fee_valuations)
+    {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
     if matches!(
@@ -1900,7 +1935,7 @@ where
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
         let mut next = self.store.snapshot().clone();
-        let transition = apply_execution_report(&mut next, report, now_ms);
+        let transition = apply_execution_report(&mut next, report, None, now_ms);
         finalize_and_store(&mut self.store, next, now_ms, transition)
     }
 
@@ -1939,6 +1974,23 @@ where
             let transition = fail_transition(&mut next, "valued execution audit is invalid");
             return finalize_and_store(&mut self.store, next, now_ms, transition);
         }
+        let previous_trade_count = next
+            .orders
+            .get(&valued.report.client_order_id)
+            .and_then(|order| order.execution_audit.as_ref())
+            .map_or(0, |audit| audit.snapshot.trades.len());
+        let inventory_deltas = candidate
+            .snapshot
+            .trades
+            .iter()
+            .skip(previous_trade_count)
+            .map(|trade| InventoryDeltaEvidence {
+                quantity: trade.quantity,
+                quote: trade.quote_quantity,
+                exchange_trade_id: Some(trade.trade_id.clone()),
+                execution_time_ms: Some(trade.trade_time_ms),
+            })
+            .collect::<Vec<_>>();
         let audit_changed = next
             .orders
             .get(&valued.report.client_order_id)
@@ -1947,8 +1999,20 @@ where
                 previous.snapshot != candidate.snapshot
                     || previous.fee_valuations != candidate.fee_valuations
             });
-        let mut transition = apply_execution_report(&mut next, &valued.report, now_ms);
-        if !matches!(transition, StrategyTransition::Failed { .. }) && audit_changed {
+        let report_was_already_applied = next
+            .orders
+            .get(&valued.report.client_order_id)
+            .is_some_and(|order| order_matches_execution_report(order, &valued.report));
+        let mut transition =
+            apply_execution_report(&mut next, &valued.report, Some(&inventory_deltas), now_ms);
+        let report_was_applied = next
+            .orders
+            .get(&valued.report.client_order_id)
+            .is_some_and(|order| order_matches_execution_report(order, &valued.report));
+        if audit_changed
+            && (!matches!(transition, StrategyTransition::Failed { .. })
+                || (report_was_applied && !report_was_already_applied))
+        {
             let Some(order) = next.orders.get_mut(&valued.report.client_order_id) else {
                 transition = fail_transition(
                     &mut next,
@@ -2462,9 +2526,18 @@ fn strategy_intent_transition_allowed(current: &StrategyOrderTracking, next: &In
     }
 }
 
+fn order_matches_execution_report(order: &StrategyOrderRecord, report: &ExecutionReport) -> bool {
+    order.exchange_order_id.as_deref() == Some(report.exchange_order_id.as_str())
+        && order.cumulative_quantity == report.cumulative_quantity
+        && order.cumulative_quote == report.cumulative_quote
+        && order.cumulative_fee == report.cumulative_fee
+        && order.terminal_status == report.terminal_status
+}
+
 fn apply_execution_report(
     state: &mut StrategyState,
     report: &ExecutionReport,
+    precise_inventory_deltas: Option<&[InventoryDeltaEvidence]>,
     now_ms: u64,
 ) -> StrategyTransition {
     let execution_after_final_state = matches!(
@@ -2551,17 +2624,16 @@ fn apply_execution_report(
         state.fail(message.clone());
         return StrategyTransition::Failed { message };
     }
+    let inventory_deltas =
+        match normalize_inventory_deltas(delta_quantity, delta_quote, precise_inventory_deltas) {
+            Ok(deltas) => deltas,
+            Err(message) => return fail_transition(state, message),
+        };
     if delta_quantity.is_zero() && delta_fee.is_zero() && !terminal_changed {
         return StrategyTransition::NoChange;
     }
-    if delta_quantity > Decimal::ZERO
-        && let Err(message) = append_inventory_event(
-            state,
-            report.client_order_id.clone(),
-            delta_quantity,
-            delta_quote,
-            now_ms,
-        )
+    if let Err(message) =
+        append_inventory_events(state, &report.client_order_id, &inventory_deltas, now_ms)
     {
         return fail_transition(state, message);
     }
@@ -2602,17 +2674,21 @@ fn apply_execution_report(
     };
 
     let mut obligation_ids = Vec::new();
+    for delta in &inventory_deltas {
+        if let Err(message) =
+            apply_inventory_accounting(state, &purpose, &shape, delta.quantity, delta.quote)
+        {
+            return fail_transition(state, message);
+        }
+    }
     if delta_quantity > Decimal::ZERO
-        && let Err(message) = apply_execution_delta(
+        && let Err(message) = add_execution_counter_obligation(
             state,
-            ExecutionDelta {
-                source_client_order_id: &report.client_order_id,
-                purpose: &purpose,
-                shape: &shape,
-                quantity: delta_quantity,
-                quote: delta_quote,
-                now_ms,
-            },
+            &report.client_order_id,
+            &purpose,
+            &shape,
+            delta_quantity,
+            now_ms,
             &mut obligation_ids,
         )
     {
@@ -2645,77 +2721,132 @@ fn apply_execution_report(
     }
 }
 
-fn append_inventory_event(
+fn append_inventory_events(
     state: &mut StrategyState,
-    source_client_order_id: ClientOrderId,
-    quantity: Decimal,
-    quote: Decimal,
+    source_client_order_id: &ClientOrderId,
+    deltas: &[InventoryDeltaEvidence],
     applied_at_ms: u64,
 ) -> Result<(), String> {
-    if quantity <= Decimal::ZERO || quote <= Decimal::ZERO {
-        return Err("inventory event quantity or quote is invalid".to_owned());
-    }
-    let sequence = state.next_inventory_event_sequence;
-    let next_sequence = sequence
-        .checked_add(1)
+    let event_count =
+        u64::try_from(deltas.len()).map_err(|_| "inventory event count overflowed".to_owned())?;
+    let first_sequence = state.next_inventory_event_sequence;
+    let next_sequence = first_sequence
+        .checked_add(event_count)
         .ok_or_else(|| "inventory event sequence overflowed".to_owned())?;
-    if state.inventory_events.contains_key(&sequence) {
+    if state
+        .inventory_events
+        .range(first_sequence..next_sequence)
+        .next()
+        .is_some()
+    {
         return Err("inventory event sequence is duplicated".to_owned());
     }
-    state.inventory_events.insert(
-        sequence,
-        InventoryExecutionEvent {
-            sequence,
-            source_client_order_id,
-            quantity,
-            quote,
-            applied_at_ms,
-        },
-    );
+    let events = deltas
+        .iter()
+        .enumerate()
+        .map(|(offset, delta)| {
+            let offset = u64::try_from(offset)
+                .map_err(|_| "inventory event offset overflowed".to_owned())?;
+            let sequence = first_sequence
+                .checked_add(offset)
+                .ok_or_else(|| "inventory event sequence overflowed".to_owned())?;
+            Ok(InventoryExecutionEvent {
+                sequence,
+                source_client_order_id: source_client_order_id.clone(),
+                quantity: delta.quantity,
+                quote: delta.quote,
+                exchange_trade_id: delta.exchange_trade_id.clone(),
+                execution_time_ms: delta.execution_time_ms,
+                applied_at_ms,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    state
+        .inventory_events
+        .extend(events.into_iter().map(|event| (event.sequence, event)));
     state.next_inventory_event_sequence = next_sequence;
     Ok(())
 }
 
-struct ExecutionDelta<'a> {
-    source_client_order_id: &'a ClientOrderId,
-    purpose: &'a StrategyOrderPurpose,
-    shape: &'a OrderShape,
+#[derive(Debug, Clone, PartialEq)]
+struct InventoryDeltaEvidence {
     quantity: Decimal,
     quote: Decimal,
-    now_ms: u64,
+    exchange_trade_id: Option<String>,
+    execution_time_ms: Option<u64>,
 }
 
-fn apply_execution_delta(
+fn normalize_inventory_deltas(
+    delta_quantity: Decimal,
+    delta_quote: Decimal,
+    precise_inventory_deltas: Option<&[InventoryDeltaEvidence]>,
+) -> Result<Vec<InventoryDeltaEvidence>, String> {
+    let deltas = match precise_inventory_deltas {
+        Some(deltas) => deltas.to_vec(),
+        None if delta_quantity > Decimal::ZERO => vec![InventoryDeltaEvidence {
+            quantity: delta_quantity,
+            quote: delta_quote,
+            exchange_trade_id: None,
+            execution_time_ms: None,
+        }],
+        None => Vec::new(),
+    };
+    let mut quantity = Decimal::ZERO;
+    let mut quote = Decimal::ZERO;
+    let mut trade_ids = BTreeSet::new();
+    for delta in &deltas {
+        let evidence_is_valid = match (&delta.exchange_trade_id, delta.execution_time_ms) {
+            (Some(trade_id), Some(execution_time_ms)) if precise_inventory_deltas.is_some() => {
+                is_valid_trade_id(trade_id)
+                    && execution_time_ms > 0
+                    && trade_ids.insert(trade_id.as_str())
+            }
+            (None, None) if precise_inventory_deltas.is_none() => true,
+            _ => false,
+        };
+        if delta.quantity <= Decimal::ZERO || delta.quote <= Decimal::ZERO || !evidence_is_valid {
+            return Err("execution inventory evidence is invalid".to_owned());
+        }
+        quantity = quantity
+            .checked_add(delta.quantity)
+            .ok_or_else(|| "execution inventory quantity overflowed".to_owned())?;
+        quote = quote
+            .checked_add(delta.quote)
+            .ok_or_else(|| "execution inventory quote overflowed".to_owned())?;
+    }
+    if quantity != delta_quantity || quote != delta_quote {
+        return Err("execution inventory evidence does not match cumulative deltas".to_owned());
+    }
+    Ok(deltas)
+}
+
+fn add_execution_counter_obligation(
     state: &mut StrategyState,
-    delta: ExecutionDelta<'_>,
+    source_client_order_id: &ClientOrderId,
+    purpose: &StrategyOrderPurpose,
+    shape: &OrderShape,
+    quantity: Decimal,
+    now_ms: u64,
     obligation_ids: &mut Vec<u64>,
 ) -> Result<(), String> {
-    apply_inventory_accounting(
-        state,
-        delta.purpose,
-        delta.shape,
-        delta.quantity,
-        delta.quote,
-    )?;
     if matches!(
-        delta.purpose,
+        purpose,
         StrategyOrderPurpose::Opening | StrategyOrderPurpose::RiskClose
     ) || !normal_grid_replacements_enabled(state.lifecycle)
     {
         return Ok(());
     }
-    let level_index = delta
-        .purpose
+    let level_index = purpose
         .level_index()
         .ok_or_else(|| "grid execution has no level identity".to_owned())?;
-    let counter = counter_shape(state, level_index, delta.shape, delta.quantity)?;
+    let counter = counter_shape(state, level_index, shape, quantity)?;
     let id = add_obligation(
         state,
         ReplacementObligationKind::Counter,
-        delta.source_client_order_id.clone(),
+        source_client_order_id.clone(),
         level_index,
         counter,
-        delta.now_ms,
+        now_ms,
     )?;
     obligation_ids.push(id);
     Ok(())
@@ -3674,7 +3805,8 @@ mod tests {
             GridConfig, GridMode, InitialOrderType, InstrumentRules, PositionSizingMode,
             QuantityRules,
         },
-        engine::{MarketSnapshot, build_grid_plan},
+        engine::{FeeValuation, MarketSnapshot, build_grid_plan},
+        exchange::{AuthoritativeOrder, OrderExecutionSnapshot, OrderLifecycle, TradeFill},
         persistence::FileStrategyStateStore,
     };
     use tempfile::tempdir;
@@ -4935,6 +5067,217 @@ mod tests {
     }
 
     #[test]
+    fn valued_sub_minimum_opening_remainder_keeps_exact_audit_when_failing_closed() {
+        let mut initial = state(Direction::Short, PositionBaseline::flat());
+        initial.instrument_rules.limit_quantity.min = Decimal::new(2, 1);
+        initial.validate().unwrap();
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let partial_quantity = shape.quantity - Decimal::new(1, 1);
+        let partial_quote = shape.price.unwrap() * partial_quantity;
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        let mut accepted = machine
+            .store()
+            .snapshot()
+            .ready_intents(101)
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.client_order_id == opening)
+            .unwrap();
+        accepted.state = IntentState::Accepted {
+            exchange_order_id: "opening-valued-dust".into(),
+        };
+        machine.synchronize_intent(&accepted, 101).unwrap();
+
+        let trade = TradeFill {
+            trade_id: "opening-valued-dust-fill".into(),
+            exchange_order_id: "opening-valued-dust".into(),
+            symbol: shape.symbol.clone(),
+            side: shape.side,
+            price: shape.price.unwrap(),
+            quantity: partial_quantity,
+            quote_quantity: partial_quote,
+            raw_commission: Decimal::ZERO,
+            commission_cost: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            realized_profit: Decimal::ZERO,
+            is_maker: true,
+            trade_time_ms: 102,
+        };
+        let snapshot = OrderExecutionSnapshot {
+            order: AuthoritativeOrder {
+                client_order_id: opening.clone(),
+                exchange_order_id: "opening-valued-dust".into(),
+                exchange: Exchange::Binance,
+                shape,
+                lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled),
+            },
+            cumulative_quantity: partial_quantity,
+            cumulative_quote: partial_quote,
+            fees_by_asset: [("USDT".into(), Decimal::ZERO)].into_iter().collect(),
+            trades: vec![trade.clone()],
+            order_time_ms: 101,
+            update_time_ms: 102,
+        };
+        let valued = ValuedExecutionReport {
+            report: report(
+                opening.clone(),
+                "opening-valued-dust",
+                partial_quantity,
+                partial_quote,
+                Some(TerminalOrderStatus::Cancelled),
+            ),
+            fee_valuations: vec![FeeValuation {
+                trade_id: trade.trade_id.clone(),
+                fee_asset: "USDT".into(),
+                fee_amount: Decimal::ZERO,
+                quote_asset: "USDT".into(),
+                quote_value: Decimal::ZERO,
+                source: FeeValuationSource::ExchangeZero,
+                valuation_symbol: None,
+                valuation_minute_start_ms: None,
+                valuation_price: None,
+            }],
+        };
+
+        let transition = machine
+            .apply_valued_execution(&snapshot, &valued, 103)
+            .unwrap();
+
+        assert!(matches!(transition, StrategyTransition::Failed { .. }));
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.opening_filled_quantity, partial_quantity);
+        assert_eq!(state.grid_position_net_quantity, -partial_quantity);
+        let order = state.orders.get(&opening).unwrap();
+        assert_eq!(
+            order.execution_audit.as_ref().unwrap().snapshot.trades[0].trade_id,
+            trade.trade_id
+        );
+        assert_eq!(
+            state
+                .inventory_events
+                .values()
+                .next()
+                .unwrap()
+                .exchange_trade_id,
+            Some("opening-valued-dust-fill".into())
+        );
+    }
+
+    #[test]
+    fn late_exact_audit_never_relabels_a_preexisting_aggregate_inventory_event() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let opening = opening_id(&initial);
+        let shape = initial.orders.get(&opening).unwrap().shape.clone();
+        let quantity = shape.quantity;
+        let quote = shape.price.unwrap() * quantity;
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        let mut accepted = machine
+            .store()
+            .snapshot()
+            .ready_intents(101)
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.client_order_id == opening)
+            .unwrap();
+        accepted.state = IntentState::Accepted {
+            exchange_order_id: "opening-aggregate-first".into(),
+        };
+        machine.synchronize_intent(&accepted, 101).unwrap();
+        machine
+            .apply_execution(
+                &report(
+                    opening.clone(),
+                    "opening-aggregate-first",
+                    quantity,
+                    quote,
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                102,
+            )
+            .unwrap();
+
+        let trade = TradeFill {
+            trade_id: "late-exact-opening-fill".into(),
+            exchange_order_id: "opening-aggregate-first".into(),
+            symbol: shape.symbol.clone(),
+            side: shape.side,
+            price: shape.price.unwrap(),
+            quantity,
+            quote_quantity: quote,
+            raw_commission: Decimal::ZERO,
+            commission_cost: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            realized_profit: Decimal::ZERO,
+            is_maker: true,
+            trade_time_ms: 102,
+        };
+        let snapshot = OrderExecutionSnapshot {
+            order: AuthoritativeOrder {
+                client_order_id: opening.clone(),
+                exchange_order_id: "opening-aggregate-first".into(),
+                exchange: Exchange::Binance,
+                shape,
+                lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Filled),
+            },
+            cumulative_quantity: quantity,
+            cumulative_quote: quote,
+            fees_by_asset: [("USDT".into(), Decimal::ZERO)].into_iter().collect(),
+            trades: vec![trade.clone()],
+            order_time_ms: 101,
+            update_time_ms: 102,
+        };
+        let valued = ValuedExecutionReport {
+            report: report(
+                opening.clone(),
+                "opening-aggregate-first",
+                quantity,
+                quote,
+                Some(TerminalOrderStatus::Filled),
+            ),
+            fee_valuations: vec![FeeValuation {
+                trade_id: trade.trade_id,
+                fee_asset: "USDT".into(),
+                fee_amount: Decimal::ZERO,
+                quote_asset: "USDT".into(),
+                quote_value: Decimal::ZERO,
+                source: FeeValuationSource::ExchangeZero,
+                valuation_symbol: None,
+                valuation_minute_start_ms: None,
+                valuation_price: None,
+            }],
+        };
+
+        let transition = machine
+            .apply_valued_execution(&snapshot, &valued, 103)
+            .unwrap();
+
+        assert!(matches!(transition, StrategyTransition::Failed { .. }));
+        let state = machine.store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert!(
+            state
+                .orders
+                .get(&opening)
+                .unwrap()
+                .execution_audit
+                .is_none()
+        );
+        assert_eq!(state.inventory_events.len(), 1);
+        assert!(
+            state
+                .inventory_events
+                .values()
+                .next()
+                .unwrap()
+                .exchange_trade_id
+                .is_none()
+        );
+        assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
     fn every_aligned_partial_opening_split_converges_exactly_for_long_and_short() {
         for direction in [Direction::Long, Direction::Short] {
             let template = state(direction, PositionBaseline::flat());
@@ -5790,6 +6133,167 @@ mod tests {
         let lot = state.neutral_lots.values().next().unwrap();
         assert_eq!(lot.signed_quantity, decimal(-10));
         assert_eq!(lot.entry_value, decimal(3));
+    }
+
+    #[test]
+    fn neutral_multi_trade_snapshot_uses_each_execution_price_across_zero() {
+        let mut machine = small_neutral_machine();
+        let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        machine
+            .apply_execution(
+                &report(
+                    buy,
+                    "neutral-existing-long",
+                    decimal(10),
+                    decimal(2),
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                101,
+            )
+            .unwrap();
+
+        let sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
+        let shape = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&sell)
+            .unwrap()
+            .shape
+            .clone();
+        let mut accepted = machine
+            .store()
+            .snapshot()
+            .ready_intents(102)
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.client_order_id == sell)
+            .unwrap();
+        accepted.state = IntentState::Accepted {
+            exchange_order_id: "neutral-multi-sell".into(),
+        };
+        machine.synchronize_intent(&accepted, 102).unwrap();
+
+        let trades = vec![
+            TradeFill {
+                trade_id: "neutral-close".into(),
+                exchange_order_id: "neutral-multi-sell".into(),
+                symbol: "ANSEMUSDT".into(),
+                side: OrderSide::Sell,
+                price: Decimal::new(30, 2),
+                quantity: decimal(10),
+                quote_quantity: decimal(3),
+                raw_commission: Decimal::ZERO,
+                commission_cost: Decimal::ZERO,
+                commission_asset: "USDT".into(),
+                realized_profit: Decimal::ONE,
+                is_maker: true,
+                trade_time_ms: 104,
+            },
+            TradeFill {
+                trade_id: "neutral-open".into(),
+                exchange_order_id: "neutral-multi-sell".into(),
+                symbol: "ANSEMUSDT".into(),
+                side: OrderSide::Sell,
+                price: Decimal::new(40, 2),
+                quantity: decimal(10),
+                quote_quantity: decimal(4),
+                raw_commission: Decimal::ZERO,
+                commission_cost: Decimal::ZERO,
+                commission_asset: "USDT".into(),
+                realized_profit: Decimal::ZERO,
+                is_maker: true,
+                trade_time_ms: 105,
+            },
+        ];
+        let snapshot = OrderExecutionSnapshot {
+            order: AuthoritativeOrder {
+                client_order_id: sell.clone(),
+                exchange_order_id: "neutral-multi-sell".into(),
+                exchange: Exchange::Aster,
+                shape,
+                lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Filled),
+            },
+            cumulative_quantity: decimal(20),
+            cumulative_quote: decimal(7),
+            fees_by_asset: [("USDT".into(), Decimal::ZERO)].into_iter().collect(),
+            trades: trades.clone(),
+            order_time_ms: 103,
+            update_time_ms: 105,
+        };
+        let valued = ValuedExecutionReport {
+            report: report(
+                sell.clone(),
+                "neutral-multi-sell",
+                decimal(20),
+                decimal(7),
+                Some(TerminalOrderStatus::Filled),
+            ),
+            fee_valuations: trades
+                .into_iter()
+                .map(|trade| FeeValuation {
+                    trade_id: trade.trade_id,
+                    fee_asset: "USDT".into(),
+                    fee_amount: Decimal::ZERO,
+                    quote_asset: "USDT".into(),
+                    quote_value: Decimal::ZERO,
+                    source: FeeValuationSource::ExchangeZero,
+                    valuation_symbol: None,
+                    valuation_minute_start_ms: None,
+                    valuation_price: None,
+                })
+                .collect(),
+        };
+
+        machine
+            .apply_valued_execution(&snapshot, &valued, 106)
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.grid_position_net_quantity, decimal(-10));
+        assert_eq!(state.gross_realized_profit, Decimal::ONE);
+        assert_eq!(state.neutral_lots.len(), 1);
+        let lot = state.neutral_lots.values().next().unwrap();
+        assert_eq!(lot.signed_quantity, decimal(-10));
+        assert_eq!(lot.entry_value, decimal(4));
+        assert_eq!(
+            state
+                .inventory_events
+                .values()
+                .filter_map(|event| event.exchange_trade_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["neutral-close", "neutral-open"]
+        );
+        let sell_obligations = state
+            .replacement_obligations
+            .values()
+            .filter(|obligation| obligation.source_client_order_id == sell)
+            .collect::<Vec<_>>();
+        assert_eq!(sell_obligations.len(), 1);
+        assert_eq!(sell_obligations[0].shape.quantity, decimal(20));
+
+        let mut redistributed = state.clone();
+        redistributed.inventory_events.get_mut(&2).unwrap().quote += Decimal::new(1, 1);
+        redistributed.inventory_events.get_mut(&3).unwrap().quote -= Decimal::new(1, 1);
+        assert_eq!(
+            redistributed.validate(),
+            Err(StrategyStateError::InventoryEventLedgerMismatch)
+        );
+
+        let mut reordered_audit = state.clone();
+        let audit = reordered_audit
+            .orders
+            .get_mut(&sell)
+            .unwrap()
+            .execution_audit
+            .as_mut()
+            .unwrap();
+        audit.snapshot.trades.swap(0, 1);
+        audit.fee_valuations.swap(0, 1);
+        assert_eq!(
+            reordered_audit.validate(),
+            Err(StrategyStateError::InvalidExecutionAudit)
+        );
     }
 
     #[test]

@@ -689,7 +689,7 @@ mod tests {
             .synchronize(&gateway(Ok(complete)), &mut machine, &id, 1_300)
             .await
             .unwrap();
-        let after_complete = machine.store().snapshot();
+        let after_complete = machine.store().snapshot().clone();
         let audit = after_complete
             .orders
             .get(&id)
@@ -704,5 +704,41 @@ mod tests {
         assert_eq!(audit.snapshot.trades.len(), 2);
         assert_eq!(audit.snapshot.trades[0].trade_id, "7");
         assert_eq!(audit.snapshot.trades[1].trade_id, "8");
+        assert_eq!(
+            after_partial
+                .inventory_events
+                .values()
+                .filter_map(|event| event.exchange_trade_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["7"]
+        );
+        assert_eq!(
+            after_complete
+                .inventory_events
+                .values()
+                .filter_map(|event| event.exchange_trade_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["7", "8"]
+        );
+
+        let repeated = service
+            .synchronize(
+                &gateway(Ok(after_complete
+                    .orders
+                    .get(&id)
+                    .unwrap()
+                    .execution_audit
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .clone())),
+                &mut machine,
+                &id,
+                1_400,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.transition, StrategyTransition::NoChange);
+        assert_eq!(machine.store().snapshot(), &after_complete);
     }
 }

@@ -81,15 +81,21 @@ state and only then materializes the counter order. Any identity or terminal-sta
 conflict remains fail-closed.
 
 Inventory accounting is independently replayable. Every positive execution
-delta appends an immutable event containing its strategy order identity,
-quantity, quote value, and application time. Before an active strategy can be
-loaded, these events must exactly reproduce the opening allocation, every
-per-level directional lot, neutral FIFO lots, net grid position, and gross
-realized profit. Aggregate totals alone are never accepted as proof because
-quantity and cost can otherwise drift between levels while the overall sum
-still appears correct. A legacy state that already contains executions but no
-complete event chain is retained for diagnosis and rejected rather than being
-silently reconstructed from guesses.
+appends immutable events containing its strategy order identity, quantity,
+quote value, and application time. An audited exchange snapshot appends one
+event per newly observed trade in canonical `(trade time, trade ID)` order; the
+event's trade ID, execution time, quantity, and quote value must exactly match
+the embedded audit. This keeps realized PnL and remaining cost basis correct
+when one synchronization batch both closes old inventory and opens inventory in
+the opposite direction. The whole cumulative delta still creates at most one
+counter-order obligation, so per-trade accounting cannot multiply replacement
+orders. Before an active strategy can be loaded, the events must exactly
+reproduce the opening allocation, every per-level directional lot, neutral FIFO
+lots, net grid position, and gross realized profit. Aggregate totals alone are
+never accepted as proof because quantity and cost can otherwise drift between
+levels while the overall sum still appears correct. A legacy state that already
+contains executions but no complete event chain is retained for diagnosis and
+rejected rather than being silently reconstructed from guesses.
 
 ## Cutover gates
 

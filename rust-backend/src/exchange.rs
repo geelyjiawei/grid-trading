@@ -194,6 +194,13 @@ pub(crate) fn is_valid_trade_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
+pub(crate) fn trades_are_canonically_ordered(trades: &[TradeFill]) -> bool {
+    trades.windows(2).all(|pair| {
+        (pair[0].trade_time_ms, pair[0].trade_id.as_str())
+            <= (pair[1].trade_time_ms, pair[1].trade_id.as_str())
+    })
+}
+
 pub(crate) mod trade_id_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
