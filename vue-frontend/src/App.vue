@@ -40,6 +40,7 @@ const price = ref<PriceSnapshot | null>(null);
 const balance = ref<BalanceSnapshot | null>(null);
 const fees = ref<FeeRates | null>(null);
 const grids = ref<GridStatus[]>([]);
+const tradingEnabled = ref(false);
 const selectedStatus = ref<GridStatus | null>(null);
 const risk = ref<RiskSnapshot | null>(null);
 const positions = ref<PositionSnapshot[]>([]);
@@ -50,8 +51,15 @@ const detailsLoading = ref(false);
 const detailsError = ref("");
 const preview = ref<GridPreview | null>(null);
 const previewContext = ref("");
+const previewConfig = ref<GridConfigRequest | null>(null);
+const previewKey = ref("");
 const previewBusy = ref(false);
 const previewError = ref("");
+const startBusy = ref(false);
+const startError = ref("");
+const startMessage = ref("");
+const stopBusy = ref(false);
+const stopError = ref("");
 const loading = ref(true);
 const strategyError = ref("");
 const marketError = ref("");
@@ -76,6 +84,14 @@ const currentPreviewContext = computed(
 );
 const visiblePreview = computed(() =>
   previewContext.value === currentPreviewContext.value ? preview.value : null,
+);
+const visiblePreviewKey = computed(() =>
+  previewContext.value === currentPreviewContext.value ? previewKey.value : "",
+);
+const strategyRunning = computed(() =>
+  grids.value.some(
+    (grid) => grid.running && grid.exchange === activeExchange.value && grid.symbol === symbol.value,
+  ),
 );
 
 function messageFrom(reason: unknown, fallback: string): string {
@@ -102,6 +118,7 @@ async function refreshStrategies(): Promise<void> {
   statusRefreshRunning = true;
   try {
     const response = await api.gridStatus();
+    tradingEnabled.value = response.trading_enabled === true;
     grids.value = (response.grids ?? []).filter((grid) => grid.running);
     selectedStatus.value =
       response.grids.find(
@@ -109,6 +126,7 @@ async function refreshStrategies(): Promise<void> {
       ) ?? null;
     strategyError.value = "";
   } catch (reason) {
+    tradingEnabled.value = false;
     strategyError.value = messageFrom(reason, "无法读取运行策略");
   } finally {
     statusRefreshRunning = false;
@@ -219,6 +237,8 @@ async function requestPreview(configRequest: GridConfigRequest): Promise<void> {
   const context = currentPreviewContext.value;
   previewBusy.value = true;
   previewError.value = "";
+  startError.value = "";
+  startMessage.value = "";
   try {
     const result = await api.preview(configRequest);
     if (requestSequence !== previewRequestSequence || context !== currentPreviewContext.value) {
@@ -226,14 +246,67 @@ async function requestPreview(configRequest: GridConfigRequest): Promise<void> {
     }
     preview.value = result;
     previewContext.value = context;
+    previewConfig.value = structuredClone(configRequest);
+    previewKey.value = JSON.stringify(configRequest);
   } catch (reason) {
     if (requestSequence === previewRequestSequence && context === currentPreviewContext.value) {
       preview.value = null;
+      previewConfig.value = null;
+      previewKey.value = "";
       previewContext.value = context;
       previewError.value = messageFrom(reason, "网格预览失败");
     }
   } finally {
     if (requestSequence === previewRequestSequence) previewBusy.value = false;
+  }
+}
+
+async function startStrategy(configRequest: GridConfigRequest): Promise<void> {
+  startError.value = "";
+  startMessage.value = "";
+  if (!tradingEnabled.value) {
+    startError.value = "Rust 实盘写入尚未启用";
+    return;
+  }
+  if (strategyRunning.value) {
+    startError.value = "当前交易所与交易对已有运行策略";
+    return;
+  }
+  if (
+    previewContext.value !== currentPreviewContext.value
+    || !previewConfig.value
+    || !visiblePreview.value
+    || previewKey.value !== JSON.stringify(configRequest)
+  ) {
+    startError.value = "预览已失效，请重新校验参数后再启动";
+    return;
+  }
+  startBusy.value = true;
+  try {
+    const response = await api.start(previewConfig.value);
+    startMessage.value = `策略 ${response.run_id} 已持久化，状态：${response.lifecycle}`;
+    await Promise.all([refreshStrategies(), refreshMarket(), refreshDetails()]);
+  } catch (reason) {
+    startError.value = messageFrom(reason, "网格启动失败");
+  } finally {
+    startBusy.value = false;
+  }
+}
+
+async function stopStrategy(): Promise<void> {
+  const status = selectedStatus.value;
+  if (!status?.running || stopBusy.value) return;
+  stopBusy.value = true;
+  stopError.value = "";
+  startMessage.value = "";
+  try {
+    const response = await api.stop(status.exchange, status.symbol);
+    startMessage.value = `停止请求已持久化，状态：${response.lifecycle}；只撤策略订单，不主动平仓`;
+    await Promise.all([refreshStrategies(), refreshMarket(), refreshDetails()]);
+  } catch (reason) {
+    stopError.value = messageFrom(reason, "网格停止失败");
+  } finally {
+    stopBusy.value = false;
   }
 }
 
@@ -287,6 +360,11 @@ async function selectExchange(exchange: Exchange): Promise<void> {
   positions.value = [];
   openOrders.value = [];
   trades.value = [];
+  preview.value = null;
+  previewConfig.value = null;
+  previewKey.value = "";
+  startError.value = "";
+  startMessage.value = "";
   marketError.value = "";
   await refreshWorkspace();
 }
@@ -295,6 +373,11 @@ async function selectStrategy(grid: GridStatus): Promise<void> {
   activeExchange.value = grid.exchange;
   symbol.value = grid.symbol;
   selectedStatus.value = grid;
+  preview.value = null;
+  previewConfig.value = null;
+  previewKey.value = "";
+  startError.value = "";
+  startMessage.value = "";
   await Promise.all([refreshMarket(), refreshDetails()]);
 }
 
@@ -332,7 +415,7 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="topbar-actions">
-        <span class="migration-lock">交易写入迁移锁定</span>
+        <span class="migration-lock">{{ tradingEnabled ? "Rust 实盘写入已启用" : "Rust 只读预览" }}</span>
         <button class="ghost-button" type="button" @click="settingsOpen = true">API 设置</button>
         <button class="primary-button compact" type="button" :disabled="loading" @click="refreshWorkspace">
           {{ loading ? "同步中…" : "立即刷新" }}
@@ -360,7 +443,7 @@ onUnmounted(() => {
     </section>
 
     <p class="migration-note">
-      当前 Vue 页面只接入读取与账户配置；启动、停止和撤单将在 Rust 交易状态机完成双实现核对后开放。
+      启动前必须通过交易所权威预览；启动请求持久化后由 Rust 状态机执行。停止只撤销本策略订单，不主动平仓，也不改动启动前已有仓位。
     </p>
     <p v-if="workspaceError || (!authenticated && authError)" class="callout danger global-error">
       {{ workspaceError || authError }}
@@ -389,11 +472,25 @@ onUnmounted(() => {
         :configured="configured"
         :fees="fees"
         :preview="visiblePreview"
+        :preview-key="visiblePreviewKey"
         :busy="previewBusy"
         :error="previewError"
+        :start-busy="startBusy"
+        :start-error="startError"
+        :start-message="startMessage"
+        :strategy-running="strategyRunning"
+        :trading-enabled="tradingEnabled"
         @preview="requestPreview"
+        @start="startStrategy"
       />
-      <StrategyOverview class="dashboard-span" :status="selectedStatus" :risk="risk" />
+      <StrategyOverview
+        class="dashboard-span"
+        :status="selectedStatus"
+        :risk="risk"
+        :stop-busy="stopBusy"
+        :stop-error="stopError"
+        @stop="stopStrategy"
+      />
       <StrategyDetailsPanel
         :exchange="activeExchange"
         :symbol="symbol"

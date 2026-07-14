@@ -123,4 +123,48 @@ describe("typed API client", () => {
       expect.objectContaining({ method: "POST", credentials: "same-origin" }),
     );
   });
+
+  it("gives every trading mutation a fresh secure idempotency key and JSON body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          message: "durable",
+          run_id: "run-safe-1",
+          exchange: "binance",
+          symbol: "MUUSDT",
+          lifecycle: "running",
+        }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.start({
+      exchange: "binance",
+      symbol: "MUUSDT",
+      direction: "short",
+      upper_price: "1020",
+      lower_price: "1000",
+      grid_count: 20,
+      total_investment: "0",
+      leverage: 5,
+      position_sizing_mode: "fixed_grid_qty",
+      grid_order_qty: "0.2",
+    });
+    await api.stop("binance", "MUUSDT");
+
+    const startInit = fetchMock.mock.calls[0]![1] as RequestInit;
+    const stopInit = fetchMock.mock.calls[1]![1] as RequestInit;
+    const startHeaders = new Headers(startInit.headers);
+    const stopHeaders = new Headers(stopInit.headers);
+    const startKey = startHeaders.get("Idempotency-Key");
+    const stopKey = stopHeaders.get("Idempotency-Key");
+    expect(startKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(stopKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(stopKey).not.toBe(startKey);
+    expect(startHeaders.get("Content-Type")).toBe("application/json");
+    expect(stopHeaders.get("Content-Type")).toBe("application/json");
+    expect(stopInit.body).toBe("{}");
+  });
 });

@@ -15,6 +15,7 @@ import type {
   PriceSnapshot,
   RiskSnapshot,
   SaveApiConfigRequest,
+  StrategyCommandResponse,
   TradesResponse,
 } from "./types";
 
@@ -61,6 +62,20 @@ export function withExchange(path: string, exchange: Exchange): string {
   return `${path}${separator}exchange=${encodeURIComponent(exchange)}`;
 }
 
+export function createIdempotencyKey(): string {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi?.getRandomValues) {
+    throw new Error("Secure idempotency key generation is unavailable");
+  }
+  const bytes = new Uint8Array(16);
+  cryptoApi.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function mutationHeaders(): HeadersInit {
+  return { "Idempotency-Key": createIdempotencyKey() };
+}
+
 export const api = {
   authStatus: () => request<AuthStatus>("/api/auth/status"),
   login: (credentials: LoginRequest) =>
@@ -91,14 +106,19 @@ export const api = {
       body: JSON.stringify(config),
     }),
   start: (config: GridConfigRequest) =>
-    request<{ ok: boolean; message: string }>("/api/grid/start", {
+    request<StrategyCommandResponse>("/api/grid/start", {
       method: "POST",
+      headers: mutationHeaders(),
       body: JSON.stringify(config),
     }),
   stop: (exchange: Exchange, symbol: string) =>
-    request<{ ok: boolean; message: string }>(
+    request<StrategyCommandResponse>(
       `/api/grid/stop/${encodeURIComponent(symbol)}?exchange=${encodeURIComponent(exchange)}`,
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({}),
+      },
     ),
   openOrders: (exchange: Exchange, symbol: string) =>
     request<OpenOrdersResponse>(

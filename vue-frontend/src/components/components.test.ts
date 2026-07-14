@@ -7,6 +7,7 @@ import GridConfigurationPanel from "./GridConfigurationPanel.vue";
 import MarketOverview from "./MarketOverview.vue";
 import StrategyDetailsPanel from "./StrategyDetailsPanel.vue";
 import StrategyList from "./StrategyList.vue";
+import StrategyOverview from "./StrategyOverview.vue";
 
 describe("Vue migration components", () => {
   it("emits login data only after the form is submitted", async () => {
@@ -109,21 +110,98 @@ describe("Vue migration components", () => {
     await wrapper.find('[data-testid="grid-order-qty"]').setValue("0.2");
     await wrapper.find("form").trigger("submit");
 
+    expect(wrapper.find(".form-error").exists() ? wrapper.find(".form-error").text() : "").toBe("");
     expect(wrapper.emitted("preview")?.[0]?.[0]).toMatchObject({
       exchange: "binance",
       symbol: "MUUSDT",
       grid_count: 20,
-      total_investment: 0,
+      total_investment: "0",
       position_sizing_mode: "fixed_grid_qty",
-      grid_order_qty: 0.2,
+      grid_order_qty: "0.2",
       initial_order_type: "market",
-      maker_fee_rate: 0.0002,
-      taker_fee_rate: 0.0005,
+      maker_fee_rate: "0.0002",
+      taker_fee_rate: "0.0005",
     });
 
     await wrapper.find('[data-testid="sizing-mode"]').setValue("investment");
     expect(wrapper.find('[data-testid="grid-order-qty"]').exists()).toBe(false);
     expect(wrapper.find('[data-testid="total-investment"]').exists()).toBe(true);
+  });
+
+  it("starts only the exact configuration that completed an authoritative preview", async () => {
+    const wrapper = mount(GridConfigurationPanel, {
+      props: {
+        exchange: "binance",
+        symbol: "MUUSDT",
+        configured: true,
+        fees: { maker_fee_rate: "0.0002", taker_fee_rate: "0.0005" },
+        preview: null,
+        previewKey: "",
+        busy: false,
+        error: "",
+        tradingEnabled: true,
+      },
+    });
+    await wrapper.find('[data-testid="lower-price"]').setValue("1000");
+    await wrapper.find('[data-testid="upper-price"]').setValue("1020");
+    await wrapper.find('[data-testid="grid-order-qty"]').setValue("0.2");
+    await wrapper.find("form").trigger("submit");
+    expect(wrapper.find(".form-error").exists() ? wrapper.find(".form-error").text() : "").toBe("");
+    const exactConfig = wrapper.emitted("preview")?.[0]?.[0];
+    expect(exactConfig).toBeDefined();
+
+    await wrapper.setProps({
+      preview: {
+        grid_step: "1",
+        grid_profit_pct: "0.1",
+        per_grid_gross_profit: "0.2",
+        per_grid_fee: "0.05",
+        per_grid_net_profit: "0.15",
+        active_grid_count: 10,
+        grid_count: 20,
+        qty_per_grid_avg: "0.2",
+        total_qty: "2",
+        maker_fee_rate: "0.0002",
+        taker_fee_rate: "0.0005",
+      },
+      previewKey: JSON.stringify(exactConfig),
+    });
+    const startButton = wrapper
+      .findAll("button")
+      .find((button) => button.text() === "启动已预览策略");
+    expect(startButton).toBeDefined();
+    expect(startButton!.attributes("disabled")).toBeUndefined();
+    await startButton!.trigger("click");
+    expect(wrapper.emitted("start")?.[0]?.[0]).toEqual(exactConfig);
+
+    await wrapper.find('[data-testid="upper-price"]').setValue("1021");
+    expect(startButton!.attributes("disabled")).toBeDefined();
+    await startButton!.trigger("click");
+    expect(wrapper.emitted("start")).toHaveLength(1);
+
+    await wrapper.find('[data-testid="upper-price"]').setValue("1020");
+    await wrapper.setProps({ tradingEnabled: false });
+    expect(startButton!.attributes("disabled")).toBeDefined();
+  });
+
+  it("requires an explicit second click before stopping a running strategy", async () => {
+    const wrapper = mount(StrategyOverview, {
+      props: {
+        status: {
+          run_id: "run-safe-1",
+          exchange: "aster",
+          symbol: "ANSEMUSDT",
+          running: true,
+        },
+        risk: null,
+      },
+    });
+    const stopButton = wrapper.find("button.stop-button");
+    await stopButton.trigger("click");
+    expect(wrapper.emitted("stop")).toBeUndefined();
+    expect(stopButton.text()).toContain("确认停止");
+    await stopButton.trigger("click");
+    expect(wrapper.emitted("stop")).toHaveLength(1);
   });
 
   it("exposes three distinct opening order semantics", () => {

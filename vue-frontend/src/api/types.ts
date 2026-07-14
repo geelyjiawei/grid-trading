@@ -3,28 +3,29 @@ export type Direction = "long" | "short" | "neutral";
 export type GridMode = "arithmetic" | "geometric";
 export type PositionSizingMode = "investment" | "fixed_grid_qty";
 export type InitialOrderType = "market" | "limit" | "post_only";
+export type DecimalValue = string | number;
 
 export interface GridConfigRequest {
   exchange?: Exchange;
   symbol: string;
   direction: Direction;
-  upper_price: number;
-  lower_price: number;
+  upper_price: DecimalValue;
+  lower_price: DecimalValue;
   grid_count: number;
-  total_investment?: number;
+  total_investment?: DecimalValue;
   leverage?: number;
   position_sizing_mode?: PositionSizingMode;
-  grid_order_qty?: number | null;
+  grid_order_qty?: DecimalValue | null;
   initial_order_type?: InitialOrderType;
-  initial_order_price?: number | null;
+  initial_order_price?: DecimalValue | null;
   grid_order_post_only?: boolean;
   grid_mode?: GridMode;
-  trigger_price?: number | null;
-  stop_loss_price?: number | null;
-  take_profit_price?: number | null;
-  maker_fee_rate?: number;
-  taker_fee_rate?: number;
-  fee_rate?: number;
+  trigger_price?: DecimalValue | null;
+  stop_loss_price?: DecimalValue | null;
+  take_profit_price?: DecimalValue | null;
+  maker_fee_rate?: DecimalValue;
+  taker_fee_rate?: DecimalValue;
+  fee_rate?: DecimalValue;
 }
 
 export interface AuthStatus {
@@ -36,28 +37,35 @@ export interface AuthStatus {
 }
 
 export interface GridStatus {
+  run_id?: string;
   exchange: Exchange;
   symbol: string;
   running: boolean;
+  engine_running?: boolean;
+  runtime_advancing?: boolean;
+  lifecycle?: string;
   direction?: Direction;
   grid_mode?: GridMode;
-  total_profit?: number;
+  total_profit?: DecimalValue;
   completed_pairs?: number;
   trigger_message?: string;
   waiting_initial_order?: boolean;
   waiting_trigger?: boolean;
-  total_equity_profit?: number;
-  gross_profit?: number;
-  total_fee?: number;
-  realized_net_profit?: number;
-  unrealised_pnl?: number;
-  total_volume?: number;
-  current_price?: number;
+  total_equity_profit?: DecimalValue;
+  gross_profit?: DecimalValue;
+  total_fee?: DecimalValue;
+  realized_net_profit?: DecimalValue;
+  unrealised_pnl?: DecimalValue;
+  total_volume?: DecimalValue;
+  current_price?: DecimalValue;
   active_orders?: GridOrder[];
   filled_orders?: GridTrade[];
   baseline_position?: PositionBaseline;
-  grid_position_net_qty?: number;
-  grid_profit_pct?: number;
+  grid_position_net_qty?: DecimalValue;
+  expected_position_net_qty?: DecimalValue;
+  opening_filled_qty?: DecimalValue;
+  opening_planned_qty?: DecimalValue;
+  grid_profit_pct?: DecimalValue;
   initial_side?: "Buy" | "Sell";
   initial_qty?: number;
   [key: string]: unknown;
@@ -67,6 +75,7 @@ export interface GridStatusList {
   running: boolean;
   count: number;
   running_count?: number;
+  trading_enabled?: boolean;
   grids: GridStatus[];
 }
 
@@ -103,8 +112,8 @@ export interface SaveApiConfigRequest {
 export interface FeeRates {
   exchange?: Exchange;
   symbol?: string;
-  maker_fee_rate: number;
-  taker_fee_rate: number;
+  maker_fee_rate: DecimalValue;
+  taker_fee_rate: DecimalValue;
   source?: string;
 }
 
@@ -221,23 +230,73 @@ export interface GridHistoryRun {
 }
 
 export interface GridPreview {
-  grid_step: number;
-  grid_profit_pct: number;
-  per_grid_gross_profit: number;
-  per_grid_fee: number;
-  per_grid_open_fee?: number;
-  per_grid_close_fee?: number;
-  per_grid_net_profit: number;
+  exchange?: Exchange;
+  symbol?: string;
+  reference_price?: DecimalValue;
+  grid_step: DecimalValue;
+  grid_step_min?: DecimalValue;
+  grid_step_max?: DecimalValue;
+  grid_profit_pct: DecimalValue;
+  grid_profit_pct_min?: DecimalValue;
+  grid_profit_pct_max?: DecimalValue;
+  per_grid_gross_profit: DecimalValue;
+  per_grid_fee: DecimalValue;
+  per_grid_open_fee?: DecimalValue;
+  per_grid_close_fee?: DecimalValue;
+  per_grid_net_profit: DecimalValue;
+  per_grid_net_profit_min?: DecimalValue;
+  per_grid_net_profit_max?: DecimalValue;
   active_grid_count: number;
+  participating_level_count?: number;
   grid_count: number;
-  qty_per_grid_min?: number;
-  qty_per_grid_max?: number;
-  qty_per_grid_avg: number;
-  min_notional?: number;
-  total_qty: number;
-  maker_fee_rate: number;
-  taker_fee_rate: number;
+  qty_per_grid_min?: DecimalValue;
+  qty_per_grid_max?: DecimalValue;
+  qty_per_grid_avg: DecimalValue;
+  min_notional?: DecimalValue;
+  total_qty: DecimalValue;
+  maker_fee_rate: DecimalValue;
+  taker_fee_rate: DecimalValue;
   fee_rate_source?: string;
+  fee_estimate_liquidity?: "maker" | "taker_conservative" | string;
+  initial_open_fee_rate?: DecimalValue | null;
+  initial_open_fee?: DecimalValue | null;
+  opening_order?: GridPlanOrderPreview | null;
+  grid_orders?: GridPlanOrderPreview[];
+  cycles?: GridCyclePreview[];
+}
+
+export interface GridPlanOrderPreview {
+  level_index?: number;
+  side: "Buy" | "Sell";
+  price?: DecimalValue | null;
+  qty: DecimalValue;
+  reduce_only?: boolean;
+  kind?: string;
+  time_in_force?: string;
+  role?: string;
+}
+
+export interface GridCyclePreview {
+  level_index: number;
+  qty: DecimalValue;
+  entry_price: DecimalValue;
+  exit_price: DecimalValue;
+  gross_profit: DecimalValue;
+  open_fee: DecimalValue;
+  close_fee: DecimalValue;
+  net_profit: DecimalValue;
+  gross_profit_pct: DecimalValue;
+  fee_rate: DecimalValue;
+  liquidity_estimate: string;
+}
+
+export interface StrategyCommandResponse {
+  ok: boolean;
+  message: string;
+  run_id: string;
+  exchange: Exchange;
+  symbol: string;
+  lifecycle: string;
 }
 
 export interface ApiErrorBody {

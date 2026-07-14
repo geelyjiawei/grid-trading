@@ -282,6 +282,9 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
 .leverage-control input { width: 100%; accent-color: var(--mint); }
 .leverage-control strong { color: var(--mint); }
 .grid-form > .primary-button { width: 100%; margin-top: 0.9rem; }
+.strategy-actions { display: flex; align-items: center; justify-content: flex-end; gap: 0.65rem; }
+.stop-button { border-color: rgba(255, 103, 116, 0.65); color: var(--danger); }
+.stop-button:hover { border-color: var(--danger); }
 .preview-card {
   display: flex;
   min-height: 100%;
@@ -296,6 +299,7 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
 .preview-metrics div { min-width: 0; padding: 0.72rem; background: #0c202a; }
 .preview-metrics span { display: block; margin-bottom: 0.25rem; color: var(--muted); font-size: 0.68rem; }
 .preview-metrics strong { display: block; overflow-wrap: anywhere; font-size: 0.82rem; }
+.preview-card > .primary-button { width: 100%; margin-top: auto; }
 .disabled-trade-button {
   width: 100%;
   margin-top: auto;

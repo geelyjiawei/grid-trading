@@ -43,7 +43,7 @@ function balanceUnit(): string {
       <div><span>可用余额{{ balanceUnit() }}</span><strong>{{ configured ? formatNumber(balance?.available ?? balance?.available_balance, 4) : "未配置" }}</strong></div>
       <div><span>账户权益{{ balanceUnit() }}</span><strong>{{ configured ? formatNumber(balance?.equity ?? balance?.wallet_balance, 4) : "未配置" }}</strong></div>
       <div><span>未实现盈亏{{ balanceUnit() }}</span><strong>{{ configured ? formatNumber(balance?.unrealised_pnl, 4) : "未配置" }}</strong></div>
-      <div><span>Maker / Taker</span><strong>{{ fees ? `${formatNumber(fees.maker_fee_rate * 100, 6)}% / ${formatNumber(fees.taker_fee_rate * 100, 6)}%` : "--" }}</strong></div>
+      <div><span>Maker / Taker</span><strong>{{ fees ? `${formatNumber(Number(fees.maker_fee_rate) * 100, 6)}% / ${formatNumber(Number(fees.taker_fee_rate) * 100, 6)}%` : "--" }}</strong></div>
     </div>
     <p v-if="loading" class="loading-line">正在同步交易所数据…</p>
   </section>

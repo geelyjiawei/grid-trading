@@ -11,36 +11,50 @@ import type {
 } from "../api/types";
 import { formatNumber } from "../format";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   exchange: Exchange;
   symbol: string;
   configured: boolean;
   fees: FeeRates | null;
   preview: GridPreview | null;
+  previewKey?: string;
   busy: boolean;
   error: string;
-}>();
+  startBusy?: boolean;
+  startError?: string;
+  startMessage?: string;
+  strategyRunning?: boolean;
+  tradingEnabled?: boolean;
+}>(), {
+  previewKey: "",
+  startBusy: false,
+  startError: "",
+  startMessage: "",
+  strategyRunning: false,
+  tradingEnabled: false,
+});
 
 const emit = defineEmits<{
   preview: [config: GridConfigRequest];
+  start: [config: GridConfigRequest];
 }>();
 
 interface FormState {
   direction: Direction;
   gridMode: "arithmetic" | "geometric";
-  gridCount: string;
+  gridCount: string | number;
   initialOrderType: InitialOrderType;
-  initialOrderPrice: string;
+  initialOrderPrice: string | number;
   gridOrderPostOnly: boolean;
-  upperPrice: string;
-  lowerPrice: string;
+  upperPrice: string | number;
+  lowerPrice: string | number;
   positionSizingMode: PositionSizingMode;
-  totalInvestment: string;
-  gridOrderQty: string;
-  triggerPrice: string;
-  stopLossPrice: string;
-  takeProfitPrice: string;
-  leverage: string;
+  totalInvestment: string | number;
+  gridOrderQty: string | number;
+  triggerPrice: string | number;
+  stopLossPrice: string | number;
+  takeProfitPrice: string | number;
+  leverage: string | number;
 }
 
 const form = reactive<FormState>({
@@ -64,7 +78,21 @@ const localError = ref("");
 
 const fixedQuantity = computed(() => form.positionSizingMode === "fixed_grid_qty");
 const canPreview = computed(
-  () => props.configured && Boolean(props.fees) && !props.busy && Boolean(props.symbol),
+  () => props.configured && Boolean(props.fees) && !props.busy && !props.startBusy && Boolean(props.symbol),
+);
+const currentConfig = computed(() => {
+  try {
+    return buildConfig();
+  } catch {
+    return null;
+  }
+});
+const currentConfigKey = computed(() => currentConfig.value ? JSON.stringify(currentConfig.value) : "");
+const previewMatchesForm = computed(
+  () => Boolean(props.preview) && Boolean(props.previewKey) && props.previewKey === currentConfigKey.value,
+);
+const canStart = computed(
+  () => canPreview.value && previewMatchesForm.value && !props.strategyRunning && props.tradingEnabled,
 );
 
 watch(
@@ -74,60 +102,107 @@ watch(
   },
 );
 
-function positive(value: string, label: string): number {
+function positiveDecimal(value: string | number, label: string): string {
+  const trimmed = String(value).trim();
+  if (!/^\d+(?:\.\d+)?$/.test(trimmed)) throw new Error(`${label}必须是正数`);
+  const [integerPart, fractionPart = ""] = trimmed.split(".");
+  const integer = integerPart!.replace(/^0+(?=\d)/, "");
+  const fraction = fractionPart.replace(/0+$/, "");
+  const canonical = fraction ? `${integer}.${fraction}` : integer;
+  if (canonical === "0") throw new Error(`${label}必须大于 0`);
+  return canonical;
+}
+
+function optionalPositive(value: string | number, label: string): string | null {
+  if (!String(value).trim()) return null;
+  return positiveDecimal(value, label);
+}
+
+function comparePositiveDecimals(left: string, right: string): number {
+  const [leftInteger, leftFraction = ""] = left.split(".");
+  const [rightInteger, rightFraction = ""] = right.split(".");
+  if (leftInteger!.length !== rightInteger!.length) {
+    return leftInteger!.length > rightInteger!.length ? 1 : -1;
+  }
+  if (leftInteger !== rightInteger) return leftInteger! > rightInteger! ? 1 : -1;
+  const width = Math.max(leftFraction.length, rightFraction.length);
+  const normalizedLeft = leftFraction.padEnd(width, "0");
+  const normalizedRight = rightFraction.padEnd(width, "0");
+  if (normalizedLeft === normalizedRight) return 0;
+  return normalizedLeft > normalizedRight ? 1 : -1;
+}
+
+function positiveInteger(value: string | number, label: string, minimum: number, maximum: number): number {
+  if (!/^\d+$/.test(String(value).trim())) throw new Error(`${label}必须是整数`);
   const number = Number(value);
-  if (!Number.isFinite(number) || number <= 0) throw new Error(`${label}必须大于 0`);
+  if (!Number.isSafeInteger(number) || number < minimum || number > maximum) {
+    throw new Error(`${label}必须是 ${minimum} 到 ${maximum} 的整数`);
+  }
   return number;
 }
 
-function optionalPositive(value: string, label: string): number | null {
-  if (!value.trim()) return null;
-  return positive(value, label);
+function buildConfig(): GridConfigRequest {
+  const upperPrice = positiveDecimal(form.upperPrice, "价格上限");
+  const lowerPrice = positiveDecimal(form.lowerPrice, "价格下限");
+  if (comparePositiveDecimals(upperPrice, lowerPrice) <= 0) {
+    throw new Error("价格上限必须高于价格下限");
+  }
+  const gridCount = positiveInteger(form.gridCount, "网格数量", 2, 100);
+  const leverage = positiveInteger(form.leverage, "杠杆倍数", 1, 125);
+  if (!props.fees) throw new Error("账户实际费率尚未读取，不能预览");
+  const normalizedSymbol = props.symbol.trim().toUpperCase();
+  if (!/^[A-Z0-9]+$/.test(normalizedSymbol)) throw new Error("交易对格式不正确");
+
+  const totalInvestment = fixedQuantity.value
+    ? "0"
+    : positiveDecimal(form.totalInvestment, "总投入金额");
+  const gridOrderQty = fixedQuantity.value
+    ? positiveDecimal(form.gridOrderQty, "每格开仓数量")
+    : null;
+
+  return {
+    exchange: props.exchange,
+    symbol: normalizedSymbol,
+    direction: form.direction,
+    grid_mode: form.gridMode,
+    upper_price: upperPrice,
+    lower_price: lowerPrice,
+    grid_count: gridCount,
+    total_investment: totalInvestment,
+    leverage,
+    position_sizing_mode: form.positionSizingMode,
+    grid_order_qty: gridOrderQty,
+    fee_rate: String(props.fees.taker_fee_rate),
+    maker_fee_rate: String(props.fees.maker_fee_rate),
+    taker_fee_rate: String(props.fees.taker_fee_rate),
+    initial_order_type: form.initialOrderType,
+    initial_order_price: form.initialOrderType === "market"
+      ? null
+      : optionalPositive(form.initialOrderPrice, "开仓限价"),
+    grid_order_post_only: form.gridOrderPostOnly,
+    trigger_price: optionalPositive(form.triggerPrice, "触发价格"),
+    stop_loss_price: optionalPositive(form.stopLossPrice, "止损价格"),
+    take_profit_price: optionalPositive(form.takeProfitPrice, "止盈价格"),
+  };
 }
 
 function submitPreview(): void {
   localError.value = "";
   try {
-    const upperPrice = positive(form.upperPrice, "价格上限");
-    const lowerPrice = positive(form.lowerPrice, "价格下限");
-    if (upperPrice <= lowerPrice) throw new Error("价格上限必须高于价格下限");
-    const gridCount = positive(form.gridCount, "网格数量");
-    if (!Number.isInteger(gridCount) || gridCount < 2 || gridCount > 100) {
-      throw new Error("网格数量必须是 2 到 100 的整数");
+    emit("preview", buildConfig());
+  } catch (reason) {
+    localError.value = reason instanceof Error ? reason.message : "参数填写不完整";
+  }
+}
+
+function submitStart(): void {
+  localError.value = "";
+  try {
+    const config = buildConfig();
+    if (!props.preview || props.previewKey !== JSON.stringify(config)) {
+      throw new Error("参数已变化，请重新校验并预览后再启动");
     }
-    const leverage = positive(form.leverage, "杠杆倍数");
-    if (!Number.isInteger(leverage)) throw new Error("杠杆倍数必须是整数");
-    if (!props.fees) throw new Error("账户实际费率尚未读取，不能预览");
-
-    const totalInvestment = fixedQuantity.value
-      ? 0
-      : positive(form.totalInvestment, "总投入金额");
-    const gridOrderQty = fixedQuantity.value
-      ? positive(form.gridOrderQty, "每格开仓数量")
-      : null;
-
-    emit("preview", {
-      exchange: props.exchange,
-      symbol: props.symbol.trim().toUpperCase(),
-      direction: form.direction,
-      grid_mode: form.gridMode,
-      upper_price: upperPrice,
-      lower_price: lowerPrice,
-      grid_count: gridCount,
-      total_investment: totalInvestment,
-      leverage,
-      position_sizing_mode: form.positionSizingMode,
-      grid_order_qty: gridOrderQty,
-      fee_rate: props.fees.taker_fee_rate,
-      maker_fee_rate: props.fees.maker_fee_rate,
-      taker_fee_rate: props.fees.taker_fee_rate,
-      initial_order_type: form.initialOrderType,
-      initial_order_price: optionalPositive(form.initialOrderPrice, "开仓限价"),
-      grid_order_post_only: form.gridOrderPostOnly,
-      trigger_price: optionalPositive(form.triggerPrice, "触发价格"),
-      stop_loss_price: optionalPositive(form.stopLossPrice, "止损价格"),
-      take_profit_price: optionalPositive(form.takeProfitPrice, "止盈价格"),
-    });
+    emit("start", config);
   } catch (reason) {
     localError.value = reason instanceof Error ? reason.message : "参数填写不完整";
   }
@@ -150,7 +225,7 @@ function quantityText(): string {
         <p class="eyebrow">后端权威预览</p>
         <h2>网格参数</h2>
       </div>
-      <span class="preview-lock">真实启动暂未开放</span>
+      <span class="preview-lock">Rust 状态机控制</span>
     </header>
 
     <div class="configuration-layout">
@@ -242,13 +317,14 @@ function quantityText(): string {
         </label>
 
         <p class="form-hint">
-          Maker {{ fees ? `${formatNumber(fees.maker_fee_rate * 100, 6)}%` : "--" }} ·
-          Taker {{ fees ? `${formatNumber(fees.taker_fee_rate * 100, 6)}%` : "--" }}。
+          Maker {{ fees ? `${formatNumber(Number(fees.maker_fee_rate) * 100, 6)}%` : "--" }} ·
+          Taker {{ fees ? `${formatNumber(Number(fees.taker_fee_rate) * 100, 6)}%` : "--" }}。
           费率和数量均由后端再次校验。
         </p>
         <p v-if="!configured" class="form-error">请先保存当前交易所配置。</p>
         <p v-else-if="!fees" class="form-error">账户实际费率尚未读取，预览已锁定。</p>
-        <p v-if="localError || error" class="form-error">{{ localError || error }}</p>
+        <p v-if="localError || error || startError" class="form-error">{{ localError || error || startError }}</p>
+        <p v-if="startMessage" class="form-hint">{{ startMessage }}</p>
         <button class="primary-button" type="submit" :disabled="!canPreview">
           {{ busy ? "正在计算…" : "校验并预览" }}
         </button>
@@ -268,7 +344,12 @@ function quantityText(): string {
           <div><span>单格净收益</span><strong>{{ formatNumber(preview.per_grid_net_profit, 6) }} USDT</strong></div>
           <div><span>交易所最低金额</span><strong>{{ formatNumber(preview.min_notional, 4) }} USDT</strong></div>
         </div>
-        <button class="disabled-trade-button" type="button" disabled>等待 Rust 交易状态机完成后开放启动</button>
+        <p v-if="preview && !previewMatchesForm" class="form-error">参数已变化，本次预览已失效。</p>
+        <p v-if="strategyRunning" class="form-hint">当前交易所与交易对已有运行策略，不能重复启动。</p>
+        <p v-else-if="!tradingEnabled" class="form-hint">Rust 实盘写入开关尚未启用，只能预览。</p>
+        <button class="primary-button" type="button" :disabled="!canStart" @click="submitStart">
+          {{ startBusy ? "正在持久化并启动…" : "启动已预览策略" }}
+        </button>
       </aside>
     </div>
   </section>

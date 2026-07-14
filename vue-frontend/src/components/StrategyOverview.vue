@@ -1,11 +1,37 @@
 <script setup lang="ts">
+import { ref, watch } from "vue";
 import type { GridStatus, RiskSnapshot } from "../api/types";
 import { directionName, formatNumber } from "../format";
 
-defineProps<{
+const props = withDefaults(defineProps<{
   status: GridStatus | null;
   risk: RiskSnapshot | null;
-}>();
+  stopBusy?: boolean;
+  stopError?: string;
+}>(), {
+  stopBusy: false,
+  stopError: "",
+});
+
+const emit = defineEmits<{ stop: [] }>();
+const stopConfirmation = ref(false);
+
+watch(
+  () => [props.status?.run_id, props.status?.running, props.stopBusy],
+  () => {
+    if (!props.status?.running || props.stopBusy) stopConfirmation.value = false;
+  },
+);
+
+function requestStop(): void {
+  if (!props.status?.running || props.stopBusy) return;
+  if (!stopConfirmation.value) {
+    stopConfirmation.value = true;
+    return;
+  }
+  stopConfirmation.value = false;
+  emit("stop");
+}
 </script>
 
 <template>
@@ -15,9 +41,20 @@ defineProps<{
         <p class="eyebrow">策略实时状态</p>
         <h2>{{ status?.symbol || "未选择策略" }}</h2>
       </div>
-      <span class="live-pill" :class="status?.running ? 'running' : 'stopped'">
-        {{ status?.waiting_initial_order ? "等待开仓" : status?.waiting_trigger ? "等待触发" : status?.running ? "运行中" : "未运行" }}
-      </span>
+      <div class="strategy-actions">
+        <span class="live-pill" :class="status?.running ? 'running' : 'stopped'">
+          {{ status?.waiting_initial_order ? "等待开仓" : status?.waiting_trigger ? "等待触发" : status?.running ? "运行中" : "未运行" }}
+        </span>
+        <button
+          v-if="status?.running"
+          class="ghost-button stop-button"
+          type="button"
+          :disabled="stopBusy"
+          @click="requestStop"
+        >
+          {{ stopBusy ? "正在停止…" : stopConfirmation ? "确认停止（只撤单）" : "停止策略" }}
+        </button>
+      </div>
     </header>
 
     <p v-if="!status" class="empty-state">从上方策略列表选择一个交易对查看明细。</p>
@@ -37,6 +74,7 @@ defineProps<{
         <div><span>完成配对</span><strong>{{ status.completed_pairs ?? 0 }}</strong></div>
       </div>
       <p v-if="status.trigger_message" class="form-hint">{{ status.trigger_message }}</p>
+      <p v-if="stopError" class="form-error">{{ stopError }}</p>
     </template>
   </section>
 </template>
