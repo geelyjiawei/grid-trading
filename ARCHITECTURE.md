@@ -37,14 +37,25 @@ only the SHA-256 token digest in bounded process memory. Logout, expiry, or a
 Rust restart revokes the session. `SESSION_SECRET` remains a legacy Python-only
 setting during migration and is not used by Rust.
 
-The preview stack can be built after creating a local `.env` file:
+The candidate stack can be built after creating a local `.env` file:
 
 ```bash
 docker compose -f docker-compose.rust-vue.yml up -d --build
 ```
 
-Do not expose or deploy this preview as the trading service. The Rust binary
-currently refuses to start when `GRID_RUST_TRADING_ENABLED=true`.
+Keep it isolated on port `8001` until shadow verification passes. With
+`GRID_RUST_TRADING_ENABLED=false`, all write endpoints fail closed. Setting it
+to `true` is accepted only when web authentication is fully configured; startup
+also performs durable runtime recovery and aborts on discovery anomalies or
+unknown recovery outcomes.
+
+The Rust candidate reads exchange credentials only from `.env` at process
+startup. `/api/config` returns masked connection status and never returns a
+secret. The Vue configuration dialog is intentionally read-only; changing a
+credential requires updating the server `.env` and rebuilding or restarting
+the candidate container. This avoids transmitting production private keys
+through browser requests before encrypted dynamic configuration and safe
+gateway hot-reload exist end to end.
 
 ## Cutover gates
 

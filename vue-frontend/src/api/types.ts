@@ -102,13 +102,6 @@ export interface ApiConfigResponse {
   configs: Partial<Record<Exchange, ExchangeConfigSummary>>;
 }
 
-export interface SaveApiConfigRequest {
-  exchange: Exchange;
-  api_key: string;
-  api_secret: string;
-  testnet: boolean;
-}
-
 export interface FeeRates {
   exchange?: Exchange;
   symbol?: string;

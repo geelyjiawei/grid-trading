@@ -31,7 +31,7 @@ describe("Vue migration components", () => {
     });
   });
 
-  it("uses production wallet fields for Aster and never pre-fills secrets", async () => {
+  it("shows environment-backed exchange status without exposing secret inputs", () => {
     const config: ApiConfigResponse = {
       configured: true,
       active_exchange: "aster",
@@ -40,7 +40,8 @@ describe("Vue migration components", () => {
           exchange: "aster",
           configured: true,
           api_key: "0x12…89",
-          testnet: true,
+          testnet: false,
+          source: "env",
         },
       },
     };
@@ -49,22 +50,16 @@ describe("Vue migration components", () => {
         open: true,
         config,
         activeExchange: "aster",
-        busy: false,
-        error: "",
       },
     });
 
-    expect(wrapper.text()).toContain("生产钱包地址");
-    expect(wrapper.text()).toContain("生产钱包私钥");
-    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
-    await wrapper.find("form").trigger("submit");
-    expect(wrapper.emitted("save")?.[0]?.[0]).toMatchObject({
-      exchange: "aster",
-      testnet: false,
-    });
-    for (const input of wrapper.findAll('input:not([type="checkbox"])')) {
-      expect((input.element as HTMLInputElement).value).toBe("");
-    }
+    expect(wrapper.text()).toContain("交易所连接状态");
+    expect(wrapper.text()).toContain("ASTER_USER_ADDRESS / ASTER_SIGNER_PRIVATE_KEY");
+    expect(wrapper.text()).toContain("0x12…89 · Mainnet");
+    expect(wrapper.text()).toContain("浏览器不会接收、回显或写入私钥");
+    expect(wrapper.find("form").exists()).toBe(false);
+    expect(wrapper.find("input").exists()).toBe(false);
+    expect(wrapper.emitted("save")).toBeUndefined();
   });
 
   it("selects a strategy with its exchange identity intact", async () => {
@@ -126,6 +121,23 @@ describe("Vue migration components", () => {
     await wrapper.find('[data-testid="sizing-mode"]').setValue("investment");
     expect(wrapper.find('[data-testid="grid-order-qty"]').exists()).toBe(false);
     expect(wrapper.find('[data-testid="total-investment"]').exists()).toBe(true);
+  });
+
+  it("directs missing exchange credentials to server configuration", () => {
+    const wrapper = mount(GridConfigurationPanel, {
+      props: {
+        exchange: "aster",
+        symbol: "ANSEMUSDT",
+        configured: false,
+        fees: null,
+        preview: null,
+        busy: false,
+        error: "",
+      },
+    });
+
+    expect(wrapper.text()).toContain("请先在服务器配置当前交易所并重启候选服务");
+    expect(wrapper.text()).not.toContain("请先保存当前交易所配置");
   });
 
   it("starts only the exact configuration that completed an authoritative preview", async () => {

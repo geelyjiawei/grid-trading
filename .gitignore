@@ -7,6 +7,7 @@ tests/__pycache__/
 .env.*
 .venv/
 data/
+/data-rust-preview/
 __pycache__/
 .coverage
 htmlcov/

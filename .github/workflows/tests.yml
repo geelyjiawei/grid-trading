@@ -143,7 +143,7 @@ jobs:
             ! command -v node
           '
 
-      - name: Smoke-test Rust health and Vue entrypoint
+      - name: Smoke-test Rust API contract and Vue entrypoint
         run: |
           set -euo pipefail
           container_id="$(docker run --detach --publish 127.0.0.1:18000:8000 grid-trading-vue-rust:test)"
@@ -154,6 +154,7 @@ jobs:
             fi
             sleep 1
           done
+          grep --fixed-strings '"ok":true' /tmp/health.json
           grep --fixed-strings '"runtime":"rust"' /tmp/health.json
           grep --fixed-strings '"trading_enabled":false' /tmp/health.json
           curl --fail --silent http://127.0.0.1:18000/api/auth/status > /tmp/auth.json
@@ -162,5 +163,20 @@ jobs:
           curl --fail --silent http://127.0.0.1:18000/api/config > /tmp/config.json
           grep --fixed-strings '"active_exchange":"bybit"' /tmp/config.json
           grep --fixed-strings '"configured":false' /tmp/config.json
+          curl --fail --silent http://127.0.0.1:18000/api/grid/status > /tmp/status.json
+          grep --fixed-strings '"running":false' /tmp/status.json
+          grep --fixed-strings '"count":0' /tmp/status.json
+          grep --fixed-strings '"grids":[]' /tmp/status.json
+          curl --fail --silent 'http://127.0.0.1:18000/api/grid/history?limit=100' > /tmp/history.json
+          grep --fixed-strings '"source":"durable_strategy_state"' /tmp/history.json
+          grep --fixed-strings '"runs":[]' /tmp/history.json
+          curl --fail --silent 'http://127.0.0.1:18000/api/trades/MUUSDT?exchange=binance&limit=100' > /tmp/trades.json
+          grep --fixed-strings '"source":"durable_exchange_execution_audit"' /tmp/trades.json
+          grep --fixed-strings '"scope":"strategy"' /tmp/trades.json
+          grep --fixed-strings '"trades":[]' /tmp/trades.json
+          test "$(curl --silent --output /tmp/risk.json --write-out '%{http_code}' 'http://127.0.0.1:18000/api/risk/MUUSDT?exchange=binance')" = "503"
+          grep --fixed-strings '"code":"exchange_not_configured"' /tmp/risk.json
+          test "$(curl --silent --output /tmp/missing.json --write-out '%{http_code}' http://127.0.0.1:18000/api/not-a-real-route)" = "404"
+          grep --fixed-strings '"code":"api_route_not_found"' /tmp/missing.json
           curl --fail --silent http://127.0.0.1:18000/ > /tmp/index.html
           grep --fixed-strings '<div id="app"></div>' /tmp/index.html

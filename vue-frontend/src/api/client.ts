@@ -14,7 +14,6 @@ import type {
   PositionsResponse,
   PriceSnapshot,
   RiskSnapshot,
-  SaveApiConfigRequest,
   StrategyCommandResponse,
   TradesResponse,
 } from "./types";
@@ -88,11 +87,6 @@ export const api = {
       method: "POST",
     }),
   config: () => request<ApiConfigResponse>("/api/config"),
-  saveConfig: (config: SaveApiConfigRequest) =>
-    request<{ ok?: boolean; message: string }>("/api/config", {
-      method: "POST",
-      body: JSON.stringify(config),
-    }),
   feeRates: (exchange: Exchange, symbol: string) =>
     request<FeeRates>(withExchange(`/api/fees/${encodeURIComponent(symbol)}`, exchange)),
   price: (exchange: Exchange, symbol: string) =>

@@ -17,7 +17,6 @@ import type {
   PriceSnapshot,
   PositionSnapshot,
   RiskSnapshot,
-  SaveApiConfigRequest,
 } from "./api/types";
 import AuthDialog from "./components/AuthDialog.vue";
 import ExchangeSettingsDialog from "./components/ExchangeSettingsDialog.vue";
@@ -64,8 +63,6 @@ const loading = ref(true);
 const strategyError = ref("");
 const marketError = ref("");
 const settingsOpen = ref(false);
-const settingsBusy = ref(false);
-const settingsError = ref("");
 let statusTimer: number | undefined;
 let marketTimer: number | undefined;
 let statusRefreshRunning = false;
@@ -381,22 +378,6 @@ async function selectStrategy(grid: GridStatus): Promise<void> {
   await Promise.all([refreshMarket(), refreshDetails()]);
 }
 
-async function saveConfig(payload: SaveApiConfigRequest): Promise<void> {
-  settingsBusy.value = true;
-  settingsError.value = "";
-  try {
-    await api.saveConfig(payload);
-    activeExchange.value = payload.exchange;
-    await loadConfig();
-    settingsOpen.value = false;
-    await refreshWorkspace();
-  } catch (reason) {
-    settingsError.value = messageFrom(reason, "配置保存失败");
-  } finally {
-    settingsBusy.value = false;
-  }
-}
-
 onMounted(() => void checkAuth());
 onUnmounted(() => {
   window.clearInterval(statusTimer);
@@ -416,7 +397,7 @@ onUnmounted(() => {
       </div>
       <div class="topbar-actions">
         <span class="migration-lock">{{ tradingEnabled ? "Rust 实盘写入已启用" : "Rust 只读预览" }}</span>
-        <button class="ghost-button" type="button" @click="settingsOpen = true">API 设置</button>
+        <button class="ghost-button" type="button" @click="settingsOpen = true">API 配置状态</button>
         <button class="primary-button compact" type="button" :disabled="loading" @click="refreshWorkspace">
           {{ loading ? "同步中…" : "立即刷新" }}
         </button>
@@ -516,10 +497,7 @@ onUnmounted(() => {
       :open="settingsOpen"
       :config="config"
       :active-exchange="activeExchange"
-      :busy="settingsBusy"
-      :error="settingsError"
       @close="settingsOpen = false"
-      @save="saveConfig"
     />
   </main>
 </template>

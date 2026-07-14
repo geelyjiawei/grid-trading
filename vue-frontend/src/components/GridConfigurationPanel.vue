@@ -321,7 +321,7 @@ function quantityText(): string {
           Taker {{ fees ? `${formatNumber(Number(fees.taker_fee_rate) * 100, 6)}%` : "--" }}。
           费率和数量均由后端再次校验。
         </p>
-        <p v-if="!configured" class="form-error">请先保存当前交易所配置。</p>
+        <p v-if="!configured" class="form-error">请先在服务器配置当前交易所并重启候选服务。</p>
         <p v-else-if="!fees" class="form-error">账户实际费率尚未读取，预览已锁定。</p>
         <p v-if="localError || error || startError" class="form-error">{{ localError || error || startError }}</p>
         <p v-if="startMessage" class="form-hint">{{ startMessage }}</p>

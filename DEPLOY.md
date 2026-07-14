@@ -74,7 +74,7 @@ AUTH_COOKIE_SECURE=false
 
 如果以后配置了 HTTPS，把 `AUTH_COOKIE_SECURE=true`。
 
-如果你确实要在网页里保存 API，需要生成 `GRID_CONFIG_KEY`：
+下面的网页加密配置仅供旧 Python 服务兼容。Vue + Rust 候选版不会从浏览器接收密钥，只会在启动时读取服务器 `.env`。如果旧服务仍需网页保存 API，才需要生成 `GRID_CONFIG_KEY`：
 
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -89,6 +89,27 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 公网服务器不建议直接用 HTTP 在网页里输入 API Key。生产环境请使用 Caddy / Nginx 配置 HTTPS，并把 `AUTH_COOKIE_SECURE=true`。
+
+## 2.2 Vue + Rust 候选服务
+
+候选服务与当前生产服务隔离，默认监听服务器本机 `127.0.0.1:8001`，并使用独立目录 `data-rust-preview/`：
+
+```bash
+docker compose -f docker-compose.rust-vue.yml up -d --build
+curl --fail http://127.0.0.1:8001/healthz
+curl --fail http://127.0.0.1:8001/api/config
+curl --fail http://127.0.0.1:8001/api/grid/status
+```
+
+第一阶段必须保持：
+
+```bash
+GRID_RUST_TRADING_ENABLED=false
+```
+
+此时可以核对 Vue 页面、交易所配置状态和只读 API，但所有启动/停止写请求都会拒绝执行。候选服务读取 Binance、AsterDEX 和 Bybit 的环境变量配置，真实 `.env` 不得提交到 GitHub。
+
+启用 Rust 实盘写入前必须同时满足：网页登录保护配置完整、交易所凭据有效、持久状态恢复无异常、隔离影子核验通过，并已准备生产回滚方案。不要让 Python 与 Rust 两个引擎同时管理同一交易所和交易对。
 
 ## 3. Docker Compose 启动
 
