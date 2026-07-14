@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     future::Future,
     path::PathBuf,
     sync::Arc,
@@ -28,11 +29,11 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{Exchange, GridConfig, OrderSide},
     engine::{
-        ArmedStrategyLifecycle, MarketSnapshot, PreparedStrategyLifecycle,
+        ArmedStrategyLifecycle, FeeValuationSource, MarketSnapshot, PreparedStrategyLifecycle,
         PreparedStrategyStopOutcome, RuntimeCoordinator, RuntimeCoordinatorError,
-        RuntimeRegistryEntry, ShadowCollectionError, StrategyLifecycle, StrategyTransition,
-        build_grid_preview, collect_stable_exchange_view, collect_strategy_shadow_view,
-        load_authoritative_fee_config,
+        RuntimeRegistryEntry, ShadowCollectionError, StrategyLifecycle, StrategyOrderPurpose,
+        StrategyState, StrategyTransition, build_grid_preview, collect_stable_exchange_view,
+        collect_strategy_shadow_view, load_authoritative_fee_config,
     },
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, InstrumentRulesGateway, MarketSnapshotGateway,
@@ -1008,6 +1009,275 @@ async fn grid_preview(
     )
 }
 
+async fn strategy_trades(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<TradeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selection
+        .exchange
+        .unwrap_or_else(|| state.exchange_gateways.preferred());
+    let limit = match validated_limit(selection.limit, 100, 1_000) {
+        Ok(limit) => limit,
+        Err(response) => return *response,
+    };
+    let (catalog, _) = match stable_runtime_catalog(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let selected = match catalog.select_live(exchange, &symbol) {
+        Ok(Some(snapshot)) => Some(snapshot),
+        Ok(None) => catalog
+            .entries()
+            .iter()
+            .filter(|entry| entry.exchange() == exchange && entry.symbol() == symbol)
+            .max_by_key(|entry| strategy_snapshot_updated_at(entry))
+            .cloned(),
+        Err(error) => {
+            tracing::error!(?exchange, symbol, error = %error, "multiple live strategies prevent an authoritative trade view");
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_selection_ambiguous",
+                "Multiple live strategies exist for this exchange and symbol",
+            );
+        }
+    };
+    let rows = match selected.as_ref() {
+        Some(StrategyCatalogSnapshot::Active(strategy)) => {
+            match strategy_trade_rows(strategy, limit) {
+                Ok(rows) => rows,
+                Err(response) => return *response,
+            }
+        }
+        Some(StrategyCatalogSnapshot::Armed(_)) | None => Vec::new(),
+    };
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "exchange": exchange,
+            "symbol": symbol,
+            "scope": "strategy",
+            "source": "durable_exchange_execution_audit",
+            "count": rows.len(),
+            "trades": rows,
+        }),
+    )
+}
+
+async fn strategy_history(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Query(selection): Query<HistorySelection>,
+) -> Response {
+    let limit = match validated_limit(selection.limit, 100, 1_000) {
+        Ok(limit) => limit,
+        Err(response) => return *response,
+    };
+    let (catalog, _) = match stable_runtime_catalog(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let mut rows = Vec::with_capacity(catalog.entries().len());
+    for snapshot in catalog.entries() {
+        match strategy_history_row(snapshot) {
+            Ok(row) => rows.push(row),
+            Err(response) => return *response,
+        }
+    }
+    rows.sort_by(|left, right| {
+        right["started_at"]
+            .as_u64()
+            .unwrap_or_default()
+            .cmp(&left["started_at"].as_u64().unwrap_or_default())
+            .then_with(|| right["run_id"].as_str().cmp(&left["run_id"].as_str()))
+    });
+    rows.truncate(limit);
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "source": "durable_strategy_state",
+            "count": rows.len(),
+            "runs": rows,
+        }),
+    )
+}
+
+fn validated_limit(
+    requested: Option<usize>,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, Box<Response>> {
+    let limit = requested.unwrap_or(default);
+    if limit == 0 || limit > maximum {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "The requested result limit is outside the supported range",
+        )));
+    }
+    Ok(limit)
+}
+
+fn strategy_snapshot_updated_at(snapshot: &StrategyCatalogSnapshot) -> u64 {
+    match snapshot {
+        StrategyCatalogSnapshot::Armed(state) => state.updated_at_ms,
+        StrategyCatalogSnapshot::Active(state) => state.updated_at_ms,
+    }
+}
+
+fn strategy_trade_rows(
+    strategy: &StrategyState,
+    limit: usize,
+) -> Result<Vec<StrategyTradeRow>, Box<Response>> {
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for order in strategy.orders.values() {
+        let Some(audit) = &order.execution_audit else {
+            continue;
+        };
+        for trade in &audit.snapshot.trades {
+            if !seen.insert((trade.exchange_order_id.clone(), trade.trade_id.clone())) {
+                return Err(Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "duplicate_trade_audit",
+                    "The durable execution audit contains a duplicate trade identity",
+                )));
+            }
+            let valuations = audit
+                .fee_valuations
+                .iter()
+                .filter(|valuation| valuation.trade_id == trade.trade_id)
+                .collect::<Vec<_>>();
+            let [valuation] = valuations.as_slice() else {
+                return Err(Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "invalid_trade_audit",
+                    "The durable execution audit does not contain one exact fee valuation",
+                )));
+            };
+            let profit = trade
+                .realized_profit
+                .checked_sub(valuation.quote_value)
+                .ok_or_else(|| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "trade_numeric_overflow",
+                        "The durable execution audit arithmetic overflowed",
+                    ))
+                })?;
+            let level_idx = match &order.purpose {
+                StrategyOrderPurpose::InitialGrid { level_index, .. }
+                | StrategyOrderPurpose::Replacement { level_index, .. } => Some(*level_index),
+                StrategyOrderPurpose::Opening | StrategyOrderPurpose::RiskClose => None,
+            };
+            rows.push(StrategyTradeRow {
+                order_id: trade.exchange_order_id.clone(),
+                order_link_id: order.client_order_id.as_str().to_owned(),
+                trade_id: trade.trade_id.clone(),
+                side: order_side_name(trade.side),
+                price: trade.price.to_string(),
+                qty: trade.quantity.to_string(),
+                volume: trade.quote_quantity.to_string(),
+                fee: trade.commission_cost.to_string(),
+                fee_usdt: valuation.quote_value.to_string(),
+                fee_asset: trade.commission_asset.clone(),
+                fee_source: fee_valuation_source_name(valuation.source),
+                liquidity: if trade.is_maker { "maker" } else { "taker" },
+                is_maker: trade.is_maker,
+                realized_pnl: trade.realized_profit.to_string(),
+                profit: profit.to_string(),
+                reduce_only: order.shape.reduce_only,
+                level_idx,
+                time: trade.trade_time_ms,
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        right
+            .time
+            .cmp(&left.time)
+            .then_with(|| right.trade_id.cmp(&left.trade_id))
+            .then_with(|| right.order_id.cmp(&left.order_id))
+    });
+    rows.truncate(limit);
+    Ok(rows)
+}
+
+fn fee_valuation_source_name(source: FeeValuationSource) -> &'static str {
+    match source {
+        FeeValuationSource::ExchangeZero => "exchange_zero",
+        FeeValuationSource::QuoteAsset => "quote_asset",
+        FeeValuationSource::HistoricalMinuteOpen => "historical_minute_open",
+    }
+}
+
+fn strategy_history_row(snapshot: &StrategyCatalogSnapshot) -> Result<Value, Box<Response>> {
+    match snapshot {
+        StrategyCatalogSnapshot::Armed(state) => Ok(json!({
+            "run_id": state.run_id.as_str(),
+            "started_at": state.created_at_ms,
+            "updated_at": state.updated_at_ms,
+            "symbol": state.symbol,
+            "exchange": state.exchange,
+            "direction": state.config.direction,
+            "grid_mode": state.config.grid_mode,
+            "grid_count": state.config.grid_count,
+            "initial_order_type": state.config.initial_order_type,
+            "initial_order_price": state.config.initial_order_price.map(|value| value.to_string()),
+            "position_sizing_mode": state.config.position_sizing_mode,
+            "grid_order_qty": state.config.grid_order_qty.map(|value| value.to_string()),
+            "total_investment": state.config.total_investment.to_string(),
+            "status": state.lifecycle,
+            "realized_net_profit": "0",
+            "net_profit": "0",
+            "total_fee": "0",
+            "total_volume": "0",
+            "completed_pairs": 0,
+        })),
+        StrategyCatalogSnapshot::Active(state) => {
+            let net_profit = state
+                .gross_realized_profit
+                .checked_sub(state.total_fee)
+                .ok_or_else(|| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "strategy_history_invalid",
+                        "The durable strategy profit arithmetic overflowed",
+                    ))
+                })?;
+            Ok(json!({
+                "run_id": state.run_id.as_str(),
+                "started_at": state.created_at_ms,
+                "updated_at": state.updated_at_ms,
+                "symbol": state.symbol,
+                "exchange": state.exchange,
+                "direction": state.direction,
+                "grid_mode": state.config.grid_mode,
+                "grid_count": state.config.grid_count,
+                "initial_order_type": state.config.initial_order_type,
+                "initial_order_price": state.config.initial_order_price.map(|value| value.to_string()),
+                "position_sizing_mode": state.config.position_sizing_mode,
+                "grid_order_qty": state.config.grid_order_qty.map(|value| value.to_string()),
+                "total_investment": state.config.total_investment.to_string(),
+                "status": state.lifecycle,
+                "gross_profit": state.gross_realized_profit.to_string(),
+                "realized_net_profit": net_profit.to_string(),
+                "net_profit": net_profit.to_string(),
+                "total_fee": state.total_fee.to_string(),
+                "total_volume": state.total_volume.to_string(),
+                "completed_pairs": state.completed_pairs,
+                "baseline_position": state.baseline.signed_quantity.to_string(),
+                "grid_position_net_qty": state.grid_position_net_quantity.to_string(),
+            }))
+        }
+    }
+}
+
 async fn stable_runtime_catalog(
     state: &ApiState,
 ) -> Result<(StrategyCatalog, Vec<RuntimeRegistryEntry>), Response> {
@@ -1346,6 +1616,39 @@ fn session_cookie(token: &str, secure: bool, max_age: u64) -> Option<HeaderValue
 #[derive(Debug, Default, Deserialize)]
 struct ExchangeSelection {
     exchange: Option<Exchange>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TradeSelection {
+    exchange: Option<Exchange>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct HistorySelection {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StrategyTradeRow {
+    order_id: String,
+    order_link_id: String,
+    trade_id: String,
+    side: &'static str,
+    price: String,
+    qty: String,
+    volume: String,
+    fee: String,
+    fee_usdt: String,
+    fee_asset: String,
+    fee_source: &'static str,
+    liquidity: &'static str,
+    is_maker: bool,
+    realized_pnl: String,
+    profit: String,
+    reduce_only: bool,
+    level_idx: Option<u16>,
+    time: u64,
 }
 
 async fn exchange_config(
@@ -2047,8 +2350,10 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/fees/{symbol}", get(exchange_fee_rates))
         .route("/api/positions/{symbol}", get(exchange_positions))
         .route("/api/orders/open/{symbol}", get(exchange_open_orders))
+        .route("/api/trades/{symbol}", get(strategy_trades))
         .route("/api/risk/{symbol}", get(exchange_risk))
         .route("/api/grid/status", get(grid_status))
+        .route("/api/grid/history", get(strategy_history))
         .route("/api/grid/preview", post(grid_preview))
         .route("/api/grid/start", post(start_grid_web))
         .route("/api/grid/stop/{symbol}", post(stop_grid_web))
@@ -2062,6 +2367,7 @@ fn router_with_state(state: ApiState) -> Router {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         sync::{
             Arc, Mutex,
@@ -2091,15 +2397,16 @@ mod tests {
             TimeInForce,
         },
         engine::{
-            ArmedStrategyState, MarketSnapshot, PositionBaseline, StrategyLifecycle,
-            StrategyOrderTracking, StrategyRunId, StrategyState, build_grid_plan,
+            ArmedStrategyState, ExecutionAuditRecord, FeeValuation, MarketSnapshot,
+            PositionBaseline, StrategyLifecycle, StrategyOrderTracking, StrategyRunId,
+            StrategyState, build_grid_plan,
         },
         exchange::{
             AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
             AuthoritativeOrder, ExchangeIdentityGateway, ExchangeMarketSnapshot, LookupError,
-            MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderLookup, OrderLookupGateway,
-            PositionSide, PositionSnapshot, PositionSnapshotGateway, TradingFeeRateGateway,
-            TradingFeeRates, configured::ExchangeEnvironment,
+            MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderExecutionSnapshot, OrderLookup,
+            OrderLookupGateway, PositionSide, PositionSnapshot, PositionSnapshotGateway, TradeFill,
+            TradingFeeRateGateway, TradingFeeRates, configured::ExchangeEnvironment,
         },
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
@@ -2640,6 +2947,92 @@ mod tests {
         )
     }
 
+    fn strategy_with_trade_audit(root: &std::path::Path) -> StrategyState {
+        let (mut strategy, _) = persist_clean_running_strategy(root);
+        let order = strategy.orders.values_mut().next().unwrap();
+        let exchange_order_id = order.exchange_order_id.clone().unwrap();
+        let trade = TradeFill {
+            trade_id: "opaque-trade-1".into(),
+            exchange_order_id: exchange_order_id.clone(),
+            symbol: strategy.symbol.clone(),
+            side: order.shape.side,
+            price: Decimal::from_str_exact("15.95").unwrap(),
+            quantity: Decimal::from_str_exact("3.14").unwrap(),
+            quote_quantity: Decimal::from_str_exact("50.083").unwrap(),
+            raw_commission: Decimal::from_str_exact("0.0277").unwrap(),
+            commission_cost: Decimal::from_str_exact("0.0277").unwrap(),
+            commission_asset: "BNB".into(),
+            realized_profit: Decimal::from_str_exact("1.5").unwrap(),
+            is_maker: false,
+            trade_time_ms: 1_779_550_014_852,
+        };
+        order.execution_audit = Some(ExecutionAuditRecord {
+            snapshot: OrderExecutionSnapshot {
+                order: AuthoritativeOrder {
+                    client_order_id: order.client_order_id.clone(),
+                    exchange_order_id,
+                    exchange: strategy.exchange,
+                    shape: order.shape.clone(),
+                    lifecycle: OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+                },
+                cumulative_quantity: trade.quantity,
+                cumulative_quote: trade.quote_quantity,
+                fees_by_asset: BTreeMap::from([("BNB".into(), trade.commission_cost)]),
+                trades: vec![trade.clone()],
+                order_time_ms: 1_779_550_000_000,
+                update_time_ms: trade.trade_time_ms,
+            },
+            fee_valuations: vec![FeeValuation {
+                trade_id: trade.trade_id,
+                fee_asset: "BNB".into(),
+                fee_amount: trade.commission_cost,
+                quote_asset: "USDT".into(),
+                quote_value: Decimal::from_str_exact("0.12").unwrap(),
+                source: FeeValuationSource::HistoricalMinuteOpen,
+                valuation_symbol: Some("BNBUSDT".into()),
+                valuation_minute_start_ms: Some(1_779_549_960_000),
+                valuation_price: Some(Decimal::from_str_exact("4.3321299639").unwrap()),
+            }],
+            synced_at_ms: 1_779_550_015_000,
+        });
+        strategy
+    }
+
+    #[test]
+    fn strategy_trade_rows_preserve_exchange_quantity_fee_and_liquidity_exactly() {
+        let directory = tempdir().unwrap();
+        let strategy = strategy_with_trade_audit(directory.path());
+
+        let rows = strategy_trade_rows(&strategy, 100).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].trade_id, "opaque-trade-1");
+        assert_eq!(rows[0].price, "15.95");
+        assert_eq!(rows[0].qty, "3.14");
+        assert_eq!(rows[0].volume, "50.083");
+        assert_eq!(rows[0].fee, "0.0277");
+        assert_eq!(rows[0].fee_usdt, "0.12");
+        assert_eq!(rows[0].liquidity, "taker");
+        assert_eq!(rows[0].realized_pnl, "1.5");
+        assert_eq!(rows[0].profit, "1.38");
+    }
+
+    #[test]
+    fn duplicate_trade_identity_fails_closed_instead_of_hiding_a_bad_audit() {
+        let directory = tempdir().unwrap();
+        let mut strategy = strategy_with_trade_audit(directory.path());
+        let audit = strategy
+            .orders
+            .values_mut()
+            .find_map(|order| order.execution_audit.as_mut())
+            .unwrap();
+        audit.snapshot.trades.push(audit.snapshot.trades[0].clone());
+
+        let response = strategy_trade_rows(&strategy, 100).unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     fn exact_read_app() -> Router {
         static STRATEGY_ROOT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
         let strategy_root = std::env::temp_dir().join(format!(
@@ -2843,6 +3236,41 @@ mod tests {
         assert_eq!(status["grids"][0]["engine_running"], false);
         assert_eq!(status["grids"][0]["grid_position_net_qty"], "0");
         assert_eq!(status["grids"][0]["expected_position_net_qty"], "0");
+
+        let history = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/history?limit=100")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = response_json(history).await;
+        assert_eq!(history["source"], "durable_strategy_state");
+        assert_eq!(history["count"], 1);
+        assert_eq!(history["runs"][0]["run_id"], strategy.run_id.as_str());
+        assert_eq!(history["runs"][0]["status"], "running");
+        assert_eq!(history["runs"][0]["net_profit"], "0");
+        assert_eq!(history["runs"][0]["grid_order_qty"], "100.000");
+
+        let trades = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/trades/ANSEMUSDT?exchange=aster&limit=100")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trades.status(), StatusCode::OK);
+        let trades = response_json(trades).await;
+        assert_eq!(trades["source"], "durable_exchange_execution_audit");
+        assert_eq!(trades["scope"], "strategy");
+        assert_eq!(trades["count"], 0);
 
         let response = app
             .oneshot(
@@ -3217,6 +3645,38 @@ mod tests {
         assert_eq!(
             response_json(unconfigured).await["error"]["code"],
             "exchange_not_configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn strategy_detail_limits_are_bounded_before_catalog_work() {
+        let app = super::super::app();
+        let zero = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/history?limit=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(zero).await["error"]["code"], "invalid_limit");
+
+        let excessive = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/trades/MUUSDT?exchange=binance&limit=1001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(excessive.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(excessive).await["error"]["code"],
+            "invalid_limit"
         );
     }
 
