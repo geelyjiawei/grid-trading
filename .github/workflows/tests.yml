@@ -139,6 +139,14 @@ jobs:
       - name: Build locked production image
         run: docker build --file Dockerfile.rust-vue --tag grid-trading-vue-rust:test .
 
+      - name: Exercise isolated Compose deployment end to end
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          sed --in-place 's/^AUTH_REQUIRED=true$/AUTH_REQUIRED=false/' .env
+          trap 'docker compose --project-name grid-trading-rust-preview --file docker-compose.rust-vue.yml down --volumes; rm -f .env' EXIT
+          sh scripts/deploy-rust-preview.sh
+
       - name: Verify image contains only the production stack
         run: |
           docker run --rm grid-trading-vue-rust:test sh -eu -c '

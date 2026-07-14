@@ -39,14 +39,45 @@ if test "${GRID_RUST_PREVIEW_VALIDATE_ONLY:-false}" = "true"; then
     exit 0
 fi
 
-production_ids_before=$(docker compose ps -q | sort)
+command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
+command -v mktemp >/dev/null 2>&1 || fail "mktemp is unavailable"
+
+temporary_directory=$(mktemp -d)
+non_preview_before=$temporary_directory/non-preview-before.txt
+non_preview_after=$temporary_directory/non-preview-after.txt
+cleanup() {
+    rm -f "$non_preview_before" "$non_preview_after"
+    rmdir "$temporary_directory" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+snapshot_non_preview_containers() {
+    output_file=$1
+    : >"$output_file"
+    for container_id in $(docker ps --no-trunc --all --quiet); do
+        compose_project=$(docker inspect --format \
+            '{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project"}}{{end}}' \
+            "$container_id") || fail "could not inspect container $container_id"
+        if test "$compose_project" = "$preview_project"; then
+            continue
+        fi
+        docker inspect --format \
+            '{{.Id}}|{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}' \
+            "$container_id" >>"$output_file" \
+            || fail "could not snapshot container $container_id"
+    done
+    sort "$output_file" -o "$output_file"
+}
+
+snapshot_non_preview_containers "$non_preview_before"
 
 docker compose --project-name "$preview_project" -f "$compose_file" up -d --build
 
-production_ids_after=$(docker compose ps -q | sort)
-test "$production_ids_before" = "$production_ids_after" \
-    || fail "the production compose container set changed during candidate deployment"
+snapshot_non_preview_containers "$non_preview_after"
+cmp -s "$non_preview_before" "$non_preview_after" \
+    || fail "a non-preview container changed during candidate deployment"
 
 sh "$repository_root/scripts/verify-rust-preview.sh"
 
-printf 'Production containers were unchanged. Candidate remains isolated and read-only.\n'
+printf 'All non-preview containers were unchanged. Candidate remains isolated and read-only.\n'

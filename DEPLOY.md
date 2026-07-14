@@ -98,7 +98,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 sh scripts/deploy-rust-preview.sh
 ```
 
-脚本会构建候选容器、确认生产 Compose 的容器 ID 没有变化，并调用 `scripts/verify-rust-preview.sh` 检查本机端口、非 root 用户、运行时文件、认证边界和关闭的交易写入开关。单独复核可执行：
+脚本会构建候选容器，比较启动前后除候选 Compose 项目外全部容器的 ID、状态、启动时间和重启次数，并调用 `scripts/verify-rust-preview.sh` 检查本机端口、非 root 用户、运行时文件、认证边界和关闭的交易写入开关。任何生产或旁路容器变化都会让部署失败，而候选项目自身的首次创建或更新不会被误判为生产变化。单独复核可执行：
 
 ```bash
 sh scripts/verify-rust-preview.sh
