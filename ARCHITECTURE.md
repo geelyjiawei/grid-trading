@@ -65,6 +65,16 @@ continues to return a read-only exchange snapshot for diagnosis, but sets
 repairs, places, or cancels an order. When trading is intentionally disabled,
 the absent runtime is reported as unconfigured rather than as a mismatch.
 
+Order recovery preserves one immutable exchange order ID from acknowledgement
+through terminal execution accounting. A terminal intent is durable evidence,
+not just a status label: it retains the authoritative exchange order ID even if
+the process crashes before strategy state is committed. Legacy terminal records
+without that ID remain readable for migration, but the runtime must
+authoritatively enrich them before it can account a fill or advance the grid.
+Every tick reconciles intents and executions before position comparison or new
+placement, so a crash cannot turn an accepted or filled order into a duplicate
+submission or an unbooked position change.
+
 ## Cutover gates
 
 The legacy production entrypoint may be replaced only when all of these are

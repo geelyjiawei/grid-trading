@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::{
     domain::{
         CancellationIntent, CancellationState, ClientOrderId, Exchange, GridConfig, IntentState,
+        TerminalOrderStatus,
     },
     engine::{
         ArmedStrategyLifecycle, ArmedStrategyState, CancellationResult, CancellationServiceError,
@@ -1152,14 +1153,42 @@ pub(crate) fn validate_cross_ledger_ownership(
         {
             return Err(RuntimeTickError::IntentLedgerMismatch);
         }
-        if let CancellationState::Resolved { status } = cancellation.state
-            && (!matches!(intent.state, IntentState::Terminal { status: order_status } if order_status == status)
-                || !matches!(order.tracking, StrategyOrderTracking::Intent { state: IntentState::Terminal { status: order_status } } if order_status == status))
-        {
-            return Err(RuntimeTickError::IntentLedgerMismatch);
+        if let CancellationState::Resolved { status } = cancellation.state {
+            let intent_matches = terminal_resolution_identity_matches(
+                &intent.state,
+                status,
+                &cancellation.exchange_order_id,
+            );
+            let strategy_matches = match &order.tracking {
+                StrategyOrderTracking::Intent { state } => terminal_resolution_identity_matches(
+                    state,
+                    status,
+                    &cancellation.exchange_order_id,
+                ),
+                _ => false,
+            };
+            if !intent_matches || !strategy_matches {
+                return Err(RuntimeTickError::IntentLedgerMismatch);
+            }
         }
     }
     Ok(())
+}
+
+fn terminal_resolution_identity_matches(
+    state: &IntentState,
+    status: TerminalOrderStatus,
+    exchange_order_id: &str,
+) -> bool {
+    match state {
+        IntentState::Terminal {
+            status: order_status,
+            exchange_order_id: recorded_id,
+        } if *order_status == status => recorded_id
+            .as_deref()
+            .is_none_or(|recorded_id| recorded_id == exchange_order_id),
+        _ => false,
+    }
 }
 
 fn validate_runtime_settings(
@@ -1251,7 +1280,7 @@ where
                     .intents
                     .get(&cancellation.client_order_id)
                     .and_then(|intent| match intent.state {
-                        IntentState::Terminal { status } => {
+                        IntentState::Terminal { status, .. } => {
                             Some((cancellation.client_order_id.clone(), status))
                         }
                         _ => None,
@@ -1686,6 +1715,43 @@ mod tests {
             discover_strategy_files, load_strategy_catalog,
         },
     };
+
+    #[test]
+    fn resolved_cancellation_accepts_only_exact_or_legacy_missing_terminal_identity() {
+        let exact = IntentState::Terminal {
+            status: TerminalOrderStatus::Cancelled,
+            exchange_order_id: Some("exchange-1".into()),
+        };
+        let legacy = IntentState::Terminal {
+            status: TerminalOrderStatus::Cancelled,
+            exchange_order_id: None,
+        };
+        let changed = IntentState::Terminal {
+            status: TerminalOrderStatus::Cancelled,
+            exchange_order_id: Some("exchange-2".into()),
+        };
+
+        assert!(terminal_resolution_identity_matches(
+            &exact,
+            TerminalOrderStatus::Cancelled,
+            "exchange-1",
+        ));
+        assert!(terminal_resolution_identity_matches(
+            &legacy,
+            TerminalOrderStatus::Cancelled,
+            "exchange-1",
+        ));
+        assert!(!terminal_resolution_identity_matches(
+            &changed,
+            TerminalOrderStatus::Cancelled,
+            "exchange-1",
+        ));
+        assert!(!terminal_resolution_identity_matches(
+            &exact,
+            TerminalOrderStatus::Filled,
+            "exchange-1",
+        ));
+    }
 
     #[derive(Clone)]
     struct MockGateway {
@@ -3648,6 +3714,132 @@ mod tests {
         assert!(!recovered.is_blocked());
         assert!(recovered.submissions.is_empty());
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_fill_after_failed_accept_commit_is_recovered_and_accounted() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut intent_store = MemoryOrderIntentStore::default();
+        intent_store.fail_on_write(2);
+        let mut runtime = runtime(gateway.clone(), intent_store, machine);
+
+        assert!(matches!(
+            runtime.tick(1_100).await,
+            Err(RuntimeTickError::Submission(SubmissionError::Persistence(
+                _
+            )))
+        ));
+        assert_eq!(gateway.placement_ids(), vec![opening_id.clone()]);
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(2, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+
+        let recovered = runtime.tick(1_200).await.unwrap();
+
+        assert!(!recovered.is_blocked());
+        assert_eq!(recovered.execution_syncs, 1);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            -opening_quantity
+        );
+        assert_eq!(
+            gateway
+                .placement_ids()
+                .iter()
+                .filter(|client_order_id| **client_order_id == opening_id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_identity_survives_a_second_crash_before_strategy_commit() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut intent_store = MemoryOrderIntentStore::default();
+        intent_store.fail_on_write(2);
+        let mut runtime = runtime(gateway.clone(), intent_store, machine);
+
+        assert!(runtime.tick(1_100).await.is_err());
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(2, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        runtime.machine_mut().store_mut().fail_next_write();
+
+        assert!(matches!(
+            runtime.tick(1_200).await,
+            Err(RuntimeTickError::Strategy(
+                StrategyMachineError::Persistence(_)
+            ))
+        ));
+        assert!(matches!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .get(&opening_id)
+                .unwrap()
+                .state,
+            IntentState::Terminal {
+                status: TerminalOrderStatus::Filled,
+                exchange_order_id: Some(_),
+            }
+        ));
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .orders
+                .get(&opening_id)
+                .unwrap()
+                .exchange_order_id
+                .is_none()
+        );
+
+        let recovered = runtime.tick(1_300).await.unwrap();
+
+        assert!(!recovered.is_blocked());
+        assert_eq!(recovered.execution_syncs, 1);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            -opening_quantity
+        );
+        assert_eq!(
+            gateway
+                .placement_ids()
+                .iter()
+                .filter(|client_order_id| **client_order_id == opening_id)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

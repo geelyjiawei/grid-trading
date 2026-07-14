@@ -33,6 +33,11 @@ the OpenAPI schema.
 - A cancelled order is not equivalent to a filled order.
 - Intent state is monotonic. Accepted or terminal orders can never regress to prepared
   or unknown states.
+- The authoritative exchange order ID is immutable after acceptance and remains part of
+  every terminal intent until cumulative execution accounting is durably committed.
+- A legacy terminal intent without an exchange order ID may be read for migration only.
+  It must be authoritatively re-queried and enriched with the exact matching identity and
+  status before strategy synchronization or execution accounting can advance.
 - A terminal exchange label without cumulative execution accounting remains unresolved
   and blocks final strategy shutdown.
 
@@ -188,6 +193,10 @@ the OpenAPI schema.
 - If the exchange accepts an order but either the intent ledger or strategy-state commit
   fails, the next tick performs authoritative client-ID reconciliation before submission.
   The immutable client order ID is never submitted a second time.
+- If recovery observes a terminal order before an accepted acknowledgement was committed,
+  the terminal ledger transition stores the exchange order ID before strategy state is
+  advanced. A second crash between those commits must still recover and account the same
+  order exactly once without resubmitting it.
 - Fresh exchange instrument rules must exactly match the rules that produced the durable
   plan. Any change fails the strategy before a new order is placed; an existing plan is
   never silently requantized under new rules.

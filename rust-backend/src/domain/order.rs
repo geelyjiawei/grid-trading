@@ -109,13 +109,23 @@ pub enum IntentState {
     },
     Terminal {
         status: TerminalOrderStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exchange_order_id: Option<String>,
     },
 }
 
 impl IntentState {
     pub fn validate(&self) -> Result<(), OrderIntentError> {
         let valid = match self {
-            Self::Prepared | Self::Terminal { .. } => true,
+            Self::Prepared
+            | Self::Terminal {
+                exchange_order_id: None,
+                ..
+            } => true,
+            Self::Terminal {
+                exchange_order_id: Some(exchange_order_id),
+                ..
+            } => !exchange_order_id.trim().is_empty(),
             Self::SubmitUnknown { message } | Self::OwnershipConflict { message } => {
                 !message.trim().is_empty()
             }
@@ -126,6 +136,17 @@ impl IntentState {
             Ok(())
         } else {
             Err(OrderIntentError::InvalidStateMetadata)
+        }
+    }
+
+    pub fn exchange_order_id(&self) -> Option<&str> {
+        match self {
+            Self::Accepted { exchange_order_id } => Some(exchange_order_id),
+            Self::Terminal {
+                exchange_order_id: Some(exchange_order_id),
+                ..
+            } => Some(exchange_order_id),
+            _ => None,
         }
     }
 }

@@ -131,8 +131,13 @@ pub fn resolve_cancellation_with<S: IntentStore>(
         .intents
         .get(client_order_id)
         .ok_or(CancellationServiceError::MissingOrderIntent)?;
-    if !matches!(order.state, IntentState::Terminal { status: order_status } if order_status == status)
-    {
+    if !matches!(
+        order.state,
+        IntentState::Terminal {
+            status: order_status,
+            exchange_order_id: Some(ref exchange_order_id),
+        } if order_status == status && exchange_order_id == &cancellation.exchange_order_id
+    ) {
         return Err(CancellationServiceError::InvalidResolution);
     }
     store.transition_cancellation(
@@ -185,16 +190,20 @@ pub enum CancellationServiceError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
 
     use async_trait::async_trait;
     use rust_decimal::Decimal;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::{
         domain::{Exchange, OrderIntent, OrderKind, OrderShape, OrderSide, TimeInForce},
         exchange::CancellationAcknowledgement,
-        persistence::MemoryOrderIntentStore,
+        persistence::{FileOrderIntentStore, MemoryOrderIntentStore},
     };
 
     type CancellationCalls = Arc<Mutex<Vec<(ClientOrderId, String)>>>;
@@ -426,6 +435,7 @@ mod tests {
                 &order.client_order_id,
                 IntentState::Terminal {
                     status: TerminalOrderStatus::Filled,
+                    exchange_order_id: Some("exchange-1".into()),
                 },
                 112,
             )
@@ -451,5 +461,41 @@ mod tests {
                 status: TerminalOrderStatus::Filled
             }
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_terminal_without_exchange_identity_cannot_resolve_cancellation() {
+        let (store, order) = accepted_store();
+        let mut snapshot = store.snapshot().clone();
+        snapshot
+            .intents
+            .get_mut(&order.client_order_id)
+            .unwrap()
+            .state = IntentState::Terminal {
+            status: TerminalOrderStatus::Cancelled,
+            exchange_order_id: None,
+        };
+        let mut cancellation = target(&order);
+        cancellation.state = CancellationState::Acknowledged;
+        cancellation.updated_at_ms = 111;
+        snapshot
+            .cancellations
+            .insert(order.client_order_id.clone(), cancellation);
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-cancellation-ledger.json");
+        fs::write(&path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+        let mut restored = FileOrderIntentStore::load(&path).unwrap();
+        let before = restored.snapshot().clone();
+
+        assert!(matches!(
+            resolve_cancellation_with(
+                &mut restored,
+                &order.client_order_id,
+                TerminalOrderStatus::Cancelled,
+                112,
+            ),
+            Err(CancellationServiceError::InvalidResolution)
+        ));
+        assert_eq!(restored.snapshot(), &before);
     }
 }

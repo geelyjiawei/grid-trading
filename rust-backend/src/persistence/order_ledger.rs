@@ -350,24 +350,42 @@ fn validate_snapshot(snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
 }
 
 fn validate_transition(current: &IntentState, next: &IntentState) -> Result<(), LedgerError> {
-    let allowed = matches!(
-        (current, next),
+    let allowed = match (current, next) {
         (
             IntentState::Prepared,
             IntentState::SubmitUnknown { .. }
-                | IntentState::Accepted { .. }
-                | IntentState::Rejected { .. }
-                | IntentState::OwnershipConflict { .. }
-        ) | (
+            | IntentState::Accepted { .. }
+            | IntentState::Rejected { .. }
+            | IntentState::OwnershipConflict { .. },
+        )
+        | (
             IntentState::SubmitUnknown { .. },
             IntentState::Accepted { .. }
-                | IntentState::Rejected { .. }
-                | IntentState::OwnershipConflict { .. }
-        ) | (
-            IntentState::Accepted { .. },
-            IntentState::Terminal { .. } | IntentState::OwnershipConflict { .. }
+            | IntentState::Rejected { .. }
+            | IntentState::OwnershipConflict { .. },
         )
-    );
+        | (IntentState::Accepted { .. }, IntentState::OwnershipConflict { .. }) => true,
+        (
+            IntentState::Accepted {
+                exchange_order_id: current_id,
+            },
+            IntentState::Terminal {
+                exchange_order_id: Some(next_id),
+                ..
+            },
+        ) => current_id == next_id,
+        (
+            IntentState::Terminal {
+                status: current_status,
+                exchange_order_id: None,
+            },
+            IntentState::Terminal {
+                status: next_status,
+                exchange_order_id: Some(exchange_order_id),
+            },
+        ) => current_status == next_status && !exchange_order_id.trim().is_empty(),
+        _ => false,
+    };
     if allowed {
         Ok(())
     } else {
@@ -598,6 +616,68 @@ mod tests {
 
         assert!(restored.snapshot().cancellations.is_empty());
         assert!(restored.snapshot().intents.is_empty());
+    }
+
+    #[test]
+    fn legacy_terminal_intent_without_exchange_id_remains_readable() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-terminal-ledger.json");
+        let mut order = intent("g_1_S_legacy_terminal");
+        order.state = IntentState::Terminal {
+            status: crate::domain::TerminalOrderStatus::Filled,
+            exchange_order_id: Some("exchange-1".into()),
+        };
+        order.updated_at_ms = 101;
+        let mut snapshot = LedgerSnapshot::default();
+        snapshot
+            .intents
+            .insert(order.client_order_id.clone(), order);
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value["intents"]["g_1_S_legacy_terminal"]["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("exchange_order_id");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let restored = FileOrderIntentStore::load(&path).unwrap();
+
+        assert!(matches!(
+            restored.snapshot().intents.values().next().unwrap().state,
+            IntentState::Terminal {
+                status: crate::domain::TerminalOrderStatus::Filled,
+                exchange_order_id: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_transition_cannot_change_the_exchange_order_identity() {
+        let mut store = MemoryOrderIntentStore::default();
+        let order = intent("g_1_S_terminal_identity");
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::Accepted {
+                    exchange_order_id: "exchange-1".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let before = store.snapshot().clone();
+
+        assert!(matches!(
+            store.transition(
+                &order.client_order_id,
+                IntentState::Terminal {
+                    status: crate::domain::TerminalOrderStatus::Filled,
+                    exchange_order_id: Some("exchange-2".into()),
+                },
+                102,
+            ),
+            Err(LedgerError::InvalidTransition)
+        ));
+        assert_eq!(store.snapshot(), &before);
     }
 
     #[test]

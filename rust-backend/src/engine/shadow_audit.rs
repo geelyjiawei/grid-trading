@@ -301,7 +301,7 @@ pub fn audit_strategy_shadow(
                         &mut summary.unexpected_order_count,
                     );
                 }
-                IntentState::Terminal { status } => {
+                IntentState::Terminal { status, .. } => {
                     if !order.terminal_processed {
                         summary.expected_authoritative_order_count += 1;
                         summary.terminal_accounting_pending_count += 1;
@@ -1206,15 +1206,14 @@ mod tests {
         let client_order_id = state.orders.keys().next().unwrap().clone();
         let (exchange_order_id, shape) = {
             let order = state.orders.get_mut(&client_order_id).unwrap();
+            let exchange_order_id = order.exchange_order_id.clone().unwrap();
             order.tracking = StrategyOrderTracking::Intent {
                 state: IntentState::Terminal {
                     status: TerminalOrderStatus::Cancelled,
+                    exchange_order_id: Some(exchange_order_id.clone()),
                 },
             };
-            (
-                order.exchange_order_id.clone().unwrap(),
-                order.shape.clone(),
-            )
+            (exchange_order_id, order.shape.clone())
         };
         let mut orders = observations(&state);
         orders.push(AuthoritativeOrder {

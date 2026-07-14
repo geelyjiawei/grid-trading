@@ -615,7 +615,10 @@ impl StrategyState {
             ) {
                 (
                     StrategyOrderTracking::Intent {
-                        state: IntentState::Terminal { status: tracked },
+                        state:
+                            IntentState::Terminal {
+                                status: tracked, ..
+                            },
                     },
                     Some(recorded),
                     true,
@@ -647,10 +650,9 @@ impl StrategyState {
             {
                 return Err(StrategyStateError::ExchangeOrderIdentityMismatch);
             }
-            if let StrategyOrderTracking::Intent {
-                state: IntentState::Accepted { exchange_order_id },
-            } = &order.tracking
-                && order.exchange_order_id.as_ref() != Some(exchange_order_id)
+            if let StrategyOrderTracking::Intent { state } = &order.tracking
+                && let Some(exchange_order_id) = state.exchange_order_id()
+                && order.exchange_order_id.as_deref() != Some(exchange_order_id)
             {
                 return Err(StrategyStateError::ExchangeOrderIdentityMismatch);
             }
@@ -1741,6 +1743,29 @@ fn synchronize_intent_state(state: &mut StrategyState, intent: &OrderIntent) -> 
         state.fail(message.clone());
         return StrategyTransition::Failed { message };
     }
+    let authoritative_exchange_order_id = intent.state.exchange_order_id().map(str::to_owned);
+    if let Some(exchange_order_id) = &authoritative_exchange_order_id
+        && order
+            .exchange_order_id
+            .as_ref()
+            .is_some_and(|current| current != exchange_order_id)
+    {
+        let message = "order intent exchange order identity changed".to_owned();
+        state.fail(message.clone());
+        return StrategyTransition::Failed { message };
+    }
+    if matches!(
+        intent.state,
+        IntentState::Terminal {
+            exchange_order_id: None,
+            ..
+        }
+    ) && order.exchange_order_id.is_none()
+    {
+        let message = "terminal order intent is missing its exchange order identity".to_owned();
+        state.fail(message.clone());
+        return StrategyTransition::Failed { message };
+    }
     let tracking = StrategyOrderTracking::Intent {
         state: intent.state.clone(),
     };
@@ -1758,8 +1783,8 @@ fn synchronize_intent_state(state: &mut StrategyState, intent: &OrderIntent) -> 
         return StrategyTransition::Failed { message };
     }
     order.tracking = tracking;
-    if let IntentState::Accepted { exchange_order_id } = &intent.state {
-        order.exchange_order_id = Some(exchange_order_id.clone());
+    if let Some(exchange_order_id) = authoritative_exchange_order_id {
+        order.exchange_order_id = Some(exchange_order_id);
     }
     if matches!(
         intent.state,
@@ -1779,26 +1804,42 @@ fn strategy_intent_transition_allowed(current: &StrategyOrderTracking, next: &In
     match current {
         StrategyOrderTracking::Ready => true,
         StrategyOrderTracking::Dormant => false,
-        StrategyOrderTracking::Intent { state: current } => matches!(
-            (current, next),
-            (
-                IntentState::Prepared,
-                IntentState::SubmitUnknown { .. }
-                    | IntentState::Accepted { .. }
-                    | IntentState::Rejected { .. }
-                    | IntentState::OwnershipConflict { .. }
-                    | IntentState::Terminal { .. }
-            ) | (
-                IntentState::SubmitUnknown { .. },
-                IntentState::Accepted { .. }
-                    | IntentState::Rejected { .. }
-                    | IntentState::OwnershipConflict { .. }
-                    | IntentState::Terminal { .. }
-            ) | (
-                IntentState::Accepted { .. },
-                IntentState::Terminal { .. } | IntentState::OwnershipConflict { .. }
-            )
-        ),
+        StrategyOrderTracking::Intent { state: current } => {
+            let ordinary_transition = matches!(
+                (current, next),
+                (
+                    IntentState::Prepared,
+                    IntentState::SubmitUnknown { .. }
+                        | IntentState::Accepted { .. }
+                        | IntentState::Rejected { .. }
+                        | IntentState::OwnershipConflict { .. }
+                        | IntentState::Terminal { .. }
+                ) | (
+                    IntentState::SubmitUnknown { .. },
+                    IntentState::Accepted { .. }
+                        | IntentState::Rejected { .. }
+                        | IntentState::OwnershipConflict { .. }
+                        | IntentState::Terminal { .. }
+                ) | (
+                    IntentState::Accepted { .. },
+                    IntentState::Terminal { .. } | IntentState::OwnershipConflict { .. }
+                )
+            );
+            let legacy_terminal_enrichment = matches!(
+                (current, next),
+                (
+                    IntentState::Terminal {
+                        status: current_status,
+                        exchange_order_id: None,
+                    },
+                    IntentState::Terminal {
+                        status: next_status,
+                        exchange_order_id: Some(_),
+                    }
+                ) if current_status == next_status
+            );
+            ordinary_transition || legacy_terminal_enrichment
+        }
     }
 }
 
@@ -1901,7 +1942,10 @@ fn apply_execution_report(
             order.terminal_status = Some(status);
             order.terminal_processed = true;
             order.tracking = StrategyOrderTracking::Intent {
-                state: IntentState::Terminal { status },
+                state: IntentState::Terminal {
+                    status,
+                    exchange_order_id: Some(report.exchange_order_id.clone()),
+                },
             };
         } else {
             order.tracking = StrategyOrderTracking::Intent {
@@ -2532,7 +2576,7 @@ fn deployment_order_is_represented(
             state: IntentState::Accepted { .. },
         } => true,
         StrategyOrderTracking::Intent {
-            state: IntentState::Terminal { status },
+            state: IntentState::Terminal { status, .. },
         } if order.terminal_processed
             && order.terminal_status == Some(*status)
             && *status != TerminalOrderStatus::Rejected =>
@@ -4529,6 +4573,7 @@ mod tests {
             .unwrap();
         intent.state = IntentState::Terminal {
             status: TerminalOrderStatus::Filled,
+            exchange_order_id: Some("terminal-order".into()),
         };
         machine.synchronize_intent(&intent, 111).unwrap();
         machine.request_stop(112).unwrap();
@@ -4679,6 +4724,7 @@ mod tests {
             .unwrap();
         intent.state = IntentState::Terminal {
             status: TerminalOrderStatus::Filled,
+            exchange_order_id: Some("terminal-regression".into()),
         };
         machine.synchronize_intent(&intent, 111).unwrap();
 

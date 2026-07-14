@@ -70,9 +70,13 @@ where
 
     if matches!(
         intent.state,
-        IntentState::Rejected { .. }
-            | IntentState::OwnershipConflict { .. }
-            | IntentState::Terminal { .. }
+        IntentState::Rejected { .. } | IntentState::OwnershipConflict { .. }
+    ) || matches!(
+        intent.state,
+        IntentState::Terminal {
+            exchange_order_id: Some(_),
+            ..
+        }
     ) {
         return Ok(ReconciliationResult::AlreadyFinal);
     }
@@ -124,6 +128,9 @@ fn reconcile_found<S: IntentStore>(
     now_ms: u64,
 ) -> Result<ReconciliationResult, ReconciliationError> {
     if let Some(message) = ownership_conflict(&intent, &snapshot) {
+        if matches!(intent.state, IntentState::Terminal { .. }) {
+            return Ok(ReconciliationResult::OwnershipConflict { message });
+        }
         store.transition(
             &intent.client_order_id,
             IntentState::OwnershipConflict {
@@ -135,6 +142,34 @@ fn reconcile_found<S: IntentStore>(
     }
 
     let exchange_order_id = snapshot.exchange_order_id;
+    if let IntentState::Terminal {
+        status: persisted_status,
+        exchange_order_id: None,
+    } = intent.state
+    {
+        let OrderLifecycle::Terminal(authoritative_status) = snapshot.lifecycle else {
+            return Ok(ReconciliationResult::OwnershipConflict {
+                message: "legacy terminal intent regressed to an active exchange order".into(),
+            });
+        };
+        if persisted_status != authoritative_status {
+            return Ok(ReconciliationResult::OwnershipConflict {
+                message: "legacy terminal intent status differs from the exchange".into(),
+            });
+        }
+        store.transition(
+            &intent.client_order_id,
+            IntentState::Terminal {
+                status: authoritative_status,
+                exchange_order_id: Some(exchange_order_id.clone()),
+            },
+            now_ms,
+        )?;
+        return Ok(ReconciliationResult::Terminal {
+            exchange_order_id,
+            status: authoritative_status,
+        });
+    }
     if !matches!(intent.state, IntentState::Accepted { .. }) {
         store.transition(
             &intent.client_order_id,
@@ -150,7 +185,10 @@ fn reconcile_found<S: IntentStore>(
         OrderLifecycle::Terminal(status) => {
             store.transition(
                 &intent.client_order_id,
-                IntentState::Terminal { status },
+                IntentState::Terminal {
+                    status,
+                    exchange_order_id: Some(exchange_order_id.clone()),
+                },
                 now_ms,
             )?;
             Ok(ReconciliationResult::Terminal {
@@ -174,8 +212,8 @@ fn ownership_conflict(intent: &OrderIntent, snapshot: &AuthoritativeOrder) -> Op
     if snapshot.shape != intent.shape {
         return Some("exchange order shape does not match the persisted intent".into());
     }
-    if let IntentState::Accepted { exchange_order_id } = &intent.state
-        && exchange_order_id != &snapshot.exchange_order_id
+    if let Some(exchange_order_id) = intent.state.exchange_order_id()
+        && exchange_order_id != snapshot.exchange_order_id
     {
         return Some("exchange order ID changed after acceptance".into());
     }
@@ -190,16 +228,20 @@ pub enum ReconciliationError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
 
     use async_trait::async_trait;
     use rust_decimal::Decimal;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::{
         domain::{Exchange, OrderKind, OrderShape, OrderSide, TimeInForce},
         exchange::{ActiveOrderStatus, LookupError},
-        persistence::MemoryOrderIntentStore,
+        persistence::{FileOrderIntentStore, LedgerSnapshot, MemoryOrderIntentStore},
     };
 
     struct FakeLookupGateway {
@@ -338,7 +380,8 @@ mod tests {
                 .unwrap()
                 .state,
             IntentState::Terminal {
-                status: TerminalOrderStatus::Filled
+                status: TerminalOrderStatus::Filled,
+                exchange_order_id: Some("exchange-123".into()),
             }
         );
         assert_eq!(service.store().snapshot().revision, 3);
@@ -473,5 +516,72 @@ mod tests {
                 exchange_order_id: "exchange-123".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_terminal_without_exchange_id_is_authoritatively_enriched() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-terminal-ledger.json");
+        let mut order = intent("g_0_B_legacyterminal");
+        order.state = IntentState::Terminal {
+            status: TerminalOrderStatus::Filled,
+            exchange_order_id: None,
+        };
+        order.updated_at_ms = 101;
+        let mut snapshot = LedgerSnapshot {
+            revision: 1,
+            ..LedgerSnapshot::default()
+        };
+        snapshot
+            .intents
+            .insert(order.client_order_id.clone(), order.clone());
+        fs::write(&path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+        let gateway = FakeLookupGateway {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            result: Ok(found(
+                &order,
+                OrderLifecycle::Terminal(TerminalOrderStatus::Filled),
+            )),
+        };
+        let mut service =
+            ReconciliationService::new(gateway, FileOrderIntentStore::load(&path).unwrap());
+
+        assert_eq!(
+            service
+                .reconcile(&order.client_order_id, 102)
+                .await
+                .unwrap(),
+            ReconciliationResult::Terminal {
+                exchange_order_id: "exchange-123".into(),
+                status: TerminalOrderStatus::Filled,
+            }
+        );
+        assert!(matches!(
+            service
+                .store()
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::Terminal {
+                status: TerminalOrderStatus::Filled,
+                exchange_order_id: Some(ref exchange_order_id),
+            } if exchange_order_id == "exchange-123"
+        ));
+        drop(service);
+        assert!(matches!(
+            FileOrderIntentStore::load(&path)
+                .unwrap()
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::Terminal {
+                exchange_order_id: Some(_),
+                ..
+            }
+        ));
     }
 }
