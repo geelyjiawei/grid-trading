@@ -11,7 +11,7 @@ use crate::domain::{
 use crate::exchange::{OrderLifecycle, is_valid_trade_id};
 
 use super::{
-    GridOrderRole, GridPlan, PlannedGridOrder,
+    GridOrderRole, GridPlan, GridPlanError, PlannedGridOrder,
     execution_accounting::{ExecutionAuditRecord, FeeValuationSource, ValuedExecutionReport},
 };
 
@@ -315,6 +315,8 @@ impl StrategyState {
         validate_symbol(&symbol)?;
         baseline.validate()?;
         baseline.validate_for_direction(direction)?;
+        plan.validate_snapshot(&config, &instrument_rules)
+            .map_err(StrategyStateError::InvalidPlan)?;
         validate_risk_prices(&config, plan.reference_price)?;
         match (config.trigger_price, trigger_activation) {
             (None, None) => {}
@@ -323,10 +325,6 @@ impl StrategyState {
                     && activation.observed_price > Decimal::ZERO => {}
             _ => return Err(StrategyStateError::InvalidTriggerActivation),
         }
-        if plan.grid_orders.is_empty() || plan.participating_level_count == 0 {
-            return Err(StrategyStateError::InvalidPlan);
-        }
-
         let lifecycle = if plan.opening_order.is_some() {
             StrategyLifecycle::AwaitingOpening
         } else {
@@ -524,6 +522,9 @@ impl StrategyState {
         }
         self.baseline.validate()?;
         self.baseline.validate_for_direction(self.direction)?;
+        self.plan
+            .validate_snapshot(&self.config, &self.instrument_rules)
+            .map_err(StrategyStateError::InvalidPlan)?;
         validate_risk_prices(&self.config, self.plan.reference_price)?;
         if self
             .risk_trigger_mark_price
@@ -559,9 +560,6 @@ impl StrategyState {
         }
         if self.updated_at_ms < self.created_at_ms {
             return Err(StrategyStateError::TimestampRegression);
-        }
-        if self.plan.grid_orders.is_empty() || self.plan.participating_level_count == 0 {
-            return Err(StrategyStateError::InvalidPlan);
         }
         match self.direction {
             Direction::Long if self.grid_position_net_quantity < Decimal::ZERO => {
@@ -3040,8 +3038,8 @@ pub enum StrategyStateError {
     InvalidMarketPrice,
     #[error("grid-owned risk close quantity cannot be represented by market rules")]
     RiskCloseQuantityInvalid,
-    #[error("strategy plan is empty or incomplete")]
-    InvalidPlan,
+    #[error("strategy plan failed deterministic validation: {0}")]
+    InvalidPlan(GridPlanError),
     #[error("initial grid order ledger does not exactly match the immutable grid plan")]
     InitialGridOrderMismatch,
     #[error("initial grid deployment flag does not match the strategy lifecycle")]
@@ -5153,6 +5151,72 @@ mod tests {
             assert_eq!(
                 corrupted.validate(),
                 Err(StrategyStateError::InitialGridOrderMismatch),
+                "{label} drift must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinated_plan_and_initial_ledger_drift_is_rejected_before_restart() {
+        let original = state(Direction::Short, PositionBaseline::flat());
+        let quantity_step = original.instrument_rules.limit_quantity.step;
+        let mut coordinated_quantity = original.clone();
+        let planned = coordinated_quantity
+            .plan
+            .grid_orders
+            .iter_mut()
+            .find(|order| order.role == GridOrderRole::Add)
+            .unwrap();
+        planned.quantity += quantity_step;
+        let changed_level = planned.level_index;
+        coordinated_quantity
+            .orders
+            .values_mut()
+            .find(|order| {
+                matches!(
+                    order.purpose,
+                    StrategyOrderPurpose::InitialGrid {
+                        level_index,
+                        role: GridOrderRole::Add,
+                    } if level_index == changed_level
+                )
+            })
+            .unwrap()
+            .shape
+            .quantity += quantity_step;
+
+        let mut raw_levels = original.clone();
+        raw_levels.plan.raw_levels[1] += Decimal::new(1, 1);
+
+        let mut normalized_levels = original.clone();
+        normalized_levels.plan.levels[1] += normalized_levels.instrument_rules.tick_size;
+
+        let mut active_count = original.clone();
+        active_count.plan.active_grid_count += 1;
+
+        let mut participating_count = original.clone();
+        participating_count.plan.participating_level_count -= 1;
+
+        let mut total_quantity = original.clone();
+        total_quantity.plan.total_quantity += quantity_step;
+
+        let mut reference_price = original;
+        reference_price.plan.reference_price += reference_price.instrument_rules.tick_size;
+
+        for (label, corrupted) in [
+            ("coordinated quantity", coordinated_quantity),
+            ("raw levels", raw_levels),
+            ("normalized levels", normalized_levels),
+            ("active count", active_count),
+            ("participating count", participating_count),
+            ("total quantity", total_quantity),
+            ("reference price", reference_price),
+        ] {
+            assert_eq!(
+                corrupted.validate(),
+                Err(StrategyStateError::InvalidPlan(
+                    GridPlanError::PlanSnapshotMismatch
+                )),
                 "{label} drift must fail closed"
             );
         }

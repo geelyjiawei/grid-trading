@@ -54,6 +54,62 @@ pub struct GridPlan {
     pub grid_orders: Vec<PlannedGridOrder>,
 }
 
+impl GridPlan {
+    pub(super) fn validate_snapshot(
+        &self,
+        config: &GridConfig,
+        rules: &InstrumentRules,
+    ) -> Result<(), GridPlanError> {
+        config.validate()?;
+        rules.validate()?;
+        if config.direction != Direction::Neutral
+            && config.initial_order_type != InitialOrderType::Market
+            && rules.floor_price(self.reference_price) != Some(self.reference_price)
+        {
+            return Err(GridPlanError::PlanSnapshotMismatch);
+        }
+        if config.direction != Direction::Neutral
+            && config.initial_order_type == InitialOrderType::Limit
+            && config
+                .initial_order_price
+                .is_some_and(|price| rules.floor_price(price) != Some(self.reference_price))
+        {
+            return Err(GridPlanError::PlanSnapshotMismatch);
+        }
+
+        // The original market mark is intentionally not persisted. Rebuilding
+        // with zero minimum notional reproduces every deterministic plan field;
+        // the actual limit legs are checked against the persisted rules below.
+        let mut structural_rules = rules.clone();
+        structural_rules.min_notional = Decimal::ZERO;
+        let replay_market = MarketSnapshot {
+            last_price: self.reference_price,
+            mark_price: self.reference_price,
+        };
+        let expected = build_grid_plan_at_reference(
+            config,
+            &replay_market,
+            &structural_rules,
+            self.reference_price,
+        )?;
+        if expected != *self {
+            return Err(GridPlanError::PlanSnapshotMismatch);
+        }
+        validate_grid_orders(config, rules, &self.levels, &self.grid_orders)?;
+        if config.direction != Direction::Neutral
+            && config.initial_order_type != InitialOrderType::Market
+        {
+            validate_notional(
+                None,
+                self.reference_price,
+                self.total_quantity,
+                rules.min_notional,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Target {
     level_index: u16,
@@ -71,9 +127,18 @@ pub fn build_grid_plan(
     rules.validate()?;
     validate_market(market)?;
 
+    let reference_price = reference_price(config, market, rules)?;
+    build_grid_plan_at_reference(config, market, rules, reference_price)
+}
+
+fn build_grid_plan_at_reference(
+    config: &GridConfig,
+    market: &MarketSnapshot,
+    rules: &InstrumentRules,
+    reference_price: Decimal,
+) -> Result<GridPlan, GridPlanError> {
     let raw_levels = calculate_levels(config)?;
     let levels = normalize_levels(&raw_levels, rules)?;
-    let reference_price = reference_price(config, market, rules)?;
     if reference_price <= levels[0] || reference_price >= levels[levels.len() - 1] {
         return Err(GridPlanError::ReferenceOutsideRange);
     }
@@ -640,6 +705,8 @@ pub enum GridPlanError {
     IncompleteGridCoverage,
     #[error("planned owned order quantity does not equal the opening or neutral allocation")]
     PlanQuantityMismatch,
+    #[error("persisted grid plan does not match its deterministic configuration snapshot")]
+    PlanSnapshotMismatch,
     #[error("numeric overflow while calculating {0}")]
     NumericOverflow(&'static str),
 }
@@ -699,6 +766,57 @@ mod tests {
         MarketSnapshot {
             last_price: last,
             mark_price: last,
+        }
+    }
+
+    #[test]
+    fn every_supported_plan_shape_passes_deterministic_snapshot_validation() {
+        let mut post_only = fixed_config(Direction::Short);
+        post_only.initial_order_type = InitialOrderType::PostOnly;
+
+        let mut market_open = fixed_config(Direction::Long);
+        market_open.initial_order_type = InitialOrderType::Market;
+        market_open.initial_order_price = None;
+
+        let mut neutral = fixed_config(Direction::Neutral);
+        neutral.initial_order_price = None;
+
+        let mut investment = fixed_config(Direction::Short);
+        investment.position_sizing_mode = PositionSizingMode::Investment;
+        investment.total_investment = decimal(500);
+        investment.grid_order_qty = None;
+        investment.initial_order_type = InitialOrderType::Market;
+        investment.initial_order_price = None;
+
+        let mut geometric = fixed_config(Direction::Long);
+        geometric.grid_mode = GridMode::Geometric;
+
+        for (label, config, snapshot) in [
+            (
+                "regular limit",
+                fixed_config(Direction::Long),
+                market(decimal(1012)),
+            ),
+            ("post only", post_only, market(decimal(1014))),
+            (
+                "unaligned market reference",
+                market_open,
+                market(Decimal::new(101337, 2)),
+            ),
+            ("neutral", neutral, market(Decimal::new(101237, 2))),
+            (
+                "investment market",
+                investment,
+                market(Decimal::new(10123, 1)),
+            ),
+            ("geometric", geometric, market(decimal(1012))),
+        ] {
+            let plan = build_grid_plan(&config, &snapshot, &rules()).unwrap();
+            assert_eq!(
+                plan.validate_snapshot(&config, &rules()),
+                Ok(()),
+                "{label} plan must round-trip"
+            );
         }
     }
 
