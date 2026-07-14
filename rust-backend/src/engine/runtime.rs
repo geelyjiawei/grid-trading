@@ -1354,13 +1354,13 @@ where
             .store()
             .snapshot()
             .expected_exchange_position()?;
-        if inputs.baseline.signed_quantity != expected_position {
+        if inputs.position.signed_quantity != expected_position {
             report.blockers.push(RuntimeBlocker {
                 stage: RuntimeStage::PositionReconciliation,
                 client_order_id: None,
                 message: format!(
                     "position snapshot is not yet consistent with execution accounting: expected {expected_position}, actual {}",
-                    inputs.baseline.signed_quantity
+                    inputs.position.signed_quantity
                 ),
             });
             return Ok(report);
@@ -1600,13 +1600,13 @@ where
             .store()
             .snapshot()
             .expected_exchange_position()?;
-        if inputs.baseline.signed_quantity != expected_position {
+        if inputs.position.signed_quantity != expected_position {
             report.blockers.push(RuntimeBlocker {
                 stage: RuntimeStage::PositionReconciliation,
                 client_order_id: None,
                 message: format!(
                     "exit position snapshot is not yet consistent with execution accounting: expected {expected_position}, actual {}",
-                    inputs.baseline.signed_quantity
+                    inputs.position.signed_quantity
                 ),
             });
             return Ok(report);
@@ -1618,7 +1618,7 @@ where
             }
             StrategyLifecycle::RiskExitRequested => {
                 let transition = self.machine.prepare_risk_close(
-                    inputs.baseline.signed_quantity,
+                    inputs.position.signed_quantity,
                     &inputs.instrument_rules,
                     now_ms,
                 )?;

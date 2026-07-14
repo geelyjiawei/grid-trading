@@ -2900,6 +2900,55 @@ mod tests {
         }
     }
 
+    fn complete_initial_deployment(
+        machine: &mut StrategyMachine<MemoryStrategyStateStore>,
+        now_ms: u64,
+    ) {
+        let opening = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| order.purpose == StrategyOrderPurpose::Opening)
+            .map(|order| (order.client_order_id.clone(), order.shape.clone()));
+        if let Some((client_order_id, shape)) = opening {
+            let fill_price = shape
+                .price
+                .unwrap_or(machine.store().snapshot().plan.reference_price);
+            machine
+                .apply_execution(
+                    &report(
+                        client_order_id,
+                        "opening-complete",
+                        shape.quantity,
+                        fill_price.checked_mul(shape.quantity).unwrap(),
+                        Some(TerminalOrderStatus::Filled),
+                    ),
+                    now_ms,
+                )
+                .unwrap();
+        }
+
+        let intents = machine
+            .store()
+            .snapshot()
+            .ready_intents(now_ms + 1)
+            .unwrap();
+        for (index, mut intent) in intents.into_iter().enumerate() {
+            intent.state = IntentState::Accepted {
+                exchange_order_id: format!("initial-boundary-{index}"),
+            };
+            machine
+                .synchronize_intent(&intent, now_ms + 2 + index as u64)
+                .unwrap();
+        }
+        assert_eq!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
+        assert!(machine.store().snapshot().initial_deployment_complete);
+    }
+
     fn short_machine_with_opening() -> StrategyMachine<MemoryStrategyStateStore> {
         let baseline = PositionBaseline {
             signed_quantity: decimal(-3),
@@ -3256,6 +3305,37 @@ mod tests {
             machine.store().snapshot().lifecycle,
             StrategyLifecycle::AwaitingOpening
         );
+    }
+
+    #[test]
+    fn running_strategies_with_baselines_ignore_both_grid_boundaries_without_risk_prices() {
+        for direction in [Direction::Long, Direction::Short, Direction::Neutral] {
+            let baseline = match direction {
+                Direction::Long => PositionBaseline {
+                    signed_quantity: decimal(3),
+                    entry_price: Some(decimal(1005)),
+                },
+                Direction::Short => PositionBaseline {
+                    signed_quantity: decimal(-3),
+                    entry_price: Some(decimal(1015)),
+                },
+                Direction::Neutral => PositionBaseline::flat(),
+            };
+            let mut machine =
+                StrategyMachine::new(MemoryStrategyStateStore::new(state(direction, baseline)));
+            complete_initial_deployment(&mut machine, 200);
+
+            let before = machine.store().snapshot().clone();
+            assert!(before.config.stop_loss_price.is_none());
+            assert!(before.config.take_profit_price.is_none());
+            for mark_price in [decimal(900), decimal(1100)] {
+                assert_eq!(
+                    machine.evaluate_risk_price(mark_price, 300).unwrap(),
+                    StrategyTransition::NoChange
+                );
+                assert_eq!(machine.store().snapshot(), &before);
+            }
+        }
     }
 
     #[test]

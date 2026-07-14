@@ -15,7 +15,9 @@ pub struct AuthoritativeStrategyInputs {
     pub symbol: String,
     pub market: MarketSnapshot,
     pub instrument_rules: InstrumentRules,
-    pub baseline: PositionBaseline,
+    /// The current authoritative exchange position. It becomes the immutable
+    /// baseline only while a new strategy is being activated.
+    pub position: PositionBaseline,
 }
 
 pub struct StrategyInputService<G> {
@@ -103,7 +105,7 @@ where
         .validate()
         .map_err(|error| StrategyInputError::InvalidInstrument(error.to_string()))?;
     let (signed_quantity, entry_price) = position.one_way_position()?;
-    let baseline = PositionBaseline::from_authoritative_position(signed_quantity, entry_price)?;
+    let position = PositionBaseline::from_authoritative_position(signed_quantity, entry_price)?;
 
     Ok(AuthoritativeStrategyInputs {
         exchange,
@@ -113,7 +115,7 @@ where
             mark_price: market.mark_price,
         },
         instrument_rules,
-        baseline,
+        position,
     })
 }
 
@@ -239,8 +241,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(inputs.symbol, "MUUSDT");
-        assert_eq!(inputs.baseline.signed_quantity, Decimal::new(-3, 0));
-        assert_eq!(inputs.baseline.entry_price, Some(Decimal::new(101125, 2)));
+        assert_eq!(inputs.position.signed_quantity, Decimal::new(-3, 0));
+        assert_eq!(inputs.position.entry_price, Some(Decimal::new(101125, 2)));
         assert_eq!(inputs.market.mark_price, Decimal::new(1010, 0));
         assert_eq!(inputs.instrument_rules, rules());
     }

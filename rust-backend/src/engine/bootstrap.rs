@@ -154,7 +154,7 @@ where
                 authoritative.config,
                 &inputs.market,
                 inputs.instrument_rules,
-                inputs.baseline,
+                inputs.position,
                 now_ms,
             )
             .map_err(StrategyBootstrapError::from);
@@ -170,7 +170,7 @@ where
         authoritative.config,
         inputs.instrument_rules,
         plan,
-        inputs.baseline,
+        inputs.position,
         now_ms,
     )
     .map_err(StrategyBootstrapError::from)
