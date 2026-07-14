@@ -835,6 +835,7 @@ impl StrategyState {
             }
         }
         validate_replacement_obligation_ledger(self)?;
+        validate_aggregate_accounting(self)?;
         self.expected_exchange_position()?;
         Ok(())
     }
@@ -1297,6 +1298,106 @@ fn validate_replacement_obligation_ledger(state: &StrategyState) -> Result<(), S
         ) {
             return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
         }
+    }
+    Ok(())
+}
+
+fn validate_aggregate_accounting(state: &StrategyState) -> Result<(), StrategyStateError> {
+    let mut expected_volume = Decimal::ZERO;
+    let mut expected_fee = Decimal::ZERO;
+    let mut buy_quote = Decimal::ZERO;
+    let mut sell_quote = Decimal::ZERO;
+    let mut expected_grid_position = Decimal::ZERO;
+    let mut expected_completed_pairs = 0_u64;
+
+    for order in state.orders.values() {
+        expected_volume = expected_volume.checked_add(order.cumulative_quote).ok_or(
+            StrategyStateError::NumericOverflow("aggregate trade volume"),
+        )?;
+        expected_fee = expected_fee
+            .checked_add(order.cumulative_fee)
+            .ok_or(StrategyStateError::NumericOverflow("aggregate trade fee"))?;
+        match order.shape.side {
+            OrderSide::Buy => {
+                expected_grid_position = expected_grid_position
+                    .checked_add(order.cumulative_quantity)
+                    .ok_or(StrategyStateError::NumericOverflow(
+                        "aggregate buy quantity",
+                    ))?;
+                buy_quote = buy_quote
+                    .checked_add(order.cumulative_quote)
+                    .ok_or(StrategyStateError::NumericOverflow("aggregate buy quote"))?;
+            }
+            OrderSide::Sell => {
+                expected_grid_position = expected_grid_position
+                    .checked_sub(order.cumulative_quantity)
+                    .ok_or(StrategyStateError::NumericOverflow(
+                        "aggregate sell quantity",
+                    ))?;
+                sell_quote = sell_quote
+                    .checked_add(order.cumulative_quote)
+                    .ok_or(StrategyStateError::NumericOverflow("aggregate sell quote"))?;
+            }
+        }
+
+        let should_count_completed_pair = !matches!(
+            order.purpose,
+            StrategyOrderPurpose::Opening | StrategyOrderPurpose::RiskClose
+        ) && order.shape.reduce_only
+            && order.terminal_status.is_some()
+            && order.cumulative_quantity > Decimal::ZERO;
+        if order.completed_pair_counted != should_count_completed_pair {
+            return Err(StrategyStateError::AggregateAccountingMismatch);
+        }
+        if should_count_completed_pair {
+            expected_completed_pairs = expected_completed_pairs.checked_add(1).ok_or(
+                StrategyStateError::NumericOverflow("aggregate completed pairs"),
+            )?;
+        }
+    }
+
+    if expected_volume != state.total_volume
+        || expected_fee != state.total_fee
+        || expected_completed_pairs != state.completed_pairs
+        || expected_grid_position != state.grid_position_net_quantity
+    {
+        return Err(StrategyStateError::AggregateAccountingMismatch);
+    }
+
+    let remaining_entry_value = if state.direction == Direction::Neutral {
+        state
+            .neutral_lots
+            .values()
+            .map(|lot| lot.entry_value)
+            .try_fold(Decimal::ZERO, |total, value| total.checked_add(value))
+    } else {
+        state
+            .lots_by_level
+            .values()
+            .map(|lot| lot.entry_value)
+            .try_fold(Decimal::ZERO, |total, value| total.checked_add(value))
+    }
+    .ok_or(StrategyStateError::NumericOverflow(
+        "aggregate remaining entry value",
+    ))?;
+    let cash_flow =
+        sell_quote
+            .checked_sub(buy_quote)
+            .ok_or(StrategyStateError::NumericOverflow(
+                "aggregate execution cash flow",
+            ))?;
+    let expected_gross_profit = if state.grid_position_net_quantity > Decimal::ZERO {
+        cash_flow.checked_add(remaining_entry_value)
+    } else if state.grid_position_net_quantity < Decimal::ZERO {
+        cash_flow.checked_sub(remaining_entry_value)
+    } else {
+        Some(cash_flow)
+    }
+    .ok_or(StrategyStateError::NumericOverflow(
+        "aggregate gross realized profit",
+    ))?;
+    if expected_gross_profit != state.gross_realized_profit {
+        return Err(StrategyStateError::AggregateAccountingMismatch);
     }
     Ok(())
 }
@@ -3279,6 +3380,8 @@ pub enum StrategyStateError {
     OrderViolatesInstrumentRules,
     #[error("strategy execution totals are invalid")]
     InvalidExecutionTotals,
+    #[error("strategy aggregate accounting does not match its durable order ledger")]
+    AggregateAccountingMismatch,
     #[error("opening execution totals do not match the durable opening ledger")]
     OpeningAccountingMismatch,
     #[error("opening order chain does not match the immutable opening plan")]
@@ -4941,6 +5044,65 @@ mod tests {
     }
 
     #[test]
+    fn persisted_aggregate_accounting_drift_is_rejected() {
+        let mut machine = short_machine_with_opening();
+        let reduce = grid_id(machine.store().snapshot(), 13, OrderSide::Buy, true);
+        machine
+            .apply_execution(
+                &report(
+                    reduce,
+                    "reduce-13",
+                    Decimal::new(2, 1),
+                    Decimal::new(2026, 1),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                110,
+            )
+            .unwrap();
+        let valid = machine.store().snapshot().clone();
+
+        type StateMutation = Box<dyn Fn(&mut StrategyState)>;
+        let mut mutations: Vec<StateMutation> = vec![
+            Box::new(|state| state.total_volume += Decimal::ONE),
+            Box::new(|state| state.total_fee += Decimal::ONE),
+            Box::new(|state| state.gross_realized_profit += Decimal::ONE),
+            Box::new(|state| state.completed_pairs += 1),
+            Box::new(|state| {
+                let lot = state.lots_by_level.values_mut().next().unwrap();
+                let extra_quantity = Decimal::new(1, 1);
+                let extra_entry_value = lot
+                    .entry_value
+                    .checked_div(lot.quantity)
+                    .unwrap()
+                    .checked_mul(extra_quantity)
+                    .unwrap();
+                lot.quantity += extra_quantity;
+                lot.entry_value += extra_entry_value;
+                state.grid_position_net_quantity -= extra_quantity;
+                state.gross_realized_profit -= extra_entry_value;
+            }),
+            Box::new(|state| {
+                state
+                    .orders
+                    .values_mut()
+                    .find(|order| order.completed_pair_counted)
+                    .unwrap()
+                    .completed_pair_counted = false;
+                state.completed_pairs = 0;
+            }),
+        ];
+
+        for mutate in mutations.drain(..) {
+            let mut drifted = valid.clone();
+            mutate(&mut drifted);
+            assert_eq!(
+                drifted.validate(),
+                Err(StrategyStateError::AggregateAccountingMismatch)
+            );
+        }
+    }
+
+    #[test]
     fn partial_cancel_records_fill_counter_and_exact_unfilled_restoration() {
         let mut machine = short_machine_with_opening();
         let add = grid_id(machine.store().snapshot(), 14, OrderSide::Sell, false);
@@ -5280,7 +5442,6 @@ mod tests {
                 .checked_add(apply_neutral_fill(&mut state, side, quantity, value).unwrap())
                 .unwrap();
 
-            state.validate().unwrap();
             assert_eq!(
                 state
                     .neutral_lots

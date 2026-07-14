@@ -2692,13 +2692,13 @@ mod tests {
         domain::{
             ClientOrderId, Direction, GridConfig, GridMode, InitialOrderType, InstrumentRules,
             IntentState, OrderIntent, OrderKind, OrderShape, PositionSizingMode, QuantityRules,
-            TimeInForce,
+            TerminalOrderStatus, TimeInForce,
         },
         engine::{
-            ArmedStrategyState, ExecutionAuditRecord, FeeValuation, MarketSnapshot, NeutralLot,
-            PositionBaseline, RuntimeRecoveryProvider, RuntimeSettings, StrategyLifecycle,
-            StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateStore,
-            build_grid_plan,
+            ArmedStrategyState, ExecutionAuditRecord, ExecutionReport, FeeValuation,
+            MarketSnapshot, PositionBaseline, RuntimeRecoveryProvider, RuntimeSettings,
+            StrategyLifecycle, StrategyMachine, StrategyOrderTracking, StrategyRunId,
+            StrategyState, StrategyStateStore, build_grid_plan,
         },
         exchange::{
             AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
@@ -3886,29 +3886,91 @@ mod tests {
     async fn active_strategy_risk_values_only_grid_owned_inventory_at_the_live_mark() {
         let directory = tempdir().unwrap();
         let strategy_root = directory.path().join("strategies");
-        let (mut strategy, mut gateway) = persist_clean_running_strategy(&strategy_root);
-        strategy.grid_position_net_quantity = Decimal::from(-100);
-        strategy.neutral_lots.insert(
-            1,
-            NeutralLot {
-                id: 1,
-                signed_quantity: Decimal::from(-100),
-                entry_value: Decimal::from(40),
-            },
-        );
-        strategy.next_neutral_lot_sequence = 2;
-        strategy.gross_realized_profit = Decimal::from_str_exact("1.5").unwrap();
-        strategy.total_fee = Decimal::from_str_exact("0.5").unwrap();
-        strategy.revision += 1;
-        strategy.updated_at_ms += 1;
+        let (initial, mut gateway) = persist_clean_running_strategy(&strategy_root);
+        let paths = StrategyFilePaths::new(&strategy_root, initial.run_id.clone()).unwrap();
+        let source = initial
+            .orders
+            .values()
+            .find(|order| order.shape.side == OrderSide::Sell)
+            .unwrap()
+            .clone();
+        let source_id = source.client_order_id.clone();
+        let source_exchange_id = source.exchange_order_id.clone().unwrap();
+        let entry_price = source.shape.price.unwrap();
+        let rules = initial.instrument_rules.clone();
+        let mut machine =
+            StrategyMachine::new(FileStrategyStateStore::load(paths.state()).unwrap());
+        machine
+            .apply_execution(
+                &ExecutionReport {
+                    client_order_id: source_id.clone(),
+                    exchange_order_id: source_exchange_id.clone(),
+                    cumulative_quantity: source.shape.quantity,
+                    cumulative_quote: entry_price * source.shape.quantity,
+                    cumulative_fee: Decimal::ZERO,
+                    terminal_status: Some(TerminalOrderStatus::Filled),
+                },
+                200,
+            )
+            .unwrap();
+        machine.materialize_replacements(&rules, 201).unwrap();
+        let replacement_prepared = machine
+            .store()
+            .snapshot()
+            .ready_intents(202)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let replacement_id = replacement_prepared.client_order_id.clone();
+        let replacement_exchange_id = "risk-replacement".to_owned();
+        let mut replacement_accepted = replacement_prepared.clone();
+        replacement_accepted.state = IntentState::Accepted {
+            exchange_order_id: replacement_exchange_id.clone(),
+        };
+        machine
+            .synchronize_intent(&replacement_accepted, 202)
+            .unwrap();
+        let strategy = machine.store().snapshot().clone();
         strategy.validate().unwrap();
-        let paths = StrategyFilePaths::new(&strategy_root, strategy.run_id.clone()).unwrap();
-        let mut store = FileStrategyStateStore::load(paths.state()).unwrap();
-        store.replace(strategy.clone()).unwrap();
 
+        let mut ledger = FileOrderIntentStore::load(paths.intents()).unwrap();
+        ledger
+            .transition(
+                &source_id,
+                IntentState::Terminal {
+                    status: TerminalOrderStatus::Filled,
+                    exchange_order_id: Some(source_exchange_id),
+                },
+                200,
+            )
+            .unwrap();
+        ledger.insert_prepared(replacement_prepared).unwrap();
+        ledger
+            .transition(
+                &replacement_id,
+                IntentState::Accepted {
+                    exchange_order_id: replacement_exchange_id.clone(),
+                },
+                202,
+            )
+            .unwrap();
+
+        gateway
+            .open_orders
+            .retain(|order| order.client_order_id != source_id);
+        let replacement = strategy.orders.get(&replacement_id).unwrap();
+        gateway.open_orders.push(AuthoritativeOrder {
+            client_order_id: replacement_id,
+            exchange_order_id: replacement_exchange_id,
+            exchange: strategy.exchange,
+            shape: replacement.shape.clone(),
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+        });
+        let mark_price = entry_price - Decimal::from_str_exact("0.02000").unwrap();
+        let expected_unrealized = ((entry_price - mark_price) * source.shape.quantity).to_string();
         gateway.position.legs[0].signed_quantity = Decimal::from(-100);
-        gateway.position.legs[0].entry_price = Some(Decimal::from_str_exact("0.40000").unwrap());
-        gateway.position.legs[0].mark_price = Decimal::from_str_exact("0.38000").unwrap();
+        gateway.position.legs[0].entry_price = Some(entry_price);
+        gateway.position.legs[0].mark_price = mark_price;
         // The account-level field is deliberately inconsistent: grid PnL must
         // be recomputed from owned lots instead of copied from this merged value.
         gateway.position.legs[0].unrealized_profit = Decimal::from(999);
@@ -3946,12 +4008,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let risk = response_json(response).await;
-        assert_eq!(risk["realized_net_profit"], "1.0");
-        assert_eq!(risk["grid_unrealised_pnl"], "2.00000");
-        assert_eq!(risk["unrealised_pnl"], "2.00000");
-        assert_eq!(risk["total_equity_profit"], "3.00000");
-        assert_eq!(risk["total_profit"], "3.00000");
-        assert_eq!(risk["profit_mark_price"], "0.38000");
+        assert_eq!(risk["realized_net_profit"], "0");
+        assert_eq!(risk["grid_unrealised_pnl"], expected_unrealized);
+        assert_eq!(risk["unrealised_pnl"], expected_unrealized);
+        assert_eq!(risk["total_equity_profit"], expected_unrealized);
+        assert_eq!(risk["total_profit"], expected_unrealized);
+        assert_eq!(risk["profit_mark_price"], mark_price.to_string());
         assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
         assert_eq!(risk["profit_calculation_error"], Value::Null);
         assert_eq!(risk["has_risk"], false);

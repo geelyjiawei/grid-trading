@@ -573,6 +573,25 @@ mod tests {
     }
 
     #[test]
+    fn drifted_aggregate_accounting_is_retained_and_rejected_on_load() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut corrupted = state();
+        corrupted.total_volume = Decimal::ONE;
+        let bytes = serde_json::to_vec_pretty(&PersistedStrategyState::Active(Box::new(corrupted)))
+            .unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(
+            FileStrategyStateStore::load(&path),
+            Err(StrategyStoreError::InvalidState(
+                StrategyStateError::AggregateAccountingMismatch
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
     fn fabricated_replacement_obligation_is_retained_and_rejected_on_load() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("strategy.json");

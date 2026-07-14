@@ -714,10 +714,7 @@ mod tests {
             Direction, GridConfig, GridMode, InitialOrderType, InstrumentRules, OrderKind,
             OrderSide, PositionSizingMode, QuantityRules, TimeInForce,
         },
-        engine::{
-            ExecutionReport, MemoryStrategyStateStore, NeutralLot, StrategyMachine,
-            StrategyStateStore,
-        },
+        engine::{ExecutionReport, MemoryStrategyStateStore, StrategyMachine, StrategyStateStore},
         engine::{GridOrderRole, MarketSnapshot, PositionBaseline, StrategyRunId, build_grid_plan},
         exchange::{ActiveOrderStatus, PositionLeg, PositionSide},
     };
@@ -1006,17 +1003,41 @@ mod tests {
 
     #[test]
     fn baseline_plus_grid_owned_quantity_is_compared_without_rewriting_either_component() {
-        let mut state = running_neutral_state(Decimal::new(100, 0));
-        state.grid_position_net_quantity = Decimal::new(100, 0);
-        state.neutral_lots.insert(
-            1,
-            NeutralLot {
-                id: 1,
-                signed_quantity: Decimal::new(100, 0),
-                entry_value: Decimal::new(101450, 0),
-            },
-        );
-        state.next_neutral_lot_sequence = 2;
+        let initial = running_neutral_state(Decimal::new(100, 0));
+        let source = initial
+            .orders
+            .values()
+            .find(|order| order.shape.side == OrderSide::Buy)
+            .unwrap()
+            .clone();
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        machine
+            .apply_execution(
+                &ExecutionReport {
+                    client_order_id: source.client_order_id,
+                    exchange_order_id: source.exchange_order_id.unwrap(),
+                    cumulative_quantity: source.shape.quantity,
+                    cumulative_quote: source.shape.price.unwrap() * source.shape.quantity,
+                    cumulative_fee: Decimal::ZERO,
+                    terminal_status: Some(TerminalOrderStatus::Filled),
+                },
+                101,
+            )
+            .unwrap();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        machine.materialize_replacements(&rules, 102).unwrap();
+        let mut replacement = machine
+            .store()
+            .snapshot()
+            .ready_intents(103)
+            .unwrap()
+            .pop()
+            .unwrap();
+        replacement.state = IntentState::Accepted {
+            exchange_order_id: "replacement-accepted".into(),
+        };
+        machine.synchronize_intent(&replacement, 103).unwrap();
+        let state = machine.store().snapshot().clone();
         state.validate().unwrap();
 
         let report = audit_strategy_shadow(
