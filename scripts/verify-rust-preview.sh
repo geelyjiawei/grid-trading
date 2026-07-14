@@ -34,7 +34,16 @@ test -n "$container_id" || fail "candidate container is not running"
 test "$(docker inspect -f '{{.State.Running}}' "$container_id")" = "true" \
     || fail "candidate container is not running"
 
-published_port=$(docker port "$container_id" 8000/tcp 2>/dev/null || true)
+published_port=
+binding_attempt=1
+while test "$binding_attempt" -le 30; do
+    published_port=$(docker port "$container_id" 8000/tcp 2>/dev/null || true)
+    if test -n "$published_port"; then
+        break
+    fi
+    sleep 1
+    binding_attempt=$((binding_attempt + 1))
+done
 test "$published_port" = "$expected_binding" \
     || fail "candidate binding mismatch (expected: $expected_binding, observed: ${published_port:-none})"
 
