@@ -1,4 +1,8 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -26,6 +30,46 @@ use crate::{
 type BinanceGateway = BinanceAdapter<ReqwestTransport, HmacSha256Signer, SystemClock>;
 type AsterGateway = AsterAdapter<ReqwestTransport, LocalEip712Signer, MonotonicMicrosecondNonce>;
 type BybitGateway = BybitAdapter<ReqwestTransport, BybitHmacSha256Signer, SystemClock>;
+
+// Leave account-wide headroom below each exchange's published order limit.
+const BINANCE_ASTER_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(60);
+const BYBIT_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(110);
+
+#[derive(Debug)]
+struct OrderPlacementPacer {
+    interval: Duration,
+    next_available: Mutex<Option<Instant>>,
+}
+
+impl OrderPlacementPacer {
+    fn for_exchange(exchange: Exchange) -> Self {
+        let interval = match exchange {
+            Exchange::Binance | Exchange::Aster => BINANCE_ASTER_ORDER_PLACEMENT_INTERVAL,
+            Exchange::Bybit => BYBIT_ORDER_PLACEMENT_INTERVAL,
+        };
+        Self {
+            interval,
+            next_available: Mutex::new(None),
+        }
+    }
+
+    fn reserve(&self, now: Instant) -> Duration {
+        let mut next_available = self
+            .next_available
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reserved_at = next_available.unwrap_or(now).max(now);
+        *next_available = Some(reserved_at + self.interval);
+        reserved_at.saturating_duration_since(now)
+    }
+
+    async fn wait_for_slot(&self) {
+        let delay = self.reserve(Instant::now());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,8 +282,10 @@ impl ConfiguredExchangeGateway {
     }
 
     pub fn shared(self) -> SharedConfiguredExchangeGateway {
+        let order_placement_pacer = Arc::new(OrderPlacementPacer::for_exchange(self.exchange()));
         SharedConfiguredExchangeGateway {
             inner: Arc::new(self),
+            order_placement_pacer,
         }
     }
 }
@@ -249,6 +295,7 @@ impl ConfiguredExchangeGateway {
 #[derive(Clone)]
 pub struct SharedConfiguredExchangeGateway {
     inner: Arc<ConfiguredExchangeGateway>,
+    order_placement_pacer: Arc<OrderPlacementPacer>,
 }
 
 impl SharedConfiguredExchangeGateway {
@@ -571,6 +618,7 @@ impl OrderPlacementGateway for SharedConfiguredExchangeGateway {
         &self,
         intent: &OrderIntent,
     ) -> Result<PlacementAcknowledgement, PlacementError> {
+        self.order_placement_pacer.wait_for_slot().await;
         self.inner.place_order(intent).await
     }
 }
@@ -780,6 +828,27 @@ mod tests {
         assert_eq!(binance.exchange(), Exchange::Binance);
         assert_eq!(aster.exchange(), Exchange::Aster);
         assert_eq!(bybit.exchange(), Exchange::Bybit);
+    }
+
+    #[test]
+    fn cloned_gateway_handles_share_one_account_order_pacer() {
+        let factory = ExchangeGatewayFactory::standard(ExchangeEnvironment::Testnet).unwrap();
+        let gateway = factory
+            .build(ExchangeCredentials::bybit("key", "secret").unwrap())
+            .unwrap()
+            .shared();
+        let clone = gateway.clone();
+        let now = Instant::now();
+
+        assert!(Arc::ptr_eq(
+            &gateway.order_placement_pacer,
+            &clone.order_placement_pacer
+        ));
+        assert_eq!(gateway.order_placement_pacer.reserve(now), Duration::ZERO);
+        assert_eq!(
+            clone.order_placement_pacer.reserve(now),
+            BYBIT_ORDER_PLACEMENT_INTERVAL
+        );
     }
 
     #[test]
