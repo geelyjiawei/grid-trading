@@ -2336,7 +2336,10 @@ async fn exchange_risk(
             let orphan_orders = collected
                 .open_orders
                 .iter()
-                .filter(|order| !strategy.orders.contains_key(&order.client_order_id))
+                .filter(|order| {
+                    is_grid_order_identity(order)
+                        && !strategy.orders.contains_key(&order.client_order_id)
+                })
                 .map(risk_order_response)
                 .collect::<Vec<_>>();
             let orphan_order_count = orphan_orders.len();
@@ -2462,6 +2465,7 @@ async fn exchange_risk(
             let orphan_orders = collected
                 .open_orders
                 .iter()
+                .filter(|order| is_grid_order_identity(order))
                 .map(risk_order_response)
                 .collect::<Vec<_>>();
             let orphan_order_count = orphan_orders.len();
@@ -2534,6 +2538,7 @@ async fn exchange_risk(
             let orphan_orders = collected
                 .open_orders
                 .iter()
+                .filter(|order| is_grid_order_identity(order))
                 .map(risk_order_response)
                 .collect::<Vec<_>>();
             let orphan_order_count = orphan_orders.len();
@@ -2671,6 +2676,13 @@ fn risk_order_response(order: &AuthoritativeOrder) -> Value {
         "status": status,
         "reduce_only": order.shape.reduce_only,
     })
+}
+
+fn is_grid_order_identity(order: &AuthoritativeOrder) -> bool {
+    const GRID_ORDER_PREFIXES: [&str; 7] = ["g_", "r_", "o_", "c_", "open_", "init_", "repair_"];
+    GRID_ORDER_PREFIXES
+        .iter()
+        .any(|prefix| order.client_order_id.as_str().starts_with(prefix))
 }
 
 fn risk_collection_failure(
@@ -3188,21 +3200,38 @@ mod tests {
         ) -> Result<Vec<AuthoritativeOrder>, SnapshotError> {
             assert_eq!(exchange, Exchange::Aster);
             assert_eq!(symbol, "ANSEMUSDT");
-            Ok(vec![AuthoritativeOrder {
-                client_order_id: ClientOrderId::parse("g_9_B_exact01").unwrap(),
-                exchange_order_id: "90071992547409931234".into(),
-                exchange,
-                shape: OrderShape {
-                    symbol: symbol.into(),
-                    side: OrderSide::Buy,
-                    price: Some(Decimal::from_str_exact("0.38000").unwrap()),
-                    quantity: Decimal::from_str_exact("100.000").unwrap(),
-                    reduce_only: true,
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::Gtc,
+            Ok(vec![
+                AuthoritativeOrder {
+                    client_order_id: ClientOrderId::parse("g_9_B_exact01").unwrap(),
+                    exchange_order_id: "90071992547409931234".into(),
+                    exchange,
+                    shape: OrderShape {
+                        symbol: symbol.into(),
+                        side: OrderSide::Buy,
+                        price: Some(Decimal::from_str_exact("0.38000").unwrap()),
+                        quantity: Decimal::from_str_exact("100.000").unwrap(),
+                        reduce_only: true,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                    },
+                    lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
                 },
-                lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
-            }])
+                AuthoritativeOrder {
+                    client_order_id: ClientOrderId::parse("manual_user_1").unwrap(),
+                    exchange_order_id: "manual-exchange-order".into(),
+                    exchange,
+                    shape: OrderShape {
+                        symbol: symbol.into(),
+                        side: OrderSide::Sell,
+                        price: Some(Decimal::from_str_exact("0.41000").unwrap()),
+                        quantity: Decimal::from_str_exact("5.000").unwrap(),
+                        reduce_only: false,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                    },
+                    lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                },
+            ])
         }
     }
 
@@ -4543,6 +4572,10 @@ mod tests {
         other_run_order.client_order_id = ClientOrderId::parse("g_OTHER001_1_B_1").unwrap();
         other_run_order.exchange_order_id = "other-run-exchange-order".into();
         gateway.open_orders.push(other_run_order);
+        let mut manual_order = gateway.open_orders[0].clone();
+        manual_order.client_order_id = ClientOrderId::parse("manual_user_1").unwrap();
+        manual_order.exchange_order_id = "manual-exchange-order".into();
+        gateway.open_orders.push(manual_order);
         let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
         gateways
             .register_gateway(

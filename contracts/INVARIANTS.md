@@ -187,6 +187,9 @@ the OpenAPI schema.
   lookups with two complete open-order reads; any changed second read, repeated page cursor,
   duplicate identity, or active lookup absent from the complete list is inconclusive and
   produces no audit result. Orders from another run and manual orders are never adopted.
+- Risk orphan classification is limited to legacy or Rust grid-order namespaces. A manual
+  order outside those namespaces is never reported or selected as a grid orphan merely
+  because its exchange, symbol, or price overlaps a strategy.
 
 ## Grid behavior
 
