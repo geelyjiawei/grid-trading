@@ -65,6 +65,12 @@ continues to return a read-only exchange snapshot for diagnosis, but sets
 repairs, places, or cancels an order. When trading is intentionally disabled,
 the absent runtime is reported as unconfigured rather than as a mismatch.
 
+Catalog mutations are serialized across processes with an operating-system file
+lease at `strategies/.catalog.lock`. The lease spans catalog discovery, durable
+start/stop/recovery work, and runtime registration, closing the check-then-create
+window in which two server processes could otherwise start the same market.
+Each run still retains its independent lifetime lease.
+
 Order recovery preserves one immutable exchange order ID from acknowledgement
 through terminal execution accounting. A terminal intent is durable evidence,
 not just a status label: it retains the authoritative exchange order ID even if

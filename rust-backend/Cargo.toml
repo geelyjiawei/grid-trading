@@ -16,6 +16,7 @@ getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
 k256.workspace = true
+libc.workspace = true
 pbkdf2.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true

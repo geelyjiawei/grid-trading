@@ -11,8 +11,9 @@ use crate::{
         OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
     },
     persistence::{
-        StrategyCatalog, StrategyCatalogError, StrategyCatalogSelectionError,
-        StrategyDiscoveryError, StrategyFilePaths, discover_strategy_files, load_strategy_catalog,
+        RuntimeLeaseError, STRATEGY_CATALOG_LEASE_FILE_NAME, StrategyCatalog, StrategyCatalogError,
+        StrategyCatalogSelectionError, StrategyDiscoveryError, StrategyFilePaths,
+        StrategyRuntimeLease, discover_strategy_files, load_strategy_catalog,
     },
 };
 
@@ -116,6 +117,13 @@ impl<G> RuntimeCoordinator<G> {
         self.registry.entries().await
     }
 
+    fn acquire_catalog_lease(&self) -> Result<StrategyRuntimeLease, RuntimeLeaseError> {
+        if self.strategy_root.as_os_str().is_empty() {
+            return Err(RuntimeLeaseError::InvalidPath);
+        }
+        StrategyRuntimeLease::acquire(self.strategy_root.join(STRATEGY_CATALOG_LEASE_FILE_NAME))
+    }
+
     pub async fn recover<P>(
         &self,
         provider: &P,
@@ -124,6 +132,7 @@ impl<G> RuntimeCoordinator<G> {
         P: RuntimeRecoveryProvider<Gateway = G>,
     {
         let _guard = self.mutation_guard.lock().await;
+        let _catalog_lease = self.acquire_catalog_lease()?;
         let root = self.strategy_root.clone();
         let discovery = tokio::task::spawn_blocking(move || discover_strategy_files(root))
             .await
@@ -160,6 +169,7 @@ where
         }
 
         let _guard = self.mutation_guard.lock().await;
+        let _catalog_lease = self.acquire_catalog_lease()?;
         self.registry.prune_terminal().await;
         let catalog = self.load_catalog().await?;
         ensure_catalog_is_clean(&catalog)?;
@@ -225,6 +235,7 @@ where
         now_ms: u64,
     ) -> Result<RuntimeStopReceipt, RuntimeCoordinatorError> {
         let _guard = self.mutation_guard.lock().await;
+        let _catalog_lease = self.acquire_catalog_lease()?;
         self.registry.prune_terminal().await;
         let catalog = self.load_catalog().await?;
         ensure_catalog_is_clean(&catalog)?;
@@ -313,6 +324,8 @@ fn ensure_catalog_is_clean(catalog: &StrategyCatalog) -> Result<(), RuntimeCoord
 
 #[derive(Debug, Error)]
 pub enum RuntimeRecoveryError {
+    #[error("strategy catalog is being modified by another process: {0}")]
+    CatalogLease(#[from] RuntimeLeaseError),
     #[error("strategy discovery task failed")]
     DiscoveryTask,
     #[error(transparent)]
@@ -332,6 +345,8 @@ pub enum RuntimeCoordinatorError {
     },
     #[error("symbol {symbol} does not use configured quote asset {quote_asset}")]
     UnsupportedQuoteAsset { symbol: String, quote_asset: String },
+    #[error("strategy catalog is being modified by another process: {0}")]
+    CatalogLease(#[from] RuntimeLeaseError),
     #[error("strategy catalog task failed")]
     CatalogTask,
     #[error(transparent)]

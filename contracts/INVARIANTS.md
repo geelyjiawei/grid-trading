@@ -251,6 +251,10 @@ the OpenAPI schema.
 - Every active or armed strategy has one independent operating-system runtime lease. A second
   process must fail before loading or mutating either ledger, and a crashed owner releases the
   lease automatically without deleting audit evidence.
+- Start, recovery, and stop also hold one catalog mutation lease across discovery, durable
+  mutation, and in-memory registration. Two processes sharing a strategy root therefore cannot
+  both pass the same-market ownership check before either run is visible. The known catalog lease
+  is ignored only when it is a regular file; a directory or symbolic link remains an anomaly.
 - Runtime state, order-intent ledger, and lease paths are derived from one validated run ID.
   Loading acquires the lease first, then verifies the persisted run ID and cross-ledger ownership;
   any mismatch prevents the runtime from becoming visible and performs no exchange operation.

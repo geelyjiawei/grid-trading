@@ -745,6 +745,7 @@ async fn stop_grid_web(
             ),
             Err(
                 RuntimeCoordinatorError::CatalogTask
+                | RuntimeCoordinatorError::CatalogLease(_)
                 | RuntimeCoordinatorError::Catalog(_)
                 | RuntimeCoordinatorError::CatalogAnomalies { .. }
                 | RuntimeCoordinatorError::CatalogSelection(_)

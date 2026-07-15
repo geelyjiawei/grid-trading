@@ -529,6 +529,7 @@ dependencies = [
  "hex",
  "hmac",
  "k256",
+ "libc",
  "pbkdf2",
  "reqwest",
  "rust_decimal",

@@ -7,6 +7,8 @@ use thiserror::Error;
 
 use crate::engine::StrategyRunId;
 
+pub(crate) const STRATEGY_CATALOG_LEASE_FILE_NAME: &str = ".catalog.lock";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrategyFilePaths {
     run_id: StrategyRunId,
@@ -122,6 +124,15 @@ pub fn discover_strategy_files(
                 path,
                 kind: StrategyDiscoveryAnomalyKind::SymbolicLink,
             });
+            continue;
+        }
+        if entry.file_name() == STRATEGY_CATALOG_LEASE_FILE_NAME {
+            if !file_type.is_file() {
+                report.anomalies.push(StrategyDiscoveryAnomaly {
+                    path,
+                    kind: StrategyDiscoveryAnomalyKind::UnexpectedEntryType,
+                });
+            }
             continue;
         }
         if !file_type.is_dir() {
@@ -287,6 +298,29 @@ mod tests {
 
         assert!(report.strategies.is_empty());
         assert!(report.anomalies.is_empty());
+    }
+
+    #[test]
+    fn catalog_lease_is_ignored_only_when_it_is_a_regular_file() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        fs::create_dir(&root).unwrap();
+        let lease = root.join(STRATEGY_CATALOG_LEASE_FILE_NAME);
+        fs::write(&lease, b"").unwrap();
+
+        let clean = discover_strategy_files(&root).unwrap();
+        assert!(clean.strategies.is_empty());
+        assert!(clean.anomalies.is_empty());
+
+        fs::remove_file(&lease).unwrap();
+        fs::create_dir(&lease).unwrap();
+        let malformed = discover_strategy_files(&root).unwrap();
+        assert_eq!(malformed.anomalies.len(), 1);
+        assert_eq!(malformed.anomalies[0].path, lease);
+        assert_eq!(
+            malformed.anomalies[0].kind,
+            StrategyDiscoveryAnomalyKind::UnexpectedEntryType
+        );
     }
 
     #[test]

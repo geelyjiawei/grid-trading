@@ -1771,10 +1771,11 @@ mod tests {
         },
         engine::{
             GridOrderRole, MarketSnapshot, MemoryStrategyStateStore, PositionBaseline,
-            RuntimeCoordinator, RuntimeCoordinatorError, RuntimeRecoveryProvider,
-            RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError,
-            RuntimeStartupFailure, StrategyLifecycle, StrategyOrderPurpose, StrategyRunId,
-            StrategyState, StrategyStateStore, build_grid_plan, recover_discovered_strategies,
+            RuntimeCoordinator, RuntimeCoordinatorError, RuntimeRecoveryError,
+            RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry,
+            RuntimeRegistryAdvanceError, RuntimeStartupFailure, StrategyLifecycle,
+            StrategyOrderPurpose, StrategyRunId, StrategyState, StrategyStateStore,
+            build_grid_plan, recover_discovered_strategies,
         },
         exchange::{
             ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
@@ -1785,8 +1786,8 @@ mod tests {
         },
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
-            MemoryOrderIntentStore, StrategyFilePaths, StrategyRuntimeLease,
-            discover_strategy_files, load_strategy_catalog,
+            MemoryOrderIntentStore, STRATEGY_CATALOG_LEASE_FILE_NAME, StrategyFilePaths,
+            StrategyRuntimeLease, discover_strategy_files, load_strategy_catalog,
         },
     };
 
@@ -2725,6 +2726,162 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn separate_coordinators_cannot_create_two_live_runs_in_one_catalog() {
+        let directory = tempdir().unwrap();
+        let first_gateway = MockGateway::new(rules(), 1_100);
+        let second_gateway = MockGateway::new(rules(), 1_100);
+        let first_coordinator = Arc::new(RuntimeCoordinator::new(
+            directory.path().to_path_buf(),
+            runtime_settings(),
+        ));
+        let second_coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+        let gate = first_gateway.block_market_snapshot();
+        let starting_coordinator = Arc::clone(&first_coordinator);
+        let first_start = tokio::spawn(async move {
+            starting_coordinator
+                .start(first_gateway, config(None), 1_100)
+                .await
+        });
+        gate.wait_until_entered().await;
+
+        let second = second_coordinator
+            .start(second_gateway.clone(), config(None), 1_100)
+            .await;
+        gate.release();
+        let first = first_start.await.unwrap();
+
+        assert!(matches!(
+            &second,
+            Err(RuntimeCoordinatorError::CatalogLease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(second_gateway.all_bootstrap_call_count(), 0);
+        let catalog = load_strategy_catalog(directory.path()).unwrap();
+        assert!(catalog.anomalies().is_empty());
+        assert_eq!(
+            catalog
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_live())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn simultaneous_separate_coordinator_starts_never_both_win() {
+        for attempt in 0..200 {
+            let directory = tempdir().unwrap();
+            let first_gateway = MockGateway::new(rules(), 1_100);
+            let second_gateway = MockGateway::new(rules(), 1_100);
+            let first_coordinator =
+                RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+            let second_coordinator =
+                RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+
+            let (first, second) = tokio::join!(
+                first_coordinator.start(first_gateway, config(None), 1_100),
+                second_coordinator.start(second_gateway, config(None), 1_100),
+            );
+
+            assert_eq!(
+                usize::from(first.is_ok()) + usize::from(second.is_ok()),
+                1,
+                "attempt={attempt} first={first:?} second={second:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_lease_blocks_recovery_before_provider_access() {
+        let directory = tempdir().unwrap();
+        let _catalog_lease =
+            StrategyRuntimeLease::acquire(directory.path().join(STRATEGY_CATALOG_LEASE_FILE_NAME))
+                .unwrap();
+        let provider = MockRecoveryProvider::new(MockGateway::new(rules(), 1_100));
+        let coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+
+        assert!(matches!(
+            coordinator.recover(&provider).await,
+            Err(RuntimeRecoveryError::CatalogLease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        assert_eq!(provider.request_count(), 0);
+        assert!(coordinator.entries().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_lease_rejects_a_symbolic_link_strategy_root_without_touching_its_target() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("external-strategies");
+        let root = directory.path().join("strategies");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &root).unwrap();
+        let provider = MockRecoveryProvider::new(MockGateway::new(rules(), 1_100));
+        let coordinator = RuntimeCoordinator::new(root, runtime_settings());
+
+        assert!(matches!(
+            coordinator.recover(&provider).await,
+            Err(RuntimeRecoveryError::CatalogLease(
+                RuntimeLeaseError::ParentSymbolicLink
+            ))
+        ));
+        assert_eq!(provider.request_count(), 0);
+        assert!(!target.join(STRATEGY_CATALOG_LEASE_FILE_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn catalog_lease_blocks_stop_without_changing_the_strategy() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+        let started = coordinator
+            .start(gateway.clone(), config(None), 1_100)
+            .await
+            .unwrap();
+        let catalog_lease =
+            StrategyRuntimeLease::acquire(directory.path().join(STRATEGY_CATALOG_LEASE_FILE_NAME))
+                .unwrap();
+
+        assert!(matches!(
+            coordinator
+                .request_stop(Exchange::Binance, "MUUSDT", 1_101)
+                .await,
+            Err(RuntimeCoordinatorError::CatalogLease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(coordinator.entries().await.len(), 1);
+        assert_eq!(
+            coordinator.entries().await[0].lifecycle,
+            Some(PreparedStrategyLifecycle::AwaitingOpening)
+        );
+
+        drop(catalog_lease);
+        let stopped = coordinator
+            .request_stop(Exchange::Binance, "MUUSDT", 1_102)
+            .await
+            .unwrap();
+        assert_eq!(stopped.run_id, started.run_id);
+        assert!(matches!(
+            stopped.outcome,
+            PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::StopRequested,
+            })
+        ));
     }
 
     #[tokio::test]
