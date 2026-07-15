@@ -3388,7 +3388,16 @@ fn strategy_profit_metrics(
     strategy: &StrategyState,
     position: &PositionSnapshot,
 ) -> Result<StrategyProfitMetrics, SnapshotError> {
-    validated_one_way_quantity(position, strategy.exchange, &strategy.symbol)?;
+    let actual_position =
+        validated_one_way_quantity(position, strategy.exchange, &strategy.symbol)?;
+    let expected_position = strategy
+        .expected_exchange_position()
+        .map_err(|_| SnapshotError::new("strategy expected-position arithmetic is invalid"))?;
+    if actual_position != expected_position {
+        return Err(SnapshotError::new(
+            "exchange position does not match the strategy-owned inventory ledger",
+        ));
+    }
     let mark_price = position
         .legs
         .first()
@@ -5677,6 +5686,16 @@ mod tests {
         assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
         assert_eq!(risk["profit_calculation_error"], Value::Null);
         assert_eq!(risk["has_risk"], false);
+    }
+
+    #[test]
+    fn strategy_profit_metrics_fail_closed_when_exchange_position_diverges_from_the_ledger() {
+        let directory = tempdir().unwrap();
+        let (strategy, mut gateway) = persist_clean_running_strategy(directory.path());
+        gateway.position.legs[0].signed_quantity = Decimal::ONE;
+        gateway.position.legs[0].entry_price = Some(Decimal::from_str_exact("0.40000").unwrap());
+
+        assert!(strategy_profit_metrics(&strategy, &gateway.position).is_err());
     }
 
     #[tokio::test]
