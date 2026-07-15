@@ -268,6 +268,10 @@ impl StrategyStateStore for FileStrategyStateStore {
         &self.snapshot
     }
 
+    fn snapshot_is_known_valid(&self) -> bool {
+        true
+    }
+
     fn replace(&mut self, next: StrategyState) -> Result<(), StrategyStoreError> {
         if self.snapshot.revision.checked_add(1) != Some(next.revision) {
             return Err(StrategyStoreError::RevisionMismatch);
@@ -416,6 +420,8 @@ mod tests {
         let restored = FileStrategyStateStore::load(&path).unwrap();
 
         assert_eq!(store.path(), path);
+        assert!(store.snapshot_is_known_valid());
+        assert!(restored.snapshot_is_known_valid());
         assert_eq!(restored.snapshot(), &original);
         assert!(fs::read_to_string(&path).unwrap().ends_with('\n'));
     }

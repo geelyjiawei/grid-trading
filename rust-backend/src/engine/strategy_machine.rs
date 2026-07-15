@@ -1943,6 +1943,12 @@ pub trait StrategyStateStore {
     fn snapshot(&self) -> &StrategyState;
     fn replace(&mut self, next: StrategyState) -> Result<(), StrategyStoreError>;
 
+    /// Returns true only when every constructor and mutation path for this
+    /// store guarantees that the current snapshot passed full validation.
+    fn snapshot_is_known_valid(&self) -> bool {
+        false
+    }
+
     fn replace_validated(
         &mut self,
         next: ValidatedStrategyState,
@@ -2025,7 +2031,8 @@ where
     S: StrategyStateStore,
 {
     pub fn new(store: S) -> Self {
-        let snapshot_validated = store.snapshot().validate().is_ok();
+        let snapshot_validated =
+            store.snapshot_is_known_valid() || store.snapshot().validate().is_ok();
         Self {
             store,
             snapshot_validated,
@@ -2043,11 +2050,20 @@ where
         &mut self.store
     }
 
+    fn ensure_snapshot_validated(&mut self) -> Result<(), StrategyMachineError> {
+        if !self.snapshot_validated {
+            self.store.snapshot().validate()?;
+            self.snapshot_validated = true;
+        }
+        Ok(())
+    }
+
     pub fn synchronize_intent(
         &mut self,
         intent: &OrderIntent,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         let transition = synchronize_intent_state(&mut next, intent);
         self.finalize_and_store(next, now_ms, transition)
@@ -2058,6 +2074,7 @@ where
         intent: &OrderIntent,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let state = self.store.snapshot();
         if intent.validate().is_ok()
             && intent.exchange == state.exchange
@@ -2082,6 +2099,7 @@ where
         report: &ExecutionReport,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         let transition = apply_execution_report(&mut next, report, None, now_ms);
         self.finalize_and_store(next, now_ms, transition)
@@ -2093,6 +2111,7 @@ where
         valued: &ValuedExecutionReport,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         let candidate = ExecutionAuditRecord {
             snapshot: snapshot.clone(),
@@ -2192,6 +2211,7 @@ where
         fresh_rules
             .validate()
             .map_err(StrategyStateError::InvalidInstrument)?;
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         if matches!(
             next.lifecycle,
@@ -2215,6 +2235,7 @@ where
         fresh_rules
             .validate()
             .map_err(StrategyStateError::InvalidInstrument)?;
+        self.ensure_snapshot_validated()?;
         if fresh_rules == &self.store.snapshot().instrument_rules {
             return Ok(StrategyTransition::NoChange);
         }
@@ -2232,6 +2253,7 @@ where
         if mark_price <= Decimal::ZERO {
             return Err(StrategyStateError::InvalidMarketPrice.into());
         }
+        self.ensure_snapshot_validated()?;
         let snapshot = self.store.snapshot();
         if !matches!(
             snapshot.lifecycle,
@@ -2317,6 +2339,7 @@ where
         fresh_rules
             .validate()
             .map_err(StrategyStateError::InvalidInstrument)?;
+        self.ensure_snapshot_validated()?;
         let snapshot = self.store.snapshot();
         if snapshot.lifecycle == StrategyLifecycle::Closed {
             return Ok(StrategyTransition::NoChange);
@@ -2424,6 +2447,7 @@ where
         actual_signed_quantity: Decimal,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let expected = self.store.snapshot().expected_exchange_position()?;
         if actual_signed_quantity == expected {
             return Ok(StrategyTransition::NoChange);
@@ -2440,6 +2464,7 @@ where
         &mut self,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         if matches!(
             next.lifecycle,
@@ -2465,6 +2490,7 @@ where
         &mut self,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         if next.lifecycle == StrategyLifecycle::Stopped {
             return Ok(StrategyTransition::NoChange);
@@ -2489,6 +2515,7 @@ where
         &mut self,
         now_ms: u64,
     ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         if next.lifecycle != StrategyLifecycle::Failed {
             return Err(StrategyStateError::InvalidLifecycleTransition.into());
@@ -2514,6 +2541,7 @@ where
     }
 
     pub fn mark_closed(&mut self, now_ms: u64) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
         if next.lifecycle == StrategyLifecycle::Closed {
             return Ok(StrategyTransition::NoChange);
@@ -6762,7 +6790,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_loaded_snapshot_cannot_use_inventory_replay_skip() {
+    fn invalid_loaded_snapshot_is_rejected_before_no_change_transition() {
         let machine = short_machine_with_opening();
         let mut drifted = machine.store().snapshot().clone();
         let moved_quantity = Decimal::new(1, 1);
@@ -6786,10 +6814,11 @@ mod tests {
         }
 
         let updated_at_ms = drifted.updated_at_ms;
+        let rules = drifted.instrument_rules.clone();
         let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(drifted));
         assert!(!machine.snapshot_validated);
         assert!(matches!(
-            machine.request_stop(updated_at_ms + 1),
+            machine.reconcile_instrument_rules(&rules, updated_at_ms + 1),
             Err(StrategyMachineError::InvalidState(
                 StrategyStateError::LevelLotLedgerMismatch
             ))
