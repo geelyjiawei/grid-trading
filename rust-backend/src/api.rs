@@ -73,14 +73,22 @@ struct HealthResponse {
     ok: bool,
     runtime: &'static str,
     trading_enabled: bool,
+    runtime_ready: bool,
+    active_strategies: usize,
     contract_version: u8,
 }
 
 async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
+    let active_strategies = match &state.runtime {
+        Some(runtime) => runtime.entries().await.len(),
+        None => 0,
+    };
     Json(HealthResponse {
         ok: true,
         runtime: "rust",
         trading_enabled: state.trading_enabled,
+        runtime_ready: state.runtime.is_some() == state.trading_enabled,
+        active_strategies,
         contract_version: 1,
     })
 }
@@ -6153,6 +6161,8 @@ mod tests {
         let payload = response_json(response).await;
         assert_eq!(payload["runtime"], "rust");
         assert_eq!(payload["trading_enabled"], false);
+        assert_eq!(payload["runtime_ready"], true);
+        assert_eq!(payload["active_strategies"], 0);
         assert_eq!(payload["contract_version"], 1);
     }
 

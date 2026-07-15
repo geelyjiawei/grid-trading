@@ -96,6 +96,8 @@ test "$ready" = "true" || fail "candidate health endpoint did not become ready"
 require_text "$health_file" '"ok":true'
 require_text "$health_file" '"runtime":"rust"'
 require_text "$health_file" '"trading_enabled":false'
+require_text "$health_file" '"runtime_ready":true'
+require_text "$health_file" '"active_strategies":0'
 
 auth_file=$temporary_directory/auth.json
 curl --noproxy '*' --fail --silent --show-error --max-time 3 "$base_url/api/auth/status" >"$auth_file" \

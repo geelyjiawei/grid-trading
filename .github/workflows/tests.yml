@@ -131,9 +131,18 @@ jobs:
       - name: Validate isolated deployment guards
         run: |
           set -euo pipefail
-          sh -n scripts/deploy-rust-preview.sh scripts/verify-rust-preview.sh
+          sh -n \
+            scripts/deploy-rust-preview.sh \
+            scripts/verify-rust-preview.sh \
+            scripts/deploy-rust-production.sh \
+            scripts/verify-rust-production.sh \
+            scripts/rollback-to-python.sh
+          python -m py_compile \
+            scripts/provision-rust-auth.py \
+            scripts/verify-rust-login.py \
+            scripts/legacy-cutover-audit.py
           cp .env.example .env
-          trap 'rm -f .env' EXIT
+          trap 'rm -f .env /tmp/grid-rust-ci-credentials.txt' EXIT
           GRID_RUST_PREVIEW_VALIDATE_ONLY=true sh scripts/deploy-rust-preview.sh
           if GRID_RUST_PREVIEW_EXPECTED_COMMIT=0000000000000000000000000000000000000000 \
             sh scripts/deploy-rust-preview.sh > /tmp/stale-preview.log 2>&1; then
@@ -141,9 +150,42 @@ jobs:
             exit 1
           fi
           grep --fixed-strings 'expected Git commit is unavailable' /tmp/stale-preview.log
+          sed --in-place 's/^GRID_CONFIG_KEY=$/GRID_CONFIG_KEY=ci-validation-only-key/' .env
+          python scripts/provision-rust-auth.py \
+            --env-file .env \
+            --credentials-file /tmp/grid-rust-ci-credentials.txt
+          test "$(stat --format='%a' .env)" = "600"
+          test "$(stat --format='%a' /tmp/grid-rust-ci-credentials.txt)" = "600"
+          GRID_RUST_PRODUCTION_VALIDATE_ONLY=true sh scripts/deploy-rust-production.sh
 
       - name: Build locked production image
         run: docker build --file Dockerfile.rust-vue --tag grid-trading-vue-rust:test .
+
+      - name: Exercise authenticated Rust production image in isolation
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          sed --in-place 's/^GRID_CONFIG_KEY=$/GRID_CONFIG_KEY=ci-production-only-key/' .env
+          python scripts/provision-rust-auth.py \
+            --env-file .env \
+            --credentials-file /tmp/grid-rust-production-credentials.txt
+          mkdir -p data-rust-production/rust-control/idempotency data-rust-production/rust-control/strategies
+          sudo chown --recursive 10001:10001 data-rust-production
+          export GRID_RUST_IMAGE=grid-trading-vue-rust:test
+          export GRID_RUST_PRODUCTION_PROJECT=grid-trading-rust-production-ci
+          export GRID_RUST_PRODUCTION_CONTAINER=grid-trading-rust-production-ci
+          export GRID_RUST_PRODUCTION_PORT=18002
+          export GRID_RUST_PRODUCTION_DATA="$PWD/data-rust-production"
+          trap 'docker compose --project-name "$GRID_RUST_PRODUCTION_PROJECT" --file docker-compose.rust-production.yml down --remove-orphans; sudo rm -rf data-rust-production; rm -f .env /tmp/grid-rust-production-credentials.txt' EXIT
+          docker compose --project-name "$GRID_RUST_PRODUCTION_PROJECT" \
+            --file docker-compose.rust-production.yml up --detach --no-build
+          GRID_RUST_PRODUCTION_URL=http://127.0.0.1:18002 \
+          GRID_RUST_PRODUCTION_EXPECTED_BINDING=127.0.0.1:18002 \
+          GRID_RUST_EXPECT_LEGACY_STATE=ignore \
+            sh scripts/verify-rust-production.sh
+          python scripts/verify-rust-login.py \
+            --credentials-file /tmp/grid-rust-production-credentials.txt \
+            --base-url http://127.0.0.1:18002
 
       - name: Exercise isolated Compose deployment end to end
         run: |
@@ -180,6 +222,8 @@ jobs:
           grep --fixed-strings '"ok":true' /tmp/health.json
           grep --fixed-strings '"runtime":"rust"' /tmp/health.json
           grep --fixed-strings '"trading_enabled":false' /tmp/health.json
+          grep --fixed-strings '"runtime_ready":true' /tmp/health.json
+          grep --fixed-strings '"active_strategies":0' /tmp/health.json
           curl --fail --silent http://127.0.0.1:18000/api/auth/status > /tmp/auth.json
           grep --fixed-strings '"required":false' /tmp/auth.json
           grep --fixed-strings '"authenticated":true' /tmp/auth.json

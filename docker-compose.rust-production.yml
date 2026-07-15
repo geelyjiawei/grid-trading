@@ -1,0 +1,30 @@
+services:
+  grid-trading-rust:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust-vue
+    image: ${GRID_RUST_IMAGE:-grid-trading-vue-rust:production}
+    container_name: ${GRID_RUST_PRODUCTION_CONTAINER:-grid-trading-rust}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      GRID_BIND: 0.0.0.0:8000
+      GRID_WEB_ROOT: /app/web
+      GRID_CONFIG_FILE: /app/data/api_config.json
+      GRID_RUST_CONTROL_ROOT: /app/data/rust-control/idempotency
+      GRID_RUST_STRATEGY_ROOT: /app/data/rust-control/strategies
+      GRID_RUST_TRADING_ENABLED: "true"
+    ports:
+      - "127.0.0.1:${GRID_RUST_PRODUCTION_PORT:-8000}:8000"
+    volumes:
+      - ${GRID_RUST_PRODUCTION_DATA:-./data-rust-production}:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
