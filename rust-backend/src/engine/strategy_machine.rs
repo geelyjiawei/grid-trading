@@ -275,6 +275,18 @@ impl ValidatedStrategyState {
         Ok(Self(snapshot))
     }
 
+    fn from_validated_transition(
+        previous: &StrategyState,
+        snapshot: StrategyState,
+    ) -> Result<Self, StrategyStateError> {
+        if inventory_replay_inputs_and_outputs_are_unchanged(previous, &snapshot) {
+            snapshot.validate_internal(false)?;
+        } else {
+            snapshot.validate()?;
+        }
+        Ok(Self(snapshot))
+    }
+
     pub fn into_inner(self) -> StrategyState {
         self.0
     }
@@ -538,6 +550,10 @@ impl StrategyState {
     }
 
     pub fn validate(&self) -> Result<(), StrategyStateError> {
+        self.validate_internal(true)
+    }
+
+    fn validate_internal(&self, replay_inventory: bool) -> Result<(), StrategyStateError> {
         if self.version != 1 {
             return Err(StrategyStateError::UnsupportedVersion(self.version));
         }
@@ -892,7 +908,7 @@ impl StrategyState {
         }
         validate_replacement_obligation_ledger(self)?;
         validate_aggregate_accounting(self)?;
-        validate_inventory_event_ledger(self)?;
+        validate_inventory_event_ledger(self, replay_inventory)?;
         self.expected_exchange_position()?;
         Ok(())
     }
@@ -1456,7 +1472,10 @@ fn validate_aggregate_accounting(state: &StrategyState) -> Result<(), StrategySt
     Ok(())
 }
 
-fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), StrategyStateError> {
+fn validate_inventory_event_ledger(
+    state: &StrategyState,
+    replay_inventory: bool,
+) -> Result<(), StrategyStateError> {
     if state.next_inventory_event_sequence == 0
         || state
             .inventory_events
@@ -1553,7 +1572,7 @@ fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), Strategy
 
     // A failed strategy is retained for diagnosis even when the execution that
     // caused the failure could not be represented by the inventory model.
-    if state.lifecycle == StrategyLifecycle::Failed {
+    if state.lifecycle == StrategyLifecycle::Failed || !replay_inventory {
         return Ok(());
     }
 
@@ -1998,6 +2017,7 @@ impl StrategyStateStore for MemoryStrategyStateStore {
 
 pub struct StrategyMachine<S> {
     store: S,
+    snapshot_validated: bool,
 }
 
 impl<S> StrategyMachine<S>
@@ -2005,7 +2025,11 @@ where
     S: StrategyStateStore,
 {
     pub fn new(store: S) -> Self {
-        Self { store }
+        let snapshot_validated = store.snapshot().validate().is_ok();
+        Self {
+            store,
+            snapshot_validated,
+        }
     }
 
     pub fn store(&self) -> &S {
@@ -2013,6 +2037,9 @@ where
     }
 
     pub fn store_mut(&mut self) -> &mut S {
+        // External mutable access can alter store-specific state. Force the
+        // next transition through full validation before trusting it again.
+        self.snapshot_validated = false;
         &mut self.store
     }
 
@@ -2023,7 +2050,7 @@ where
     ) -> Result<StrategyTransition, StrategyMachineError> {
         let mut next = self.store.snapshot().clone();
         let transition = synchronize_intent_state(&mut next, intent);
-        finalize_and_store(&mut self.store, next, now_ms, transition)
+        self.finalize_and_store(next, now_ms, transition)
     }
 
     pub fn synchronize_intent_if_needed(
@@ -2057,7 +2084,7 @@ where
     ) -> Result<StrategyTransition, StrategyMachineError> {
         let mut next = self.store.snapshot().clone();
         let transition = apply_execution_report(&mut next, report, None, now_ms);
-        finalize_and_store(&mut self.store, next, now_ms, transition)
+        self.finalize_and_store(next, now_ms, transition)
     }
 
     pub fn apply_valued_execution(
@@ -2099,7 +2126,7 @@ where
             });
         if audit_validation.is_err() {
             let transition = fail_transition(&mut next, "valued execution audit is invalid");
-            return finalize_and_store(&mut self.store, next, now_ms, transition);
+            return self.finalize_and_store(next, now_ms, transition);
         }
         let previous_trade_count = next
             .orders
@@ -2145,7 +2172,7 @@ where
                     &mut next,
                     "valued execution order disappeared during audit persistence",
                 );
-                return finalize_and_store(&mut self.store, next, now_ms, transition);
+                return self.finalize_and_store(next, now_ms, transition);
             };
             order.execution_audit = Some(candidate);
             if transition == StrategyTransition::NoChange {
@@ -2154,7 +2181,7 @@ where
                 };
             }
         }
-        finalize_and_store(&mut self.store, next, now_ms, transition)
+        self.finalize_and_store(next, now_ms, transition)
     }
 
     pub fn materialize_replacements(
@@ -2177,7 +2204,7 @@ where
             return Ok(StrategyTransition::NoChange);
         }
         let transition = materialize_replacement_orders(&mut next, fresh_rules);
-        finalize_and_store(&mut self.store, next, now_ms, transition)
+        self.finalize_and_store(next, now_ms, transition)
     }
 
     pub fn reconcile_instrument_rules(
@@ -2194,12 +2221,7 @@ where
         let mut next = self.store.snapshot().clone();
         let message = "authoritative exchange instrument rules changed".to_owned();
         next.fail(message.clone());
-        finalize_and_store(
-            &mut self.store,
-            next,
-            now_ms,
-            StrategyTransition::Failed { message },
-        )
+        self.finalize_and_store(next, now_ms, StrategyTransition::Failed { message })
     }
 
     pub fn evaluate_risk_price(
@@ -2279,8 +2301,7 @@ where
         next.lifecycle = StrategyLifecycle::RiskExitRequested;
         next.risk_exit_reason = Some(reason);
         next.risk_trigger_mark_price = Some(mark_price);
-        finalize_and_store(
-            &mut self.store,
+        self.finalize_and_store(
             next,
             now_ms,
             StrategyTransition::RiskExitRequested { reason, mark_price },
@@ -2317,7 +2338,7 @@ where
                 &mut next,
                 "exchange instrument rules changed before the risk close",
             );
-            return finalize_and_store(&mut self.store, next, now_ms, transition);
+            return self.finalize_and_store(next, now_ms, transition);
         }
         if next.orders.values().any(order_may_still_be_live) {
             return Err(StrategyStateError::OrdersNotTerminal.into());
@@ -2330,12 +2351,11 @@ where
                     "risk close position mismatch: expected {expected}, actual {actual_signed_quantity}"
                 ),
             );
-            return finalize_and_store(&mut self.store, next, now_ms, transition);
+            return self.finalize_and_store(next, now_ms, transition);
         }
         if next.grid_position_net_quantity.is_zero() {
             next.lifecycle = StrategyLifecycle::Closed;
-            return finalize_and_store(
-                &mut self.store,
+            return self.finalize_and_store(
                 next,
                 now_ms,
                 StrategyTransition::LifecycleChanged {
@@ -2359,7 +2379,7 @@ where
                 &mut next,
                 "exact grid-owned risk close quantity is not accepted by market rules",
             );
-            return finalize_and_store(&mut self.store, next, now_ms, transition);
+            return self.finalize_and_store(next, now_ms, transition);
         }
         let side = if next.grid_position_net_quantity > Decimal::ZERO {
             OrderSide::Sell
@@ -2389,8 +2409,7 @@ where
             terminal_processed: false,
             completed_pair_counted: false,
         })?;
-        finalize_and_store(
-            &mut self.store,
+        self.finalize_and_store(
             next,
             now_ms,
             StrategyTransition::RiskCloseOrderReady {
@@ -2414,12 +2433,7 @@ where
             "authoritative position mismatch: expected {expected}, actual {actual_signed_quantity}"
         );
         next.fail(message.clone());
-        finalize_and_store(
-            &mut self.store,
-            next,
-            now_ms,
-            StrategyTransition::Failed { message },
-        )
+        self.finalize_and_store(next, now_ms, StrategyTransition::Failed { message })
     }
 
     pub fn request_stop(
@@ -2438,8 +2452,7 @@ where
             return Ok(StrategyTransition::NoChange);
         }
         next.lifecycle = StrategyLifecycle::StopRequested;
-        finalize_and_store(
-            &mut self.store,
+        self.finalize_and_store(
             next,
             now_ms,
             StrategyTransition::LifecycleChanged {
@@ -2463,8 +2476,7 @@ where
             return Err(StrategyStateError::OrdersNotTerminal.into());
         }
         next.lifecycle = StrategyLifecycle::Stopped;
-        finalize_and_store(
-            &mut self.store,
+        self.finalize_and_store(
             next,
             now_ms,
             StrategyTransition::LifecycleChanged {
@@ -2492,8 +2504,7 @@ where
             return Err(StrategyStateError::InvalidFailureState.into());
         }
         next.lifecycle = StrategyLifecycle::Stopped;
-        finalize_and_store(
-            &mut self.store,
+        self.finalize_and_store(
             next,
             now_ms,
             StrategyTransition::LifecycleChanged {
@@ -2518,8 +2529,7 @@ where
             return Err(StrategyStateError::CannotCloseStrategy.into());
         }
         next.lifecycle = StrategyLifecycle::Closed;
-        finalize_and_store(
-            &mut self.store,
+        self.finalize_and_store(
             next,
             now_ms,
             StrategyTransition::LifecycleChanged {
@@ -2544,25 +2554,36 @@ fn order_may_still_be_live(order: &StrategyOrderRecord) -> bool {
     }
 }
 
-fn finalize_and_store<S: StrategyStateStore>(
-    store: &mut S,
-    mut next: StrategyState,
-    now_ms: u64,
-    transition: StrategyTransition,
-) -> Result<StrategyTransition, StrategyMachineError> {
-    if transition == StrategyTransition::NoChange {
-        return Ok(transition);
+impl<S> StrategyMachine<S>
+where
+    S: StrategyStateStore,
+{
+    fn finalize_and_store(
+        &mut self,
+        mut next: StrategyState,
+        now_ms: u64,
+        transition: StrategyTransition,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        if transition == StrategyTransition::NoChange {
+            return Ok(transition);
+        }
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or(StrategyStateError::NumericOverflow("strategy revision"))?;
+        if now_ms < next.updated_at_ms {
+            return Err(StrategyStateError::TimestampRegression.into());
+        }
+        next.updated_at_ms = now_ms;
+        let validated = if self.snapshot_validated {
+            ValidatedStrategyState::from_validated_transition(self.store.snapshot(), next)?
+        } else {
+            ValidatedStrategyState::new(next)?
+        };
+        self.store.replace_validated(validated)?;
+        self.snapshot_validated = true;
+        Ok(transition)
     }
-    next.revision = next
-        .revision
-        .checked_add(1)
-        .ok_or(StrategyStateError::NumericOverflow("strategy revision"))?;
-    if now_ms < next.updated_at_ms {
-        return Err(StrategyStateError::TimestampRegression.into());
-    }
-    next.updated_at_ms = now_ms;
-    store.replace_validated(ValidatedStrategyState::new(next)?)?;
-    Ok(transition)
 }
 
 fn synchronize_intent_state(state: &mut StrategyState, intent: &OrderIntent) -> StrategyTransition {
@@ -3102,6 +3123,45 @@ impl InventoryAccountingSnapshot {
         state.next_neutral_lot_sequence = self.next_neutral_lot_sequence;
         state.gross_realized_profit = self.gross_realized_profit;
     }
+}
+
+fn inventory_replay_inputs_and_outputs_are_unchanged(
+    previous: &StrategyState,
+    next: &StrategyState,
+) -> bool {
+    if previous.direction != next.direction
+        || previous.inventory_events != next.inventory_events
+        || previous.grid_position_net_quantity != next.grid_position_net_quantity
+        || previous.opening_filled_quantity != next.opening_filled_quantity
+        || previous.opening_filled_value != next.opening_filled_value
+        || previous.lots_by_level != next.lots_by_level
+        || previous.neutral_lots != next.neutral_lots
+        || previous.next_neutral_lot_sequence != next.next_neutral_lot_sequence
+        || previous.gross_realized_profit != next.gross_realized_profit
+    {
+        return false;
+    }
+
+    let (Ok(previous_opening_targets), Ok(next_opening_targets)) =
+        (opening_lot_targets(previous), opening_lot_targets(next))
+    else {
+        return false;
+    };
+    if previous_opening_targets != next_opening_targets {
+        return false;
+    }
+
+    previous.inventory_events.values().all(|event| {
+        let Some(previous_order) = previous.orders.get(&event.source_client_order_id) else {
+            return false;
+        };
+        next.orders
+            .get(&event.source_client_order_id)
+            .is_some_and(|next_order| {
+                previous_order.purpose == next_order.purpose
+                    && previous_order.shape == next_order.shape
+            })
+    })
 }
 
 fn inventory_events_in_accounting_order(
@@ -6702,6 +6762,42 @@ mod tests {
     }
 
     #[test]
+    fn invalid_loaded_snapshot_cannot_use_inventory_replay_skip() {
+        let machine = short_machine_with_opening();
+        let mut drifted = machine.store().snapshot().clone();
+        let moved_quantity = Decimal::new(1, 1);
+        let moved_entry_value = {
+            let source = drifted.lots_by_level.get(&0).unwrap();
+            source
+                .entry_value
+                .checked_mul(moved_quantity)
+                .and_then(|value| value.checked_div(source.quantity))
+                .unwrap()
+        };
+        {
+            let source = drifted.lots_by_level.get_mut(&0).unwrap();
+            source.quantity -= moved_quantity;
+            source.entry_value -= moved_entry_value;
+        }
+        {
+            let destination = drifted.lots_by_level.get_mut(&1).unwrap();
+            destination.quantity += moved_quantity;
+            destination.entry_value += moved_entry_value;
+        }
+
+        let updated_at_ms = drifted.updated_at_ms;
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(drifted));
+        assert!(!machine.snapshot_validated);
+        assert!(matches!(
+            machine.request_stop(updated_at_ms + 1),
+            Err(StrategyMachineError::InvalidState(
+                StrategyStateError::LevelLotLedgerMismatch
+            ))
+        ));
+        assert!(!machine.snapshot_validated);
+    }
+
+    #[test]
     fn missing_or_reordered_inventory_events_are_rejected() {
         let mut machine = short_machine_with_opening();
         let reduce = grid_id(machine.store().snapshot(), 0, OrderSide::Buy, true);
@@ -7544,6 +7640,81 @@ mod tests {
             inventory_accounting_update_mode(&snapshot, &[delta(None, None)]),
             InventoryAccountingUpdateMode::Replay
         );
+    }
+
+    #[test]
+    fn inventory_replay_skip_requires_exactly_unchanged_inputs_and_outputs() {
+        let previous = short_machine_with_opening().store().snapshot().clone();
+
+        let mut metadata_only = previous.clone();
+        metadata_only.revision += 1;
+        metadata_only.updated_at_ms += 1;
+        assert!(inventory_replay_inputs_and_outputs_are_unchanged(
+            &previous,
+            &metadata_only
+        ));
+        ValidatedStrategyState::from_validated_transition(&previous, metadata_only).unwrap();
+
+        let mut changed_event = previous.clone();
+        changed_event
+            .inventory_events
+            .values_mut()
+            .next()
+            .unwrap()
+            .quote += Decimal::ONE;
+        assert!(!inventory_replay_inputs_and_outputs_are_unchanged(
+            &previous,
+            &changed_event
+        ));
+
+        let mut changed_lot = previous.clone();
+        changed_lot
+            .lots_by_level
+            .values_mut()
+            .next()
+            .unwrap()
+            .entry_value += Decimal::ONE;
+        assert!(!inventory_replay_inputs_and_outputs_are_unchanged(
+            &previous,
+            &changed_lot
+        ));
+
+        let mut changed_source_order = previous.clone();
+        let source_client_order_id = changed_source_order
+            .inventory_events
+            .values()
+            .next()
+            .unwrap()
+            .source_client_order_id
+            .clone();
+        let source_order = changed_source_order
+            .orders
+            .get_mut(&source_client_order_id)
+            .unwrap();
+        source_order.shape.side = match source_order.shape.side {
+            OrderSide::Buy => OrderSide::Sell,
+            OrderSide::Sell => OrderSide::Buy,
+        };
+        assert!(!inventory_replay_inputs_and_outputs_are_unchanged(
+            &previous,
+            &changed_source_order
+        ));
+
+        let mut changed_opening_target = previous.clone();
+        changed_opening_target
+            .orders
+            .values_mut()
+            .find(|order| {
+                matches!(order.purpose, StrategyOrderPurpose::InitialGrid { .. })
+                    && order.shape.reduce_only
+            })
+            .unwrap()
+            .shape
+            .quantity += Decimal::ONE;
+        assert!(!inventory_replay_inputs_and_outputs_are_unchanged(
+            &previous,
+            &changed_opening_target
+        ));
     }
 
     #[test]
