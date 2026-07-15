@@ -5188,10 +5188,9 @@ mod tests {
 
         assert_eq!(report.blockers[0].stage, RuntimeStage::InstrumentRules);
         assert_eq!(gateway.placement_call_count(), 0);
-        assert_eq!(
-            runtime.machine().store().snapshot().lifecycle,
-            StrategyLifecycle::Failed
-        );
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Stopped);
+        assert!(state.failure.is_some());
     }
 
     #[tokio::test]
