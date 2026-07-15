@@ -1231,7 +1231,7 @@ mod tests {
         let transport = MockTransport::with_response(Ok(HttpResponse {
             status: 200,
             body: r#"[
-                {"symbol":"ANSEMUSDT","orderId":4770039,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"0.38","origQty":"70","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
+                {"symbol":"ANSEMUSDT","orderId":4770039,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"0.38","origQty":"70","executedQty":"0","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
             ]"#
                 .into(),
         }));

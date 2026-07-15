@@ -290,6 +290,7 @@ mod tests {
             exchange: order.exchange,
             shape: order.shape.clone(),
             lifecycle,
+            executed_quantity: None,
         })
     }
 

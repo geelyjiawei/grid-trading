@@ -852,6 +852,7 @@ mod tests {
                     exchange: state.exchange,
                     shape: order.shape.clone(),
                     lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                    executed_quantity: Some(Decimal::ZERO),
                 }),
                 _ => None,
             })
@@ -1254,6 +1255,7 @@ mod tests {
             exchange: state.exchange,
             shape,
             lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled),
+            executed_quantity: None,
         });
         state.validate().unwrap();
 

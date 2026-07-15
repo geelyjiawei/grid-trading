@@ -414,6 +414,7 @@ fn parse_order_row(
             exchange: Exchange::Bybit,
             shape,
             lifecycle,
+            executed_quantity: Some(cumulative_quantity),
         },
         cumulative_quantity,
         cumulative_quote,

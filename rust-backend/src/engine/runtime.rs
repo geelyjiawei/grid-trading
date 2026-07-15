@@ -2367,6 +2367,7 @@ mod tests {
                 exchange: intent.exchange,
                 shape: intent.shape.clone(),
                 lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                executed_quantity: Some(Decimal::ZERO),
             };
             state
                 .orders

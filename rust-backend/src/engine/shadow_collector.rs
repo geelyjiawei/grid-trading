@@ -495,6 +495,7 @@ mod tests {
                 exchange: state.exchange,
                 shape: order.shape.clone(),
                 lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                executed_quantity: Some(Decimal::ZERO),
             })
             .collect()
     }

@@ -2584,10 +2584,49 @@ async fn exchange_open_orders(
         Ok(snapshot) => {
             let mut orders = Vec::with_capacity(snapshot.len());
             for order in snapshot {
+                let Some(executed_quantity) = order.executed_quantity else {
+                    return snapshot_failure(
+                        "open orders",
+                        exchange,
+                        SnapshotError::new(
+                            "open-order snapshot omitted authoritative executed quantity",
+                        ),
+                    );
+                };
+                if executed_quantity < Decimal::ZERO || executed_quantity > order.shape.quantity {
+                    return snapshot_failure(
+                        "open orders",
+                        exchange,
+                        SnapshotError::new(
+                            "open-order snapshot contained invalid executed quantity",
+                        ),
+                    );
+                }
                 let status = match order.lifecycle {
-                    OrderLifecycle::Active(ActiveOrderStatus::New) => "NEW",
+                    OrderLifecycle::Active(ActiveOrderStatus::New)
+                        if executed_quantity.is_zero() =>
+                    {
+                        "NEW"
+                    }
                     OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled) => {
+                        if executed_quantity.is_zero() || executed_quantity >= order.shape.quantity
+                        {
+                            return snapshot_failure(
+                                "open orders",
+                                exchange,
+                                SnapshotError::new(
+                                    "partially-filled order contained invalid executed quantity",
+                                ),
+                            );
+                        }
                         "PARTIALLY_FILLED"
+                    }
+                    OrderLifecycle::Active(ActiveOrderStatus::New) => {
+                        return snapshot_failure(
+                            "open orders",
+                            exchange,
+                            SnapshotError::new("new order contained non-zero executed quantity"),
+                        );
                     }
                     OrderLifecycle::Terminal(_) => {
                         return snapshot_failure(
@@ -2597,12 +2636,16 @@ async fn exchange_open_orders(
                         );
                     }
                 };
+                let remaining_quantity = order.shape.quantity - executed_quantity;
                 orders.push(json!({
                     "order_id": order.exchange_order_id,
                     "order_link_id": order.client_order_id.as_str(),
                     "side": order_side_name(order.shape.side),
                     "price": order.shape.price.map(|price| price.to_string()).unwrap_or_else(|| "0".into()),
                     "qty": order.shape.quantity.to_string(),
+                    "original_qty": order.shape.quantity.to_string(),
+                    "executed_qty": executed_quantity.to_string(),
+                    "remaining_qty": remaining_quantity.to_string(),
                     "status": status,
                     "reduce_only": order.shape.reduce_only,
                 }));
@@ -4018,7 +4061,8 @@ mod tests {
                         kind: OrderKind::Limit,
                         time_in_force: TimeInForce::Gtc,
                     },
-                    lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                    lifecycle: OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+                    executed_quantity: Some(Decimal::from_str_exact("30.000").unwrap()),
                 },
                 AuthoritativeOrder {
                     client_order_id: ClientOrderId::parse("manual_user_1").unwrap(),
@@ -4034,6 +4078,7 @@ mod tests {
                         time_in_force: TimeInForce::Gtc,
                     },
                     lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                    executed_quantity: Some(Decimal::ZERO),
                 },
             ])
         }
@@ -4102,6 +4147,7 @@ mod tests {
                     time_in_force: TimeInForce::Gtc,
                 },
                 lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                executed_quantity: Some(Decimal::ZERO),
             }))
         }
     }
@@ -4180,6 +4226,7 @@ mod tests {
                 time_in_force: TimeInForce::Gtc,
             },
             lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            executed_quantity: Some(Decimal::ZERO),
         }
     }
 
@@ -4403,6 +4450,7 @@ mod tests {
                 exchange: state.exchange,
                 shape: order.shape.clone(),
                 lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                executed_quantity: Some(Decimal::ZERO),
             });
         }
         state.lifecycle = StrategyLifecycle::Running;
@@ -4501,6 +4549,7 @@ mod tests {
                     exchange: strategy.exchange,
                     shape: order.shape.clone(),
                     lifecycle: OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+                    executed_quantity: Some(trade.quantity),
                 },
                 cumulative_quantity: trade.quantity,
                 cumulative_quote: trade.quote_quantity,
@@ -4746,6 +4795,10 @@ mod tests {
         assert_eq!(orders["orders"][0]["order_id"], "90071992547409931234");
         assert_eq!(orders["orders"][0]["price"], "0.38000");
         assert_eq!(orders["orders"][0]["qty"], "100.000");
+        assert_eq!(orders["orders"][0]["original_qty"], "100.000");
+        assert_eq!(orders["orders"][0]["executed_qty"], "30.000");
+        assert_eq!(orders["orders"][0]["remaining_qty"], "70.000");
+        assert_eq!(orders["orders"][0]["status"], "PARTIALLY_FILLED");
         assert_eq!(orders["orders"][0]["reduce_only"], true);
 
         let history = app
@@ -5634,6 +5687,7 @@ mod tests {
             exchange: strategy.exchange,
             shape: replacement.shape.clone(),
             lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            executed_quantity: Some(Decimal::ZERO),
         });
         let mark_price = entry_price - Decimal::from_str_exact("0.02000").unwrap();
         let expected_unrealized = ((entry_price - mark_price) * source.shape.quantity).to_string();

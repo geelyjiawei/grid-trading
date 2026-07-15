@@ -152,6 +152,9 @@ export interface GridOrder {
   side: "Buy" | "Sell";
   price: string | number;
   qty: string | number;
+  original_qty?: string | number;
+  executed_qty?: string | number;
+  remaining_qty?: string | number;
   status?: string;
   reduce_only?: boolean;
   reduceOnly?: boolean;

@@ -398,6 +398,7 @@ mod tests {
                 time_in_force: TimeInForce::Gtc,
             },
             lifecycle,
+            executed_quantity: None,
         }
     }
 

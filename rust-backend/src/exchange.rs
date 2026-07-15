@@ -135,6 +135,8 @@ pub struct AuthoritativeOrder {
     pub exchange: Exchange,
     pub shape: OrderShape,
     pub lifecycle: OrderLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_quantity: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -48,6 +48,14 @@ function reduceOnly(order: GridOrder): boolean {
   return Boolean(order.reduce_only ?? order.reduceOnly);
 }
 
+function orderQuantity(order: GridOrder): string {
+  const remaining = formatExactDecimal(order.remaining_qty ?? order.qty);
+  if (order.status !== "PARTIALLY_FILLED" || order.original_qty === undefined) {
+    return remaining;
+  }
+  return `${remaining} / ${formatExactDecimal(order.original_qty)}`;
+}
+
 function feeDisplayAsset(trade: GridTrade): string {
   if (trade.fee_usdt !== null && trade.fee_usdt !== undefined) {
     return trade.fee_quote_asset || "USDT";
@@ -114,7 +122,7 @@ function feeDisplayAsset(trade: GridTrade): string {
           <tr v-for="order in orders" :key="order.order_id ?? order.orderId ?? order.order_link_id ?? order.orderLinkId">
             <td :class="order.side === 'Buy' ? 'positive' : 'negative'">{{ order.side }}</td>
             <td>{{ formatExactDecimal(order.price) }}</td>
-            <td>{{ formatExactDecimal(order.qty) }}</td>
+            <td>{{ orderQuantity(order) }}</td>
             <td>{{ reduceOnly(order) ? "止盈/平仓" : "开仓/补仓" }}</td>
             <td>{{ order.status || "--" }}</td>
             <td class="mono-cell">{{ order.order_link_id ?? order.orderLinkId ?? "--" }}</td>

@@ -639,12 +639,36 @@ fn parse_authoritative_order_value(
         .validate()
         .map_err(|_| CodecError::InvalidField("orderShape"))?;
 
+    let lifecycle = parse_lifecycle(required_string(value, "status")?)?;
+    let executed_quantity = required_decimal(value, "executedQty")?;
+    if executed_quantity < Decimal::ZERO || executed_quantity > quantity {
+        return Err(CodecError::InvalidField("executedQty"));
+    }
+    match lifecycle {
+        OrderLifecycle::Active(ActiveOrderStatus::New) if !executed_quantity.is_zero() => {
+            return Err(CodecError::InvalidField("status"));
+        }
+        OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+            if executed_quantity <= Decimal::ZERO || executed_quantity >= quantity =>
+        {
+            return Err(CodecError::InvalidField("status"));
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Filled) if executed_quantity != quantity => {
+            return Err(CodecError::InvalidField("status"));
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Rejected) if !executed_quantity.is_zero() => {
+            return Err(CodecError::InvalidField("status"));
+        }
+        _ => {}
+    }
+
     Ok(AuthoritativeOrder {
         client_order_id,
         exchange_order_id,
         exchange,
         shape,
-        lifecycle: parse_lifecycle(required_string(value, "status")?)?,
+        lifecycle,
+        executed_quantity: Some(executed_quantity),
     })
 }
 
@@ -831,7 +855,7 @@ mod tests {
         let order = parse_authoritative_order(
             r#"{
                 "symbol":"ANSEMUSDT","orderId":4770039,"clientOrderId":"g_0_B_test",
-                "side":"BUY","price":"0.3800000","origQty":"70","status":"NEW",
+                "side":"BUY","price":"0.3800000","origQty":"70","executedQty":"0","status":"NEW",
                 "reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"
             }"#,
             Exchange::Aster,
@@ -841,6 +865,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(order.shape.quantity, Decimal::new(70, 0));
+        assert_eq!(order.executed_quantity, Some(Decimal::ZERO));
         assert_eq!(order.shape.price, Some(Decimal::new(38, 2)));
         assert_eq!(
             order.lifecycle,
@@ -852,8 +877,8 @@ mod tests {
     fn open_order_snapshot_is_complete_sorted_and_active_only() {
         let orders = parse_open_orders(
             r#"[
-                {"symbol":"ANSEMUSDT","orderId":2,"clientOrderId":"g_RUN00001_2_S_2","side":"SELL","price":"0.382","origQty":"100","status":"PARTIALLY_FILLED","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
-                {"symbol":"ANSEMUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"0.380","origQty":"100","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
+                {"symbol":"ANSEMUSDT","orderId":2,"clientOrderId":"g_RUN00001_2_S_2","side":"SELL","price":"0.382","origQty":"100","executedQty":"30","status":"PARTIALLY_FILLED","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
+                {"symbol":"ANSEMUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"0.380","origQty":"100","executedQty":"0","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
             ]"#,
             Exchange::Aster,
             "ANSEMUSDT",
@@ -863,6 +888,7 @@ mod tests {
         assert_eq!(orders.len(), 2);
         assert_eq!(orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
         assert_eq!(orders[1].shape.quantity, Decimal::new(100, 0));
+        assert_eq!(orders[1].executed_quantity, Some(Decimal::new(30, 0)));
         assert_eq!(
             orders[1].lifecycle,
             OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
@@ -871,7 +897,7 @@ mod tests {
 
     #[test]
     fn open_order_snapshot_rejects_terminal_duplicate_and_foreign_rows() {
-        let base = r#"{"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"1","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}"#;
+        let base = r#"{"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"1","executedQty":"0","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}"#;
         let terminal = base.replace("\"NEW\"", "\"FILLED\"");
         let foreign = base.replace("MUUSDT", "ANSEMUSDT");
         assert!(parse_open_orders(&format!("[{terminal}]"), Exchange::Binance, "MUUSDT").is_err());
@@ -924,7 +950,7 @@ mod tests {
             r#"[
                 {"symbol":"MUUSDT","orderId":8,"clientOrderId":"manual_1","side":"BUY","price":"1000","origQty":"1","status":"NEW","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
                 {"symbol":"MUUSDT","orderId":9,"clientOrderId":"manual:id/with.dots","side":"BUY","price":"1000","origQty":"1","status":"NEW","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"},
-                {"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"1","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
+                {"symbol":"MUUSDT","orderId":1,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"1","executedQty":"0","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
             ]"#,
             Exchange::Binance,
             "MUUSDT",

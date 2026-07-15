@@ -989,8 +989,8 @@ mod tests {
         let transport = MockTransport::with_response(Ok(HttpResponse {
             status: 200,
             body: r#"[
-                {"symbol":"MUUSDT","orderId":91,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"70","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"},
-                {"symbol":"MUUSDT","orderId":92,"clientOrderId":"g_RUN00001_2_S_2","side":"SELL","price":"1012","origQty":"100","status":"PARTIALLY_FILLED","reduceOnly":false,"timeInForce":"GTX","type":"LIMIT"}
+                {"symbol":"MUUSDT","orderId":91,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"1010","origQty":"70","executedQty":"0","status":"NEW","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"},
+                {"symbol":"MUUSDT","orderId":92,"clientOrderId":"g_RUN00001_2_S_2","side":"SELL","price":"1012","origQty":"100","executedQty":"30","status":"PARTIALLY_FILLED","reduceOnly":false,"timeInForce":"GTX","type":"LIMIT"}
             ]"#
                 .into(),
         }));

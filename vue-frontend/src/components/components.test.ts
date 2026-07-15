@@ -367,8 +367,11 @@ describe("Vue migration components", () => {
             order_link_id: "g_7_B_exact",
             side: "Buy",
             price: "0.380001234567",
-            qty: "70.000000001",
-            status: "NEW",
+            qty: "100.000000001",
+            original_qty: "100.000000001",
+            executed_qty: "30.000000000",
+            remaining_qty: "70.000000001",
+            status: "PARTIALLY_FILLED",
             reduce_only: true,
           },
         ],
@@ -388,7 +391,7 @@ describe("Vue migration components", () => {
     await orderTab!.trigger("click");
 
     expect(wrapper.text()).toContain("0.380001234567");
-    expect(wrapper.text()).toContain("70.000000001");
+    expect(wrapper.text()).toContain("70.000000001 / 100.000000001");
     expect(wrapper.text()).toContain("g_7_B_exact");
     expect(wrapper.text()).toContain("止盈/平仓");
   });
