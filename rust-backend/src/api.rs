@@ -772,13 +772,13 @@ async fn execute_start_grid(
     body: Bytes,
 ) -> Response {
     let configuration_gate = Arc::clone(&state.exchange_configuration_gate);
-    let _configuration_guard = configuration_gate.lock().await;
     let payload = match parse_json_object(&body) {
         Ok(payload) => payload,
         Err(response) => return *response,
     };
     let command = Arc::clone(&state.start_command);
     run_idempotent_command(state, key, method, uri, body, async move {
+        let _configuration_guard = configuration_gate.lock().await;
         command.execute(payload).await
     })
     .await
