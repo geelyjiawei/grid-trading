@@ -46,6 +46,13 @@ function runProfit(run: GridHistoryRun): string | number | undefined {
 function reduceOnly(order: GridOrder): boolean {
   return Boolean(order.reduce_only ?? order.reduceOnly);
 }
+
+function feeDisplayAsset(trade: GridTrade): string {
+  if (trade.fee_usdt !== null && trade.fee_usdt !== undefined) {
+    return trade.fee_quote_asset || "USDT";
+  }
+  return trade.fee_asset || "";
+}
 </script>
 
 <template>
@@ -117,7 +124,7 @@ function reduceOnly(order: GridOrder): boolean {
 
     <div v-else-if="configured && activeTab === 'trades'" class="detail-content table-scroll">
       <table>
-        <thead><tr><th>方向</th><th>价格</th><th>数量</th><th>交易量</th><th>手续费</th><th>流动性</th><th>已实现盈亏</th><th>时间</th></tr></thead>
+        <thead><tr><th>方向</th><th>价格</th><th>数量</th><th>交易量</th><th>手续费折算</th><th>流动性</th><th>已实现盈亏</th><th>时间</th></tr></thead>
         <tbody>
           <tr v-if="trades.length === 0"><td colspan="8" class="empty-state">暂无成交</td></tr>
           <tr v-for="trade in trades" :key="`${trade.order_id}:${trade.trade_id}`">
@@ -125,7 +132,7 @@ function reduceOnly(order: GridOrder): boolean {
             <td>{{ formatNumber(trade.price, 8) }}</td>
             <td>{{ formatNumber(trade.qty, 8) }}</td>
             <td>{{ formatNumber(trade.volume, 8) }}</td>
-            <td>{{ formatNumber(trade.fee_usdt ?? trade.fee, 8) }} {{ trade.fee_asset || "" }}</td>
+            <td>{{ formatNumber(trade.fee_usdt ?? trade.fee, 8) }} {{ feeDisplayAsset(trade) }}</td>
             <td>{{ trade.is_maker === true ? "挂单" : trade.is_maker === false ? "吃单" : trade.liquidity || "--" }}</td>
             <td>{{ formatNumber(trade.realized_pnl ?? trade.profit, 8) }}</td>
             <td>{{ formatTimestamp(trade.time) }}</td>

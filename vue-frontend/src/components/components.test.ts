@@ -374,4 +374,43 @@ describe("Vue migration components", () => {
     expect(wrapper.text()).toContain("g_7_B_exact");
     expect(wrapper.text()).toContain("止盈/平仓");
   });
+
+  it("labels converted trade fees with the quote asset instead of the charged asset", async () => {
+    const wrapper = mount(StrategyDetailsPanel, {
+      props: {
+        exchange: "binance",
+        symbol: "MUUSDT",
+        configured: true,
+        loading: false,
+        error: "",
+        positions: [],
+        orders: [],
+        trades: [{
+          order_id: "order-1",
+          trade_id: "trade-1",
+          side: "Sell",
+          price: "1014",
+          qty: "0.2",
+          volume: "202.8",
+          fee: "0.0003",
+          fee_usdt: "0.12",
+          fee_asset: "BNB",
+          fee_quote_asset: "USDT",
+          is_maker: true,
+          realized_pnl: "1.5",
+          profit: "1.38",
+          time: 1_784_102_730_940,
+        }],
+        history: [],
+      },
+    });
+    const tradeTab = wrapper
+      .findAll(".detail-tabs button")
+      .find((button) => button.text().startsWith("成交"));
+    expect(tradeTab).toBeDefined();
+    await tradeTab!.trigger("click");
+
+    expect(wrapper.text()).toContain("0.12 USDT");
+    expect(wrapper.text()).not.toContain("0.12 BNB");
+  });
 });

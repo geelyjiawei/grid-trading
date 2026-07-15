@@ -1589,6 +1589,7 @@ fn strategy_trade_rows(
                 fee: trade.commission_cost.to_string(),
                 fee_usdt: valuation.quote_value.to_string(),
                 fee_asset: trade.commission_asset.clone(),
+                fee_quote_asset: valuation.quote_asset.clone(),
                 fee_source: fee_valuation_source_name(valuation.source),
                 liquidity: if trade.is_maker { "maker" } else { "taker" },
                 is_maker: trade.is_maker,
@@ -2068,6 +2069,7 @@ struct StrategyTradeRow {
     fee: String,
     fee_usdt: String,
     fee_asset: String,
+    fee_quote_asset: String,
     fee_source: &'static str,
     liquidity: &'static str,
     is_maker: bool,
@@ -4528,6 +4530,8 @@ mod tests {
         assert_eq!(rows[0].volume, "50.083");
         assert_eq!(rows[0].fee, "0.0277");
         assert_eq!(rows[0].fee_usdt, "0.12");
+        assert_eq!(rows[0].fee_asset, "BNB");
+        assert_eq!(rows[0].fee_quote_asset, "USDT");
         assert_eq!(rows[0].liquidity, "taker");
         assert_eq!(rows[0].realized_pnl, "1.5");
         assert_eq!(rows[0].profit, "1.38");

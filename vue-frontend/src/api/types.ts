@@ -168,6 +168,7 @@ export interface GridTrade {
   fee?: string | number;
   fee_usdt?: string | number;
   fee_asset?: string;
+  fee_quote_asset?: string;
   liquidity?: string;
   is_maker?: boolean;
   realized_pnl?: string | number;
