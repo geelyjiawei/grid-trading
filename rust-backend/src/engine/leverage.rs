@@ -7,6 +7,7 @@ use crate::{
         SnapshotError,
     },
 };
+use rust_decimal::Decimal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeveragePreflightResult {
@@ -31,9 +32,16 @@ where
         return Err(LeveragePreflightError::InvalidInput);
     }
     let symbol = symbol.to_ascii_uppercase();
-    let before = observed_leverage(gateway, exchange, &symbol).await?;
+    let (position_quantity, before) =
+        observed_position_and_leverage(gateway, exchange, &symbol).await?;
     if before == expected_leverage {
         return Ok(LeveragePreflightResult::AlreadyConfigured);
+    }
+    if !position_quantity.is_zero() {
+        return Err(LeveragePreflightError::ExistingPositionLeverageMismatch {
+            observed: before,
+            requested: expected_leverage,
+        });
     }
 
     let acknowledgement = match gateway
@@ -48,11 +56,11 @@ where
             return Err(LeveragePreflightError::Definitive { code, message });
         }
         Err(LeverageError::Unknown { message }) => {
-            return match observed_leverage(gateway, exchange, &symbol).await {
-                Ok(observed) if observed == expected_leverage => {
+            return match observed_position_and_leverage(gateway, exchange, &symbol).await {
+                Ok((_, observed)) if observed == expected_leverage => {
                     Ok(LeveragePreflightResult::ReconciledAfterUnknown)
                 }
-                Ok(observed) => Err(LeveragePreflightError::Unknown {
+                Ok((_, observed)) => Err(LeveragePreflightError::Unknown {
                     message: format!(
                         "{message}; verification still reports leverage {observed}, expected {expected_leverage}"
                     ),
@@ -64,7 +72,7 @@ where
         }
     };
     validate_acknowledgement(&acknowledgement, exchange, &symbol, expected_leverage)?;
-    let observed = observed_leverage(gateway, exchange, &symbol).await?;
+    let (_, observed) = observed_position_and_leverage(gateway, exchange, &symbol).await?;
     if observed != expected_leverage {
         return Err(LeveragePreflightError::NotVerified {
             expected: expected_leverage,
@@ -74,11 +82,11 @@ where
     Ok(LeveragePreflightResult::ConfiguredAndVerified)
 }
 
-async fn observed_leverage<G>(
+async fn observed_position_and_leverage<G>(
     gateway: &G,
     exchange: Exchange,
     symbol: &str,
-) -> Result<u16, LeveragePreflightError>
+) -> Result<(Decimal, u16), LeveragePreflightError>
 where
     G: PositionSnapshotGateway,
 {
@@ -88,9 +96,13 @@ where
             "position leverage snapshot identity mismatch",
         )));
     }
-    snapshot
+    let (signed_quantity, _) = snapshot
+        .one_way_position()
+        .map_err(LeveragePreflightError::Snapshot)?;
+    let leverage = snapshot
         .one_way_leverage()
-        .map_err(LeveragePreflightError::Snapshot)
+        .map_err(LeveragePreflightError::Snapshot)?;
+    Ok((signed_quantity, leverage))
 }
 
 fn validate_acknowledgement(
@@ -112,6 +124,10 @@ fn validate_acknowledgement(
 pub enum LeveragePreflightError {
     #[error("leverage preflight input is invalid")]
     InvalidInput,
+    #[error(
+        "existing position leverage is {observed}; refusing to change it to requested leverage {requested}"
+    )]
+    ExistingPositionLeverageMismatch { observed: u16, requested: u16 },
     #[error("leverage request is invalid: {0}")]
     InvalidRequest(String),
     #[error("exchange definitively rejected leverage: {message}")]
@@ -216,13 +232,17 @@ mod tests {
     }
 
     fn position(leverage: Option<u16>) -> PositionSnapshot {
+        position_with_quantity(leverage, Decimal::ZERO)
+    }
+
+    fn position_with_quantity(leverage: Option<u16>, signed_quantity: Decimal) -> PositionSnapshot {
         PositionSnapshot {
             exchange: Exchange::Binance,
             symbol: "MUUSDT".into(),
             legs: vec![PositionLeg {
                 side: PositionSide::Both,
-                signed_quantity: Decimal::ZERO,
-                entry_price: None,
+                signed_quantity,
+                entry_price: (!signed_quantity.is_zero()).then_some(Decimal::new(1011, 0)),
                 mark_price: Decimal::new(1010, 0),
                 unrealized_profit: Decimal::ZERO,
                 leverage,
@@ -237,6 +257,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, LeveragePreflightResult::AlreadyConfigured);
+        assert_eq!(gateway.set_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn existing_position_leverage_is_never_changed_by_strategy_startup() {
+        let gateway = FakeGateway {
+            state: Arc::new(Mutex::new(FakeState {
+                snapshots: [Ok(position_with_quantity(Some(3), Decimal::new(-3, 0)))]
+                    .into_iter()
+                    .collect(),
+                setting: Ok(acknowledgement(5)),
+                set_calls: 0,
+            })),
+        };
+
+        assert!(matches!(
+            ensure_symbol_leverage(&gateway, Exchange::Binance, "MUUSDT", 5).await,
+            Err(LeveragePreflightError::ExistingPositionLeverageMismatch {
+                observed: 3,
+                requested: 5
+            })
+        ));
         assert_eq!(gateway.set_calls(), 0);
     }
 

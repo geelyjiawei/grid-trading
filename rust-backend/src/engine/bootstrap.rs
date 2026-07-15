@@ -466,8 +466,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn immediate_strategy_uses_fresh_fees_leverage_rules_and_baseline_before_intents() {
-        let gateway = FakeGateway::new(Decimal::new(1014, 0), 3, Decimal::new(-3, 0));
+    async fn immediate_strategy_preserves_matching_existing_leverage_and_baseline() {
+        let gateway = FakeGateway::new(Decimal::new(1014, 0), 5, Decimal::new(-3, 0));
         let prepared = prepare_new_strategy(
             &gateway,
             StrategyRunId::parse("BOOT0002").unwrap(),
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(active.lifecycle, StrategyLifecycle::AwaitingOpening);
         let state = gateway.state.lock().unwrap();
         assert_eq!(state.leverage, 5);
-        assert_eq!(state.calls.leverage_writes, 1);
+        assert_eq!(state.calls.leverage_writes, 0);
         assert!(state.calls.position >= 2);
         assert_eq!(state.calls.fees, 1);
         assert_eq!(state.calls.rules, 1);
