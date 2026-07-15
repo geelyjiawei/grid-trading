@@ -2782,6 +2782,7 @@ fn apply_execution_report(
             Ok(deltas) => deltas,
             Err(message) => return fail_transition(state, message),
         };
+    let inventory_update_mode = inventory_accounting_update_mode(state, &inventory_deltas);
     if delta_quantity.is_zero() && delta_fee.is_zero() && !terminal_changed {
         return StrategyTransition::NoChange;
     }
@@ -2827,17 +2828,20 @@ fn apply_execution_report(
     };
 
     let mut obligation_ids = Vec::new();
-    if let Err(replay_message) = rebuild_inventory_accounting(state) {
+    let accounting_result = match inventory_update_mode {
+        InventoryAccountingUpdateMode::Unchanged => Ok(()),
+        InventoryAccountingUpdateMode::Incremental => {
+            apply_inventory_deltas(state, &purpose, &shape, &inventory_deltas)
+        }
+        InventoryAccountingUpdateMode::Replay => rebuild_inventory_accounting(state),
+    };
+    if let Err(replay_message) = accounting_result {
         // Preserve the prior fail-closed diagnostic shape when exact global
         // chronology cannot be reconstructed (for example, legacy aggregate
         // evidence mixed with exact trades).
         previous_inventory.restore(state);
-        for delta in &inventory_deltas {
-            if let Err(message) =
-                apply_inventory_accounting(state, &purpose, &shape, delta.quantity, delta.quote)
-            {
-                return fail_transition(state, message);
-            }
+        if let Err(message) = apply_inventory_deltas(state, &purpose, &shape, &inventory_deltas) {
+            return fail_transition(state, message);
         }
         return fail_transition(state, replay_message);
     }
@@ -2936,6 +2940,120 @@ struct InventoryDeltaEvidence {
     execution_time_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryAccountingUpdateMode {
+    Unchanged,
+    Incremental,
+    Replay,
+}
+
+fn inventory_accounting_update_mode(
+    state: &StrategyState,
+    deltas: &[InventoryDeltaEvidence],
+) -> InventoryAccountingUpdateMode {
+    let Some(first_delta) = deltas.first() else {
+        return InventoryAccountingUpdateMode::Unchanged;
+    };
+    let Some(first_delta_exact) = inventory_evidence_mode(
+        first_delta.exchange_trade_id.as_deref(),
+        first_delta.execution_time_ms,
+    ) else {
+        return InventoryAccountingUpdateMode::Replay;
+    };
+    if deltas.iter().any(|delta| {
+        inventory_evidence_mode(delta.exchange_trade_id.as_deref(), delta.execution_time_ms)
+            != Some(first_delta_exact)
+    }) {
+        return InventoryAccountingUpdateMode::Replay;
+    }
+
+    if first_delta_exact {
+        for pair in deltas.windows(2) {
+            let (Some(left_id), Some(left_time), Some(right_id), Some(right_time)) = (
+                pair[0].exchange_trade_id.as_deref(),
+                pair[0].execution_time_ms,
+                pair[1].exchange_trade_id.as_deref(),
+                pair[1].execution_time_ms,
+            ) else {
+                return InventoryAccountingUpdateMode::Replay;
+            };
+            if !compare_trade_chronology(left_time, left_id, right_time, right_id).is_lt() {
+                return InventoryAccountingUpdateMode::Replay;
+            }
+        }
+    }
+
+    let Some(first_event) = state.inventory_events.values().next() else {
+        return InventoryAccountingUpdateMode::Incremental;
+    };
+    let Some(first_event_exact) = inventory_evidence_mode(
+        first_event.exchange_trade_id.as_deref(),
+        first_event.execution_time_ms,
+    ) else {
+        return InventoryAccountingUpdateMode::Replay;
+    };
+    if first_delta_exact != first_event_exact
+        || state.inventory_events.values().any(|event| {
+            inventory_evidence_mode(event.exchange_trade_id.as_deref(), event.execution_time_ms)
+                != Some(first_event_exact)
+        })
+    {
+        return InventoryAccountingUpdateMode::Replay;
+    }
+    if !first_delta_exact {
+        return InventoryAccountingUpdateMode::Incremental;
+    }
+
+    let mut latest_event = first_event;
+    for event in state.inventory_events.values().skip(1) {
+        let (Some(left_id), Some(left_time), Some(right_id), Some(right_time)) = (
+            latest_event.exchange_trade_id.as_deref(),
+            latest_event.execution_time_ms,
+            event.exchange_trade_id.as_deref(),
+            event.execution_time_ms,
+        ) else {
+            return InventoryAccountingUpdateMode::Replay;
+        };
+        if compare_trade_chronology(left_time, left_id, right_time, right_id).is_lt() {
+            latest_event = event;
+        }
+    }
+
+    let (Some(latest_id), Some(latest_time), Some(first_id), Some(first_time)) = (
+        latest_event.exchange_trade_id.as_deref(),
+        latest_event.execution_time_ms,
+        first_delta.exchange_trade_id.as_deref(),
+        first_delta.execution_time_ms,
+    ) else {
+        return InventoryAccountingUpdateMode::Replay;
+    };
+    if compare_trade_chronology(latest_time, latest_id, first_time, first_id).is_lt() {
+        InventoryAccountingUpdateMode::Incremental
+    } else {
+        InventoryAccountingUpdateMode::Replay
+    }
+}
+
+fn inventory_evidence_mode(trade_id: Option<&str>, execution_time_ms: Option<u64>) -> Option<bool> {
+    match (trade_id, execution_time_ms) {
+        (Some(_), Some(_)) => Some(true),
+        (None, None) => Some(false),
+        _ => None,
+    }
+}
+
+fn apply_inventory_deltas(
+    state: &mut StrategyState,
+    purpose: &StrategyOrderPurpose,
+    shape: &OrderShape,
+    deltas: &[InventoryDeltaEvidence],
+) -> Result<(), String> {
+    for delta in deltas {
+        apply_inventory_accounting(state, purpose, shape, delta.quantity, delta.quote)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct InventoryAccountingSnapshot {
     grid_position_net_quantity: Decimal,
@@ -2985,8 +3103,8 @@ impl InventoryAccountingSnapshot {
 
 fn inventory_events_in_accounting_order(
     state: &StrategyState,
-) -> Result<Vec<InventoryExecutionEvent>, String> {
-    let mut events = state.inventory_events.values().cloned().collect::<Vec<_>>();
+) -> Result<Vec<&InventoryExecutionEvent>, String> {
+    let mut events = state.inventory_events.values().collect::<Vec<_>>();
     let exact_event_count = events
         .iter()
         .filter(|event| event.exchange_trade_id.is_some() && event.execution_time_ms.is_some())
@@ -7320,6 +7438,53 @@ mod tests {
         assert_eq!(
             restored.neutral_lots.values().next().unwrap().entry_value,
             decimal(3)
+        );
+    }
+
+    #[test]
+    fn inventory_update_mode_only_uses_incremental_accounting_for_proven_appends() {
+        let mut snapshot = state(Direction::Neutral, PositionBaseline::flat());
+        let source_client_order_id = snapshot.orders.keys().next().unwrap().clone();
+        let delta =
+            |trade_id: Option<&str>, execution_time_ms: Option<u64>| InventoryDeltaEvidence {
+                quantity: Decimal::ONE,
+                quote: Decimal::ONE,
+                exchange_trade_id: trade_id.map(str::to_owned),
+                execution_time_ms,
+            };
+
+        assert_eq!(
+            inventory_accounting_update_mode(&snapshot, &[]),
+            InventoryAccountingUpdateMode::Unchanged
+        );
+        assert_eq!(
+            inventory_accounting_update_mode(&snapshot, &[delta(Some("20"), Some(200))]),
+            InventoryAccountingUpdateMode::Incremental
+        );
+
+        snapshot.inventory_events.insert(
+            1,
+            InventoryExecutionEvent {
+                sequence: 1,
+                source_client_order_id,
+                quantity: Decimal::ONE,
+                quote: Decimal::ONE,
+                exchange_trade_id: Some("20".into()),
+                execution_time_ms: Some(200),
+                applied_at_ms: 200,
+            },
+        );
+        assert_eq!(
+            inventory_accounting_update_mode(&snapshot, &[delta(Some("21"), Some(200))]),
+            InventoryAccountingUpdateMode::Incremental
+        );
+        assert_eq!(
+            inventory_accounting_update_mode(&snapshot, &[delta(Some("19"), Some(200))]),
+            InventoryAccountingUpdateMode::Replay
+        );
+        assert_eq!(
+            inventory_accounting_update_mode(&snapshot, &[delta(None, None)]),
+            InventoryAccountingUpdateMode::Replay
         );
     }
 
