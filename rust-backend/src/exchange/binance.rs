@@ -1459,7 +1459,7 @@ mod tests {
             status: 200,
             body: r#"{
                 "symbol":"MUUSDT","orderId":91,"clientOrderId":"g_7_S_fixed",
-                "side":"SELL","price":"1011","origQty":"0.2","status":"PARTIALLY_FILLED",
+                "side":"SELL","price":"1011","origQty":"0.2","executedQty":"0.1","status":"PARTIALLY_FILLED",
                 "reduceOnly":false,"timeInForce":"GTX","type":"LIMIT"
             }"#
             .into(),

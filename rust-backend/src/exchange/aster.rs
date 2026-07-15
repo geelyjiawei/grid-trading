@@ -1617,7 +1617,7 @@ mod tests {
             status: 200,
             body: r#"{
                 "symbol":"ANSEMUSDT","orderId":4770039,"clientOrderId":"g_0_B_fixed",
-                "side":"BUY","price":"0.3800000","origQty":"70","status":"NEW",
+                "side":"BUY","price":"0.3800000","origQty":"70","executedQty":"0","status":"NEW",
                 "reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"
             }"#
             .into(),

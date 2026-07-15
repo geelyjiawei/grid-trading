@@ -8,7 +8,9 @@ use crate::{
     domain::{ClientOrderId, Exchange, OrderSide, TerminalOrderStatus},
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, HistoricalMinutePrice, OrderExecutionSnapshot,
-        OrderLifecycle, TradeFill, codec::parse_authoritative_order, compare_trade_chronology,
+        OrderLifecycle, TradeFill,
+        codec::{CodecError, parse_authoritative_order},
+        compare_trade_chronology,
     },
 };
 
@@ -53,7 +55,13 @@ pub(super) fn parse_order_execution_header(
     }
     let order =
         parse_authoritative_order(body, exchange, expected_symbol, expected_client_order_id)
-            .map_err(|_| ExecutionCodecError::InvalidField("order"))?;
+            .map_err(|error| match error {
+                CodecError::InvalidField("status") => ExecutionCodecError::InvalidField("status"),
+                CodecError::InvalidField("executedQty") => {
+                    ExecutionCodecError::InvalidField("executedQty")
+                }
+                _ => ExecutionCodecError::InvalidField("order"),
+            })?;
     if order.exchange_order_id != expected_exchange_order_id {
         return Err(ExecutionCodecError::OrderIdentityMismatch);
     }
