@@ -169,6 +169,52 @@ pub trait OpenOrderSnapshotGateway: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalOrder {
+    /// Opaque exchange-provided order identity. It must remain a string.
+    pub exchange_order_id: String,
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub side: crate::domain::OrderSide,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub status: String,
+    pub created_at_ms: u64,
+}
+
+impl HistoricalOrder {
+    pub fn validate(&self) -> Result<(), SnapshotError> {
+        if self.exchange_order_id.is_empty()
+            || self.exchange_order_id.len() > 128
+            || !self
+                .exchange_order_id
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic())
+            || self.symbol.is_empty()
+            || !self.symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || self.price < Decimal::ZERO
+            || self.quantity <= Decimal::ZERO
+            || self.status.is_empty()
+            || self.status.len() > 64
+            || !self.status.bytes().all(|byte| byte.is_ascii_graphic())
+            || self.created_at_ms == 0
+        {
+            return Err(SnapshotError::new("historical order is invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait OrderHistorySnapshotGateway: Send + Sync {
+    async fn order_history_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoricalOrder>, SnapshotError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TradeFill {
     /// Opaque exchange-provided execution identity. It must never be parsed as
     /// a number unless an exchange's pagination contract explicitly requires it.

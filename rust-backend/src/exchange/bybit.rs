@@ -12,18 +12,18 @@ use crate::{
     exchange::{
         AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
         CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
-        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalPriceGateway,
+        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         bybit_codec::{
             parse_account_balance_snapshot, parse_cancellation_acknowledgement, parse_error,
             parse_exact_order_record, parse_execution_page, parse_historical_minute_open,
             parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_open_order_page, parse_placement_acknowledgement, parse_position_snapshot,
-            parse_trading_fee_rates,
+            parse_open_order_page, parse_order_history_page, parse_placement_acknowledgement,
+            parse_position_snapshot, parse_trading_fee_rates,
         },
         codec::validate_snapshot_request,
         execution::assemble_execution_snapshot,
@@ -41,6 +41,8 @@ const EXECUTION_PAGE_LIMIT: usize = 100;
 const MAX_EXECUTION_PAGES: usize = 100;
 const OPEN_ORDER_PAGE_LIMIT: usize = 50;
 const MAX_OPEN_ORDER_PAGES: usize = 100;
+const ORDER_HISTORY_PAGE_LIMIT: usize = 50;
+const MAX_ORDER_HISTORY_PAGES: usize = 20;
 
 pub trait BybitRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, BybitSignatureError>;
@@ -671,6 +673,91 @@ where
 }
 
 #[async_trait]
+impl<T, S, C> OrderHistorySnapshotGateway for BybitAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BybitRequestSigner,
+    C: MillisecondClock,
+{
+    async fn order_history_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoricalOrder>, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Bybit, symbol)?;
+        if !(1..=1_000).contains(&limit) {
+            return Err(SnapshotError::new("order-history limit must be 1..=1000"));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = BTreeSet::new();
+        let mut exchange_order_ids = BTreeSet::new();
+        let mut orders = Vec::with_capacity(limit);
+
+        for _ in 0..MAX_ORDER_HISTORY_PAGES {
+            let page_limit = ORDER_HISTORY_PAGE_LIMIT.min(limit - orders.len());
+            let mut query = vec![
+                ("category".into(), CATEGORY.into()),
+                ("symbol".into(), symbol.clone()),
+                ("limit".into(), page_limit.to_string()),
+            ];
+            if let Some(value) = &cursor {
+                query.push(("cursor".into(), value.clone()));
+            }
+            let request = self
+                .signed_get("/v5/order/history", query)
+                .map_err(|error| SnapshotError::new(error.to_string()))?;
+            let body = self
+                .execute_snapshot(request, "Bybit order-history snapshot")
+                .await?;
+            let page = parse_order_history_page(&body, &symbol).map_err(|error| {
+                SnapshotError::new(format!("invalid Bybit order-history snapshot: {error}"))
+            })?;
+            if page.orders.len() > page_limit {
+                return Err(SnapshotError::new(
+                    "Bybit order-history page exceeded the requested limit",
+                ));
+            }
+            for order in page.orders {
+                if !exchange_order_ids.insert(order.exchange_order_id.clone()) {
+                    return Err(SnapshotError::new(
+                        "Bybit order-history pages contain duplicate order identities",
+                    ));
+                }
+                orders.push(order);
+            }
+            if orders.len() == limit {
+                break;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                cursor = None;
+                break;
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(SnapshotError::new(
+                    "Bybit order-history cursor did not advance",
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+
+        if orders.len() < limit && cursor.is_some() {
+            return Err(SnapshotError::new(
+                "Bybit order history exceeded bounded pagination",
+            ));
+        }
+        orders.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| left.exchange_order_id.cmp(&right.exchange_order_id))
+        });
+        Ok(orders)
+    }
+}
+
+#[async_trait]
 impl<T, S, C> ExecutionSnapshotGateway for BybitAdapter<T, S, C>
 where
     T: HttpTransport,
@@ -1099,6 +1186,12 @@ mod tests {
         )
     }
 
+    fn order_history_page(order_id: &str, time: u64, cursor: &str) -> String {
+        format!(
+            r#"{{"retCode":0,"retMsg":"OK","result":{{"category":"linear","list":[{{"orderId":"{order_id}","orderLinkId":"","symbol":"MUUSDT","price":"1011.00000","qty":"0.240","side":"Sell","orderStatus":"Filled","createdTime":"{time}"}}],"nextPageCursor":"{cursor}"}},"time":1700000001001}}"#
+        )
+    }
+
     #[tokio::test]
     async fn open_order_snapshot_exhausts_cursor_pages_before_returning() {
         let transport = MockTransport::default();
@@ -1140,6 +1233,47 @@ mod tests {
         assert_eq!(orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
         assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
         assert_eq!(orders[1].shape.quantity, Decimal::new(100, 0));
+    }
+
+    #[tokio::test]
+    async fn order_history_exhausts_cursor_pages_and_honors_exact_limit() {
+        let transport = MockTransport::default();
+        transport.push(ok(order_history_page(
+            "order-older",
+            1_780_000_000_001,
+            "cursor:2",
+        )));
+        transport.push(ok(order_history_page("order-newer", 1_780_000_000_002, "")));
+
+        let orders = adapter(transport.clone())
+            .order_history_snapshot(Exchange::Bybit, "MUUSDT", 2)
+            .await
+            .unwrap();
+        let requests = transport.requests();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/v5/order/history");
+        assert!(
+            requests[0]
+                .query
+                .iter()
+                .any(|item| item == &("limit".into(), "2".into()))
+        );
+        assert!(
+            requests[1]
+                .query
+                .iter()
+                .any(|item| item == &("limit".into(), "1".into()))
+        );
+        assert!(
+            requests[1]
+                .query
+                .iter()
+                .any(|item| item == &("cursor".into(), "cursor:2".into()))
+        );
+        assert_eq!(orders[0].exchange_order_id, "order-newer");
+        assert_eq!(orders[0].price.to_string(), "1011.00000");
+        assert_eq!(orders[0].quantity.to_string(), "0.240");
     }
 
     #[tokio::test]

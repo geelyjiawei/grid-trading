@@ -7,8 +7,8 @@ use crate::{
     domain::Exchange,
     exchange::{
         AccountBalanceSnapshotGateway, ExchangeIdentityGateway, MarketSnapshotGateway,
-        OpenOrderSnapshotGateway, OrderLookupGateway, PositionSnapshotGateway,
-        TradingFeeRateGateway,
+        OpenOrderSnapshotGateway, OrderHistorySnapshotGateway, OrderLookupGateway,
+        PositionSnapshotGateway, TradingFeeRateGateway,
         configured::{
             ConfiguredExchangeGateway, ExchangeEnvironment, SharedConfiguredExchangeGateway,
         },
@@ -22,6 +22,7 @@ pub trait ReadOnlyExchangeGateway:
     + TradingFeeRateGateway
     + PositionSnapshotGateway
     + OpenOrderSnapshotGateway
+    + OrderHistorySnapshotGateway
     + OrderLookupGateway
 {
 }
@@ -33,6 +34,7 @@ impl<T> ReadOnlyExchangeGateway for T where
         + TradingFeeRateGateway
         + PositionSnapshotGateway
         + OpenOrderSnapshotGateway
+        + OrderHistorySnapshotGateway
         + OrderLookupGateway
 {
 }

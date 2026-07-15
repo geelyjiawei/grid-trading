@@ -12,8 +12,8 @@ use crate::{
     exchange::{
         AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
         CancellationAcknowledgement, ExchangeMarketSnapshot, HistoricalMinutePrice,
-        LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
-        PositionSide, PositionSnapshot, TradeFill, TradingFeeRates,
+        HistoricalOrder, LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement,
+        PositionLeg, PositionSide, PositionSnapshot, TradeFill, TradingFeeRates,
         execution::OrderExecutionHeader, is_valid_trade_id, strategy_client_order_id,
     },
 };
@@ -248,6 +248,63 @@ pub(super) fn parse_open_order_page(
     }
     orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
     Ok(OpenOrderPage {
+        orders,
+        next_cursor: (!cursor.is_empty()).then_some(cursor),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct OrderHistoryPage {
+    pub orders: Vec<HistoricalOrder>,
+    pub next_cursor: Option<String>,
+}
+
+pub(super) fn parse_order_history_page(
+    body: &str,
+    expected_symbol: &str,
+) -> Result<OrderHistoryPage, BybitCodecError> {
+    let root = success_root(body)?;
+    let result = result_object(&root)?;
+    require_category(result)?;
+    let cursor = optional_string(result, "nextPageCursor")?.unwrap_or_default();
+    if !cursor.is_empty()
+        && (cursor.len() > 2_048 || !cursor.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(BybitCodecError::InvalidField("nextPageCursor"));
+    }
+    let rows = required_array(result, "list")?;
+    if rows.len() > MAX_OPEN_ORDER_PAGE_SIZE {
+        return Err(BybitCodecError::InvalidField("list"));
+    }
+
+    let expected_symbol = expected_symbol.to_ascii_uppercase();
+    let mut exchange_order_ids = BTreeSet::new();
+    let mut orders = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = required_string(row, "symbol")?.to_ascii_uppercase();
+        if symbol != expected_symbol {
+            return Err(BybitCodecError::IdentityMismatch);
+        }
+        let exchange_order_id = required_string(row, "orderId")?.to_owned();
+        if !exchange_order_ids.insert(exchange_order_id.clone()) {
+            return Err(BybitCodecError::DuplicateRecord);
+        }
+        let order = HistoricalOrder {
+            exchange_order_id,
+            exchange: Exchange::Bybit,
+            symbol: symbol.clone(),
+            side: parse_side(required_string(row, "side")?)?,
+            price: required_decimal(row, "price")?,
+            quantity: required_decimal(row, "qty")?,
+            status: required_string(row, "orderStatus")?.to_owned(),
+            created_at_ms: required_u64(row, "createdTime")?,
+        };
+        order
+            .validate()
+            .map_err(|_| BybitCodecError::InvalidField("orderHistory"))?;
+        orders.push(order);
+    }
+    Ok(OrderHistoryPage {
         orders,
         next_cursor: (!cursor.is_empty()).then_some(cursor),
     })
@@ -893,6 +950,25 @@ mod tests {
         assert!(parse_open_order_page(&format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{row},{row}]}}}}"#), "MUUSDT").is_err());
         assert!(parse_open_order_page(&format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"","list":[{terminal}]}}}}"#), "MUUSDT").is_err());
         assert!(parse_open_order_page(&format!(r#"{{"retCode":0,"result":{{"category":"linear","nextPageCursor":"bad cursor","list":[{row}]}}}}"#), "MUUSDT").is_err());
+    }
+
+    #[test]
+    fn order_history_page_preserves_exact_values_and_manual_orders() {
+        let page = parse_order_history_page(
+            r#"{"retCode":0,"result":{"category":"linear","nextPageCursor":"next%3A2","list":[
+                {"symbol":"MUUSDT","orderId":"opaque-order-2","orderLinkId":"","side":"Sell","price":"1011.00000","qty":"0.240","orderStatus":"Filled","createdTime":"1780000000002"},
+                {"symbol":"MUUSDT","orderId":"opaque-order-1","orderLinkId":"manual:id","side":"Buy","price":"0","qty":"0.240","orderStatus":"Cancelled","createdTime":"1780000000001"}
+            ]}}"#,
+            "MUUSDT",
+        )
+        .unwrap();
+
+        assert_eq!(page.next_cursor.as_deref(), Some("next%3A2"));
+        assert_eq!(page.orders.len(), 2);
+        assert_eq!(page.orders[0].exchange_order_id, "opaque-order-2");
+        assert_eq!(page.orders[0].price.to_string(), "1011.00000");
+        assert_eq!(page.orders[0].quantity.to_string(), "0.240");
+        assert_eq!(page.orders[1].price.to_string(), "0");
     }
 
     #[test]

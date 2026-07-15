@@ -11,9 +11,10 @@ use crate::{
     },
     exchange::{
         AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
-        CancellationAcknowledgement, ExchangeMarketSnapshot, LeverageAcknowledgement,
-        OrderLifecycle, PlacementAcknowledgement, PositionLeg, PositionSide, PositionSnapshot,
-        SnapshotError, TradingFeeRates, protocol::Parameters, strategy_client_order_id,
+        CancellationAcknowledgement, ExchangeMarketSnapshot, HistoricalOrder,
+        LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
+        PositionSide, PositionSnapshot, SnapshotError, TradingFeeRates, protocol::Parameters,
+        strategy_client_order_id,
     },
 };
 
@@ -458,6 +459,63 @@ pub(super) fn parse_open_orders(
     Ok(orders)
 }
 
+pub(super) fn parse_order_history(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+    maximum_orders: usize,
+) -> Result<Vec<HistoricalOrder>, CodecError> {
+    let value = parse_json(body)?;
+    let rows = value
+        .as_array()
+        .ok_or(CodecError::InvalidField("orderHistory"))?;
+    if maximum_orders == 0 || maximum_orders > 1_000 || rows.len() > maximum_orders {
+        return Err(CodecError::InvalidField("orderHistory"));
+    }
+
+    let expected_symbol = expected_symbol.to_ascii_uppercase();
+    let mut exchange_order_ids = BTreeSet::new();
+    let mut orders = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = required_string(row, "symbol")?.to_ascii_uppercase();
+        if symbol != expected_symbol {
+            return Err(CodecError::SymbolMismatch);
+        }
+        let exchange_order_id = required_scalar_text(row, "orderId")?;
+        if !exchange_order_ids.insert(exchange_order_id.clone()) {
+            return Err(CodecError::InvalidField("orderId"));
+        }
+        let side = match required_string(row, "side")?.to_ascii_uppercase().as_str() {
+            "BUY" => OrderSide::Buy,
+            "SELL" => OrderSide::Sell,
+            _ => return Err(CodecError::InvalidField("side")),
+        };
+        let order = HistoricalOrder {
+            exchange_order_id,
+            exchange,
+            symbol: symbol.clone(),
+            side,
+            price: required_decimal(row, "price")?,
+            quantity: required_decimal(row, "origQty")?,
+            status: required_string(row, "status")?.to_owned(),
+            created_at_ms: required_scalar_text(row, "time")?
+                .parse::<u64>()
+                .map_err(|_| CodecError::InvalidField("time"))?,
+        };
+        order
+            .validate()
+            .map_err(|_| CodecError::InvalidField("orderHistory"))?;
+        orders.push(order);
+    }
+    orders.sort_by(|left, right| {
+        right
+            .created_at_ms
+            .cmp(&left.created_at_ms)
+            .then_with(|| left.exchange_order_id.cmp(&right.exchange_order_id))
+    });
+    Ok(orders)
+}
+
 fn parse_authoritative_order_value(
     value: &Value,
     exchange: Exchange,
@@ -762,6 +820,43 @@ mod tests {
             parse_open_orders(&format!("[{base},{base}]"), Exchange::Binance, "MUUSDT").is_err()
         );
         assert!(parse_open_orders(&format!("[{foreign}]"), Exchange::Binance, "MUUSDT").is_err());
+    }
+
+    #[test]
+    fn order_history_preserves_precision_and_sorts_newest_first() {
+        let orders = parse_order_history(
+            r#"[
+                {"symbol":"MUUSDT","orderId":9007199254740993,"side":"SELL","price":"1011.00000","origQty":"0.240","status":"FILLED","time":1780000000001},
+                {"symbol":"MUUSDT","orderId":"manual-order-2","side":"BUY","price":"0","origQty":"0.240","status":"CANCELED","time":"1780000000002"}
+            ]"#,
+            Exchange::Binance,
+            "MUUSDT",
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(orders[0].exchange_order_id, "manual-order-2");
+        assert_eq!(orders[0].price.to_string(), "0");
+        assert_eq!(orders[1].exchange_order_id, "9007199254740993");
+        assert_eq!(orders[1].price.to_string(), "1011.00000");
+        assert_eq!(orders[1].quantity.to_string(), "0.240");
+    }
+
+    #[test]
+    fn order_history_rejects_duplicate_or_foreign_exchange_rows() {
+        let row = r#"{"symbol":"MUUSDT","orderId":"same","side":"SELL","price":"1011","origQty":"1","status":"FILLED","time":1780000000001}"#;
+        assert!(
+            parse_order_history(&format!("[{row},{row}]"), Exchange::Aster, "MUUSDT", 2,).is_err()
+        );
+        assert!(
+            parse_order_history(
+                &format!("[{}]", row.replace("MUUSDT", "OTHERUSDT")),
+                Exchange::Aster,
+                "MUUSDT",
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]

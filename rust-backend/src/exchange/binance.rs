@@ -9,19 +9,19 @@ use crate::{
     exchange::{
         AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
         CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
-        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalPriceGateway,
+        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_account_balance_snapshot, parse_authoritative_order,
             parse_cancellation_acknowledgement, parse_exchange_error, parse_instrument_rules,
             parse_leverage_acknowledgement, parse_market_snapshot, parse_open_orders,
-            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
-            validate_snapshot_request,
+            parse_order_history, parse_placement_acknowledgement, parse_position_snapshot,
+            parse_trading_fee_rates, validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -654,6 +654,43 @@ where
 }
 
 #[async_trait]
+impl<T, S, C> OrderHistorySnapshotGateway for BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn order_history_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoricalOrder>, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)?;
+        if !(1..=1_000).contains(&limit) {
+            return Err(SnapshotError::new("order-history limit must be 1..=1000"));
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v1/allOrders",
+                vec![
+                    ("symbol".into(), symbol.clone()),
+                    ("limit".into(), limit.to_string()),
+                ],
+            )
+            .map_err(|error| SnapshotError::new(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Binance order-history snapshot")
+            .await?;
+        parse_order_history(&body, Exchange::Binance, &symbol, limit).map_err(|error| {
+            SnapshotError::new(format!("invalid Binance order-history snapshot: {error}"))
+        })
+    }
+}
+
+#[async_trait]
 impl<T, S, C> ExecutionSnapshotGateway for BinanceAdapter<T, S, C>
 where
     T: HttpTransport,
@@ -948,6 +985,36 @@ mod tests {
         assert_eq!(orders.len(), 2);
         assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
         assert_eq!(orders[1].shape.time_in_force, TimeInForce::PostOnly);
+    }
+
+    #[tokio::test]
+    async fn order_history_uses_signed_all_orders_and_preserves_exact_values() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[
+                {"symbol":"MUUSDT","orderId":9007199254740993,"side":"SELL","price":"1011.00000","origQty":"0.240","status":"FILLED","time":1780000000001}
+            ]"#
+                .into(),
+        }));
+
+        let orders = adapter(transport.clone())
+            .order_history_snapshot(Exchange::Binance, "MUUSDT", 25)
+            .await
+            .unwrap();
+        let request = transport.request();
+
+        assert_eq!(request.path, "/fapi/v1/allOrders");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert!(
+            request
+                .query
+                .iter()
+                .any(|item| item == &("limit".into(), "25".into()))
+        );
+        assert!(request.query.iter().any(|(key, _)| key == "signature"));
+        assert_eq!(orders[0].exchange_order_id, "9007199254740993");
+        assert_eq!(orders[0].price.to_string(), "1011.00000");
+        assert_eq!(orders[0].quantity.to_string(), "0.240");
     }
 
     #[tokio::test]

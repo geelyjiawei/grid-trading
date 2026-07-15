@@ -10,12 +10,12 @@ use crate::{
     exchange::{
         AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
         CancellationError, ExchangeIdentityGateway, ExchangeMarketSnapshot, ExecutionSnapshotError,
-        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalPriceGateway,
+        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         aster::{AsterAdapter, AsterSignatureError, LocalEip712Signer},
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
@@ -405,6 +405,34 @@ impl OpenOrderSnapshotGateway for ConfiguredExchangeGateway {
 }
 
 #[async_trait]
+impl OrderHistorySnapshotGateway for ConfiguredExchangeGateway {
+    async fn order_history_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoricalOrder>, SnapshotError> {
+        match self {
+            Self::Binance(gateway) => {
+                gateway
+                    .order_history_snapshot(exchange, symbol, limit)
+                    .await
+            }
+            Self::Aster(gateway) => {
+                gateway
+                    .order_history_snapshot(exchange, symbol, limit)
+                    .await
+            }
+            Self::Bybit(gateway) => {
+                gateway
+                    .order_history_snapshot(exchange, symbol, limit)
+                    .await
+            }
+        }
+    }
+}
+
+#[async_trait]
 impl ExecutionSnapshotGateway for ConfiguredExchangeGateway {
     async fn execution_snapshot(
         &self,
@@ -592,6 +620,20 @@ impl OpenOrderSnapshotGateway for SharedConfiguredExchangeGateway {
         symbol: &str,
     ) -> Result<Vec<crate::exchange::AuthoritativeOrder>, SnapshotError> {
         self.inner.open_orders_snapshot(exchange, symbol).await
+    }
+}
+
+#[async_trait]
+impl OrderHistorySnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn order_history_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoricalOrder>, SnapshotError> {
+        self.inner
+            .order_history_snapshot(exchange, symbol, limit)
+            .await
     }
 }
 

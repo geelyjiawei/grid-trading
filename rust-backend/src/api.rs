@@ -2259,6 +2259,87 @@ async fn exchange_open_orders(
     }
 }
 
+async fn exchange_order_history(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<TradeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let limit = selection.limit.unwrap_or(50);
+    if !(1..=1_000).contains(&limit) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "limit must be between 1 and 1000",
+        );
+    }
+    let exchange = selected_exchange(
+        &state,
+        ExchangeSelection {
+            exchange: selection.exchange,
+        },
+    );
+    let gateway = match read_gateway(&state, exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+    match gateway
+        .order_history_snapshot(exchange, &symbol, limit)
+        .await
+    {
+        Ok(snapshot) => {
+            if snapshot.len() > limit {
+                return snapshot_failure(
+                    "order history",
+                    exchange,
+                    SnapshotError::new("order-history snapshot exceeded the requested limit"),
+                );
+            }
+            let mut exchange_order_ids = BTreeSet::new();
+            let mut orders = Vec::with_capacity(snapshot.len());
+            for order in snapshot {
+                if order.exchange != exchange
+                    || order.symbol != symbol
+                    || order.validate().is_err()
+                    || !exchange_order_ids.insert(order.exchange_order_id.clone())
+                {
+                    return snapshot_failure(
+                        "order history",
+                        exchange,
+                        SnapshotError::new(
+                            "order-history snapshot contained invalid or duplicate identity",
+                        ),
+                    );
+                }
+                orders.push(json!({
+                    "order_id": order.exchange_order_id,
+                    "side": order_side_name(order.side),
+                    "price": order.price.to_string(),
+                    "qty": order.quantity.to_string(),
+                    "status": order.status,
+                    "created_time": order.created_at_ms.to_string(),
+                }));
+            }
+            let count = orders.len();
+            no_store_json(
+                StatusCode::OK,
+                json!({
+                    "orders": orders,
+                    "count": count,
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "source": "exchange",
+                }),
+            )
+        }
+        Err(error) => snapshot_failure("order history", exchange, error),
+    }
+}
+
 #[derive(Debug)]
 struct RiskStrategyObservation {
     selected: Option<StrategyCatalogSnapshot>,
@@ -3165,6 +3246,7 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/fees/{symbol}", get(exchange_fee_rates))
         .route("/api/positions/{symbol}", get(exchange_positions))
         .route("/api/orders/open/{symbol}", get(exchange_open_orders))
+        .route("/api/orders/history/{symbol}", get(exchange_order_history))
         .route("/api/trades/{symbol}", get(strategy_trades))
         .route("/api/risk/{symbol}", get(exchange_risk))
         .route(
@@ -3227,10 +3309,11 @@ mod tests {
         exchange::{
             AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
             AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
-            ExchangeIdentityGateway, ExchangeMarketSnapshot, LookupError, MarketSnapshotGateway,
-            OpenOrderSnapshotGateway, OrderCancellationGateway, OrderExecutionSnapshot,
-            OrderLookup, OrderLookupGateway, PositionSide, PositionSnapshot,
-            PositionSnapshotGateway, TradeFill, TradingFeeRateGateway, TradingFeeRates,
+            ExchangeIdentityGateway, ExchangeMarketSnapshot, HistoricalOrder, LookupError,
+            MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
+            OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
+            PositionSide, PositionSnapshot, PositionSnapshotGateway, TradeFill,
+            TradingFeeRateGateway, TradingFeeRates,
             configured::{
                 ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayFactory,
                 SharedConfiguredExchangeGateway,
@@ -3583,6 +3666,42 @@ mod tests {
     }
 
     #[async_trait]
+    impl OrderHistorySnapshotGateway for ExactReadGateway {
+        async fn order_history_snapshot(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            limit: usize,
+        ) -> Result<Vec<HistoricalOrder>, SnapshotError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            assert_eq!(limit, 2);
+            Ok(vec![
+                HistoricalOrder {
+                    exchange_order_id: "90071992547409931235".into(),
+                    exchange,
+                    symbol: symbol.into(),
+                    side: OrderSide::Buy,
+                    price: Decimal::from_str_exact("0.38000").unwrap(),
+                    quantity: Decimal::from_str_exact("100.000").unwrap(),
+                    status: "FILLED".into(),
+                    created_at_ms: 1_780_000_000_002,
+                },
+                HistoricalOrder {
+                    exchange_order_id: "manual-order-previous".into(),
+                    exchange,
+                    symbol: symbol.into(),
+                    side: OrderSide::Sell,
+                    price: Decimal::from_str_exact("0.41000").unwrap(),
+                    quantity: Decimal::from_str_exact("5.000").unwrap(),
+                    status: "CANCELED".into(),
+                    created_at_ms: 1_780_000_000_001,
+                },
+            ])
+        }
+    }
+
+    #[async_trait]
     impl OrderLookupGateway for ExactReadGateway {
         async fn lookup_order_by_client_id(
             &self,
@@ -3757,6 +3876,18 @@ mod tests {
             assert_eq!(exchange, self.position.exchange);
             assert_eq!(symbol, self.position.symbol);
             Ok(self.open_orders.clone())
+        }
+    }
+
+    #[async_trait]
+    impl OrderHistorySnapshotGateway for StrategyRiskGateway {
+        async fn order_history_snapshot(
+            &self,
+            _exchange: Exchange,
+            _symbol: &str,
+            _limit: usize,
+        ) -> Result<Vec<HistoricalOrder>, SnapshotError> {
+            Err(SnapshotError::new("not used by strategy risk test"))
         }
     }
 
@@ -4225,6 +4356,7 @@ mod tests {
         assert_eq!(risk["has_risk"], true);
 
         let orders = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/orders/open/ANSEMUSDT?exchange=aster")
@@ -4239,6 +4371,25 @@ mod tests {
         assert_eq!(orders["orders"][0]["price"], "0.38000");
         assert_eq!(orders["orders"][0]["qty"], "100.000");
         assert_eq!(orders["orders"][0]["reduce_only"], true);
+
+        let history = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/orders/history/ANSEMUSDT?exchange=aster&limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        assert_eq!(history.headers()[CACHE_CONTROL], "no-store");
+        let history = response_json(history).await;
+        assert_eq!(history["source"], "exchange");
+        assert_eq!(history["count"], 2);
+        assert_eq!(history["orders"][0]["order_id"], "90071992547409931235");
+        assert_eq!(history["orders"][0]["price"], "0.38000");
+        assert_eq!(history["orders"][0]["qty"], "100.000");
+        assert_eq!(history["orders"][0]["created_time"], "1780000000002");
     }
 
     #[test]

@@ -71,6 +71,12 @@ the OpenAPI schema.
   is an unknown outcome. The same client order ID must be reconciled before any retry.
 - Only the exchange's definitive order-not-found code is `NotFound`; transport and
   malformed lookup responses remain inconclusive.
+- Order history is read directly from the selected exchange for one exact symbol. Exchange
+  order IDs remain opaque strings, decimal price and quantity retain exchange precision,
+  and manual orders are not hidden from this read-only account view.
+- Order-history limits and pagination are bounded. Foreign-symbol rows, duplicate exchange
+  order IDs, malformed cursors, or a cursor that does not advance fail the complete snapshot;
+  they never return a partial result as if it were authoritative.
 - A cancellation acknowledgement must match both immutable client and exchange order
   IDs. It confirms only that cancellation was accepted; terminal state still requires
   authoritative cumulative execution accounting.
