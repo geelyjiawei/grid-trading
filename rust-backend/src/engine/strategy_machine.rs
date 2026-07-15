@@ -5527,6 +5527,28 @@ mod tests {
                     410 + case_index * 1_000 + offset as u64,
                 );
             }
+            let expected_side = match direction {
+                Direction::Short => OrderSide::Sell,
+                Direction::Long => OrderSide::Buy,
+                Direction::Neutral => unreachable!(),
+            };
+            let live_grid_orders = machine
+                .store()
+                .snapshot()
+                .orders
+                .values()
+                .filter(|order| order_may_still_be_live(order))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                live_grid_orders.len(),
+                usize::from(machine.store().snapshot().config.grid_count),
+                "crossing the favorable boundary must restore every configured grid order"
+            );
+            assert!(live_grid_orders.iter().all(|order| {
+                order.shape.side == expected_side
+                    && !order.shape.reduce_only
+                    && order.shape.quantity == Decimal::new(2, 1)
+            }));
             for (offset, client_order_id) in counter_ids.into_iter().enumerate() {
                 let shape = machine.store().snapshot().orders[&client_order_id]
                     .shape
