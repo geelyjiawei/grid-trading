@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -15,8 +16,8 @@ use crate::{
         StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking, StrategyRunId,
         StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
         StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
-        cancel_with, load_strategy_inputs, prepare_new_strategy, reconcile_with,
-        resolve_cancellation_with, submit_with,
+        cancel_with, intent_requires_lookup, load_strategy_inputs, prepare_new_strategy,
+        reconcile_lookup_with, resolve_cancellation_with, submit_with,
     },
     exchange::{
         ActiveOrderStatus, ExchangeIdentityGateway, ExecutionSnapshotGateway,
@@ -30,6 +31,8 @@ use crate::{
         StrategyFilePathError, StrategyFilePaths, StrategyRuntimeLease,
     },
 };
+
+const MAX_CONCURRENT_ORDER_LOOKUPS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1363,6 +1366,30 @@ where
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        let lookup_ids = ledger_ids
+            .iter()
+            .filter_map(|client_order_id| {
+                let intent = self.intent_store.snapshot().intents.get(client_order_id)?;
+                let has_matching_progress = open_progress
+                    .as_ref()
+                    .and_then(|progress| progress.get(client_order_id))
+                    .is_some_and(|progress| accepted_progress_matches(intent, progress));
+                (intent_requires_lookup(intent) && !has_matching_progress)
+                    .then_some(client_order_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let gateway = &self.gateway;
+        let lookup_symbol = symbol.as_str();
+        let mut lookup_results =
+            stream::iter(lookup_ids.into_iter().map(|client_order_id| async move {
+                let result = gateway
+                    .lookup_order_by_client_id(exchange, lookup_symbol, &client_order_id)
+                    .await;
+                (client_order_id, result)
+            }))
+            .buffered(MAX_CONCURRENT_ORDER_LOOKUPS)
+            .collect::<BTreeMap<_, _>>()
+            .await;
         for client_order_id in &ledger_ids {
             let current_intent = self
                 .intent_store
@@ -1379,14 +1406,13 @@ where
                 ReconciliationResult::Accepted {
                     exchange_order_id: progress.order.exchange_order_id.clone(),
                 }
+            } else if !intent_requires_lookup(&current_intent) {
+                ReconciliationResult::AlreadyFinal
             } else {
-                reconcile_with(
-                    &self.gateway,
-                    &mut self.intent_store,
-                    client_order_id,
-                    now_ms,
-                )
-                .await?
+                let lookup = lookup_results
+                    .remove(client_order_id)
+                    .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+                reconcile_lookup_with(&mut self.intent_store, client_order_id, lookup, now_ms)?
             };
             report.ledger_reconciliations += 1;
             let intent = self
@@ -1911,6 +1937,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use async_trait::async_trait;
@@ -2035,6 +2062,9 @@ mod tests {
         rules_snapshot_calls: usize,
         position_snapshot_calls: usize,
         order_lookup_calls: usize,
+        active_order_lookups: usize,
+        maximum_concurrent_order_lookups: usize,
+        order_lookup_delay: Option<Duration>,
         execution_snapshot_calls: usize,
         open_progress_enabled: bool,
         open_progress_calls: usize,
@@ -2091,6 +2121,9 @@ mod tests {
                     rules_snapshot_calls: 0,
                     position_snapshot_calls: 0,
                     order_lookup_calls: 0,
+                    active_order_lookups: 0,
+                    maximum_concurrent_order_lookups: 0,
+                    order_lookup_delay: None,
                     execution_snapshot_calls: 0,
                     open_progress_enabled: false,
                     open_progress_calls: 0,
@@ -2147,6 +2180,18 @@ mod tests {
 
         fn order_lookup_call_count(&self) -> usize {
             self.state.lock().unwrap().order_lookup_calls
+        }
+
+        fn measure_delayed_order_lookups(&self, delay: Duration) {
+            let mut state = self.state.lock().unwrap();
+            state.order_lookup_calls = 0;
+            state.active_order_lookups = 0;
+            state.maximum_concurrent_order_lookups = 0;
+            state.order_lookup_delay = Some(delay);
+        }
+
+        fn maximum_concurrent_order_lookup_count(&self) -> usize {
+            self.state.lock().unwrap().maximum_concurrent_order_lookups
         }
 
         fn execution_snapshot_call_count(&self) -> usize {
@@ -2479,14 +2524,28 @@ mod tests {
             _symbol: &str,
             client_order_id: &ClientOrderId,
         ) -> Result<OrderLookup, LookupError> {
-            let mut state = self.state.lock().unwrap();
-            state.order_lookup_calls += 1;
-            Ok(state
-                .orders
-                .get(client_order_id)
-                .cloned()
-                .map(OrderLookup::Found)
-                .unwrap_or(OrderLookup::NotFound))
+            let (delay, lookup) = {
+                let mut state = self.state.lock().unwrap();
+                state.order_lookup_calls += 1;
+                state.active_order_lookups += 1;
+                state.maximum_concurrent_order_lookups = state
+                    .maximum_concurrent_order_lookups
+                    .max(state.active_order_lookups);
+                (
+                    state.order_lookup_delay,
+                    state
+                        .orders
+                        .get(client_order_id)
+                        .cloned()
+                        .map(OrderLookup::Found)
+                        .unwrap_or(OrderLookup::NotFound),
+                )
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.state.lock().unwrap().active_order_lookups -= 1;
+            Ok(lookup)
         }
     }
 
@@ -4301,6 +4360,26 @@ mod tests {
         assert!(second.submissions.is_empty());
         assert!(!second.is_blocked());
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_lookup_fallback_is_concurrent_but_bounded() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.measure_delayed_order_lookups(Duration::from_millis(20));
+
+        let report = runtime.tick(1_300).await.unwrap();
+
+        assert!(!report.is_blocked(), "{report:?}");
+        assert_eq!(gateway.order_lookup_call_count(), 20);
+        assert!(gateway.maximum_concurrent_order_lookup_count() > 1);
+        assert!(gateway.maximum_concurrent_order_lookup_count() <= MAX_CONCURRENT_ORDER_LOOKUPS);
     }
 
     #[tokio::test]

@@ -48,6 +48,7 @@ pub use preview::{GridCycleEstimate, GridPreviewError, GridPreviewMetrics, build
 pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };
+pub(crate) use reconciliation::{intent_requires_lookup, reconcile_lookup_with};
 pub(crate) use runtime::validate_cross_ledger_ownership;
 pub use runtime::{
     FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, FileStrategyRecoveryError,

@@ -68,16 +68,7 @@ where
         .cloned()
         .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
 
-    if matches!(
-        intent.state,
-        IntentState::Rejected { .. } | IntentState::OwnershipConflict { .. }
-    ) || matches!(
-        intent.state,
-        IntentState::Terminal {
-            exchange_order_id: Some(_),
-            ..
-        }
-    ) {
+    if !intent_requires_lookup(&intent) {
         return Ok(ReconciliationResult::AlreadyFinal);
     }
 
@@ -88,6 +79,41 @@ where
             &intent.client_order_id,
         )
         .await;
+
+    reconcile_lookup_with(store, client_order_id, lookup, now_ms)
+}
+
+pub(crate) fn intent_requires_lookup(intent: &OrderIntent) -> bool {
+    !matches!(
+        intent.state,
+        IntentState::Rejected { .. } | IntentState::OwnershipConflict { .. }
+    ) && !matches!(
+        intent.state,
+        IntentState::Terminal {
+            exchange_order_id: Some(_),
+            ..
+        }
+    )
+}
+
+pub(crate) fn reconcile_lookup_with<S>(
+    store: &mut S,
+    client_order_id: &ClientOrderId,
+    lookup: Result<OrderLookup, crate::exchange::LookupError>,
+    now_ms: u64,
+) -> Result<ReconciliationResult, ReconciliationError>
+where
+    S: IntentStore,
+{
+    let intent = store
+        .snapshot()
+        .intents
+        .get(client_order_id)
+        .cloned()
+        .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
+    if !intent_requires_lookup(&intent) {
+        return Ok(ReconciliationResult::AlreadyFinal);
+    }
 
     match lookup {
         Ok(OrderLookup::Found(snapshot)) => reconcile_found(store, intent, snapshot, now_ms),
