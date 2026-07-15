@@ -267,9 +267,10 @@ where
     pub async fn advance_all(&self, now_ms: u64) -> Vec<RuntimeAdvanceResult> {
         let entries = self.registry.entries().await;
         let advances = entries.into_iter().filter_map(|entry| {
-            if entry
-                .lifecycle
-                .is_some_and(PreparedStrategyLifecycle::is_terminal)
+            if entry.advancing
+                || entry
+                    .lifecycle
+                    .is_some_and(PreparedStrategyLifecycle::is_terminal)
             {
                 return None;
             }

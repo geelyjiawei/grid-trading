@@ -231,30 +231,33 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                 tracing::error!("system clock is unavailable; runtime tick skipped");
                 continue;
             };
-            for advance in runtime.advance_all(now_ms).await {
-                match advance.result {
-                    Ok(PreparedStrategyStep::WaitingForTrigger) => {}
-                    Ok(PreparedStrategyStep::Activated) => {
-                        tracing::info!(run_id = advance.run_id.as_str(), "strategy activated");
-                    }
-                    Ok(PreparedStrategyStep::Active(report)) => {
-                        if report.is_blocked() {
-                            tracing::warn!(
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                for advance in runtime.advance_all(now_ms).await {
+                    match advance.result {
+                        Ok(PreparedStrategyStep::WaitingForTrigger) => {}
+                        Ok(PreparedStrategyStep::Activated) => {
+                            tracing::info!(run_id = advance.run_id.as_str(), "strategy activated");
+                        }
+                        Ok(PreparedStrategyStep::Active(report)) => {
+                            if report.is_blocked() {
+                                tracing::warn!(
+                                    run_id = advance.run_id.as_str(),
+                                    blocker_count = report.blockers.len(),
+                                    "strategy tick is blocked pending authoritative reconciliation"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
                                 run_id = advance.run_id.as_str(),
-                                blocker_count = report.blockers.len(),
-                                "strategy tick is blocked pending authoritative reconciliation"
+                                error = %error,
+                                "strategy tick failed closed"
                             );
                         }
                     }
-                    Err(error) => {
-                        tracing::error!(
-                            run_id = advance.run_id.as_str(),
-                            error = %error,
-                            "strategy tick failed closed"
-                        );
-                    }
                 }
-            }
+            });
         }
     });
 }

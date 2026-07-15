@@ -3201,12 +3201,40 @@ mod tests {
         .await
         .is_ok();
 
-        gate.release();
-        let results = batch.await.unwrap();
         assert!(
             unrelated_progressed,
             "a slow strategy must not delay an unrelated market's tick"
         );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let entries = coordinator.entries().await;
+                if entries
+                    .iter()
+                    .find(|entry| entry.run_id == second_run)
+                    .is_some_and(|entry| !entry.advancing)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the unrelated strategy should finish its first tick");
+        let second_market_calls_after_first = second_gateway.market_snapshot_call_count();
+        let overlapping = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            coordinator.advance_all(1_250),
+        )
+        .await
+        .expect("a new scheduler batch must not wait for the slow strategy");
+        assert_eq!(overlapping.len(), 1);
+        assert_eq!(overlapping[0].run_id, second_run);
+        assert!(overlapping[0].result.is_ok());
+        assert!(second_gateway.market_snapshot_call_count() > second_market_calls_after_first);
+
+        gate.release();
+        let results = batch.await.unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].run_id, first_run);
         assert_eq!(results[1].run_id, second_run);
