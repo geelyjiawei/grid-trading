@@ -190,6 +190,11 @@ the OpenAPI schema.
 - Risk orphan classification is limited to legacy or Rust grid-order namespaces. A manual
   order outside those namespaces is never reported or selected as a grid orphan merely
   because its exchange, symbol, or price overlaps a strategy.
+- Orphan cancellation starts from one stable, anomaly-free catalog and exchange snapshot,
+  selects only grid-order namespaces not owned by the live strategy, and revalidates the
+  exact client ID, exchange ID, side, price, quantity, reduce-only flag, order type, and
+  time-in-force immediately before each cancellation. Identity drift performs no write;
+  an unknown cancellation outcome is never retried automatically with the same key.
 
 ## Grid behavior
 

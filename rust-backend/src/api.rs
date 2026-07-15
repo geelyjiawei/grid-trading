@@ -36,8 +36,9 @@ use crate::{
         collect_stable_exchange_view, collect_strategy_shadow_view, load_authoritative_fee_config,
     },
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, InstrumentRulesGateway, MarketSnapshotGateway,
-        OrderLifecycle, PositionLeg, PositionSnapshot, SnapshotError,
+        ActiveOrderStatus, AuthoritativeOrder, CancellationError, ExchangeIdentityGateway,
+        InstrumentRulesGateway, MarketSnapshotGateway, OrderCancellationGateway, OrderLifecycle,
+        OrderLookup, OrderLookupGateway, PositionLeg, PositionSnapshot, SnapshotError,
         configured::SharedConfiguredExchangeGateway,
         registry::{ExchangeGatewayRegistry, ReadOnlyExchangeGateway, RegistryError},
     },
@@ -89,6 +90,7 @@ struct ApiState {
     trading_enabled: bool,
     idempotency: Arc<dyn IdempotencyStore>,
     start_command: Arc<dyn StartGridCommand>,
+    cancel_orders_command: Arc<dyn CancelExchangeOrdersCommand>,
     runtime: Option<Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>>,
     exchange_gateways: ExchangeGatewayRegistry,
     strategy_root: PathBuf,
@@ -111,6 +113,7 @@ impl ApiState {
             trading_enabled: false,
             idempotency: Arc::new(FileIdempotencyStore::new(idempotency_root)),
             start_command: Arc::new(DisabledStartGridCommand),
+            cancel_orders_command: Arc::new(DisabledCancelExchangeOrdersCommand),
             runtime: None,
             exchange_gateways,
             strategy_root,
@@ -131,6 +134,7 @@ impl ApiState {
             trading_enabled,
             idempotency,
             start_command,
+            cancel_orders_command: Arc::new(DisabledCancelExchangeOrdersCommand),
             runtime: None,
             exchange_gateways: ExchangeGatewayRegistry::default(),
             strategy_root,
@@ -165,6 +169,15 @@ impl ApiState {
         self
     }
 
+    #[cfg(test)]
+    fn with_cancel_orders_command(
+        mut self,
+        cancel_orders_command: Arc<dyn CancelExchangeOrdersCommand>,
+    ) -> Self {
+        self.cancel_orders_command = cancel_orders_command;
+        self
+    }
+
     fn enabled(
         admin_token: Option<AdminTokenVerifier>,
         web_authentication: WebAuthService,
@@ -173,6 +186,9 @@ impl ApiState {
         strategy_root: PathBuf,
         runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
     ) -> Self {
+        let cancel_orders_command = Arc::new(ConfiguredCancelExchangeOrdersCommand {
+            exchange_gateways: exchange_gateways.clone(),
+        });
         let start_command = Arc::new(RuntimeStartGridCommand {
             runtime: Arc::clone(&runtime),
             exchange_gateways: exchange_gateways.clone(),
@@ -186,6 +202,7 @@ impl ApiState {
             trading_enabled: true,
             idempotency: Arc::new(FileIdempotencyStore::new(idempotency_root)),
             start_command,
+            cancel_orders_command,
             runtime: Some(runtime),
             exchange_gateways,
             strategy_root,
@@ -209,6 +226,161 @@ impl StartGridCommand for DisabledStartGridCommand {
     ) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
         Err(CommandOutcomeUnknown)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CancelExchangeOrdersOutcome {
+    cancellation_accepted: Vec<String>,
+    already_terminal: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CancelExchangeOrdersError {
+    Unavailable,
+    ObservationUnavailable { cancellation_accepted: Vec<String> },
+    OutcomeUnknown,
+}
+
+#[async_trait]
+trait CancelExchangeOrdersCommand: Send + Sync {
+    async fn execute(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: Vec<AuthoritativeOrder>,
+    ) -> Result<CancelExchangeOrdersOutcome, CancelExchangeOrdersError>;
+}
+
+struct DisabledCancelExchangeOrdersCommand;
+
+#[async_trait]
+impl CancelExchangeOrdersCommand for DisabledCancelExchangeOrdersCommand {
+    async fn execute(
+        &self,
+        _exchange: Exchange,
+        _symbol: &str,
+        _targets: Vec<AuthoritativeOrder>,
+    ) -> Result<CancelExchangeOrdersOutcome, CancelExchangeOrdersError> {
+        Err(CancelExchangeOrdersError::Unavailable)
+    }
+}
+
+struct ConfiguredCancelExchangeOrdersCommand {
+    exchange_gateways: ExchangeGatewayRegistry,
+}
+
+#[async_trait]
+impl CancelExchangeOrdersCommand for ConfiguredCancelExchangeOrdersCommand {
+    async fn execute(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: Vec<AuthoritativeOrder>,
+    ) -> Result<CancelExchangeOrdersOutcome, CancelExchangeOrdersError> {
+        let gateway = self
+            .exchange_gateways
+            .trading_gateway(exchange)
+            .map_err(|_| CancelExchangeOrdersError::Unavailable)?;
+        cancel_exact_exchange_orders_with(&gateway, exchange, symbol, targets).await
+    }
+}
+
+async fn cancel_exact_exchange_orders_with<G>(
+    gateway: &G,
+    exchange: Exchange,
+    symbol: &str,
+    mut targets: Vec<AuthoritativeOrder>,
+) -> Result<CancelExchangeOrdersOutcome, CancelExchangeOrdersError>
+where
+    G: ExchangeIdentityGateway + OrderLookupGateway + OrderCancellationGateway + ?Sized,
+{
+    if gateway.exchange() != exchange {
+        return Err(CancelExchangeOrdersError::Unavailable);
+    }
+
+    targets.sort_by(|left, right| {
+        left.client_order_id
+            .cmp(&right.client_order_id)
+            .then_with(|| left.exchange_order_id.cmp(&right.exchange_order_id))
+    });
+    let mut client_order_ids = BTreeSet::new();
+    let mut exchange_order_ids = BTreeSet::new();
+    for target in &targets {
+        if target.exchange != exchange
+            || target.shape.symbol != symbol
+            || target.exchange_order_id.trim().is_empty()
+            || !matches!(target.lifecycle, OrderLifecycle::Active(_))
+            || !is_grid_order_identity(target)
+            || target.shape.validate().is_err()
+            || !client_order_ids.insert(target.client_order_id.clone())
+            || !exchange_order_ids.insert(target.exchange_order_id.clone())
+        {
+            return Err(CancelExchangeOrdersError::ObservationUnavailable {
+                cancellation_accepted: Vec::new(),
+            });
+        }
+    }
+
+    let mut cancellation_accepted = Vec::with_capacity(targets.len());
+    let mut already_terminal = Vec::new();
+    for target in targets {
+        let lookup = gateway
+            .lookup_order_by_client_id(exchange, symbol, &target.client_order_id)
+            .await
+            .map_err(|_| CancelExchangeOrdersError::ObservationUnavailable {
+                cancellation_accepted: cancellation_accepted.clone(),
+            })?;
+        let authoritative = match lookup {
+            OrderLookup::NotFound => {
+                already_terminal.push(target.exchange_order_id);
+                continue;
+            }
+            OrderLookup::Found(authoritative) => authoritative,
+        };
+        if authoritative.exchange != target.exchange
+            || authoritative.client_order_id != target.client_order_id
+            || authoritative.exchange_order_id != target.exchange_order_id
+            || authoritative.shape != target.shape
+        {
+            return Err(CancelExchangeOrdersError::ObservationUnavailable {
+                cancellation_accepted,
+            });
+        }
+        if matches!(authoritative.lifecycle, OrderLifecycle::Terminal(_)) {
+            already_terminal.push(target.exchange_order_id);
+            continue;
+        }
+
+        match gateway
+            .cancel_order(
+                exchange,
+                symbol,
+                &target.client_order_id,
+                &target.exchange_order_id,
+            )
+            .await
+        {
+            Ok(acknowledgement)
+                if acknowledgement.client_order_id == target.client_order_id
+                    && acknowledgement.exchange_order_id == target.exchange_order_id =>
+            {
+                cancellation_accepted.push(target.exchange_order_id);
+            }
+            Ok(_) | Err(CancellationError::Unknown { .. }) => {
+                return Err(CancelExchangeOrdersError::OutcomeUnknown);
+            }
+            Err(CancellationError::Invalid { .. }) => {
+                return Err(CancelExchangeOrdersError::ObservationUnavailable {
+                    cancellation_accepted,
+                });
+            }
+        }
+    }
+
+    Ok(CancelExchangeOrdersOutcome {
+        cancellation_accepted,
+        already_terminal,
+    })
 }
 
 #[derive(Debug)]
@@ -2601,6 +2773,147 @@ async fn exchange_risk(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn cancel_orphan_orders_web(
+    _session: AuthenticatedWebSession,
+    _trading: TradingEnabled,
+    IdempotencyHeader(key): IdempotencyHeader,
+    _content_type: JsonContentType,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = parse_json_object(&body) {
+        return *response;
+    }
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let command_state = state.clone();
+    let command = Arc::clone(&state.cancel_orders_command);
+
+    run_idempotent_command(state, key, method, uri, body, async move {
+        let targets = match collect_orphan_cancel_targets(&command_state, exchange, &symbol).await {
+            Ok(targets) => targets,
+            Err(OrphanTargetCollectionError) => {
+                return command_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "orphan_snapshot_unavailable",
+                    "A stable authoritative orphan-order snapshot is unavailable",
+                );
+            }
+        };
+        if targets.is_empty() {
+            return StoredCommandResponse::new(
+                StatusCode::OK.as_u16(),
+                json!({
+                    "ok": true,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "cancelled": [],
+                    "cancellation_accepted": [],
+                    "already_terminal": [],
+                }),
+            )
+            .map_err(|_| CommandOutcomeUnknown);
+        }
+
+        match command.execute(exchange, &symbol, targets).await {
+            Ok(outcome) => {
+                let cancellation_accepted = outcome.cancellation_accepted;
+                StoredCommandResponse::new(
+                    StatusCode::ACCEPTED.as_u16(),
+                    json!({
+                        "ok": true,
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "cancelled": cancellation_accepted,
+                        "cancellation_accepted": cancellation_accepted,
+                        "already_terminal": outcome.already_terminal,
+                    }),
+                )
+                .map_err(|_| CommandOutcomeUnknown)
+            }
+            Err(CancelExchangeOrdersError::Unavailable) => command_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "exchange_trading_unavailable",
+                "The selected exchange trading gateway is not configured",
+            ),
+            Err(CancelExchangeOrdersError::ObservationUnavailable {
+                cancellation_accepted,
+            }) => {
+                StoredCommandResponse::new(
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    json!({
+                        "ok": false,
+                        "error": {
+                            "code": "orphan_cancellation_observation_changed",
+                            "message": "An orphan order changed identity or status; cancellation stopped safely",
+                        },
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "cancelled": cancellation_accepted,
+                        "cancellation_accepted": cancellation_accepted,
+                    }),
+                )
+                .map_err(|_| CommandOutcomeUnknown)
+            }
+            Err(CancelExchangeOrdersError::OutcomeUnknown) => Err(CommandOutcomeUnknown),
+        }
+    })
+    .await
+}
+
+struct OrphanTargetCollectionError;
+
+async fn collect_orphan_cancel_targets(
+    state: &ApiState,
+    exchange: Exchange,
+    symbol: &str,
+) -> Result<Vec<AuthoritativeOrder>, OrphanTargetCollectionError> {
+    let (catalog, _) = stable_runtime_catalog(state)
+        .await
+        .map_err(|_| OrphanTargetCollectionError)?;
+    let selected = catalog
+        .select_live(exchange, symbol)
+        .map_err(|_| OrphanTargetCollectionError)?;
+    let gateway = read_gateway(state, exchange).map_err(|_| OrphanTargetCollectionError)?;
+    let mut targets = match selected {
+        Some(StrategyCatalogSnapshot::Active(strategy)) => {
+            collect_strategy_shadow_view(gateway.as_ref(), &strategy)
+                .await
+                .map_err(|_| OrphanTargetCollectionError)?
+                .open_orders
+                .into_iter()
+                .filter(|order| {
+                    is_grid_order_identity(order)
+                        && !strategy.orders.contains_key(&order.client_order_id)
+                })
+                .collect::<Vec<_>>()
+        }
+        Some(StrategyCatalogSnapshot::Armed(_)) | None => {
+            collect_stable_exchange_view(gateway.as_ref(), exchange, symbol)
+                .await
+                .map_err(|_| OrphanTargetCollectionError)?
+                .open_orders
+                .into_iter()
+                .filter(is_grid_order_identity)
+                .collect::<Vec<_>>()
+        }
+    };
+    targets.sort_by(|left, right| {
+        left.client_order_id
+            .cmp(&right.client_order_id)
+            .then_with(|| left.exchange_order_id.cmp(&right.exchange_order_id))
+    });
+    Ok(targets)
+}
+
 fn validated_one_way_quantity(
     position: &PositionSnapshot,
     exchange: Exchange,
@@ -2854,6 +3167,10 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/orders/open/{symbol}", get(exchange_open_orders))
         .route("/api/trades/{symbol}", get(strategy_trades))
         .route("/api/risk/{symbol}", get(exchange_risk))
+        .route(
+            "/api/risk/cancel-orphans/{symbol}",
+            post(cancel_orphan_orders_web),
+        )
         .route("/api/grid/status", get(grid_status))
         .route("/api/grid/status/{symbol}", get(grid_symbol_status))
         .route("/api/grid/history", get(strategy_history))
@@ -2909,10 +3226,11 @@ mod tests {
         },
         exchange::{
             AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
-            AuthoritativeOrder, ExchangeIdentityGateway, ExchangeMarketSnapshot, LookupError,
-            MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderExecutionSnapshot, OrderLookup,
-            OrderLookupGateway, PositionSide, PositionSnapshot, PositionSnapshotGateway, TradeFill,
-            TradingFeeRateGateway, TradingFeeRates,
+            AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
+            ExchangeIdentityGateway, ExchangeMarketSnapshot, LookupError, MarketSnapshotGateway,
+            OpenOrderSnapshotGateway, OrderCancellationGateway, OrderExecutionSnapshot,
+            OrderLookup, OrderLookupGateway, PositionSide, PositionSnapshot,
+            PositionSnapshotGateway, TradeFill, TradingFeeRateGateway, TradingFeeRates,
             configured::{
                 ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayFactory,
                 SharedConfiguredExchangeGateway,
@@ -3020,6 +3338,35 @@ mod tests {
         ) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(CommandOutcomeUnknown)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCancelCommand {
+        calls: AtomicUsize,
+        targets: Mutex<Vec<Vec<AuthoritativeOrder>>>,
+    }
+
+    #[async_trait]
+    impl CancelExchangeOrdersCommand for RecordingCancelCommand {
+        async fn execute(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            targets: Vec<AuthoritativeOrder>,
+        ) -> Result<CancelExchangeOrdersOutcome, CancelExchangeOrdersError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let cancellation_accepted = targets
+                .iter()
+                .map(|target| target.exchange_order_id.clone())
+                .collect();
+            self.targets.lock().unwrap().push(targets);
+            Ok(CancelExchangeOrdersOutcome {
+                cancellation_accepted,
+                already_terminal: Vec::new(),
+            })
         }
     }
 
@@ -3263,6 +3610,83 @@ mod tests {
                 },
                 lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
             }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ExactCancellationGateway {
+        lookup: OrderLookup,
+        cancellation: Result<CancellationAcknowledgement, CancellationError>,
+        lookup_calls: Arc<AtomicUsize>,
+        cancellation_calls: Arc<AtomicUsize>,
+    }
+
+    impl ExactCancellationGateway {
+        fn matching(order: AuthoritativeOrder) -> Self {
+            Self {
+                lookup: OrderLookup::Found(order.clone()),
+                cancellation: Ok(CancellationAcknowledgement {
+                    client_order_id: order.client_order_id,
+                    exchange_order_id: order.exchange_order_id,
+                }),
+                lookup_calls: Arc::new(AtomicUsize::new(0)),
+                cancellation_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ExchangeIdentityGateway for ExactCancellationGateway {
+        fn exchange(&self) -> Exchange {
+            Exchange::Aster
+        }
+    }
+
+    #[async_trait]
+    impl OrderLookupGateway for ExactCancellationGateway {
+        async fn lookup_order_by_client_id(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            _client_order_id: &ClientOrderId,
+        ) -> Result<OrderLookup, LookupError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.lookup.clone())
+        }
+    }
+
+    #[async_trait]
+    impl OrderCancellationGateway for ExactCancellationGateway {
+        async fn cancel_order(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            _client_order_id: &ClientOrderId,
+            _exchange_order_id: &str,
+        ) -> Result<CancellationAcknowledgement, CancellationError> {
+            assert_eq!(exchange, Exchange::Aster);
+            assert_eq!(symbol, "ANSEMUSDT");
+            self.cancellation_calls.fetch_add(1, Ordering::SeqCst);
+            self.cancellation.clone()
+        }
+    }
+
+    fn exact_orphan_order() -> AuthoritativeOrder {
+        AuthoritativeOrder {
+            client_order_id: ClientOrderId::parse("g_9_B_exact01").unwrap(),
+            exchange_order_id: "90071992547409931234".into(),
+            exchange: Exchange::Aster,
+            shape: OrderShape {
+                symbol: "ANSEMUSDT".into(),
+                side: OrderSide::Buy,
+                price: Some(Decimal::from_str_exact("0.38000").unwrap()),
+                quantity: Decimal::from_str_exact("100.000").unwrap(),
+                reduce_only: true,
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::Gtc,
+            },
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
         }
     }
 
@@ -4112,6 +4536,133 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn orphan_cancellation_is_guarded_before_body_processing() {
+        let response = super::super::app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/risk/cancel-orphans/ANSEMUSDT?exchange=aster")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "rust_trading_disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_cancellation_selects_only_grid_orders_and_replays_once() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        fs::create_dir_all(&strategy_root).unwrap();
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(ExactReadGateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let command = Arc::new(RecordingCancelCommand::default());
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                true,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root)
+            .with_cancel_orders_command(command.clone()),
+        );
+        let make_request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/risk/cancel-orphans/ANSEMUSDT?exchange=aster")
+                .header(CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, KEY)
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(make_request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_payload = response_json(first).await;
+        assert_eq!(
+            first_payload["cancellation_accepted"],
+            json!(["90071992547409931234"])
+        );
+        {
+            let targets = command.targets.lock().unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].len(), 1);
+            assert_eq!(targets[0][0].client_order_id.as_str(), "g_9_B_exact01");
+        }
+
+        let replay = app.oneshot(make_request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(response_json(replay).await, first_payload);
+        assert_eq!(command.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn orphan_cancellation_revalidates_exact_identity_before_writing() {
+        let target = exact_orphan_order();
+        let matching = ExactCancellationGateway::matching(target.clone());
+        let outcome = cancel_exact_exchange_orders_with(
+            &matching,
+            Exchange::Aster,
+            "ANSEMUSDT",
+            vec![target.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.cancellation_accepted, vec!["90071992547409931234"]);
+        assert_eq!(matching.lookup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(matching.cancellation_calls.load(Ordering::SeqCst), 1);
+
+        let mut changed = target.clone();
+        changed.shape.quantity = Decimal::from(99);
+        let drifted = ExactCancellationGateway::matching(changed);
+        assert!(matches!(
+            cancel_exact_exchange_orders_with(
+                &drifted,
+                Exchange::Aster,
+                "ANSEMUSDT",
+                vec![target.clone()],
+            )
+            .await,
+            Err(CancelExchangeOrdersError::ObservationUnavailable { .. })
+        ));
+        assert_eq!(drifted.lookup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drifted.cancellation_calls.load(Ordering::SeqCst), 0);
+
+        let mut manual = target;
+        manual.client_order_id = ClientOrderId::parse("manual_user_1").unwrap();
+        let rejected = ExactCancellationGateway::matching(manual.clone());
+        assert!(matches!(
+            cancel_exact_exchange_orders_with(
+                &rejected,
+                Exchange::Aster,
+                "ANSEMUSDT",
+                vec![manual],
+            )
+            .await,
+            Err(CancelExchangeOrdersError::ObservationUnavailable { .. })
+        ));
+        assert_eq!(rejected.lookup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rejected.cancellation_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
