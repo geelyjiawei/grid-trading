@@ -12,9 +12,9 @@ use crate::{
     exchange::{
         AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
         CancellationAcknowledgement, ExchangeMarketSnapshot, HistoricalOrder,
-        LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement, PositionLeg,
-        PositionSide, PositionSnapshot, SnapshotError, TradingFeeRates, protocol::Parameters,
-        strategy_client_order_id,
+        LeverageAcknowledgement, OpenOrderExecutionProgress, OrderLifecycle,
+        PlacementAcknowledgement, PositionLeg, PositionSide, PositionSnapshot, SnapshotError,
+        TradingFeeRates, protocol::Parameters, strategy_client_order_id,
     },
 };
 
@@ -457,6 +457,65 @@ pub(super) fn parse_open_orders(
     }
     orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
     Ok(orders)
+}
+
+pub(super) fn parse_open_order_execution_progress(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+) -> Result<Vec<OpenOrderExecutionProgress>, CodecError> {
+    const MAX_OPEN_ORDERS: usize = 1_000;
+
+    let value = parse_json(body)?;
+    let rows = value
+        .as_array()
+        .ok_or(CodecError::InvalidField("openOrders"))?;
+    if rows.len() > MAX_OPEN_ORDERS {
+        return Err(CodecError::InvalidField("openOrders"));
+    }
+    let mut client_order_ids = BTreeSet::new();
+    let mut exchange_order_ids = BTreeSet::new();
+    let mut progress = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(raw_client_order_id) = row
+            .get("clientOrderId")
+            .and_then(json_scalar_text)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        if strategy_client_order_id(&raw_client_order_id)
+            .map_err(|_| CodecError::InvalidField("clientOrderId"))?
+            .is_none()
+        {
+            continue;
+        }
+        let order = parse_authoritative_order_value(row, exchange, expected_symbol, None)?;
+        let cumulative_quantity = required_decimal(row, "executedQty")?;
+        let cumulative_quote = required_decimal(row, "cumQuote")?;
+        let valid_progress = match order.lifecycle {
+            OrderLifecycle::Active(ActiveOrderStatus::New) => cumulative_quantity.is_zero(),
+            OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled) => {
+                cumulative_quantity > Decimal::ZERO && cumulative_quantity < order.shape.quantity
+            }
+            OrderLifecycle::Terminal(_) => false,
+        };
+        if !valid_progress
+            || cumulative_quote < Decimal::ZERO
+            || (cumulative_quantity.is_zero() && !cumulative_quote.is_zero())
+            || (cumulative_quantity > Decimal::ZERO && cumulative_quote <= Decimal::ZERO)
+            || !client_order_ids.insert(order.client_order_id.clone())
+            || !exchange_order_ids.insert(order.exchange_order_id.clone())
+        {
+            return Err(CodecError::InvalidField("openOrders"));
+        }
+        progress.push(OpenOrderExecutionProgress {
+            order,
+            cumulative_quantity,
+        });
+    }
+    progress.sort_by(|left, right| left.order.client_order_id.cmp(&right.order.client_order_id));
+    Ok(progress)
 }
 
 pub(super) fn parse_order_history(

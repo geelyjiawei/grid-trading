@@ -434,6 +434,31 @@ impl OrderHistorySnapshotGateway for ConfiguredExchangeGateway {
 
 #[async_trait]
 impl ExecutionSnapshotGateway for ConfiguredExchangeGateway {
+    async fn open_order_execution_progress_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Option<Vec<crate::exchange::OpenOrderExecutionProgress>>, ExecutionSnapshotError>
+    {
+        match self {
+            Self::Binance(gateway) => {
+                gateway
+                    .open_order_execution_progress_snapshot(exchange, symbol)
+                    .await
+            }
+            Self::Aster(gateway) => {
+                gateway
+                    .open_order_execution_progress_snapshot(exchange, symbol)
+                    .await
+            }
+            Self::Bybit(gateway) => {
+                gateway
+                    .open_order_execution_progress_snapshot(exchange, symbol)
+                    .await
+            }
+        }
+    }
+
     async fn execution_snapshot(
         &self,
         exchange: Exchange,
@@ -639,6 +664,17 @@ impl OrderHistorySnapshotGateway for SharedConfiguredExchangeGateway {
 
 #[async_trait]
 impl ExecutionSnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn open_order_execution_progress_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Option<Vec<crate::exchange::OpenOrderExecutionProgress>>, ExecutionSnapshotError>
+    {
+        self.inner
+            .open_order_execution_progress_snapshot(exchange, symbol)
+            .await
+    }
+
     async fn execution_snapshot(
         &self,
         exchange: Exchange,

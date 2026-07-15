@@ -19,9 +19,10 @@ use crate::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_account_balance_snapshot, parse_authoritative_order,
             parse_cancellation_acknowledgement, parse_exchange_error, parse_instrument_rules,
-            parse_leverage_acknowledgement, parse_market_snapshot, parse_open_orders,
-            parse_order_history, parse_placement_acknowledgement, parse_position_snapshot,
-            parse_trading_fee_rates, validate_snapshot_request,
+            parse_leverage_acknowledgement, parse_market_snapshot,
+            parse_open_order_execution_progress, parse_open_orders, parse_order_history,
+            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
+            validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -779,6 +780,31 @@ where
     S: AsterMessageSigner,
     N: NonceSource,
 {
+    async fn open_order_execution_progress_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Option<Vec<crate::exchange::OpenOrderExecutionProgress>>, ExecutionSnapshotError>
+    {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)
+            .map_err(|error| execution_error(error.to_string()))?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v3/openOrders",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| execution_error(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Aster open-order execution progress")
+            .await
+            .map_err(|error| execution_error(error.to_string()))?;
+        parse_open_order_execution_progress(&body, Exchange::Aster, &symbol)
+            .map(Some)
+            .map_err(|error| execution_error(format!("invalid Aster open-order progress: {error}")))
+    }
+
     async fn execution_snapshot(
         &self,
         exchange: Exchange,
@@ -1226,6 +1252,29 @@ mod tests {
         assert!(signed_message.contains("&signer=0x2222222222222222222222222222222222222222"));
         assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
         assert!(orders[0].shape.reduce_only);
+    }
+
+    #[tokio::test]
+    async fn open_order_progress_preserves_authoritative_partial_quantity() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[
+                {"symbol":"ANSEMUSDT","orderId":4770039,"clientOrderId":"g_RUN00001_1_B_1","side":"BUY","price":"0.38","origQty":"100","executedQty":"70","cumQuote":"26.6","status":"PARTIALLY_FILLED","reduceOnly":true,"timeInForce":"GTC","type":"LIMIT"}
+            ]"#
+                .into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+        let progress = adapter(transport.clone(), signer)
+            .open_order_execution_progress_snapshot(Exchange::Aster, "ANSEMUSDT")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(transport.request().path, "/fapi/v3/openOrders");
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].cumulative_quantity, Decimal::new(70, 0));
+        assert_eq!(progress[0].order.shape.quantity, Decimal::new(100, 0));
     }
 
     #[tokio::test]

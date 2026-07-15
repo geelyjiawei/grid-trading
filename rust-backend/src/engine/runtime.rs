@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,16 +12,17 @@ use crate::{
         ArmedStrategyLifecycle, ArmedStrategyState, CancellationResult, CancellationServiceError,
         ExecutionAccountingError, ExecutionSyncService, ReconciliationError, ReconciliationResult,
         StrategyBootstrapError, StrategyLifecycle, StrategyMachine, StrategyMachineError,
-        StrategyOrderPurpose, StrategyOrderTracking, StrategyRunId, StrategyState,
-        StrategyStateError, StrategyStateStore, StrategyStoreError, StrategyTransition,
-        SubmissionError, SubmissionResult, activate_armed_strategy, cancel_with,
-        load_strategy_inputs, prepare_new_strategy, reconcile_with, resolve_cancellation_with,
-        submit_with,
+        StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking, StrategyRunId,
+        StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
+        StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
+        cancel_with, load_strategy_inputs, prepare_new_strategy, reconcile_with,
+        resolve_cancellation_with, submit_with,
     },
     exchange::{
-        ExchangeIdentityGateway, ExecutionSnapshotGateway, HistoricalPriceGateway,
-        InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
+        ActiveOrderStatus, ExchangeIdentityGateway, ExecutionSnapshotGateway,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway,
+        OpenOrderExecutionProgress, OrderCancellationGateway, OrderLifecycle, OrderLookupGateway,
+        OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
     },
     persistence::{
         FileArmedStrategyStateStore, FileOrderIntentStore, FilePreparedStrategyStore,
@@ -1250,6 +1251,61 @@ fn terminal_resolution_identity_matches(
     }
 }
 
+fn index_open_order_progress(
+    progress: Vec<OpenOrderExecutionProgress>,
+) -> Option<BTreeMap<ClientOrderId, OpenOrderExecutionProgress>> {
+    let mut indexed = BTreeMap::new();
+    for item in progress {
+        let valid_quantity = match item.order.lifecycle {
+            OrderLifecycle::Active(ActiveOrderStatus::New) => item.cumulative_quantity.is_zero(),
+            OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled) => {
+                item.cumulative_quantity > rust_decimal::Decimal::ZERO
+                    && item.cumulative_quantity < item.order.shape.quantity
+            }
+            OrderLifecycle::Terminal(_) => false,
+        };
+        if !valid_quantity
+            || indexed
+                .insert(item.order.client_order_id.clone(), item)
+                .is_some()
+        {
+            return None;
+        }
+    }
+    Some(indexed)
+}
+
+fn accepted_progress_matches(
+    intent: &crate::domain::OrderIntent,
+    progress: &OpenOrderExecutionProgress,
+) -> bool {
+    progress.order.client_order_id == intent.client_order_id
+        && progress.order.exchange == intent.exchange
+        && progress.order.shape == intent.shape
+        && matches!(
+            &intent.state,
+            IntentState::Accepted { exchange_order_id }
+                if exchange_order_id == &progress.order.exchange_order_id
+        )
+}
+
+fn execution_progress_matches(
+    exchange: Exchange,
+    order: &StrategyOrderRecord,
+    progress: &OpenOrderExecutionProgress,
+) -> bool {
+    progress.order.client_order_id == order.client_order_id
+        && progress.order.exchange == exchange
+        && progress.order.shape == order.shape
+        && order.exchange_order_id.as_deref() == Some(progress.order.exchange_order_id.as_str())
+        && matches!(
+            &order.tracking,
+            StrategyOrderTracking::Intent {
+                state: IntentState::Accepted { exchange_order_id }
+            } if exchange_order_id == &progress.order.exchange_order_id
+        )
+}
+
 fn validate_runtime_settings(
     quote_asset: &str,
     maximum_market_age_ms: u64,
@@ -1283,6 +1339,18 @@ where
         self.converge_accounted_terminal_intents(now_ms)?;
         self.validate_ledger_ownership()?;
         let mut report = RuntimeTickReport::new();
+        let (exchange, symbol) = {
+            let state = self.machine.store().snapshot();
+            (state.exchange, state.symbol.clone())
+        };
+        let open_progress = match self
+            .gateway
+            .open_order_execution_progress_snapshot(exchange, &symbol)
+            .await
+        {
+            Ok(Some(progress)) => index_open_order_progress(progress),
+            Ok(None) | Err(_) => None,
+        };
         let ledger_ids = self
             .intent_store
             .snapshot()
@@ -1291,13 +1359,30 @@ where
             .cloned()
             .collect::<Vec<_>>();
         for client_order_id in &ledger_ids {
-            let result = reconcile_with(
-                &self.gateway,
-                &mut self.intent_store,
-                client_order_id,
-                now_ms,
-            )
-            .await?;
+            let current_intent = self
+                .intent_store
+                .snapshot()
+                .intents
+                .get(client_order_id)
+                .cloned()
+                .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+            let accepted_progress = open_progress
+                .as_ref()
+                .and_then(|progress| progress.get(client_order_id))
+                .filter(|progress| accepted_progress_matches(&current_intent, progress));
+            let result = if let Some(progress) = accepted_progress {
+                ReconciliationResult::Accepted {
+                    exchange_order_id: progress.order.exchange_order_id.clone(),
+                }
+            } else {
+                reconcile_with(
+                    &self.gateway,
+                    &mut self.intent_store,
+                    client_order_id,
+                    now_ms,
+                )
+                .await?
+            };
             report.ledger_reconciliations += 1;
             let intent = self
                 .intent_store
@@ -1363,6 +1448,23 @@ where
             .map(|order| order.client_order_id.clone())
             .collect::<Vec<_>>();
         for client_order_id in &execution_ids {
+            let unchanged_open_order = {
+                let state = self.machine.store().snapshot();
+                let order = state
+                    .orders
+                    .get(client_order_id)
+                    .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+                open_progress
+                    .as_ref()
+                    .and_then(|progress| progress.get(client_order_id))
+                    .is_some_and(|progress| {
+                        execution_progress_matches(state.exchange, order, progress)
+                            && progress.cumulative_quantity == order.cumulative_quantity
+                    })
+            };
+            if unchanged_open_order {
+                continue;
+            }
             match self
                 .execution_sync
                 .synchronize(&self.gateway, &mut self.machine, client_order_id, now_ms)
@@ -1820,8 +1922,8 @@ mod tests {
         },
         engine::{
             GridOrderRole, MarketSnapshot, MemoryStrategyStateStore, PositionBaseline,
-            RuntimeCoordinator, RuntimeCoordinatorError, RuntimeRecoveryError,
-            RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry,
+            ReplacementObligationKind, RuntimeCoordinator, RuntimeCoordinatorError,
+            RuntimeRecoveryError, RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry,
             RuntimeRegistryAdvanceError, RuntimeStartupFailure, StrategyLifecycle,
             StrategyOrderPurpose, StrategyRunId, StrategyState, StrategyStateStore,
             build_grid_plan, recover_discovered_strategies,
@@ -1898,6 +2000,10 @@ mod tests {
         market_snapshot_calls: usize,
         rules_snapshot_calls: usize,
         position_snapshot_calls: usize,
+        order_lookup_calls: usize,
+        execution_snapshot_calls: usize,
+        open_progress_enabled: bool,
+        open_progress_calls: usize,
         fee_rate_calls: usize,
         leverage_write_calls: usize,
         market_gate: Option<Arc<MarketGate>>,
@@ -1950,6 +2056,10 @@ mod tests {
                     market_snapshot_calls: 0,
                     rules_snapshot_calls: 0,
                     position_snapshot_calls: 0,
+                    order_lookup_calls: 0,
+                    execution_snapshot_calls: 0,
+                    open_progress_enabled: false,
+                    open_progress_calls: 0,
                     fee_rate_calls: 0,
                     leverage_write_calls: 0,
                     market_gate: None,
@@ -1995,6 +2105,22 @@ mod tests {
 
         fn market_snapshot_call_count(&self) -> usize {
             self.state.lock().unwrap().market_snapshot_calls
+        }
+
+        fn enable_open_progress(&self) {
+            self.state.lock().unwrap().open_progress_enabled = true;
+        }
+
+        fn order_lookup_call_count(&self) -> usize {
+            self.state.lock().unwrap().order_lookup_calls
+        }
+
+        fn execution_snapshot_call_count(&self) -> usize {
+            self.state.lock().unwrap().execution_snapshot_calls
+        }
+
+        fn open_progress_call_count(&self) -> usize {
+            self.state.lock().unwrap().open_progress_calls
         }
 
         fn account_preflight_call_count(&self) -> usize {
@@ -2316,10 +2442,9 @@ mod tests {
             _symbol: &str,
             client_order_id: &ClientOrderId,
         ) -> Result<OrderLookup, LookupError> {
-            Ok(self
-                .state
-                .lock()
-                .unwrap()
+            let mut state = self.state.lock().unwrap();
+            state.order_lookup_calls += 1;
+            Ok(state
                 .orders
                 .get(client_order_id)
                 .cloned()
@@ -2330,6 +2455,34 @@ mod tests {
 
     #[async_trait]
     impl ExecutionSnapshotGateway for MockGateway {
+        async fn open_order_execution_progress_snapshot(
+            &self,
+            _exchange: Exchange,
+            _symbol: &str,
+        ) -> Result<Option<Vec<OpenOrderExecutionProgress>>, ExecutionSnapshotError> {
+            let mut state = self.state.lock().unwrap();
+            if !state.open_progress_enabled {
+                return Ok(None);
+            }
+            state.open_progress_calls += 1;
+            let progress = state
+                .orders
+                .values()
+                .filter(|order| matches!(order.lifecycle, OrderLifecycle::Active(_)))
+                .map(|order| {
+                    let cumulative_quantity = state
+                        .executions
+                        .get(&order.client_order_id)
+                        .map_or(Decimal::ZERO, |snapshot| snapshot.cumulative_quantity);
+                    OpenOrderExecutionProgress {
+                        order: order.clone(),
+                        cumulative_quantity,
+                    }
+                })
+                .collect();
+            Ok(Some(progress))
+        }
+
         async fn execution_snapshot(
             &self,
             _exchange: Exchange,
@@ -2337,9 +2490,9 @@ mod tests {
             client_order_id: &ClientOrderId,
             _exchange_order_id: &str,
         ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
-            self.state
-                .lock()
-                .unwrap()
+            let mut state = self.state.lock().unwrap();
+            state.execution_snapshot_calls += 1;
+            state
                 .executions
                 .get(client_order_id)
                 .cloned()
@@ -4083,6 +4236,73 @@ mod tests {
         assert!(second.submissions.is_empty());
         assert!(!second.is_blocked());
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn batched_open_progress_skips_idle_orders_but_syncs_the_exact_partial_fill() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+
+        let lookup_before_idle = gateway.order_lookup_call_count();
+        let execution_before_idle = gateway.execution_snapshot_call_count();
+        let idle = runtime.tick(1_300).await.unwrap();
+
+        assert!(!idle.is_blocked(), "{idle:?}");
+        assert_eq!(gateway.open_progress_call_count(), 1);
+        assert_eq!(gateway.order_lookup_call_count(), lookup_before_idle);
+        assert_eq!(
+            gateway.execution_snapshot_call_count(),
+            execution_before_idle
+        );
+        assert_eq!(idle.execution_syncs, 0);
+
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let partial_quantity = source_shape.quantity / Decimal::new(2, 0);
+        gateway.partially_fill_order(
+            &source_id,
+            partial_quantity,
+            source_shape.price.unwrap(),
+            Decimal::new(1, 3),
+        );
+        gateway.set_position(
+            -(opening_quantity + partial_quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+
+        let lookup_before_fill = gateway.order_lookup_call_count();
+        let execution_before_fill = gateway.execution_snapshot_call_count();
+        let filled = runtime.tick(1_400).await.unwrap();
+
+        assert!(!filled.is_blocked(), "{filled:?}");
+        assert_eq!(gateway.open_progress_call_count(), 2);
+        assert_eq!(gateway.order_lookup_call_count(), lookup_before_fill);
+        assert_eq!(
+            gateway.execution_snapshot_call_count(),
+            execution_before_fill + 1
+        );
+        assert_eq!(filled.execution_syncs, 1);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .replacement_obligations
+                .values()
+                .filter(|obligation| {
+                    obligation.kind == ReplacementObligationKind::Counter
+                        && obligation.source_client_order_id == source_id
+                })
+                .map(|obligation| obligation.shape.quantity)
+                .sum::<Decimal>(),
+            partial_quantity
+        );
     }
 
     #[tokio::test]

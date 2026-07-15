@@ -764,6 +764,68 @@ where
     S: BybitRequestSigner,
     C: MillisecondClock,
 {
+    async fn open_order_execution_progress_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Option<Vec<crate::exchange::OpenOrderExecutionProgress>>, ExecutionSnapshotError>
+    {
+        validate_snapshot_request(exchange, Exchange::Bybit, symbol)
+            .map_err(|error| execution_error(error.to_string()))?;
+        let symbol = symbol.to_ascii_uppercase();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = BTreeSet::new();
+        let mut client_order_ids = BTreeSet::new();
+        let mut exchange_order_ids = BTreeSet::new();
+        let mut progress = Vec::new();
+        for _ in 0..MAX_OPEN_ORDER_PAGES {
+            let mut query = vec![
+                ("category".into(), CATEGORY.into()),
+                ("symbol".into(), symbol.clone()),
+                ("openOnly".into(), "0".into()),
+                ("limit".into(), OPEN_ORDER_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(value) = &cursor {
+                query.push(("cursor".into(), value.clone()));
+            }
+            let request = self
+                .signed_get("/v5/order/realtime", query)
+                .map_err(|error| execution_error(error.to_string()))?;
+            let body = self
+                .execute_snapshot(request, "Bybit open-order execution progress")
+                .await
+                .map_err(|error| execution_error(error.to_string()))?;
+            let page = parse_open_order_page(&body, &symbol).map_err(|error| {
+                execution_error(format!("invalid Bybit open-order progress: {error}"))
+            })?;
+            for item in page.progress {
+                if !client_order_ids.insert(item.order.client_order_id.clone())
+                    || !exchange_order_ids.insert(item.order.exchange_order_id.clone())
+                {
+                    return Err(execution_error(
+                        "Bybit open-order progress contains duplicate identities",
+                    ));
+                }
+                progress.push(item);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                progress.sort_by(|left, right| {
+                    left.order.client_order_id.cmp(&right.order.client_order_id)
+                });
+                return Ok(Some(progress));
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(execution_error(
+                    "Bybit open-order progress cursor did not advance",
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(execution_error(
+            "Bybit open-order progress exceeded bounded pagination",
+        ))
+    }
+
     async fn execution_snapshot(
         &self,
         exchange: Exchange,
@@ -1233,6 +1295,23 @@ mod tests {
         assert_eq!(orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
         assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
         assert_eq!(orders[1].shape.quantity, Decimal::new(100, 0));
+    }
+
+    #[tokio::test]
+    async fn open_order_progress_preserves_authoritative_partial_quantity() {
+        let transport =
+            MockTransport::with_response(ok(order_result("PartiallyFilled", "0.07", "70.77")));
+
+        let progress = adapter(transport.clone())
+            .open_order_execution_progress_snapshot(Exchange::Bybit, "MUUSDT")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(transport.requests()[0].path, "/v5/order/realtime");
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].cumulative_quantity, Decimal::new(7, 2));
+        assert_eq!(progress[0].order.shape.quantity, Decimal::new(2, 1));
     }
 
     #[tokio::test]

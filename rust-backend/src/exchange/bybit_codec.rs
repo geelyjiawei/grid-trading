@@ -12,9 +12,10 @@ use crate::{
     exchange::{
         AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
         CancellationAcknowledgement, ExchangeMarketSnapshot, HistoricalMinutePrice,
-        HistoricalOrder, LeverageAcknowledgement, OrderLifecycle, PlacementAcknowledgement,
-        PositionLeg, PositionSide, PositionSnapshot, TradeFill, TradingFeeRates,
-        execution::OrderExecutionHeader, is_valid_trade_id, strategy_client_order_id,
+        HistoricalOrder, LeverageAcknowledgement, OpenOrderExecutionProgress, OrderLifecycle,
+        PlacementAcknowledgement, PositionLeg, PositionSide, PositionSnapshot, TradeFill,
+        TradingFeeRates, execution::OrderExecutionHeader, is_valid_trade_id,
+        strategy_client_order_id,
     },
 };
 
@@ -205,6 +206,7 @@ pub(super) fn parse_exact_order_record(
 #[derive(Debug, PartialEq)]
 pub(super) struct OpenOrderPage {
     pub orders: Vec<AuthoritativeOrder>,
+    pub progress: Vec<OpenOrderExecutionProgress>,
     pub next_cursor: Option<String>,
 }
 
@@ -228,6 +230,7 @@ pub(super) fn parse_open_order_page(
     let mut client_order_ids = BTreeSet::new();
     let mut exchange_order_ids = BTreeSet::new();
     let mut orders = Vec::with_capacity(rows.len());
+    let mut progress = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(raw_client_order_id) = row.get("orderLinkId").and_then(Value::as_str) else {
             continue;
@@ -244,11 +247,16 @@ pub(super) fn parse_open_order_page(
         {
             return Err(BybitCodecError::DuplicateRecord);
         }
+        progress.push(OpenOrderExecutionProgress {
+            order: header.order.clone(),
+            cumulative_quantity: header.cumulative_quantity,
+        });
         orders.push(header.order);
     }
     orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
     Ok(OpenOrderPage {
         orders,
+        progress,
         next_cursor: (!cursor.is_empty()).then_some(cursor),
     })
 }

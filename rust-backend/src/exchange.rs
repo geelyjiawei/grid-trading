@@ -138,6 +138,12 @@ pub struct AuthoritativeOrder {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenOrderExecutionProgress {
+    pub order: AuthoritativeOrder,
+    pub cumulative_quantity: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OrderLookup {
     Found(AuthoritativeOrder),
     NotFound,
@@ -341,6 +347,14 @@ impl ExecutionSnapshotError {
 
 #[async_trait]
 pub trait ExecutionSnapshotGateway: Send + Sync {
+    async fn open_order_execution_progress_snapshot(
+        &self,
+        _exchange: Exchange,
+        _symbol: &str,
+    ) -> Result<Option<Vec<OpenOrderExecutionProgress>>, ExecutionSnapshotError> {
+        Ok(None)
+    }
+
     async fn execution_snapshot(
         &self,
         exchange: Exchange,

@@ -19,9 +19,10 @@ use crate::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_account_balance_snapshot, parse_authoritative_order,
             parse_cancellation_acknowledgement, parse_exchange_error, parse_instrument_rules,
-            parse_leverage_acknowledgement, parse_market_snapshot, parse_open_orders,
-            parse_order_history, parse_placement_acknowledgement, parse_position_snapshot,
-            parse_trading_fee_rates, validate_snapshot_request,
+            parse_leverage_acknowledgement, parse_market_snapshot,
+            parse_open_order_execution_progress, parse_open_orders, parse_order_history,
+            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
+            validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -697,6 +698,33 @@ where
     S: BinanceRequestSigner,
     C: MillisecondClock,
 {
+    async fn open_order_execution_progress_snapshot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+    ) -> Result<Option<Vec<crate::exchange::OpenOrderExecutionProgress>>, ExecutionSnapshotError>
+    {
+        validate_snapshot_request(exchange, Exchange::Binance, symbol)
+            .map_err(|error| execution_error(error.to_string()))?;
+        let symbol = symbol.to_ascii_uppercase();
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v1/openOrders",
+                vec![("symbol".into(), symbol.clone())],
+            )
+            .map_err(|error| execution_error(error.to_string()))?;
+        let body = self
+            .execute_snapshot(request, "Binance open-order execution progress")
+            .await
+            .map_err(|error| execution_error(error.to_string()))?;
+        parse_open_order_execution_progress(&body, Exchange::Binance, &symbol)
+            .map(Some)
+            .map_err(|error| {
+                execution_error(format!("invalid Binance open-order progress: {error}"))
+            })
+    }
+
     async fn execution_snapshot(
         &self,
         exchange: Exchange,
@@ -985,6 +1013,28 @@ mod tests {
         assert_eq!(orders.len(), 2);
         assert_eq!(orders[0].shape.quantity, Decimal::new(70, 0));
         assert_eq!(orders[1].shape.time_in_force, TimeInForce::PostOnly);
+    }
+
+    #[tokio::test]
+    async fn open_order_progress_preserves_authoritative_partial_quantity() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"[
+                {"symbol":"MUUSDT","orderId":92,"clientOrderId":"g_RUN00001_2_S_2","side":"SELL","price":"1012","origQty":"100","executedQty":"70","cumQuote":"70840","status":"PARTIALLY_FILLED","reduceOnly":false,"timeInForce":"GTC","type":"LIMIT"}
+            ]"#
+                .into(),
+        }));
+
+        let progress = adapter(transport.clone())
+            .open_order_execution_progress_snapshot(Exchange::Binance, "MUUSDT")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(transport.request().path, "/fapi/v1/openOrders");
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].cumulative_quantity, Decimal::new(70, 0));
+        assert_eq!(progress[0].order.shape.quantity, Decimal::new(100, 0));
     }
 
     #[tokio::test]
