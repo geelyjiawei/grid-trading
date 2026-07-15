@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7.0
+
 FROM node:22-alpine AS vue-build
 
 WORKDIR /src/vue-frontend
@@ -11,7 +13,12 @@ FROM rust:1.90-bookworm AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY rust-backend/ ./rust-backend/
-RUN cargo build --locked --release --package grid-trading-server
+RUN --mount=type=cache,id=grid-trading-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=grid-trading-cargo-target,target=/src/target,sharing=locked \
+    cargo build --locked --release --package grid-trading-server \
+    && install -D --mode=0755 \
+        /src/target/release/grid-trading-server \
+        /out/grid-trading-server
 
 FROM debian:bookworm-slim AS runtime
 
@@ -22,7 +29,7 @@ RUN apt-get update \
     && useradd --uid 10001 --gid grid --no-create-home --shell /usr/sbin/nologin grid
 
 WORKDIR /app
-COPY --from=rust-build /src/target/release/grid-trading-server /usr/local/bin/grid-trading-server
+COPY --from=rust-build /out/grid-trading-server /usr/local/bin/grid-trading-server
 COPY --from=vue-build /src/vue-frontend/dist/ /app/web/
 
 RUN mkdir -p /app/data/rust-control/idempotency /app/data/rust-control/strategies \
