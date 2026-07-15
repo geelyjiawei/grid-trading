@@ -1639,6 +1639,10 @@ fn validate_execution_audit_payload(
         || snapshot.order.exchange_order_id.trim().is_empty()
         || order.exchange_order_id.as_deref() != Some(&snapshot.order.exchange_order_id)
         || snapshot.order.shape != order.shape
+        || snapshot
+            .order
+            .executed_quantity
+            .is_some_and(|quantity| quantity != snapshot.cumulative_quantity)
         || snapshot.cumulative_quantity != expected_quantity
         || snapshot.cumulative_quote != expected_quote
         || snapshot.order_time_ms == 0
@@ -7093,6 +7097,22 @@ mod tests {
         audit.fee_valuations.swap(0, 1);
         assert_eq!(
             reordered_audit.validate(),
+            Err(StrategyStateError::InvalidExecutionAudit)
+        );
+
+        let mut conflicting_quantity_audit = state.clone();
+        conflicting_quantity_audit
+            .orders
+            .get_mut(&sell)
+            .unwrap()
+            .execution_audit
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .order
+            .executed_quantity = Some(decimal(19));
+        assert_eq!(
+            conflicting_quantity_audit.validate(),
             Err(StrategyStateError::InvalidExecutionAudit)
         );
     }

@@ -215,6 +215,10 @@ impl ExecutionAccountingService {
             || !crate::exchange::trades_are_canonically_ordered(&snapshot.trades)
             || snapshot.cumulative_quantity < Decimal::ZERO
             || snapshot.cumulative_quote < Decimal::ZERO
+            || snapshot
+                .order
+                .executed_quantity
+                .is_some_and(|quantity| quantity != snapshot.cumulative_quantity)
             || (snapshot.cumulative_quantity.is_zero() && !snapshot.cumulative_quote.is_zero())
             || (snapshot.cumulative_quantity > Decimal::ZERO
                 && snapshot.cumulative_quote <= Decimal::ZERO)
@@ -578,6 +582,32 @@ mod tests {
             1_020_001,
         )]);
         snapshot.cumulative_quantity = Decimal::new(313, 2);
+
+        assert_eq!(
+            service.value_snapshot(&gateway, &snapshot).await,
+            Err(ExecutionAccountingError::InvalidExecutionSnapshot)
+        );
+        assert!(gateway.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conflicting_exchange_execution_quantity_is_rejected_before_price_lookup() {
+        let gateway = gateway(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_020_000,
+            open_price: Decimal::new(600, 0),
+        });
+        let service = ExecutionAccountingService::new("USDT").unwrap();
+        let mut snapshot = snapshot(vec![trade(
+            1,
+            Decimal::new(314, 2),
+            Decimal::new(50083, 3),
+            Decimal::new(1, 2),
+            "BNB",
+            1_020_001,
+        )]);
+        snapshot.order.executed_quantity = Some(Decimal::new(313, 2));
 
         assert_eq!(
             service.value_snapshot(&gateway, &snapshot).await,

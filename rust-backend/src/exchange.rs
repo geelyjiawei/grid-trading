@@ -585,6 +585,7 @@ pub trait PositionSnapshotGateway: Send + Sync {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+    use crate::domain::{OrderKind, OrderSide, TimeInForce};
 
     fn snapshot(observed_at_ms: u64) -> ExchangeMarketSnapshot {
         ExchangeMarketSnapshot {
@@ -616,6 +617,31 @@ mod snapshot_tests {
             legs: vec![leg],
         };
         assert!(position.one_way_leverage().is_err());
+    }
+
+    #[test]
+    fn legacy_authoritative_order_without_executed_quantity_remains_readable() {
+        let order = AuthoritativeOrder {
+            client_order_id: ClientOrderId::parse("g_0_B_legacy").unwrap(),
+            exchange_order_id: "42".into(),
+            exchange: Exchange::Binance,
+            shape: OrderShape {
+                symbol: "MUUSDT".into(),
+                side: OrderSide::Buy,
+                price: Some(Decimal::new(1011, 0)),
+                quantity: Decimal::ONE,
+                reduce_only: false,
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::Gtc,
+            },
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            executed_quantity: Some(Decimal::ZERO),
+        };
+        let mut encoded = serde_json::to_value(order).unwrap();
+        encoded.as_object_mut().unwrap().remove("executed_quantity");
+
+        let restored: AuthoritativeOrder = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.executed_quantity, None);
     }
 
     #[test]

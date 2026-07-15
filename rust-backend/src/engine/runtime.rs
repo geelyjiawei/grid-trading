@@ -1264,7 +1264,12 @@ fn index_open_order_progress(
             }
             OrderLifecycle::Terminal(_) => false,
         };
+        let exact_quantity_matches = item
+            .order
+            .executed_quantity
+            .is_none_or(|quantity| quantity == item.cumulative_quantity);
         if !valid_quantity
+            || !exact_quantity_matches
             || indexed
                 .insert(item.order.client_order_id.clone(), item)
                 .is_some()
@@ -1979,6 +1984,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn open_order_progress_rejects_conflicting_execution_quantities() {
+        let client_order_id = ClientOrderId::parse("g_0_S_progress").unwrap();
+        let order = AuthoritativeOrder {
+            client_order_id,
+            exchange_order_id: "exchange-progress".into(),
+            exchange: Exchange::Binance,
+            shape: OrderShape {
+                symbol: "MUUSDT".into(),
+                side: OrderSide::Sell,
+                price: Some(Decimal::new(1011, 0)),
+                quantity: Decimal::new(10, 0),
+                reduce_only: false,
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::Gtc,
+            },
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+            executed_quantity: Some(Decimal::new(2, 0)),
+        };
+
+        assert!(
+            index_open_order_progress(vec![OpenOrderExecutionProgress {
+                order,
+                cumulative_quantity: Decimal::new(3, 0),
+            }])
+            .is_none()
+        );
+    }
+
     #[derive(Clone)]
     struct MockGateway {
         exchange: Exchange,
@@ -2210,6 +2244,7 @@ mod tests {
                 .get_mut(client_order_id)
                 .expect("order must have been placed");
             order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Filled);
+            order.executed_quantity = Some(order.shape.quantity);
             let order = order.clone();
             let quantity = order.shape.quantity;
             let quote_quantity = quantity * price;
@@ -2264,6 +2299,7 @@ mod tests {
                 .expect("order must have been placed");
             assert!(quantity > Decimal::ZERO && quantity < order.shape.quantity);
             order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+            order.executed_quantity = Some(quantity);
             let order = order.clone();
             let quote_quantity = quantity * price;
             let trade_id = format!("trade-{}", order.exchange_order_id);
