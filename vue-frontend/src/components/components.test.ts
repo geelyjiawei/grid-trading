@@ -340,7 +340,7 @@ describe("Vue migration components", () => {
     expect(wrapper.text()).toContain("账户权益 (USDT)");
   });
 
-  it("shows authoritative open order quantities without normalizing them", async () => {
+  it("shows authoritative order decimals without rounding them", async () => {
     const wrapper = mount(StrategyDetailsPanel, {
       props: {
         exchange: "aster",
@@ -354,8 +354,8 @@ describe("Vue migration components", () => {
             order_id: "123",
             order_link_id: "g_7_B_exact",
             side: "Buy",
-            price: "0.3800000",
-            qty: "70",
+            price: "0.380001234567",
+            qty: "70.000000001",
             status: "NEW",
             reduce_only: true,
           },
@@ -370,7 +370,8 @@ describe("Vue migration components", () => {
     expect(orderTab).toBeDefined();
     await orderTab!.trigger("click");
 
-    expect(wrapper.text()).toContain("70");
+    expect(wrapper.text()).toContain("0.380001234567");
+    expect(wrapper.text()).toContain("70.000000001");
     expect(wrapper.text()).toContain("g_7_B_exact");
     expect(wrapper.text()).toContain("止盈/平仓");
   });

@@ -10,6 +10,7 @@ import type {
 import {
   directionName,
   exchangeName,
+  formatExactDecimal,
   formatNumber,
   formatTimestamp,
 } from "../format";
@@ -112,8 +113,8 @@ function feeDisplayAsset(trade: GridTrade): string {
           <tr v-if="orders.length === 0"><td colspan="6" class="empty-state">交易所当前没有挂单</td></tr>
           <tr v-for="order in orders" :key="order.order_id ?? order.orderId ?? order.order_link_id ?? order.orderLinkId">
             <td :class="order.side === 'Buy' ? 'positive' : 'negative'">{{ order.side }}</td>
-            <td>{{ formatNumber(order.price, 8) }}</td>
-            <td>{{ formatNumber(order.qty, 8) }}</td>
+            <td>{{ formatExactDecimal(order.price) }}</td>
+            <td>{{ formatExactDecimal(order.qty) }}</td>
             <td>{{ reduceOnly(order) ? "止盈/平仓" : "开仓/补仓" }}</td>
             <td>{{ order.status || "--" }}</td>
             <td class="mono-cell">{{ order.order_link_id ?? order.orderLinkId ?? "--" }}</td>
@@ -129,12 +130,12 @@ function feeDisplayAsset(trade: GridTrade): string {
           <tr v-if="trades.length === 0"><td colspan="8" class="empty-state">暂无成交</td></tr>
           <tr v-for="trade in trades" :key="`${trade.order_id}:${trade.trade_id}`">
             <td :class="trade.side === 'Buy' ? 'positive' : 'negative'">{{ trade.side }}</td>
-            <td>{{ formatNumber(trade.price, 8) }}</td>
-            <td>{{ formatNumber(trade.qty, 8) }}</td>
-            <td>{{ formatNumber(trade.volume, 8) }}</td>
-            <td>{{ formatNumber(trade.fee_usdt ?? trade.fee, 8) }} {{ feeDisplayAsset(trade) }}</td>
+            <td>{{ formatExactDecimal(trade.price) }}</td>
+            <td>{{ formatExactDecimal(trade.qty) }}</td>
+            <td>{{ formatExactDecimal(trade.volume) }}</td>
+            <td>{{ formatExactDecimal(trade.fee_usdt ?? trade.fee) }} {{ feeDisplayAsset(trade) }}</td>
             <td>{{ trade.is_maker === true ? "挂单" : trade.is_maker === false ? "吃单" : trade.liquidity || "--" }}</td>
-            <td>{{ formatNumber(trade.realized_pnl ?? trade.profit, 8) }}</td>
+            <td>{{ formatExactDecimal(trade.realized_pnl ?? trade.profit) }}</td>
             <td>{{ formatTimestamp(trade.time) }}</td>
           </tr>
         </tbody>

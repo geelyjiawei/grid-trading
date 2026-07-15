@@ -28,6 +28,20 @@ export function formatNumber(value: unknown, maximumFractionDigits = 4): string 
   });
 }
 
+export function formatExactDecimal(value: unknown): string {
+  const text = typeof value === "string"
+    ? value.trim()
+    : typeof value === "number" && Number.isFinite(value)
+      ? String(value)
+      : "";
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(text);
+  if (!match) return "--";
+
+  const integer = match[2].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const fraction = (match[3] ?? "").replace(/0+$/, "");
+  return `${match[1]}${integer}${fraction ? `.${fraction}` : ""}`;
+}
+
 export function formatPercent(value: unknown, fractionDigits = 2): string {
   const number = finiteNumber(value);
   if (number === null) return "--";
