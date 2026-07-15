@@ -33,6 +33,7 @@ use crate::{
 };
 
 const MAX_CONCURRENT_ORDER_LOOKUPS: usize = 8;
+const MAX_CONCURRENT_EXECUTION_SNAPSHOTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1490,6 +1491,7 @@ where
             .filter(|order| order.exchange_order_id.is_some() && !order.terminal_processed)
             .map(|order| order.client_order_id.clone())
             .collect::<Vec<_>>();
+        let mut execution_sync_ids = Vec::new();
         for client_order_id in &execution_ids {
             let unchanged_open_order = {
                 let state = self.machine.store().snapshot();
@@ -1509,14 +1511,47 @@ where
                             && progress.cumulative_quantity == order.cumulative_quantity
                     })
             };
-            if unchanged_open_order {
-                continue;
+            if !unchanged_open_order {
+                execution_sync_ids.push(client_order_id.clone());
             }
-            match self
-                .execution_sync
-                .synchronize(&self.gateway, &mut self.machine, client_order_id, now_ms)
-                .await
-            {
+        }
+        let execution_requests = execution_sync_ids
+            .iter()
+            .map(|client_order_id| {
+                (
+                    client_order_id.clone(),
+                    self.execution_sync
+                        .request_for(&self.machine, client_order_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let execution_sync = &self.execution_sync;
+        let gateway = &self.gateway;
+        let mut loaded_execution_snapshots = stream::iter(execution_requests.into_iter().map(
+            |(client_order_id, request)| async move {
+                let result = match request {
+                    Ok(request) => execution_sync.load_snapshot(gateway, request).await,
+                    Err(error) => Err(error),
+                };
+                (client_order_id, result)
+            },
+        ))
+        .buffered(MAX_CONCURRENT_EXECUTION_SNAPSHOTS)
+        .collect::<BTreeMap<_, _>>()
+        .await;
+        for client_order_id in &execution_sync_ids {
+            let loaded = loaded_execution_snapshots
+                .remove(client_order_id)
+                .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+            let result = match loaded {
+                Ok(loaded) => {
+                    self.execution_sync
+                        .apply_loaded_snapshot(&self.gateway, &mut self.machine, loaded, now_ms)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(result) => {
                     report.execution_syncs += 1;
                     // A validated execution snapshot proves ownership and current
@@ -2082,6 +2117,9 @@ mod tests {
         maximum_concurrent_order_lookups: usize,
         order_lookup_delay: Option<Duration>,
         execution_snapshot_calls: usize,
+        active_execution_snapshots: usize,
+        maximum_concurrent_execution_snapshots: usize,
+        execution_snapshot_delay: Option<Duration>,
         open_progress_enabled: bool,
         open_progress_calls: usize,
         fee_rate_calls: usize,
@@ -2141,6 +2179,9 @@ mod tests {
                     maximum_concurrent_order_lookups: 0,
                     order_lookup_delay: None,
                     execution_snapshot_calls: 0,
+                    active_execution_snapshots: 0,
+                    maximum_concurrent_execution_snapshots: 0,
+                    execution_snapshot_delay: None,
                     open_progress_enabled: false,
                     open_progress_calls: 0,
                     fee_rate_calls: 0,
@@ -2212,6 +2253,21 @@ mod tests {
 
         fn execution_snapshot_call_count(&self) -> usize {
             self.state.lock().unwrap().execution_snapshot_calls
+        }
+
+        fn measure_delayed_execution_snapshots(&self, delay: Duration) {
+            let mut state = self.state.lock().unwrap();
+            state.execution_snapshot_calls = 0;
+            state.active_execution_snapshots = 0;
+            state.maximum_concurrent_execution_snapshots = 0;
+            state.execution_snapshot_delay = Some(delay);
+        }
+
+        fn maximum_concurrent_execution_snapshot_count(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap()
+                .maximum_concurrent_execution_snapshots
         }
 
         fn open_progress_call_count(&self) -> usize {
@@ -2602,13 +2658,23 @@ mod tests {
             client_order_id: &ClientOrderId,
             _exchange_order_id: &str,
         ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
-            let mut state = self.state.lock().unwrap();
-            state.execution_snapshot_calls += 1;
-            state
-                .executions
-                .get(client_order_id)
-                .cloned()
-                .ok_or_else(|| ExecutionSnapshotError::new("execution is not visible"))
+            let (delay, snapshot) = {
+                let mut state = self.state.lock().unwrap();
+                state.execution_snapshot_calls += 1;
+                state.active_execution_snapshots += 1;
+                state.maximum_concurrent_execution_snapshots = state
+                    .maximum_concurrent_execution_snapshots
+                    .max(state.active_execution_snapshots);
+                (
+                    state.execution_snapshot_delay,
+                    state.executions.get(client_order_id).cloned(),
+                )
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.state.lock().unwrap().active_execution_snapshots -= 1;
+            snapshot.ok_or_else(|| ExecutionSnapshotError::new("execution is not visible"))
         }
     }
 
@@ -4402,6 +4468,78 @@ mod tests {
             execution_snapshots_before
         );
         assert_eq!(report.execution_syncs, 0);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_partial_fills_load_snapshots_concurrently_but_apply_in_order() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let add_orders = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                matches!(
+                    order.purpose,
+                    StrategyOrderPurpose::InitialGrid {
+                        role: GridOrderRole::Add,
+                        ..
+                    }
+                ) && matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. }
+                    }
+                )
+            })
+            .take(4)
+            .map(|order| (order.client_order_id.clone(), order.shape.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(add_orders.len(), 4);
+        let mut partial_total = Decimal::ZERO;
+        for (client_order_id, shape) in &add_orders {
+            let partial_quantity = shape.quantity / Decimal::new(2, 0);
+            partial_total += partial_quantity;
+            gateway.partially_fill_order(
+                client_order_id,
+                partial_quantity,
+                shape.price.unwrap(),
+                Decimal::new(1, 3),
+            );
+        }
+        gateway.set_position(
+            -(opening_quantity + partial_total),
+            Some(Decimal::new(1014, 0)),
+        );
+        gateway.enable_open_progress();
+        gateway.measure_delayed_execution_snapshots(Duration::from_millis(20));
+
+        let report = runtime.tick(1_300).await.unwrap();
+
+        assert!(!report.is_blocked(), "{report:?}");
+        assert_eq!(gateway.execution_snapshot_call_count(), 4);
+        assert!(gateway.maximum_concurrent_execution_snapshot_count() > 1);
+        assert!(
+            gateway.maximum_concurrent_execution_snapshot_count()
+                <= MAX_CONCURRENT_EXECUTION_SNAPSHOTS
+        );
+        assert_eq!(report.execution_syncs, 4);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            -(opening_quantity + partial_total)
+        );
     }
 
     #[tokio::test]

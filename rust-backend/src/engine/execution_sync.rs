@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-    domain::ClientOrderId,
+    domain::{ClientOrderId, Exchange, OrderShape},
     engine::{
         ExecutionAccountingError, ExecutionAccountingService, StrategyMachine,
         StrategyMachineError, StrategyStateStore, StrategyTransition, ValuedExecutionReport,
@@ -14,6 +14,21 @@ pub struct ExecutionSyncResult {
     pub snapshot: OrderExecutionSnapshot,
     pub valued_report: ValuedExecutionReport,
     pub transition: StrategyTransition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExecutionSyncRequest {
+    exchange: Exchange,
+    symbol: String,
+    shape: OrderShape,
+    client_order_id: ClientOrderId,
+    exchange_order_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LoadedExecutionSnapshot {
+    request: ExecutionSyncRequest,
+    snapshot: OrderExecutionSnapshot,
 }
 
 #[derive(Debug, Error)]
@@ -55,37 +70,78 @@ impl ExecutionSyncService {
         G: ExecutionSnapshotGateway + HistoricalPriceGateway,
         S: StrategyStateStore,
     {
-        let (exchange, symbol, shape, exchange_order_id) = {
-            let state = machine.store().snapshot();
-            let order = state
-                .orders
-                .get(client_order_id)
-                .ok_or(ExecutionSyncError::UnknownStrategyOrder)?;
-            let exchange_order_id = order
-                .exchange_order_id
-                .clone()
-                .filter(|order_id| !order_id.trim().is_empty())
-                .ok_or(ExecutionSyncError::MissingExchangeOrderId)?;
-            (
-                state.exchange,
-                state.symbol.clone(),
-                order.shape.clone(),
-                exchange_order_id,
-            )
-        };
+        let request = self.request_for(machine, client_order_id)?;
+        let loaded = self.load_snapshot(gateway, request).await?;
+        self.apply_loaded_snapshot(gateway, machine, loaded, now_ms)
+            .await
+    }
 
+    pub(crate) fn request_for<S>(
+        &self,
+        machine: &StrategyMachine<S>,
+        client_order_id: &ClientOrderId,
+    ) -> Result<ExecutionSyncRequest, ExecutionSyncError>
+    where
+        S: StrategyStateStore,
+    {
+        let state = machine.store().snapshot();
+        let order = state
+            .orders
+            .get(client_order_id)
+            .ok_or(ExecutionSyncError::UnknownStrategyOrder)?;
+        let exchange_order_id = order
+            .exchange_order_id
+            .clone()
+            .filter(|order_id| !order_id.trim().is_empty())
+            .ok_or(ExecutionSyncError::MissingExchangeOrderId)?;
+        Ok(ExecutionSyncRequest {
+            exchange: state.exchange,
+            symbol: state.symbol.clone(),
+            shape: order.shape.clone(),
+            client_order_id: client_order_id.clone(),
+            exchange_order_id,
+        })
+    }
+
+    pub(crate) async fn load_snapshot<G>(
+        &self,
+        gateway: &G,
+        request: ExecutionSyncRequest,
+    ) -> Result<LoadedExecutionSnapshot, ExecutionSyncError>
+    where
+        G: ExecutionSnapshotGateway,
+    {
         let snapshot = gateway
-            .execution_snapshot(exchange, &symbol, client_order_id, &exchange_order_id)
+            .execution_snapshot(
+                request.exchange,
+                &request.symbol,
+                &request.client_order_id,
+                &request.exchange_order_id,
+            )
             .await
             .map_err(|error| ExecutionSyncError::SnapshotInconclusive(error.to_string()))?;
-        if snapshot.order.exchange != exchange
-            || snapshot.order.shape.symbol != symbol
-            || snapshot.order.client_order_id != *client_order_id
-            || snapshot.order.exchange_order_id != exchange_order_id
-            || snapshot.order.shape != shape
-        {
+        if !request.matches(&snapshot) {
             return Err(ExecutionSyncError::OrderIdentityMismatch);
         }
+        Ok(LoadedExecutionSnapshot { request, snapshot })
+    }
+
+    pub(crate) async fn apply_loaded_snapshot<G, S>(
+        &self,
+        gateway: &G,
+        machine: &mut StrategyMachine<S>,
+        loaded: LoadedExecutionSnapshot,
+        now_ms: u64,
+    ) -> Result<ExecutionSyncResult, ExecutionSyncError>
+    where
+        G: HistoricalPriceGateway,
+        S: StrategyStateStore,
+    {
+        let current_request = self.request_for(machine, &loaded.request.client_order_id)?;
+        if current_request != loaded.request || !current_request.matches(&loaded.snapshot) {
+            return Err(ExecutionSyncError::OrderIdentityMismatch);
+        }
+        let snapshot = loaded.snapshot;
         let valued_report = self.accounting.value_snapshot(gateway, &snapshot).await?;
         let transition = machine.apply_valued_execution(&snapshot, &valued_report, now_ms)?;
         Ok(ExecutionSyncResult {
@@ -93,6 +149,16 @@ impl ExecutionSyncService {
             valued_report,
             transition,
         })
+    }
+}
+
+impl ExecutionSyncRequest {
+    fn matches(&self, snapshot: &OrderExecutionSnapshot) -> bool {
+        snapshot.order.exchange == self.exchange
+            && snapshot.order.shape.symbol == self.symbol
+            && snapshot.order.client_order_id == self.client_order_id
+            && snapshot.order.exchange_order_id == self.exchange_order_id
+            && snapshot.order.shape == self.shape
     }
 }
 
