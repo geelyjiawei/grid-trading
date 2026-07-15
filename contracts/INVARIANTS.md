@@ -26,6 +26,10 @@ the OpenAPI schema.
   evidence that the original order may already exist, never proof that it was rejected.
 - A missing client order ID lookup is inconclusive and never authorizes a replacement
   order.
+- For an already accepted order, a separately fetched execution snapshot may supersede
+  transient lookup absence only after exact exchange, client ID, exchange order ID, and
+  immutable order-shape validation. An inconclusive or foreign execution snapshot never
+  clears the lookup blocker.
 - Reconciliation accepts an exchange order only when its exchange, client ID, order
   ID, side, price, quantity, reduce-only flag, type, and time-in-force are consistent
   with the immutable intent.

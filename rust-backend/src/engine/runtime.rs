@@ -1370,6 +1370,14 @@ where
             {
                 Ok(result) => {
                     report.execution_syncs += 1;
+                    // A validated execution snapshot proves ownership and current
+                    // exchange visibility more strongly than a transiently absent
+                    // per-order lookup. Do not let the weaker read stall unrelated
+                    // ready grid orders in this tick.
+                    report.blockers.retain(|blocker| {
+                        blocker.stage != RuntimeStage::LedgerReconciliation
+                            || blocker.client_order_id.as_ref() != Some(client_order_id)
+                    });
                     if matches!(result.transition, StrategyTransition::Failed { .. }) {
                         report.blockers.push(RuntimeBlocker {
                             stage: RuntimeStage::StrategyFailed,
@@ -2463,6 +2471,14 @@ mod tests {
         config: GridConfig,
         rules: &InstrumentRules,
     ) -> StrategyMachine<MemoryStrategyStateStore> {
+        machine_with_baseline(config, rules, PositionBaseline::flat())
+    }
+
+    fn machine_with_baseline(
+        config: GridConfig,
+        rules: &InstrumentRules,
+        baseline: PositionBaseline,
+    ) -> StrategyMachine<MemoryStrategyStateStore> {
         let plan = build_grid_plan(
             &config,
             &MarketSnapshot {
@@ -2477,7 +2493,7 @@ mod tests {
             config,
             rules.clone(),
             plan,
-            PositionBaseline::flat(),
+            baseline,
             1_000,
         )
         .unwrap();
@@ -5161,6 +5177,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoritative_active_execution_allows_deployment_after_transient_lookup_absence() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.maximum_submissions_per_tick = 1;
+
+        let opening = runtime.tick(1_100).await.unwrap();
+        assert_eq!(opening.submissions.len(), 1);
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+
+        let first_grid = runtime.tick(1_200).await.unwrap();
+        assert!(!first_grid.is_blocked(), "{first_grid:?}");
+        assert_eq!(first_grid.submissions.len(), 1);
+        let visible_through_execution = first_grid.submissions[0].client_order_id.clone();
+        gateway.hide_order_from_lookup(&visible_through_execution);
+
+        let continued = runtime.tick(1_300).await.unwrap();
+
+        assert!(
+            !continued.is_blocked(),
+            "an exact active execution snapshot must supersede transient lookup absence: {continued:?}"
+        );
+        assert_eq!(continued.submissions.len(), 1);
+        assert_ne!(
+            continued.submissions[0].client_order_id,
+            visible_through_execution
+        );
+        assert_eq!(gateway.placement_call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn foreign_execution_never_clears_transient_lookup_absence_or_allows_more_orders() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.maximum_submissions_per_tick = 1;
+
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        let first_grid = runtime.tick(1_200).await.unwrap();
+        let hidden = first_grid.submissions[0].client_order_id.clone();
+        gateway.hide_order_from_lookup(&hidden);
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .get_mut(&hidden)
+            .unwrap()
+            .order
+            .shape
+            .quantity += Decimal::new(1, 1);
+
+        let blocked = runtime.tick(1_300).await.unwrap();
+
+        assert!(blocked.is_blocked(), "{blocked:?}");
+        assert!(blocked.submissions.is_empty());
+        assert!(blocked.blockers.iter().any(|blocker| {
+            blocker.stage == RuntimeStage::LedgerReconciliation
+                && blocker.client_order_id.as_ref() == Some(&hidden)
+        }));
+        assert!(blocked.blockers.iter().any(|blocker| {
+            blocker.stage == RuntimeStage::ExecutionAccounting
+                && blocker.client_order_id.as_ref() == Some(&hidden)
+        }));
+        assert_eq!(gateway.placement_call_count(), 2);
+    }
+
+    #[tokio::test]
     async fn unknown_first_grid_placement_stops_the_remaining_batch_and_never_retries() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
@@ -5385,7 +5492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_cancellation_is_not_retried_when_exact_lookup_is_not_found() {
+    async fn unknown_cancellation_retries_when_exact_execution_proves_the_order_is_active() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
         let machine = machine(config(None), &rules);
@@ -5400,14 +5507,57 @@ mod tests {
         assert_eq!(gateway.cancellation_call_count(), 1);
 
         gateway.hide_order_from_lookup(&opening_id);
-        let inconclusive = runtime.tick(1_300).await.unwrap();
+        let retried = runtime.tick(1_300).await.unwrap();
 
         assert!(
-            inconclusive
+            retried
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::CancellationUnknown)
+        );
+        assert!(
+            !retried
                 .blockers
                 .iter()
                 .any(|blocker| blocker.stage == RuntimeStage::LedgerReconciliation)
         );
+        assert_eq!(gateway.cancellation_call_count(), 2);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::StopRequested
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_cancellation_is_not_retried_without_any_authoritative_active_evidence() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        runtime.machine_mut().request_stop(1_150).unwrap();
+        gateway.fail_next_cancellation(CancellationError::Unknown {
+            message: "timeout after cancellation request".into(),
+        });
+        runtime.tick(1_200).await.unwrap();
+        assert_eq!(gateway.cancellation_call_count(), 1);
+
+        {
+            let mut state = gateway.state.lock().unwrap();
+            state.orders.remove(&opening_id);
+            state.executions.remove(&opening_id);
+        }
+        let inconclusive = runtime.tick(1_300).await.unwrap();
+
+        assert!(inconclusive.blockers.iter().any(|blocker| {
+            blocker.stage == RuntimeStage::LedgerReconciliation
+                && blocker.client_order_id.as_ref() == Some(&opening_id)
+        }));
+        assert!(inconclusive.blockers.iter().any(|blocker| {
+            blocker.stage == RuntimeStage::ExecutionAccounting
+                && blocker.client_order_id.as_ref() == Some(&opening_id)
+        }));
         assert_eq!(gateway.cancellation_call_count(), 1);
         assert_eq!(
             runtime.machine().store().snapshot().lifecycle,
@@ -5613,6 +5763,111 @@ mod tests {
                 .snapshot()
                 .grid_position_net_quantity,
             Decimal::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn risk_exit_accounts_a_fill_winning_the_cancel_race_and_preserves_the_baseline() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let baseline_quantity = Decimal::new(-3, 0);
+        let baseline = PositionBaseline::from_authoritative_position(
+            baseline_quantity,
+            Some(Decimal::new(1010, 0)),
+        )
+        .unwrap();
+        let machine = machine_with_baseline(
+            config(Some(Decimal::new(1021, 0))),
+            &rules,
+            baseline.clone(),
+        );
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        gateway.set_position(baseline_quantity, Some(Decimal::new(1010, 0)));
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(
+            baseline_quantity - opening_quantity,
+            Some(Decimal::new(1012, 0)),
+        );
+        runtime.tick(1_200).await.unwrap();
+
+        gateway.set_market_price(Decimal::new(1022, 0), 1_300);
+        let cancelling = runtime.tick(1_300).await.unwrap();
+        assert!(!cancelling.cancellations.is_empty());
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::RiskExitRequested
+        );
+
+        let cancellation_ids = gateway.cancellation_ids();
+        let raced_id = cancellation_ids[0].clone();
+        let raced_shape = gateway
+            .state
+            .lock()
+            .unwrap()
+            .orders
+            .get(&raced_id)
+            .unwrap()
+            .shape
+            .clone();
+        gateway.fill_order(&raced_id, raced_shape.price.unwrap(), Decimal::new(1, 2));
+        for client_order_id in cancellation_ids
+            .iter()
+            .filter(|client_order_id| **client_order_id != raced_id)
+        {
+            gateway.mark_order_cancelled(client_order_id);
+        }
+        let raced_delta = match raced_shape.side {
+            OrderSide::Buy => raced_shape.quantity,
+            OrderSide::Sell => -raced_shape.quantity,
+        };
+        let expected_grid_quantity = -opening_quantity + raced_delta;
+        gateway.set_position(
+            baseline_quantity + expected_grid_quantity,
+            Some(Decimal::new(1012, 0)),
+        );
+
+        let closing = runtime.tick(1_400).await.unwrap();
+        assert_eq!(closing.submissions.len(), 1, "{closing:?}");
+        let close_intent = gateway
+            .state
+            .lock()
+            .unwrap()
+            .placement_calls
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(close_intent.shape.quantity, expected_grid_quantity.abs());
+        assert_eq!(close_intent.shape.side, OrderSide::Buy);
+        assert!(close_intent.shape.reduce_only);
+        assert_eq!(close_intent.shape.kind, OrderKind::Market);
+
+        gateway.fill_order(
+            &close_intent.client_order_id,
+            Decimal::new(1022, 0),
+            Decimal::new(5, 2),
+        );
+        gateway.set_position(baseline_quantity, Some(Decimal::new(1010, 0)));
+        let closed = runtime.tick(1_500).await.unwrap();
+
+        assert!(!closed.is_blocked(), "{closed:?}");
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Closed);
+        assert_eq!(state.baseline, baseline);
+        assert_eq!(state.grid_position_net_quantity, Decimal::ZERO);
+        assert_eq!(
+            state.expected_exchange_position().unwrap(),
+            baseline_quantity
         );
     }
 }
