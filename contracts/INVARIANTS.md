@@ -21,6 +21,9 @@ the OpenAPI schema.
   shape.
 - A write intent is durable before the exchange request.
 - Timeout or malformed acknowledgement is `SUBMIT_UNKNOWN`, never a safe retry.
+- An unreadable write rejection, exchange `UNKNOWN`/`DISCONNECTED` response, or
+  duplicate client-order-ID response is also `SUBMIT_UNKNOWN`; duplicate identity is
+  evidence that the original order may already exist, never proof that it was rejected.
 - A missing client order ID lookup is inconclusive and never authorizes a replacement
   order.
 - Reconciliation accepts an exchange order only when its exchange, client ID, order
@@ -192,7 +195,10 @@ the OpenAPI schema.
   unrounded user input or a later ticker value.
 - Grid levels that collapse after exchange tick-size quantization are rejected before
   any opening exposure is created.
-- Partial fills preserve exact remainders, including valid sub-minimum fragments.
+- Partial fills preserve exact remainders. Reduce-only orders may bypass minimum notional where
+  the exchange explicitly permits it, but no order bypasses the authoritative `LOT_SIZE.minQty`.
+  An exact counter fragment below `minQty` fails closed with its obligation retained; quantity is
+  never inflated, rounded, or silently omitted to manufacture a submit-safe order.
 - Completed legs restore the exact opposite order, including outside the configured
   range when that is the defined grid transition.
 - A strategy is ready only when the entire initial target plan is represented.
@@ -215,6 +221,9 @@ the OpenAPI schema.
 - Counter and cancelled-remainder obligations are created only while a strategy is
   deploying or running. Fills observed during stop, risk exit, failure, or finalization
   are still booked exactly, but can never schedule a normal grid replacement.
+- A replacement-planning failure blocks that same runtime tick before submission and is
+  reported as a strategy failure immediately; monitoring never presents the failed tick
+  as healthy while waiting for a later poll.
 
 ## Persistence and recovery
 
@@ -276,7 +285,9 @@ the OpenAPI schema.
   attachment, and duplicate failures are reported per run and release only the rejected claim.
 - The runtime registry owns one independent asynchronous mutex per run ID. A second tick for the
   same run is rejected rather than queued with stale time, while unrelated runs can advance in
-  parallel. Registration never replaces an existing owner and returns the rejected leased handle.
+  parallel. The scheduler polls every non-terminal run concurrently and returns reports in stable
+  run-ID order, so one slow exchange cannot delay another market. Registration never replaces an
+  existing owner and returns the rejected leased handle.
 - Armed-to-active activation replaces one durable runtime state atomically. Any planning,
   rule, baseline, runtime-setting, or intent-ledger failure leaves the armed bytes unchanged
   and creates no order. Successful activation transfers the same held runtime lease without

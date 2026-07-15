@@ -1479,8 +1479,18 @@ where
                 .drive_exit(report, StrategyLifecycle::RiskExitRequested, now_ms)
                 .await;
         }
-        self.machine
+        let replacement_transition = self
+            .machine
             .materialize_replacements(&inputs.instrument_rules, now_ms)?;
+        if matches!(replacement_transition, StrategyTransition::Failed { .. }) {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::StrategyFailed,
+                client_order_id: None,
+                message: "replacement planning failed before order submission".into(),
+            });
+            self.validate_ledger_ownership()?;
+            return Ok(report);
+        }
         self.submit_ready_orders(&mut report, now_ms).await?;
         self.validate_ledger_ownership()?;
         Ok(report)
@@ -2932,6 +2942,77 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert!(second[0].result.is_ok());
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_scheduler_does_not_let_one_slow_market_block_another() {
+        let first_directory = tempdir().unwrap();
+        let second_directory = tempdir().unwrap();
+        let coordinator_directory = tempdir().unwrap();
+        let first_gateway = MockGateway::new(rules(), 1_100);
+        let second_gateway = MockGateway::new(rules(), 1_100).with_symbol("ALTUSDT");
+        let first_run = StrategyRunId::parse("batch001").unwrap();
+        let second_run = StrategyRunId::parse("batch002").unwrap();
+        let first = prepare_leased_file_strategy(
+            first_gateway.clone(),
+            first_directory.path(),
+            first_run.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let mut second_config = config(None);
+        second_config.symbol = "ALTUSDT".into();
+        let second = prepare_leased_file_strategy(
+            second_gateway.clone(),
+            second_directory.path(),
+            second_run.clone(),
+            second_config,
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let coordinator = Arc::new(RuntimeCoordinator::new(
+            coordinator_directory.path().to_path_buf(),
+            runtime_settings(),
+        ));
+        assert!(matches!(
+            coordinator.registry().register(first).await,
+            RuntimeRegistration::Registered
+        ));
+        assert!(matches!(
+            coordinator.registry().register(second).await,
+            RuntimeRegistration::Registered
+        ));
+
+        let gate = first_gateway.block_market_snapshot();
+        let second_market_calls_before = second_gateway.market_snapshot_call_count();
+        let advancing = Arc::clone(&coordinator);
+        let batch = tokio::spawn(async move { advancing.advance_all(1_200).await });
+        gate.wait_until_entered().await;
+        let unrelated_progressed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while second_gateway.market_snapshot_call_count() == second_market_calls_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+        gate.release();
+        let results = batch.await.unwrap();
+        assert!(
+            unrelated_progressed,
+            "a slow strategy must not delay an unrelated market's tick"
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].run_id, first_run);
+        assert_eq!(results[1].run_id, second_run);
+        assert!(results.iter().all(|result| result.result.is_ok()));
+        assert_eq!(first_gateway.placement_call_count(), 1);
+        assert_eq!(second_gateway.placement_call_count(), 1);
     }
 
     #[tokio::test]
@@ -4470,6 +4551,65 @@ mod tests {
         assert!(!stable.is_blocked(), "{stable:?}");
         assert!(stable.submissions.is_empty());
         assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+    }
+
+    #[tokio::test]
+    async fn unsubmitable_reduce_only_fragment_blocks_the_same_tick_without_placing_an_order() {
+        let mut strict_rules = rules();
+        strict_rules.limit_quantity.min = Decimal::new(2, 1);
+        strict_rules.market_quantity.min = Decimal::new(2, 1);
+        let mut exact_config = config(None);
+        exact_config.grid_order_qty = Some(Decimal::new(4, 1));
+        let gateway = MockGateway::new(strict_rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(exact_config, &strict_rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let partial_quantity = Decimal::new(1, 1);
+        let placements_before_fill = gateway.placement_call_count();
+        gateway.partially_fill_order(
+            &source_id,
+            partial_quantity,
+            source_shape.price.unwrap(),
+            Decimal::new(1, 2),
+        );
+        gateway.set_position(
+            -(opening_quantity + partial_quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+
+        let failed = runtime.tick(1_300).await.unwrap();
+
+        assert!(failed.is_blocked(), "{failed:?}");
+        assert!(
+            failed
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::StrategyFailed)
+        );
+        assert_eq!(gateway.placement_call_count(), placements_before_fill);
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(
+            state.grid_position_net_quantity,
+            -(opening_quantity + partial_quantity)
+        );
+        assert_eq!(state.replacement_obligations.len(), 1);
+        assert!(
+            state
+                .replacement_obligations
+                .values()
+                .all(|obligation| obligation.assigned_client_order_id.is_none())
+        );
+        assert!(state.orders.values().all(|order| {
+            order.shape.quantity != partial_quantity
+                || !matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
+        }));
     }
 
     #[tokio::test]

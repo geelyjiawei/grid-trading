@@ -1429,6 +1429,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_or_duplicate_identity_rejections_require_lookup_reconciliation() {
+        for body in [
+            r#"{"code":-1000,"msg":"Unknown error while processing"}"#,
+            r#"{"code":-1001,"msg":"Internal error"}"#,
+            r#"{"code":-4116,"msg":"clientOrderId is duplicated"}"#,
+            "upstream returned an unreadable response",
+        ] {
+            let transport = MockTransport::with_response(Ok(HttpResponse {
+                status: 400,
+                body: body.into(),
+            }));
+            let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+            assert!(matches!(
+                adapter(transport, signer).place_order(&intent()).await,
+                Err(PlacementError::Unknown { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn non_authoritative_success_is_unknown() {
         let transport = MockTransport::with_response(Ok(HttpResponse {
             status: 200,

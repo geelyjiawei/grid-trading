@@ -282,7 +282,10 @@ pub(super) fn parse_account_balance_snapshot(
 }
 
 pub(super) fn execution_status_is_unknown(code: Option<&str>) -> bool {
-    matches!(code, Some("-1006" | "-1007"))
+    matches!(
+        code,
+        None | Some("-1000" | "-1001" | "-1006" | "-1007" | "-4116")
+    )
 }
 
 pub(super) fn order_is_definitively_absent(code: Option<&str>) -> bool {

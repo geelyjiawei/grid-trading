@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
+use futures::future::join_all;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -265,19 +266,25 @@ where
 
     pub async fn advance_all(&self, now_ms: u64) -> Vec<RuntimeAdvanceResult> {
         let entries = self.registry.entries().await;
-        let mut results = Vec::with_capacity(entries.len());
-        for entry in entries {
+        let advances = entries.into_iter().filter_map(|entry| {
             if entry
                 .lifecycle
                 .is_some_and(PreparedStrategyLifecycle::is_terminal)
             {
-                continue;
+                return None;
             }
-            results.push(RuntimeAdvanceResult {
-                run_id: entry.run_id.clone(),
-                result: self.registry.advance(&entry.run_id, now_ms).await,
-            });
-        }
+            let registry = Arc::clone(&self.registry);
+            Some(async move {
+                let result = registry.advance(&entry.run_id, now_ms).await;
+                RuntimeAdvanceResult {
+                    run_id: entry.run_id,
+                    result,
+                }
+            })
+        });
+        // join_all polls every independent run concurrently while preserving the
+        // catalog's deterministic run-ID order in the returned report.
+        let results = join_all(advances).await;
         self.registry.prune_terminal().await;
         results
     }

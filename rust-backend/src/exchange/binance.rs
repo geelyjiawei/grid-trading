@@ -1248,6 +1248,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_or_duplicate_identity_rejections_require_lookup_reconciliation() {
+        for body in [
+            r#"{"code":-1000,"msg":"Unknown error while processing"}"#,
+            r#"{"code":-1001,"msg":"Internal error"}"#,
+            r#"{"code":-4116,"msg":"clientOrderId is duplicated"}"#,
+            "upstream returned an unreadable response",
+        ] {
+            let transport = MockTransport::with_response(Ok(HttpResponse {
+                status: 400,
+                body: body.into(),
+            }));
+
+            assert!(matches!(
+                adapter(transport).place_order(&intent()).await,
+                Err(PlacementError::Unknown { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_success_acknowledgement_is_unknown() {
         let transport = MockTransport::with_response(Ok(HttpResponse {
             status: 200,

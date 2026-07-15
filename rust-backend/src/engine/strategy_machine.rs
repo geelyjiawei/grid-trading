@@ -1169,14 +1169,11 @@ fn validate_order_against_instrument(
         OrderKind::Limit => &rules.limit_quantity,
         OrderKind::Market => &rules.market_quantity,
     };
-    let below_minimum_is_allowed =
-        matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
-            && order.shape.reduce_only;
     if !quantity_rules.is_aligned(order.shape.quantity)
         || quantity_rules
             .max
             .is_some_and(|maximum| order.shape.quantity > maximum)
-        || (!below_minimum_is_allowed && order.shape.quantity < quantity_rules.min)
+        || order.shape.quantity < quantity_rules.min
     {
         return Err(StrategyStateError::OrderViolatesInstrumentRules);
     }
@@ -3669,9 +3666,14 @@ fn materialize_replacement_orders(
                 let Some(obligation) = state.replacement_obligations.get(&id) else {
                     return fail_transition(state, "replacement obligation is missing");
                 };
-                if replacement_quantity_is_valid(&obligation.shape, fresh_rules)
-                    && let Err(message) =
-                        materialize_obligation_bucket(state, &[id], fresh_rules, &mut created)
+                if !replacement_quantity_is_valid(&obligation.shape, fresh_rules) {
+                    return fail_transition(
+                        state,
+                        "exact reduce-only replacement violates the exchange LOT_SIZE quantity filter",
+                    );
+                }
+                if let Err(message) =
+                    materialize_obligation_bucket(state, &[id], fresh_rules, &mut created)
                 {
                     return fail_transition(state, message);
                 }
@@ -3973,6 +3975,7 @@ fn replacement_quantity_is_valid(shape: &OrderShape, rules: &InstrumentRules) ->
     let quantity = shape.quantity;
     let quantity_rules = &rules.limit_quantity;
     if !quantity_rules.is_aligned(quantity)
+        || quantity < quantity_rules.min
         || quantity_rules.max.is_some_and(|maximum| quantity > maximum)
     {
         return false;
@@ -4979,6 +4982,177 @@ mod tests {
                 );
                 assert_eq!(machine.store().snapshot(), &before);
             }
+        }
+    }
+
+    #[test]
+    fn favorable_boundary_round_trip_preserves_the_baseline_and_exact_grid_quantity() {
+        for (case_index, direction, baseline, outside_price) in [
+            (
+                0_u64,
+                Direction::Short,
+                PositionBaseline {
+                    signed_quantity: decimal(-3),
+                    entry_price: Some(decimal(1015)),
+                },
+                decimal(900),
+            ),
+            (
+                1_u64,
+                Direction::Long,
+                PositionBaseline {
+                    signed_quantity: decimal(3),
+                    entry_price: Some(decimal(1005)),
+                },
+                decimal(1100),
+            ),
+        ] {
+            let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+                direction,
+                baseline.clone(),
+            )));
+            complete_initial_deployment(&mut machine, 200 + case_index * 1_000);
+
+            let before = machine.store().snapshot().clone();
+            let initial_grid_quantity = before.grid_position_net_quantity;
+            let initial_expected_position = before.expected_exchange_position().unwrap();
+            let mut profit_orders = before
+                .orders
+                .values()
+                .filter(|order| order.purpose.is_initial_grid() && order.shape.reduce_only)
+                .map(|order| {
+                    (
+                        order.purpose.level_index().unwrap(),
+                        order.client_order_id.clone(),
+                        order.shape.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            profit_orders.sort_by_key(|(level_index, _, _)| *level_index);
+            assert_eq!(
+                profit_orders
+                    .iter()
+                    .map(|(_, _, shape)| shape.quantity)
+                    .sum::<Decimal>(),
+                initial_grid_quantity.abs()
+            );
+
+            assert_eq!(
+                machine
+                    .evaluate_risk_price(outside_price, 300 + case_index * 1_000)
+                    .unwrap(),
+                StrategyTransition::NoChange
+            );
+            for (offset, (_, client_order_id, shape)) in profit_orders.iter().enumerate() {
+                let price = shape.price.unwrap();
+                let exchange_order_id = machine.store().snapshot().orders[client_order_id]
+                    .exchange_order_id
+                    .clone()
+                    .unwrap();
+                machine
+                    .apply_execution(
+                        &report(
+                            client_order_id.clone(),
+                            &exchange_order_id,
+                            shape.quantity,
+                            price.checked_mul(shape.quantity).unwrap(),
+                            Some(TerminalOrderStatus::Filled),
+                        ),
+                        310 + case_index * 1_000 + offset as u64,
+                    )
+                    .unwrap();
+            }
+
+            let flattened = machine.store().snapshot();
+            assert_eq!(flattened.baseline, baseline);
+            assert_eq!(flattened.grid_position_net_quantity, Decimal::ZERO);
+            assert_eq!(
+                flattened.expected_exchange_position().unwrap(),
+                baseline.signed_quantity
+            );
+            assert!(flattened.lots_by_level.is_empty());
+            assert_eq!(
+                flattened
+                    .replacement_obligations
+                    .values()
+                    .filter(|obligation| {
+                        obligation.kind == ReplacementObligationKind::Counter
+                            && obligation.assigned_client_order_id.is_none()
+                    })
+                    .count(),
+                profit_orders.len()
+            );
+            assert!(flattened.orders.values().all(|order| {
+                order.purpose != StrategyOrderPurpose::RiskClose
+                    && order.shape.kind == OrderKind::Limit
+            }));
+
+            let rules = flattened.instrument_rules.clone();
+            let counter_ids = match machine
+                .materialize_replacements(&rules, 400 + case_index * 1_000)
+                .unwrap()
+            {
+                StrategyTransition::ReplacementOrdersReady { client_order_ids } => client_order_ids,
+                other => panic!("expected exact counter orders, got {other:?}"),
+            };
+            assert_eq!(counter_ids.len(), profit_orders.len());
+            for (offset, client_order_id) in counter_ids.iter().enumerate() {
+                let counter = machine.store().snapshot().orders[client_order_id].clone();
+                let source = profit_orders
+                    .iter()
+                    .find(|(level_index, _, _)| Some(*level_index) == counter.purpose.level_index())
+                    .unwrap();
+                assert_eq!(counter.shape.quantity, source.2.quantity);
+                assert!(!counter.shape.reduce_only);
+                assert_ne!(counter.shape.side, source.2.side);
+                assert_eq!(counter.shape.kind, OrderKind::Limit);
+
+                accept_strategy_order(
+                    &mut machine,
+                    client_order_id,
+                    &format!("boundary-counter-{case_index}-{offset}"),
+                    410 + case_index * 1_000 + offset as u64,
+                );
+            }
+            for (offset, client_order_id) in counter_ids.into_iter().enumerate() {
+                let shape = machine.store().snapshot().orders[&client_order_id]
+                    .shape
+                    .clone();
+                let price = shape.price.unwrap();
+                machine
+                    .apply_execution(
+                        &report(
+                            client_order_id,
+                            &format!("boundary-counter-{case_index}-{offset}"),
+                            shape.quantity,
+                            price.checked_mul(shape.quantity).unwrap(),
+                            Some(TerminalOrderStatus::Filled),
+                        ),
+                        450 + case_index * 1_000 + offset as u64,
+                    )
+                    .unwrap();
+            }
+
+            let restored = machine.store().snapshot();
+            assert_eq!(restored.baseline, baseline);
+            assert_eq!(restored.grid_position_net_quantity, initial_grid_quantity);
+            assert_eq!(
+                restored.expected_exchange_position().unwrap(),
+                initial_expected_position
+            );
+            assert_eq!(
+                restored
+                    .lots_by_level
+                    .values()
+                    .map(|lot| lot.quantity)
+                    .sum::<Decimal>(),
+                initial_grid_quantity.abs()
+            );
+            assert!(restored.orders.values().all(|order| {
+                order.purpose != StrategyOrderPurpose::RiskClose
+                    && order.shape.kind == OrderKind::Limit
+            }));
+            assert_eq!(restored.validate(), Ok(()));
         }
     }
 
@@ -8263,7 +8437,7 @@ mod tests {
     }
 
     #[test]
-    fn reduce_only_partial_quantity_materializes_below_normal_minimum() {
+    fn reduce_only_partial_quantity_below_minimum_fails_closed_without_an_order() {
         let mut config = config(Direction::Short);
         config.grid_order_qty = Some(decimal(2));
         let mut instrument = instrument();
@@ -8315,14 +8489,19 @@ mod tests {
             )
             .unwrap();
 
-        machine.materialize_replacements(&instrument, 103).unwrap();
+        let transition = machine.materialize_replacements(&instrument, 103).unwrap();
 
         let state = machine.store().snapshot();
-        let replacements = replacement_orders(state);
-        assert_eq!(replacements.len(), 1);
-        assert_eq!(replacements[0].shape.quantity, Decimal::new(1, 1));
-        assert!(replacements[0].shape.reduce_only);
-        assert!(replacements[0].shape.quantity < state.instrument_rules.limit_quantity.min);
+        assert!(matches!(transition, StrategyTransition::Failed { .. }));
+        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert!(replacement_orders(state).is_empty());
+        assert_eq!(state.replacement_obligations.len(), 1);
+        assert!(
+            state
+                .replacement_obligations
+                .values()
+                .all(|obligation| obligation.assigned_client_order_id.is_none())
+        );
     }
 
     #[test]
