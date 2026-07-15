@@ -1571,7 +1571,8 @@ where
                 .orders
                 .values()
                 .filter(|order| {
-                    !matches!(order.purpose, StrategyOrderPurpose::RiskClose)
+                    (lifecycle == StrategyLifecycle::Failed
+                        || !matches!(order.purpose, StrategyOrderPurpose::RiskClose))
                         && matches!(
                             order.tracking,
                             StrategyOrderTracking::Intent {
@@ -5840,6 +5841,100 @@ mod tests {
                 .snapshot()
                 .grid_position_net_quantity,
             Decimal::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_cancels_an_accepted_risk_close_before_releasing_the_market() {
+        let original_rules = rules();
+        let gateway = MockGateway::new(original_rules.clone(), 1_100);
+        let machine = machine(config(Some(Decimal::new(1021, 0))), &original_rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        runtime.tick(1_200).await.unwrap();
+
+        gateway.set_cancellation_marks_terminal(true);
+        gateway.set_market_price(Decimal::new(1022, 0), 1_300);
+        runtime.tick(1_300).await.unwrap();
+        let closing = runtime.tick(1_400).await.unwrap();
+        assert_eq!(closing.submissions.len(), 1, "{closing:?}");
+        let risk_close = gateway
+            .state
+            .lock()
+            .unwrap()
+            .placement_calls
+            .last()
+            .unwrap()
+            .clone();
+        assert!(risk_close.shape.reduce_only);
+        assert_eq!(risk_close.shape.kind, OrderKind::Market);
+        let placements_before_failure = gateway.placement_call_count();
+        let cancellations_before_failure = gateway.cancellation_call_count();
+
+        let mut changed_rules = original_rules;
+        changed_rules.tick_size = Decimal::new(5, 1);
+        gateway.set_rules(changed_rules);
+        let failed = runtime.tick(1_500).await.unwrap();
+        assert!(
+            failed
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::InstrumentRules),
+            "{failed:?}"
+        );
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Failed
+        );
+        assert_eq!(
+            gateway.cancellation_call_count(),
+            cancellations_before_failure
+        );
+
+        let cleanup = runtime.tick(1_600).await.unwrap();
+        assert!(
+            cleanup
+                .cancellations
+                .iter()
+                .any(|cancellation| cancellation.client_order_id == risk_close.client_order_id),
+            "{cleanup:?}"
+        );
+        assert_eq!(
+            gateway.cancellation_call_count(),
+            cancellations_before_failure + 1
+        );
+        assert_eq!(
+            gateway.cancellation_ids().last(),
+            Some(&risk_close.client_order_id)
+        );
+        assert_eq!(gateway.placement_call_count(), placements_before_failure);
+
+        runtime.tick(1_700).await.unwrap();
+        let settled = runtime.machine().store().snapshot();
+        assert_eq!(settled.lifecycle, StrategyLifecycle::Stopped);
+        assert!(settled.failure.is_some());
+        assert_eq!(gateway.placement_call_count(), placements_before_failure);
+        assert_eq!(
+            gateway.cancellation_call_count(),
+            cancellations_before_failure + 1
+        );
+        assert!(
+            settled
+                .orders
+                .get(&risk_close.client_order_id)
+                .is_some_and(|order| order.terminal_processed)
         );
     }
 
