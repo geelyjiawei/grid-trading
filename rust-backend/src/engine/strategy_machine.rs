@@ -1559,15 +1559,18 @@ fn validate_inventory_event_ledger(state: &StrategyState) -> Result<(), Strategy
 
     let accounting_events = inventory_events_in_accounting_order(state)
         .map_err(|_| StrategyStateError::InventoryEventLedgerMismatch)?;
-    let mut replay = state.clone();
-    InventoryAccountingSnapshot::empty().restore(&mut replay);
+    let opening_lot_targets =
+        opening_lot_targets(state).map_err(|_| StrategyStateError::InventoryEventLedgerMismatch)?;
+    let mut replay = InventoryAccountingSnapshot::empty();
     for event in &accounting_events {
         let order = state
             .orders
             .get(&event.source_client_order_id)
             .ok_or(StrategyStateError::InventoryEventLedgerMismatch)?;
-        apply_inventory_accounting(
+        apply_inventory_accounting_snapshot(
             &mut replay,
+            state.direction,
+            Ok(&opening_lot_targets),
             &order.purpose,
             &order.shape,
             event.quantity,
@@ -3140,22 +3143,24 @@ fn inventory_events_in_accounting_order(
 
 fn rebuild_inventory_accounting(state: &mut StrategyState) -> Result<(), String> {
     let events = inventory_events_in_accounting_order(state)?;
-    let mut replay = state.clone();
-    InventoryAccountingSnapshot::empty().restore(&mut replay);
+    let opening_lot_targets = opening_lot_targets(state)?;
+    let mut replay = InventoryAccountingSnapshot::empty();
     for event in &events {
         let order = state
             .orders
             .get(&event.source_client_order_id)
             .ok_or_else(|| "inventory event references an unknown order".to_owned())?;
-        apply_inventory_accounting(
+        apply_inventory_accounting_snapshot(
             &mut replay,
+            state.direction,
+            Ok(&opening_lot_targets),
             &order.purpose,
             &order.shape,
             event.quantity,
             event.quote,
         )?;
     }
-    InventoryAccountingSnapshot::capture(&replay).restore(state);
+    replay.restore(state);
     Ok(())
 }
 
@@ -3242,71 +3247,113 @@ fn apply_inventory_accounting(
     quantity: Decimal,
     quote: Decimal,
 ) -> Result<(), String> {
+    let direction = state.direction;
+    let opening_lot_targets = if matches!(purpose, StrategyOrderPurpose::Opening) {
+        opening_lot_targets(state)
+    } else {
+        Ok(Vec::new())
+    };
+    let mut accounting = InventoryAccountingSnapshot::capture(state);
+    let result = apply_inventory_accounting_snapshot(
+        &mut accounting,
+        direction,
+        opening_lot_targets
+            .as_ref()
+            .map(Vec::as_slice)
+            .map_err(String::as_str),
+        purpose,
+        shape,
+        quantity,
+        quote,
+    );
+    // Preserve the old failure semantics: if an exchange execution cannot be
+    // fully represented, retain every accounting mutation applied before the
+    // exact validation failure so the failed strategy still reports the delta.
+    accounting.restore(state);
+    result
+}
+
+fn apply_inventory_accounting_snapshot(
+    accounting: &mut InventoryAccountingSnapshot,
+    direction: Direction,
+    opening_lot_targets: Result<&[(u16, Decimal)], &str>,
+    purpose: &StrategyOrderPurpose,
+    shape: &OrderShape,
+    quantity: Decimal,
+    quote: Decimal,
+) -> Result<(), String> {
     let signed_quantity = match shape.side {
         OrderSide::Buy => quantity,
         OrderSide::Sell => -quantity,
     };
-    state.grid_position_net_quantity = state
+    accounting.grid_position_net_quantity = accounting
         .grid_position_net_quantity
         .checked_add(signed_quantity)
         .ok_or_else(|| "grid position quantity overflowed".to_owned())?;
 
     if matches!(purpose, StrategyOrderPurpose::Opening) {
-        state.opening_filled_quantity = state
+        accounting.opening_filled_quantity = accounting
             .opening_filled_quantity
             .checked_add(quantity)
             .ok_or_else(|| "opening quantity overflowed".to_owned())?;
-        state.opening_filled_value = state
+        accounting.opening_filled_value = accounting
             .opening_filled_value
             .checked_add(quote)
             .ok_or_else(|| "opening value overflowed".to_owned())?;
-        allocate_opening_delta(state, quantity, quote)?;
-        return validate_directional_position(state, shape);
+        let opening_lot_targets = opening_lot_targets.map_err(str::to_owned)?;
+        allocate_opening_delta(accounting, opening_lot_targets, quantity, quote)?;
+        return validate_directional_position(accounting, direction, shape);
     }
 
     if matches!(purpose, StrategyOrderPurpose::RiskClose) {
-        validate_directional_position(state, shape)?;
-        let realized = consume_risk_close_lots(state, shape.side, quantity, quote)?;
-        state.gross_realized_profit = state
-            .gross_realized_profit
-            .checked_add(realized)
-            .ok_or_else(|| "risk close realized profit overflowed".to_owned())?;
+        validate_directional_position(accounting, direction, shape)?;
+        let realized = consume_risk_close_lots(accounting, direction, shape.side, quantity, quote)?;
+        accounting.gross_realized_profit =
+            accounting
+                .gross_realized_profit
+                .checked_add(realized)
+                .ok_or_else(|| "risk close realized profit overflowed".to_owned())?;
         return Ok(());
     }
 
-    validate_directional_position(state, shape)?;
+    validate_directional_position(accounting, direction, shape)?;
     let level_index = purpose
         .level_index()
         .ok_or_else(|| "grid execution has no level identity".to_owned())?;
-    if state.direction != Direction::Neutral {
+    if direction != Direction::Neutral {
         if shape.reduce_only {
-            let realized = consume_level_lot(state, level_index, quantity, quote)?;
-            state.gross_realized_profit = state
+            let realized = consume_level_lot(accounting, direction, level_index, quantity, quote)?;
+            accounting.gross_realized_profit = accounting
                 .gross_realized_profit
                 .checked_add(realized)
                 .ok_or_else(|| "realized profit overflowed".to_owned())?;
         } else {
-            add_level_lot(state, level_index, quantity, quote)?;
+            add_level_lot(accounting, level_index, quantity, quote)?;
         }
     } else {
-        let realized = apply_neutral_fill(state, shape.side, quantity, quote)?;
-        state.gross_realized_profit = state
-            .gross_realized_profit
-            .checked_add(realized)
-            .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
+        let realized = apply_neutral_fill(accounting, shape.side, quantity, quote)?;
+        accounting.gross_realized_profit =
+            accounting
+                .gross_realized_profit
+                .checked_add(realized)
+                .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
     }
     Ok(())
 }
 
-fn validate_directional_position(state: &StrategyState, shape: &OrderShape) -> Result<(), String> {
-    match state.direction {
+fn validate_directional_position(
+    accounting: &InventoryAccountingSnapshot,
+    direction: Direction,
+    shape: &OrderShape,
+) -> Result<(), String> {
+    match direction {
         Direction::Long => {
             let valid_shape = if shape.reduce_only {
                 shape.side == OrderSide::Sell
             } else {
                 shape.side == OrderSide::Buy
             };
-            if !valid_shape || state.grid_position_net_quantity < Decimal::ZERO {
+            if !valid_shape || accounting.grid_position_net_quantity < Decimal::ZERO {
                 return Err("long strategy execution violates owned-position direction".into());
             }
         }
@@ -3316,7 +3363,7 @@ fn validate_directional_position(state: &StrategyState, shape: &OrderShape) -> R
             } else {
                 shape.side == OrderSide::Sell
             };
-            if !valid_shape || state.grid_position_net_quantity > Decimal::ZERO {
+            if !valid_shape || accounting.grid_position_net_quantity > Decimal::ZERO {
                 return Err("short strategy execution violates owned-position direction".into());
             }
         }
@@ -3326,7 +3373,7 @@ fn validate_directional_position(state: &StrategyState, shape: &OrderShape) -> R
 }
 
 fn add_level_lot(
-    state: &mut StrategyState,
+    accounting: &mut InventoryAccountingSnapshot,
     level_index: u16,
     quantity: Decimal,
     entry_value: Decimal,
@@ -3334,10 +3381,13 @@ fn add_level_lot(
     if quantity <= Decimal::ZERO || entry_value <= Decimal::ZERO {
         return Err("opening grid execution has invalid quantity or value".into());
     }
-    let lot = state.lots_by_level.entry(level_index).or_insert(LevelLot {
-        quantity: Decimal::ZERO,
-        entry_value: Decimal::ZERO,
-    });
+    let lot = accounting
+        .lots_by_level
+        .entry(level_index)
+        .or_insert(LevelLot {
+            quantity: Decimal::ZERO,
+            entry_value: Decimal::ZERO,
+        });
     lot.quantity = lot
         .quantity
         .checked_add(quantity)
@@ -3350,12 +3400,13 @@ fn add_level_lot(
 }
 
 fn consume_level_lot(
-    state: &mut StrategyState,
+    accounting: &mut InventoryAccountingSnapshot,
+    direction: Direction,
     level_index: u16,
     quantity: Decimal,
     exit_value: Decimal,
 ) -> Result<Decimal, String> {
-    let Some(lot) = state.lots_by_level.get_mut(&level_index) else {
+    let Some(lot) = accounting.lots_by_level.get_mut(&level_index) else {
         return Err(format!(
             "reduce execution has no owned lot at level {level_index}"
         ));
@@ -3373,9 +3424,9 @@ fn consume_level_lot(
     lot.quantity -= quantity;
     lot.entry_value -= consumed_entry_value;
     if lot.quantity.is_zero() {
-        state.lots_by_level.remove(&level_index);
+        accounting.lots_by_level.remove(&level_index);
     }
-    match state.direction {
+    match direction {
         Direction::Long => exit_value
             .checked_sub(consumed_entry_value)
             .ok_or_else(|| "long realized profit overflowed".to_owned()),
@@ -3387,7 +3438,7 @@ fn consume_level_lot(
 }
 
 fn apply_neutral_fill(
-    state: &mut StrategyState,
+    accounting: &mut InventoryAccountingSnapshot,
     side: OrderSide,
     quantity: Decimal,
     trade_value: Decimal,
@@ -3395,7 +3446,7 @@ fn apply_neutral_fill(
     if quantity <= Decimal::ZERO || trade_value <= Decimal::ZERO {
         return Err("neutral execution is invalid".into());
     }
-    let opposing_ids = state
+    let opposing_ids = accounting
         .neutral_lots
         .iter()
         .filter_map(|(id, lot)| {
@@ -3412,7 +3463,7 @@ fn apply_neutral_fill(
         if remaining_quantity.is_zero() {
             break;
         }
-        let lot = state
+        let lot = accounting
             .neutral_lots
             .get(&id)
             .cloned()
@@ -3446,9 +3497,9 @@ fn apply_neutral_fill(
             .ok_or_else(|| "neutral realized profit overflowed".to_owned())?;
 
         if consumed == available {
-            state.neutral_lots.remove(&id);
+            accounting.neutral_lots.remove(&id);
         } else {
-            let current = state
+            let current = accounting
                 .neutral_lots
                 .get_mut(&id)
                 .ok_or_else(|| "neutral lot disappeared during update".to_owned())?;
@@ -3464,12 +3515,12 @@ fn apply_neutral_fill(
     }
 
     if remaining_quantity > Decimal::ZERO {
-        let id = state.next_neutral_lot_sequence;
-        state.next_neutral_lot_sequence = state
+        let id = accounting.next_neutral_lot_sequence;
+        accounting.next_neutral_lot_sequence = accounting
             .next_neutral_lot_sequence
             .checked_add(1)
             .ok_or_else(|| "neutral lot sequence overflowed".to_owned())?;
-        state.neutral_lots.insert(
+        accounting.neutral_lots.insert(
             id,
             NeutralLot {
                 id,
@@ -3487,15 +3538,16 @@ fn apply_neutral_fill(
 }
 
 fn consume_risk_close_lots(
-    state: &mut StrategyState,
+    accounting: &mut InventoryAccountingSnapshot,
+    direction: Direction,
     side: OrderSide,
     quantity: Decimal,
     exit_value: Decimal,
 ) -> Result<Decimal, String> {
-    if state.direction == Direction::Neutral {
-        return apply_neutral_fill(state, side, quantity, exit_value);
+    if direction == Direction::Neutral {
+        return apply_neutral_fill(accounting, side, quantity, exit_value);
     }
-    let level_indices = state.lots_by_level.keys().copied().collect::<Vec<_>>();
+    let level_indices = accounting.lots_by_level.keys().copied().collect::<Vec<_>>();
     let mut remaining_quantity = quantity;
     let mut remaining_exit_value = exit_value;
     let mut realized = Decimal::ZERO;
@@ -3503,7 +3555,7 @@ fn consume_risk_close_lots(
         if remaining_quantity.is_zero() {
             break;
         }
-        let available = state
+        let available = accounting
             .lots_by_level
             .get(&level_index)
             .map_or(Decimal::ZERO, |lot| lot.quantity);
@@ -3521,7 +3573,8 @@ fn consume_risk_close_lots(
         };
         realized = realized
             .checked_add(consume_level_lot(
-                state,
+                accounting,
+                direction,
                 level_index,
                 consumed,
                 consumed_exit_value,
@@ -3736,14 +3789,7 @@ fn normal_grid_replacements_enabled(lifecycle: StrategyLifecycle) -> bool {
     )
 }
 
-fn allocate_opening_delta(
-    state: &mut StrategyState,
-    delta_quantity: Decimal,
-    delta_quote: Decimal,
-) -> Result<(), String> {
-    if delta_quantity <= Decimal::ZERO || delta_quote <= Decimal::ZERO {
-        return Err("opening execution delta is invalid".into());
-    }
+fn opening_lot_targets(state: &StrategyState) -> Result<Vec<(u16, Decimal)>, String> {
     let mut protected_orders = state
         .orders
         .values()
@@ -3757,13 +3803,25 @@ fn allocate_opening_delta(
         })
         .collect::<Result<Vec<_>, _>>()?;
     protected_orders.sort_by_key(|(level_index, _)| *level_index);
+    Ok(protected_orders)
+}
+
+fn allocate_opening_delta(
+    accounting: &mut InventoryAccountingSnapshot,
+    protected_orders: &[(u16, Decimal)],
+    delta_quantity: Decimal,
+    delta_quote: Decimal,
+) -> Result<(), String> {
+    if delta_quantity <= Decimal::ZERO || delta_quote <= Decimal::ZERO {
+        return Err("opening execution delta is invalid".into());
+    }
     let mut remaining_quantity = delta_quantity;
     let mut remaining_quote = delta_quote;
-    for (level_index, planned_quantity) in protected_orders {
+    for &(level_index, planned_quantity) in protected_orders {
         if remaining_quantity.is_zero() {
             break;
         }
-        let already_allocated = state
+        let already_allocated = accounting
             .lots_by_level
             .get(&level_index)
             .map_or(Decimal::ZERO, |lot| lot.quantity);
@@ -3780,7 +3838,7 @@ fn allocate_opening_delta(
                 .and_then(|value| value.checked_div(delta_quantity))
                 .ok_or_else(|| "opening lot value allocation overflowed".to_owned())?
         };
-        add_level_lot(state, level_index, quantity, entry_value)?;
+        add_level_lot(accounting, level_index, quantity, entry_value)?;
         remaining_quantity -= quantity;
         remaining_quote -= entry_value;
     }
@@ -7783,7 +7841,7 @@ mod tests {
     #[test]
     fn neutral_inventory_invariants_hold_across_one_thousand_deterministic_fills() {
         let machine = small_neutral_machine();
-        let mut state = machine.store().snapshot().clone();
+        let mut accounting = InventoryAccountingSnapshot::capture(machine.store().snapshot());
         let mut seed = 0x5eed_u64;
         let mut realized = Decimal::ZERO;
 
@@ -7801,26 +7859,26 @@ mod tests {
                 OrderSide::Buy => quantity,
                 OrderSide::Sell => -quantity,
             };
-            state.grid_position_net_quantity = state
+            accounting.grid_position_net_quantity = accounting
                 .grid_position_net_quantity
                 .checked_add(signed)
                 .unwrap();
             realized = realized
-                .checked_add(apply_neutral_fill(&mut state, side, quantity, value).unwrap())
+                .checked_add(apply_neutral_fill(&mut accounting, side, quantity, value).unwrap())
                 .unwrap();
 
             assert_eq!(
-                state
+                accounting
                     .neutral_lots
                     .values()
                     .map(|lot| lot.signed_quantity)
                     .sum::<Decimal>(),
-                state.grid_position_net_quantity
+                accounting.grid_position_net_quantity
             );
-            assert!(state.neutral_lots.values().all(|lot| {
-                (state.grid_position_net_quantity > Decimal::ZERO
+            assert!(accounting.neutral_lots.values().all(|lot| {
+                (accounting.grid_position_net_quantity > Decimal::ZERO
                     && lot.signed_quantity > Decimal::ZERO)
-                    || (state.grid_position_net_quantity < Decimal::ZERO
+                    || (accounting.grid_position_net_quantity < Decimal::ZERO
                         && lot.signed_quantity < Decimal::ZERO)
             }));
         }
