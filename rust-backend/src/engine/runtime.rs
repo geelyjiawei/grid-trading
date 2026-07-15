@@ -1406,20 +1406,14 @@ where
             });
         }
         self.validate_ledger_ownership()?;
-        if report.is_blocked() {
-            return Ok(report);
-        }
-
         let (exchange, symbol, lifecycle) = {
             let state = self.machine.store().snapshot();
             (state.exchange, state.symbol.clone(), state.lifecycle)
         };
         if lifecycle == StrategyLifecycle::Failed {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::StrategyFailed,
-                client_order_id: None,
-                message: "strategy is failed".into(),
-            });
+            return self.drive_exit(report, lifecycle, now_ms).await;
+        }
+        if report.is_blocked() {
             return Ok(report);
         }
         if matches!(
@@ -1458,7 +1452,9 @@ where
                 client_order_id: None,
                 message: "exchange instrument rules changed".into(),
             });
-            return Ok(report);
+            return self
+                .drive_exit(report, StrategyLifecycle::Failed, now_ms)
+                .await;
         }
         let expected_position = self
             .machine
@@ -1497,10 +1493,17 @@ where
                 message: "replacement planning failed before order submission".into(),
             });
             self.validate_ledger_ownership()?;
-            return Ok(report);
+            return self
+                .drive_exit(report, StrategyLifecycle::Failed, now_ms)
+                .await;
         }
         self.submit_ready_orders(&mut report, now_ms).await?;
         self.validate_ledger_ownership()?;
+        if self.machine.store().snapshot().lifecycle == StrategyLifecycle::Failed {
+            return self
+                .drive_exit(report, StrategyLifecycle::Failed, now_ms)
+                .await;
+        }
         Ok(report)
     }
 
@@ -1685,6 +1688,24 @@ where
             return Ok(report);
         }
 
+        if lifecycle == StrategyLifecycle::Failed {
+            if !report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::StrategyFailed)
+            {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::StrategyFailed,
+                    client_order_id: None,
+                    message:
+                        "strategy is failed; all unambiguously owned active orders are terminal"
+                            .into(),
+                });
+            }
+            self.validate_ledger_ownership()?;
+            return Ok(report);
+        }
+
         let inputs = match load_strategy_inputs(
             &self.gateway,
             exchange,
@@ -1771,7 +1792,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         sync::{Arc, Mutex},
     };
 
@@ -4598,6 +4619,23 @@ mod tests {
             -(opening_quantity + partial_quantity),
             Some(Decimal::new(1014, 0)),
         );
+        let accepted_before_failure = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. }
+                    }
+                )
+            })
+            .map(|order| order.client_order_id.clone())
+            .collect::<BTreeSet<_>>();
+        gateway.set_cancellation_marks_terminal(true);
 
         let failed = runtime.tick(1_300).await.unwrap();
 
@@ -4625,6 +4663,35 @@ mod tests {
         assert!(state.orders.values().all(|order| {
             order.shape.quantity != partial_quantity
                 || !matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
+        }));
+        assert_eq!(
+            gateway
+                .cancellation_ids()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            accepted_before_failure
+        );
+        assert!(
+            state
+                .orders
+                .values()
+                .all(|order| !matches!(order.purpose, StrategyOrderPurpose::RiskClose))
+        );
+
+        let cancellations_after_failure = gateway.cancellation_call_count();
+        let settled = runtime.tick(1_400).await.unwrap();
+        assert!(settled.is_blocked(), "{settled:?}");
+        assert_eq!(
+            gateway.cancellation_call_count(),
+            cancellations_after_failure
+        );
+        assert_eq!(gateway.placement_call_count(), placements_before_fill);
+        let settled_state = runtime.machine().store().snapshot();
+        assert!(accepted_before_failure.iter().all(|client_order_id| {
+            settled_state
+                .orders
+                .get(client_order_id)
+                .is_some_and(|order| order.terminal_processed)
         }));
     }
 
