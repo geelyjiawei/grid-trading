@@ -1,3 +1,4 @@
+mod exchange_config;
 mod idempotency;
 mod order_ledger;
 mod runtime_files;
@@ -5,6 +6,9 @@ mod runtime_lease;
 mod strategy_catalog;
 mod strategy_state;
 
+pub use exchange_config::{
+    EncryptedExchangeConfigStore, ExchangeConfigStoreError, StoredExchangeConfiguration,
+};
 pub use idempotency::{
     BeginIdempotency, CompleteIdempotency, FileIdempotencyStore, IdempotencyError, IdempotencyKey,
     IdempotencyStore, RequestFingerprint, StoredCommandResponse,

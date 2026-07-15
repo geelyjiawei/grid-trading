@@ -214,6 +214,10 @@ impl LocalEip712Signer {
             signer_address,
         })
     }
+
+    pub fn signer_address(&self) -> &str {
+        &self.signer_address
+    }
 }
 
 impl std::fmt::Debug for LocalEip712Signer {

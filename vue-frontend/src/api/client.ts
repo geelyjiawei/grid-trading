@@ -4,6 +4,8 @@ import type {
   BalanceSnapshot,
   AuthStatus,
   Exchange,
+  ExchangeConfigRequest,
+  ExchangeConfigSaveResponse,
   FeeRates,
   GridConfigRequest,
   GridHistoryResponse,
@@ -87,6 +89,11 @@ export const api = {
       method: "POST",
     }),
   config: () => request<ApiConfigResponse>("/api/config"),
+  saveConfig: (config: ExchangeConfigRequest) =>
+    request<ExchangeConfigSaveResponse>("/api/config", {
+      method: "POST",
+      body: JSON.stringify(config),
+    }),
   feeRates: (exchange: Exchange, symbol: string) =>
     request<FeeRates>(withExchange(`/api/fees/${encodeURIComponent(symbol)}`, exchange)),
   price: (exchange: Exchange, symbol: string) =>

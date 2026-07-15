@@ -7,7 +7,7 @@ pub mod security;
 pub mod web_auth;
 
 use std::{
-    env,
+    env, fs,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,11 +26,15 @@ use crate::{
         RuntimeRecoveryProvider, RuntimeSettings,
     },
     exchange::{
+        aster::LocalEip712Signer,
         configured::{
             ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayBuildError,
             ExchangeGatewayFactory, SharedConfiguredExchangeGateway,
         },
         registry::{ExchangeGatewayRegistry, RegistryError},
+    },
+    persistence::{
+        EncryptedExchangeConfigStore, ExchangeConfigStoreError, StoredExchangeConfiguration,
     },
     security::{AdminTokenError, AdminTokenVerifier},
 };
@@ -38,6 +42,7 @@ use crate::{
 const DEFAULT_CONTROL_ROOT: &str = "/app/data/rust-control/idempotency";
 const DEFAULT_STRATEGY_ROOT: &str = "/app/data/rust-control/strategies";
 const DEFAULT_WEB_ROOT: &str = "/app/web";
+const DEFAULT_CONFIG_FILE: &str = "/app/data/api_config.json";
 const DEFAULT_RUNTIME_TICK_MS: u64 = 1_000;
 const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
 const DEFAULT_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
@@ -48,6 +53,7 @@ pub fn app() -> Router {
         None,
         WebAuthService::disabled(),
         ExchangeGatewayRegistry::default(),
+        None,
         PathBuf::from(DEFAULT_CONTROL_ROOT),
         PathBuf::from(DEFAULT_STRATEGY_ROOT),
         PathBuf::from(DEFAULT_WEB_ROOT),
@@ -112,7 +118,11 @@ pub async fn app_from_environment() -> Result<Router, AppConfigurationError> {
     if !web_root.is_absolute() {
         return Err(AppConfigurationError::RelativeWebRoot);
     }
+    let exchange_config_store = exchange_config_store_from_environment()?;
     let exchange_gateways = exchange_gateways_from_environment()?;
+    if let Some(store) = &exchange_config_store {
+        register_stored_exchange_gateways(&exchange_gateways, store)?;
+    }
     let runtime = if trading_enabled {
         let settings = RuntimeSettings::new(
             "USDT",
@@ -149,6 +159,7 @@ pub async fn app_from_environment() -> Result<Router, AppConfigurationError> {
         admin_token,
         web_authentication,
         exchange_gateways,
+        exchange_config_store,
         control_root,
         strategy_root,
         web_root,
@@ -163,10 +174,12 @@ fn optional_admin_token(secret: String) -> Result<Option<AdminTokenVerifier>, Ad
     AdminTokenVerifier::from_secret(Zeroizing::new(secret)).map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_app(
     admin_token: Option<AdminTokenVerifier>,
     web_authentication: WebAuthService,
     exchange_gateways: ExchangeGatewayRegistry,
+    exchange_config_store: Option<EncryptedExchangeConfigStore>,
     control_root: PathBuf,
     strategy_root: PathBuf,
     web_root: PathBuf,
@@ -177,6 +190,7 @@ fn build_app(
             admin_token,
             web_authentication,
             exchange_gateways,
+            exchange_config_store,
             control_root,
             strategy_root,
             runtime,
@@ -287,6 +301,69 @@ fn exchange_gateways_from_environment() -> Result<ExchangeGatewayRegistry, AppCo
     }
 
     Ok(registry)
+}
+
+fn exchange_config_store_from_environment()
+-> Result<Option<EncryptedExchangeConfigStore>, AppConfigurationError> {
+    let path = read_nonempty_env_text("GRID_CONFIG_FILE")?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
+    let Some(master_key) = read_nonempty_env_text("GRID_CONFIG_KEY")? else {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(AppConfigurationError::MissingExchangeConfigKey),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(AppConfigurationError::InspectExchangeConfig(error)),
+        }
+    };
+    let salt = read_nonempty_env_text("GRID_CONFIG_SALT")?.map(Zeroizing::new);
+    EncryptedExchangeConfigStore::new(path, Zeroizing::new(master_key), salt)
+        .map(Some)
+        .map_err(AppConfigurationError::from)
+}
+
+fn register_stored_exchange_gateways(
+    registry: &ExchangeGatewayRegistry,
+    store: &EncryptedExchangeConfigStore,
+) -> Result<(), AppConfigurationError> {
+    for configuration in store.load()? {
+        let environment = if configuration.testnet() {
+            ExchangeEnvironment::Testnet
+        } else {
+            ExchangeEnvironment::Production
+        };
+        let masked_identifier = Some(mask_identifier(configuration.api_key()));
+        if configuration.exchange() == Exchange::Aster {
+            let signer = LocalEip712Signer::from_private_key(configuration.api_secret())
+                .map_err(ExchangeGatewayBuildError::from)?;
+            if !signer
+                .signer_address()
+                .eq_ignore_ascii_case(configuration.api_key())
+            {
+                return Err(AppConfigurationError::AsterStoredWalletMismatch);
+            }
+        }
+        let credentials = credentials_from_stored_configuration(&configuration)?;
+        let gateway = ExchangeGatewayFactory::standard(environment)?.build(credentials)?;
+        registry.replace_configured(gateway, environment, "file", masked_identifier)?;
+    }
+    Ok(())
+}
+
+fn credentials_from_stored_configuration(
+    configuration: &StoredExchangeConfiguration,
+) -> Result<ExchangeCredentials, AppConfigurationError> {
+    let credentials = match configuration.exchange() {
+        Exchange::Binance => ExchangeCredentials::binance(
+            configuration.api_key().to_owned(),
+            configuration.api_secret().to_owned(),
+        )?,
+        Exchange::Aster => ExchangeCredentials::aster(configuration.api_secret().to_owned())?,
+        Exchange::Bybit => ExchangeCredentials::bybit(
+            configuration.api_key().to_owned(),
+            configuration.api_secret().to_owned(),
+        )?,
+    };
+    Ok(credentials)
 }
 
 fn preferred_exchange_from_environment() -> Result<Exchange, AppConfigurationError> {
@@ -448,10 +525,18 @@ pub enum AppConfigurationError {
     EnvironmentWhitespace(&'static str),
     #[error("GRID_EXCHANGE or EXCHANGE must be binance, aster, or bybit")]
     InvalidExchange,
+    #[error("GRID_CONFIG_KEY is required when GRID_CONFIG_FILE already exists")]
+    MissingExchangeConfigKey,
+    #[error("GRID_CONFIG_FILE cannot be inspected: {0}")]
+    InspectExchangeConfig(std::io::Error),
+    #[error("encrypted exchange configuration is invalid: {0}")]
+    InvalidExchangeConfig(#[from] ExchangeConfigStoreError),
     #[error("{0} API credentials must provide both key and secret")]
     IncompleteExchangeCredentials(&'static str),
     #[error("ASTER_SIGNER_PRIVATE_KEY conflicts with legacy ASTER_API_SECRET")]
     ConflictingAsterPrivateKeys,
+    #[error("stored Aster wallet address does not match its private key")]
+    AsterStoredWalletMismatch,
     #[error("exchange credential is invalid: {0}")]
     InvalidExchangeCredential(#[from] exchange::configured::CredentialError),
     #[error("exchange gateway initialization failed: {0}")]
@@ -511,6 +596,7 @@ mod tests {
             None,
             WebAuthService::disabled(),
             ExchangeGatewayRegistry::default(),
+            None,
             PathBuf::from(DEFAULT_CONTROL_ROOT),
             PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
@@ -536,6 +622,7 @@ mod tests {
             None,
             WebAuthService::disabled(),
             ExchangeGatewayRegistry::default(),
+            None,
             PathBuf::from(DEFAULT_CONTROL_ROOT),
             PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),
@@ -561,6 +648,7 @@ mod tests {
             None,
             WebAuthService::disabled(),
             ExchangeGatewayRegistry::default(),
+            None,
             PathBuf::from(DEFAULT_CONTROL_ROOT),
             PathBuf::from(DEFAULT_STRATEGY_ROOT),
             web.path().to_path_buf(),

@@ -403,7 +403,7 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
 .modal-card input:focus, .modal-card select:focus { border-color: var(--mint); }
 .modal-card .primary-button { width: 100%; margin-top: 1rem; }
 .exchange-config-list { display: grid; gap: 0.45rem; }
-.exchange-config-list article {
+.exchange-config-list button {
   display: grid;
   grid-template-columns: minmax(5rem, 0.7fr) auto;
   align-items: center;
@@ -413,17 +413,17 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
   border-radius: 10px;
   background: #0d222c;
   font-size: 0.78rem;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
 }
-.exchange-config-list article span { text-align: right; }
-.exchange-config-list article small {
-  grid-column: 1 / -1;
-  overflow-wrap: anywhere;
-  font-size: 0.7rem;
-}
+.exchange-config-list button:hover, .exchange-config-list button.active { border-color: var(--mint); background: #102c35; }
+.exchange-config-list button span { text-align: right; }
 .check-row { gap: 0.55rem; margin-top: 1rem; }
 .check-row span { margin: 0 !important; }
 .form-hint { margin: 0.75rem 0 0; color: var(--muted); font-size: 0.75rem; line-height: 1.55; }
 .form-error { margin: 0.75rem 0 0; color: var(--danger); font-size: 0.78rem; }
+.form-success { margin: 0.75rem 0 0; color: var(--mint); font-size: 0.78rem; }
 
 @media (max-width: 860px) {
   .topbar { align-items: flex-start; flex-direction: column; }
@@ -444,8 +444,8 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
   .exchange-tabs button { padding: 0.55rem 0.65rem; }
   .metric-grid, .compact-grid, .strategy-overview .metric-grid { grid-template-columns: 1fr 1fr; }
   .strategy-row { align-items: flex-start; }
-  .exchange-config-list article { grid-template-columns: 1fr; gap: 0.2rem; }
-  .exchange-config-list article span { text-align: left; }
+  .exchange-config-list button { grid-template-columns: 1fr; gap: 0.2rem; }
+  .exchange-config-list button span { text-align: left; }
   .form-grid { grid-template-columns: 1fr; }
   .preview-metrics { grid-template-columns: 1fr 1fr; }
   .detail-metrics { grid-template-columns: 1fr 1fr; }

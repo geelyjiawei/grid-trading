@@ -31,7 +31,7 @@ describe("Vue migration components", () => {
     });
   });
 
-  it("shows environment-backed exchange status without exposing secret inputs", () => {
+  it("saves Aster with one private key while keeping exchange status masked", async () => {
     const config: ApiConfigResponse = {
       configured: true,
       active_exchange: "aster",
@@ -50,16 +50,22 @@ describe("Vue migration components", () => {
         open: true,
         config,
         activeExchange: "aster",
+        busy: false,
+        error: "",
+        message: "",
       },
     });
 
-    expect(wrapper.text()).toContain("交易所连接状态");
-    expect(wrapper.text()).toContain("ASTER_USER_ADDRESS / ASTER_SIGNER_PRIVATE_KEY");
+    expect(wrapper.text()).toContain("交易所 API 配置");
     expect(wrapper.text()).toContain("0x12…89 · Mainnet");
-    expect(wrapper.text()).toContain("浏览器不会接收、回显或写入私钥");
-    expect(wrapper.find("form").exists()).toBe(false);
-    expect(wrapper.find("input").exists()).toBe(false);
-    expect(wrapper.emitted("save")).toBeUndefined();
+    const privateKey = wrapper.find('input[type="password"]');
+    await privateKey.setValue("1".repeat(64));
+    await wrapper.find("form").trigger("submit");
+    expect(wrapper.emitted("save")?.[0]?.[0]).toEqual({
+      exchange: "aster",
+      private_key: "1".repeat(64),
+      testnet: false,
+    });
   });
 
   it("selects a strategy with its exchange identity intact", async () => {

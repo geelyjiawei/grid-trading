@@ -6,6 +6,7 @@ import type {
   AuthStatus,
   BalanceSnapshot,
   Exchange,
+  ExchangeConfigRequest,
   FeeRates,
   GridConfigRequest,
   GridPreview,
@@ -33,6 +34,9 @@ const authenticated = ref(false);
 const authBusy = ref(false);
 const authError = ref("");
 const config = ref<ApiConfigResponse | null>(null);
+const configBusy = ref(false);
+const configError = ref("");
+const configMessage = ref("");
 const activeExchange = ref<Exchange>("bybit");
 const symbol = ref("BTCUSDT");
 const price = ref<PriceSnapshot | null>(null);
@@ -415,6 +419,23 @@ async function selectExchange(exchange: Exchange): Promise<void> {
   await refreshWorkspace();
 }
 
+async function saveExchangeConfig(request: ExchangeConfigRequest): Promise<void> {
+  configBusy.value = true;
+  configError.value = "";
+  configMessage.value = "";
+  try {
+    await api.saveConfig(request);
+    await loadConfig();
+    activeExchange.value = request.exchange;
+    configMessage.value = `${exchangeName(request.exchange)} API 配置已验证并加密保存`;
+    await refreshWorkspace();
+  } catch (reason) {
+    configError.value = messageFrom(reason, "API 配置保存失败");
+  } finally {
+    configBusy.value = false;
+  }
+}
+
 async function selectStrategy(grid: GridStatus): Promise<void> {
   activeExchange.value = grid.exchange;
   symbol.value = grid.symbol;
@@ -547,7 +568,11 @@ onUnmounted(() => {
       :open="settingsOpen"
       :config="config"
       :active-exchange="activeExchange"
+      :busy="configBusy"
+      :error="configError"
+      :message="configMessage"
       @close="settingsOpen = false"
+      @save="saveExchangeConfig"
     />
   </main>
 </template>

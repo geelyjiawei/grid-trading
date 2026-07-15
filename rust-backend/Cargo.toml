@@ -14,6 +14,7 @@ base64.workspace = true
 data-encoding.workspace = true
 getrandom.workspace = true
 futures.workspace = true
+fernet.workspace = true
 hex.workspace = true
 hmac.workspace = true
 k256.workspace = true

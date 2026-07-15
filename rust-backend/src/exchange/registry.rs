@@ -1,4 +1,7 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -74,26 +77,42 @@ impl fmt::Debug for GatewayEntry {
     }
 }
 
-#[derive(Clone)]
-pub struct ExchangeGatewayRegistry {
+struct RegistryState {
     preferred: Exchange,
     binance: Option<GatewayEntry>,
     aster: Option<GatewayEntry>,
     bybit: Option<GatewayEntry>,
 }
 
+#[derive(Clone)]
+pub struct ExchangeGatewayRegistry {
+    inner: Arc<RwLock<RegistryState>>,
+}
+
 impl ExchangeGatewayRegistry {
     pub fn empty(preferred: Exchange) -> Self {
         Self {
-            preferred,
-            binance: None,
-            aster: None,
-            bybit: None,
+            inner: Arc::new(RwLock::new(RegistryState {
+                preferred,
+                binance: None,
+                aster: None,
+                bybit: None,
+            })),
         }
     }
 
     pub fn preferred(&self) -> Exchange {
-        self.preferred
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .preferred
+    }
+
+    pub fn set_preferred(&self, preferred: Exchange) {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .preferred = preferred;
     }
 
     pub fn register_configured(
@@ -142,7 +161,11 @@ impl ExchangeGatewayRegistry {
             return Err(RegistryError::InvalidMaskedIdentifier);
         }
         let exchange = gateway.exchange();
-        let slot = self.slot_mut(exchange);
+        let mut state = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = state.slot_mut(exchange);
         if slot.is_some() {
             return Err(RegistryError::Duplicate(exchange));
         }
@@ -156,11 +179,40 @@ impl ExchangeGatewayRegistry {
         Ok(())
     }
 
+    pub fn replace_configured(
+        &self,
+        gateway: ConfiguredExchangeGateway,
+        environment: ExchangeEnvironment,
+        source: impl Into<String>,
+        masked_identifier: Option<String>,
+    ) -> Result<(), RegistryError> {
+        let source = source.into();
+        validate_entry_metadata(&source, masked_identifier.as_deref())?;
+        let gateway = gateway.shared();
+        let exchange = gateway.exchange();
+        let entry = GatewayEntry {
+            gateway: Arc::new(gateway.clone()),
+            trading_gateway: Some(gateway),
+            environment,
+            source,
+            masked_identifier,
+        };
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .slot_mut(exchange) = Some(entry);
+        Ok(())
+    }
+
     pub fn gateway(
         &self,
         exchange: Exchange,
     ) -> Result<Arc<dyn ReadOnlyExchangeGateway>, RegistryError> {
-        self.slot(exchange)
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .slot(exchange)
             .map(|entry| Arc::clone(&entry.gateway))
             .ok_or(RegistryError::NotConfigured(exchange))
     }
@@ -169,7 +221,11 @@ impl ExchangeGatewayRegistry {
         &self,
         exchange: Exchange,
     ) -> Result<SharedConfiguredExchangeGateway, RegistryError> {
-        let entry = self
+        let state = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = state
             .slot(exchange)
             .ok_or(RegistryError::NotConfigured(exchange))?;
         entry
@@ -179,11 +235,19 @@ impl ExchangeGatewayRegistry {
     }
 
     pub fn is_configured(&self, exchange: Exchange) -> bool {
-        self.slot(exchange).is_some()
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .slot(exchange)
+            .is_some()
     }
 
     pub fn summary(&self, exchange: Exchange) -> ExchangeConfigurationSummary {
-        match self.slot(exchange) {
+        let state = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.slot(exchange) {
             Some(entry) => ExchangeConfigurationSummary {
                 exchange,
                 configured: true,
@@ -208,7 +272,9 @@ impl ExchangeGatewayRegistry {
             self.summary(Exchange::Bybit),
         ]
     }
+}
 
+impl RegistryState {
     fn slot(&self, exchange: Exchange) -> Option<&GatewayEntry> {
         match exchange {
             Exchange::Binance => self.binance.as_ref(),
@@ -226,6 +292,19 @@ impl ExchangeGatewayRegistry {
     }
 }
 
+fn validate_entry_metadata(
+    source: &str,
+    masked_identifier: Option<&str>,
+) -> Result<(), RegistryError> {
+    if source.trim().is_empty() {
+        return Err(RegistryError::InvalidSource);
+    }
+    if masked_identifier.is_some_and(|identifier| identifier.trim().is_empty()) {
+        return Err(RegistryError::InvalidMaskedIdentifier);
+    }
+    Ok(())
+}
+
 impl Default for ExchangeGatewayRegistry {
     fn default() -> Self {
         Self::empty(Exchange::Bybit)
@@ -234,12 +313,16 @@ impl Default for ExchangeGatewayRegistry {
 
 impl fmt::Debug for ExchangeGatewayRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         formatter
             .debug_struct("ExchangeGatewayRegistry")
-            .field("preferred", &self.preferred)
-            .field("binance_configured", &self.binance.is_some())
-            .field("aster_configured", &self.aster.is_some())
-            .field("bybit_configured", &self.bybit.is_some())
+            .field("preferred", &state.preferred)
+            .field("binance_configured", &state.binance.is_some())
+            .field("aster_configured", &state.aster.is_some())
+            .field("bybit_configured", &state.bybit.is_some())
             .finish()
     }
 }
@@ -320,5 +403,38 @@ mod tests {
             ),
             Err(RegistryError::Duplicate(Exchange::Binance))
         );
+    }
+
+    #[test]
+    fn cloned_registry_observes_atomic_gateway_replacement_and_preference() {
+        let factory = ExchangeGatewayFactory::standard(ExchangeEnvironment::Production).unwrap();
+        let first = factory
+            .build(ExchangeCredentials::binance("first", "secret").unwrap())
+            .unwrap();
+        let replacement = factory
+            .build(ExchangeCredentials::binance("second", "secret").unwrap())
+            .unwrap();
+        let mut registry = ExchangeGatewayRegistry::empty(Exchange::Bybit);
+        registry
+            .register_configured(first, ExchangeEnvironment::Production, "env", None)
+            .unwrap();
+        let observer = registry.clone();
+
+        registry
+            .replace_configured(
+                replacement,
+                ExchangeEnvironment::Testnet,
+                "file",
+                Some("seco****alue".into()),
+            )
+            .unwrap();
+        registry.set_preferred(Exchange::Binance);
+
+        assert_eq!(observer.preferred(), Exchange::Binance);
+        let summary = observer.summary(Exchange::Binance);
+        assert!(summary.configured);
+        assert!(summary.testnet);
+        assert_eq!(summary.source.as_deref(), Some("file"));
+        assert_eq!(summary.api_key.as_deref(), Some("seco****alue"));
     }
 }

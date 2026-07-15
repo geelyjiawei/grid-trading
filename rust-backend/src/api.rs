@@ -36,15 +36,21 @@ use crate::{
         collect_stable_exchange_view, collect_strategy_shadow_view, load_authoritative_fee_config,
     },
     exchange::{
-        ActiveOrderStatus, AuthoritativeOrder, CancellationError, ExchangeIdentityGateway,
-        InstrumentRulesGateway, MarketSnapshotGateway, OrderCancellationGateway, OrderLifecycle,
-        OrderLookup, OrderLookupGateway, PositionLeg, PositionSnapshot, SnapshotError,
-        configured::SharedConfiguredExchangeGateway,
+        AccountBalanceSnapshotGateway, ActiveOrderStatus, AuthoritativeOrder, CancellationError,
+        ExchangeIdentityGateway, InstrumentRulesGateway, MarketSnapshotGateway,
+        OrderCancellationGateway, OrderLifecycle, OrderLookup, OrderLookupGateway, PositionLeg,
+        PositionSnapshot, SnapshotError,
+        aster::LocalEip712Signer,
+        configured::{
+            ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayFactory,
+            SharedConfiguredExchangeGateway,
+        },
         registry::{ExchangeGatewayRegistry, ReadOnlyExchangeGateway, RegistryError},
     },
     persistence::{
-        BeginIdempotency, FileIdempotencyStore, IdempotencyError, IdempotencyKey, IdempotencyStore,
-        RequestFingerprint, StoredCommandResponse, StrategyCatalog, StrategyCatalogSnapshot,
+        BeginIdempotency, EncryptedExchangeConfigStore, FileIdempotencyStore, IdempotencyError,
+        IdempotencyKey, IdempotencyStore, RequestFingerprint, StoredCommandResponse,
+        StoredExchangeConfiguration, StrategyCatalog, StrategyCatalogSnapshot,
         load_strategy_catalog,
     },
     security::AdminTokenVerifier,
@@ -55,6 +61,8 @@ use crate::{
 };
 
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1_024;
+const MAX_CONFIG_BODY_BYTES: usize = 32 * 1_024;
+const MAX_CONFIG_SECRET_BYTES: usize = 16 * 1_024;
 const PREVIEW_MARKET_MAX_AGE_MS: u64 = 15_000;
 const PREVIEW_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -93,6 +101,8 @@ struct ApiState {
     cancel_orders_command: Arc<dyn CancelExchangeOrdersCommand>,
     runtime: Option<Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>>,
     exchange_gateways: ExchangeGatewayRegistry,
+    exchange_config_store: Option<EncryptedExchangeConfigStore>,
+    exchange_configuration_gate: Arc<tokio::sync::Mutex<()>>,
     strategy_root: PathBuf,
 }
 
@@ -101,6 +111,7 @@ impl ApiState {
         admin_token: Option<AdminTokenVerifier>,
         web_authentication: WebAuthService,
         exchange_gateways: ExchangeGatewayRegistry,
+        exchange_config_store: Option<EncryptedExchangeConfigStore>,
         idempotency_root: PathBuf,
         strategy_root: PathBuf,
     ) -> Self {
@@ -116,6 +127,8 @@ impl ApiState {
             cancel_orders_command: Arc::new(DisabledCancelExchangeOrdersCommand),
             runtime: None,
             exchange_gateways,
+            exchange_config_store,
+            exchange_configuration_gate: Arc::new(tokio::sync::Mutex::new(())),
             strategy_root,
         }
     }
@@ -137,6 +150,8 @@ impl ApiState {
             cancel_orders_command: Arc::new(DisabledCancelExchangeOrdersCommand),
             runtime: None,
             exchange_gateways: ExchangeGatewayRegistry::default(),
+            exchange_config_store: None,
+            exchange_configuration_gate: Arc::new(tokio::sync::Mutex::new(())),
             strategy_root,
         }
     }
@@ -150,6 +165,15 @@ impl ApiState {
     #[cfg(test)]
     fn with_exchange_gateways(mut self, exchange_gateways: ExchangeGatewayRegistry) -> Self {
         self.exchange_gateways = exchange_gateways;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_exchange_config_store(
+        mut self,
+        exchange_config_store: EncryptedExchangeConfigStore,
+    ) -> Self {
+        self.exchange_config_store = Some(exchange_config_store);
         self
     }
 
@@ -182,6 +206,7 @@ impl ApiState {
         admin_token: Option<AdminTokenVerifier>,
         web_authentication: WebAuthService,
         exchange_gateways: ExchangeGatewayRegistry,
+        exchange_config_store: Option<EncryptedExchangeConfigStore>,
         idempotency_root: PathBuf,
         strategy_root: PathBuf,
         runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
@@ -205,6 +230,8 @@ impl ApiState {
             cancel_orders_command,
             runtime: Some(runtime),
             exchange_gateways,
+            exchange_config_store,
+            exchange_configuration_gate: Arc::new(tokio::sync::Mutex::new(())),
             strategy_root,
         }
     }
@@ -744,6 +771,8 @@ async fn execute_start_grid(
     uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
+    let configuration_gate = Arc::clone(&state.exchange_configuration_gate);
+    let _configuration_guard = configuration_gate.lock().await;
     let payload = match parse_json_object(&body) {
         Ok(payload) => payload,
         Err(response) => return *response,
@@ -1960,7 +1989,8 @@ fn no_store_json<T: Serialize>(status: StatusCode, body: T) -> Response {
     response
 }
 
-fn api_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+fn api_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
+    let message = message.into();
     let mut response = (
         status,
         Json(json!({"error": {"code": code, "message": message}})),
@@ -2061,6 +2091,7 @@ async fn exchange_config(
             "exchange": preferred,
             "active_exchange": preferred,
             "testnet": preferred_summary.testnet,
+            "storage": state.exchange_config_store.as_ref().map_or("unavailable", EncryptedExchangeConfigStore::backend),
             "configs": {
                 "binance": state.exchange_gateways.summary(Exchange::Binance),
                 "aster": state.exchange_gateways.summary(Exchange::Aster),
@@ -2068,6 +2099,330 @@ async fn exchange_config(
             }
         }),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeConfigRequest {
+    #[serde(default = "default_config_exchange")]
+    exchange: Exchange,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_secret: Option<String>,
+    #[serde(default)]
+    private_key: Option<String>,
+    #[serde(default)]
+    testnet: bool,
+}
+
+fn default_config_exchange() -> Exchange {
+    Exchange::Bybit
+}
+
+struct PreparedExchangeConfiguration {
+    stored: StoredExchangeConfiguration,
+    credentials: ExchangeCredentials,
+    masked_identifier: String,
+    environment: ExchangeEnvironment,
+}
+
+#[derive(Debug)]
+struct ExchangeConfigInputError {
+    message: String,
+}
+
+impl ExchangeConfigInputError {
+    fn response(self) -> Response {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_exchange_config",
+            self.message,
+        )
+    }
+}
+
+async fn save_exchange_config(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Json(request): Json<ExchangeConfigRequest>,
+) -> Response {
+    let Some(store) = state.exchange_config_store.clone() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config_storage_unavailable",
+            "GRID_CONFIG_KEY must be configured before exchange credentials can be saved",
+        );
+    };
+    let configuration_gate = Arc::clone(&state.exchange_configuration_gate);
+    let _configuration_guard = configuration_gate.lock().await;
+    if let Err(response) = ensure_exchange_configuration_is_mutable(&state, request.exchange).await
+    {
+        return response;
+    }
+    let prepared = match prepare_exchange_configuration(request) {
+        Ok(prepared) => prepared,
+        Err(error) => return error.response(),
+    };
+    let exchange = prepared.stored.exchange();
+    let gateway = match ExchangeGatewayFactory::standard(prepared.environment)
+        .and_then(|factory| factory.build(prepared.credentials))
+    {
+        Ok(gateway) => gateway,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_exchange_credentials",
+                "The exchange credentials are invalid",
+            );
+        }
+    };
+    match gateway.account_balance_snapshot(exchange).await {
+        Ok(snapshot) if snapshot.exchange == exchange => {}
+        Ok(_) | Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "exchange_verification_failed",
+                "The exchange rejected the credentials or returned an invalid account response",
+            );
+        }
+    }
+
+    let stored = prepared.stored;
+    let save_store = store.clone();
+    let save_result = tokio::task::spawn_blocking(move || save_store.upsert(&stored)).await;
+    match save_result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "config_storage_failed",
+                "The credentials were verified but could not be saved securely",
+            );
+        }
+    }
+    if state
+        .exchange_gateways
+        .replace_configured(
+            gateway,
+            prepared.environment,
+            "file",
+            Some(prepared.masked_identifier),
+        )
+        .is_err()
+    {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config_activation_failed",
+            "The credentials were saved but could not be activated; restart the service",
+        );
+    }
+    state.exchange_gateways.set_preferred(exchange);
+    no_store_json(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "message": "Exchange API config saved",
+            "exchange": exchange,
+            "configured": true,
+            "testnet": prepared.environment == ExchangeEnvironment::Testnet,
+        }),
+    )
+}
+
+async fn ensure_exchange_configuration_is_mutable(
+    state: &ApiState,
+    exchange: Exchange,
+) -> Result<(), Response> {
+    if let Some(runtime) = &state.runtime {
+        let has_live_runtime = runtime.entries().await.into_iter().any(|entry| {
+            entry.exchange == exchange
+                && entry
+                    .lifecycle
+                    .is_none_or(|lifecycle| !lifecycle.is_terminal())
+        });
+        if has_live_runtime {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "exchange_strategy_running",
+                "Stop all strategies on this exchange before changing its credentials",
+            ));
+        }
+    }
+
+    let strategy_root = state.strategy_root.clone();
+    let catalog = tokio::task::spawn_blocking(move || load_strategy_catalog(strategy_root))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_unavailable",
+                "The strategy catalog could not be checked safely",
+            )
+        })?
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_unavailable",
+                "The strategy catalog could not be checked safely",
+            )
+        })?;
+    if !catalog.anomalies().is_empty() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy_catalog_unavailable",
+            "The strategy catalog contains unresolved anomalies",
+        ));
+    }
+    if catalog
+        .entries()
+        .iter()
+        .any(|entry| entry.exchange() == exchange && entry.is_live())
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "exchange_strategy_running",
+            "Stop all strategies on this exchange before changing its credentials",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_exchange_configuration(
+    mut request: ExchangeConfigRequest,
+) -> Result<PreparedExchangeConfiguration, ExchangeConfigInputError> {
+    let environment = if request.testnet {
+        ExchangeEnvironment::Testnet
+    } else {
+        ExchangeEnvironment::Production
+    };
+    match request.exchange {
+        Exchange::Aster => {
+            let api_secret = normalized_optional_secret(request.api_secret.take(), "API secret")?;
+            let private_key =
+                normalized_optional_secret(request.private_key.take(), "Aster private key")?;
+            let private_key = match (api_secret, private_key) {
+                (Some(api_secret), Some(private_key)) if api_secret != private_key => {
+                    return Err(invalid_exchange_config(
+                        "Aster API secret and private key do not match",
+                    ));
+                }
+                (Some(api_secret), _) => api_secret,
+                (_, Some(private_key)) => private_key,
+                (None, None) => {
+                    return Err(invalid_exchange_config("Aster private key is required"));
+                }
+            };
+            let signer =
+                LocalEip712Signer::from_private_key(private_key.as_str()).map_err(|_| {
+                    invalid_exchange_config("Aster private key is not a valid wallet key")
+                })?;
+            let wallet_address = signer.signer_address().to_owned();
+            if let Some(declared_address) =
+                normalized_optional_secret(request.api_key.take(), "Aster wallet address")?
+                && !declared_address.eq_ignore_ascii_case(&wallet_address)
+            {
+                return Err(invalid_exchange_config(
+                    "Aster wallet address does not match the private key",
+                ));
+            }
+            let stored = StoredExchangeConfiguration::new(
+                Exchange::Aster,
+                wallet_address.clone(),
+                private_key.as_str().to_owned(),
+                request.testnet,
+            )
+            .map_err(|_| invalid_exchange_config("Aster credentials are invalid"))?;
+            let credentials = ExchangeCredentials::aster(private_key.as_str().to_owned())
+                .map_err(|_| invalid_exchange_config("Aster credentials are invalid"))?;
+            Ok(PreparedExchangeConfiguration {
+                stored,
+                credentials,
+                masked_identifier: mask_identifier(&wallet_address),
+                environment,
+            })
+        }
+        Exchange::Binance | Exchange::Bybit => {
+            if request.private_key.is_some() {
+                return Err(invalid_exchange_config(
+                    "Private key is only supported for Aster",
+                ));
+            }
+            let api_key = required_config_secret(request.api_key.take(), "API key")?;
+            let api_secret = required_config_secret(request.api_secret.take(), "API secret")?;
+            let stored = StoredExchangeConfiguration::new(
+                request.exchange,
+                api_key.as_str().to_owned(),
+                api_secret.as_str().to_owned(),
+                request.testnet,
+            )
+            .map_err(|_| invalid_exchange_config("Exchange credentials are invalid"))?;
+            let credentials = match request.exchange {
+                Exchange::Binance => ExchangeCredentials::binance(
+                    api_key.as_str().to_owned(),
+                    api_secret.as_str().to_owned(),
+                ),
+                Exchange::Bybit => ExchangeCredentials::bybit(
+                    api_key.as_str().to_owned(),
+                    api_secret.as_str().to_owned(),
+                ),
+                Exchange::Aster => unreachable!("Aster is handled separately"),
+            }
+            .map_err(|_| invalid_exchange_config("Exchange credentials are invalid"))?;
+            Ok(PreparedExchangeConfiguration {
+                stored,
+                credentials,
+                masked_identifier: mask_identifier(api_key.as_str()),
+                environment,
+            })
+        }
+    }
+}
+
+fn required_config_secret(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Zeroizing<String>, ExchangeConfigInputError> {
+    normalized_optional_secret(value, field)?
+        .ok_or_else(|| invalid_exchange_config(format!("{field} is required")))
+}
+
+fn normalized_optional_secret(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Option<Zeroizing<String>>, ExchangeConfigInputError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = Zeroizing::new(value);
+    if value.is_empty()
+        || value.len() > MAX_CONFIG_SECRET_BYTES
+        || value.trim() != value.as_str()
+        || ['\r', '\n', '\0']
+            .into_iter()
+            .any(|character| value.contains(character))
+    {
+        return Err(invalid_exchange_config(format!("{field} is invalid")));
+    }
+    Ok(Some(value))
+}
+
+fn invalid_exchange_config(message: impl Into<String>) -> ExchangeConfigInputError {
+    ExchangeConfigInputError {
+        message: message.into(),
+    }
+}
+
+fn mask_identifier(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= 8 {
+        return "****".into();
+    }
+    let prefix = characters[..4].iter().collect::<String>();
+    let suffix = characters[characters.len() - 4..]
+        .iter()
+        .collect::<String>();
+    format!("{prefix}****{suffix}")
 }
 
 async fn exchange_balance(
@@ -3210,6 +3565,7 @@ pub(crate) fn router(
     admin_token: Option<AdminTokenVerifier>,
     web_authentication: WebAuthService,
     exchange_gateways: ExchangeGatewayRegistry,
+    exchange_config_store: Option<EncryptedExchangeConfigStore>,
     idempotency_root: PathBuf,
     strategy_root: PathBuf,
     runtime: Option<Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>>,
@@ -3219,6 +3575,7 @@ pub(crate) fn router(
             admin_token,
             web_authentication,
             exchange_gateways,
+            exchange_config_store,
             idempotency_root,
             strategy_root,
             runtime,
@@ -3227,6 +3584,7 @@ pub(crate) fn router(
             admin_token,
             web_authentication,
             exchange_gateways,
+            exchange_config_store,
             idempotency_root,
             strategy_root,
         ),
@@ -3240,7 +3598,12 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/auth/status", get(web_auth_status))
         .route("/api/auth/login", post(web_auth_login))
         .route("/api/auth/logout", post(web_auth_logout))
-        .route("/api/config", get(exchange_config))
+        .route(
+            "/api/config",
+            get(exchange_config)
+                .post(save_exchange_config)
+                .layer(DefaultBodyLimit::max(MAX_CONFIG_BODY_BYTES)),
+        )
         .route("/api/balance", get(exchange_balance))
         .route("/api/price/{symbol}", get(exchange_price))
         .route("/api/fees/{symbol}", get(exchange_fee_rates))
@@ -4390,6 +4753,104 @@ mod tests {
         assert_eq!(history["orders"][0]["price"], "0.38000");
         assert_eq!(history["orders"][0]["qty"], "100.000");
         assert_eq!(history["orders"][0]["created_time"], "1780000000002");
+    }
+
+    #[tokio::test]
+    async fn exchange_config_save_requires_encrypted_storage_before_validation() {
+        let directory = tempdir().unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_strategy_root(directory.path().join("strategies")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/config")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"exchange":"aster","private_key":"not-persisted","testnet":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "config_storage_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_config_rejects_invalid_aster_key_without_writing_a_file() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("api_config.json");
+        let store = EncryptedExchangeConfigStore::new(
+            config_path.clone(),
+            Zeroizing::new("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()),
+            None,
+        )
+        .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_config_store(store)
+            .with_strategy_root(directory.path().join("strategies")),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/config")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"exchange":"aster","private_key":"not-a-wallet-key","testnet":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_exchange_config"
+        );
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn exchange_config_prepares_one_wallet_aster_credentials() {
+        let private_key = "1".repeat(64);
+        let prepared = prepare_exchange_configuration(ExchangeConfigRequest {
+            exchange: Exchange::Aster,
+            api_key: None,
+            api_secret: None,
+            private_key: Some(private_key.clone()),
+            testnet: false,
+        })
+        .unwrap();
+
+        assert_eq!(prepared.stored.exchange(), Exchange::Aster);
+        assert_eq!(prepared.stored.api_secret(), private_key);
+        assert!(prepared.stored.api_key().starts_with("0x"));
+        assert_eq!(prepared.stored.api_key().len(), 42);
+        assert!(!prepared.masked_identifier.contains(&"1".repeat(32)));
     }
 
     #[test]
