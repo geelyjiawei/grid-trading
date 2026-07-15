@@ -1689,17 +1689,26 @@ where
         }
 
         if lifecycle == StrategyLifecycle::Failed {
+            let cleanup = self.machine.mark_failed_stopped(now_ms)?;
             if !report
                 .blockers
                 .iter()
                 .any(|blocker| blocker.stage == RuntimeStage::StrategyFailed)
             {
+                let message = if matches!(
+                    cleanup,
+                    StrategyTransition::LifecycleChanged {
+                        lifecycle: StrategyLifecycle::Stopped
+                    }
+                ) {
+                    "strategy failed; owned orders are terminal and market ownership was released"
+                } else {
+                    "strategy failed; cleanup is waiting for every uncertain order to become authoritative terminal"
+                };
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::StrategyFailed,
                     client_order_id: None,
-                    message:
-                        "strategy is failed; all unambiguously owned active orders are terminal"
-                            .into(),
+                    message: message.into(),
                 });
             }
             self.validate_ledger_ownership()?;
@@ -4687,6 +4696,8 @@ mod tests {
         );
         assert_eq!(gateway.placement_call_count(), placements_before_fill);
         let settled_state = runtime.machine().store().snapshot();
+        assert_eq!(settled_state.lifecycle, StrategyLifecycle::Stopped);
+        assert!(settled_state.failure.is_some());
         assert!(accepted_before_failure.iter().all(|client_order_id| {
             settled_state
                 .orders

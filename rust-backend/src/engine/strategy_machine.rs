@@ -2382,6 +2382,35 @@ where
         )
     }
 
+    pub fn mark_failed_stopped(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        let mut next = self.store.snapshot().clone();
+        if next.lifecycle != StrategyLifecycle::Failed {
+            return Err(StrategyStateError::InvalidLifecycleTransition.into());
+        }
+        if next.orders.values().any(order_may_still_be_live) {
+            return Ok(StrategyTransition::NoChange);
+        }
+        if next
+            .failure
+            .as_deref()
+            .is_none_or(|message| message.trim().is_empty())
+        {
+            return Err(StrategyStateError::InvalidLifecycleTransition.into());
+        }
+        next.lifecycle = StrategyLifecycle::Stopped;
+        finalize_and_store(
+            &mut self.store,
+            next,
+            now_ms,
+            StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::Stopped,
+            },
+        )
+    }
+
     pub fn mark_closed(&mut self, now_ms: u64) -> Result<StrategyTransition, StrategyMachineError> {
         let mut next = self.store.snapshot().clone();
         if next.lifecycle == StrategyLifecycle::Closed {
@@ -8761,6 +8790,54 @@ mod tests {
             machine.store().snapshot().lifecycle,
             StrategyLifecycle::Failed
         );
+    }
+
+    #[test]
+    fn failed_cleanup_releases_the_market_only_after_uncertain_orders_are_final() {
+        let mut failed = state(Direction::Short, PositionBaseline::flat());
+        let opening_id = failed
+            .orders
+            .values()
+            .find(|order| order.purpose == StrategyOrderPurpose::Opening)
+            .unwrap()
+            .client_order_id
+            .clone();
+        failed.orders.get_mut(&opening_id).unwrap().tracking = StrategyOrderTracking::Intent {
+            state: IntentState::SubmitUnknown {
+                message: "placement outcome is unknown".into(),
+            },
+        };
+        failed.fail("replacement planning failed");
+        failed.validate().unwrap();
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(failed));
+
+        assert_eq!(
+            machine.mark_failed_stopped(101).unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::Failed
+        );
+
+        let mut resolved = machine.store().snapshot().clone();
+        resolved.orders.get_mut(&opening_id).unwrap().tracking = StrategyOrderTracking::Intent {
+            state: IntentState::Rejected {
+                code: Some("REJECTED".into()),
+                message: "exchange definitively rejected the order".into(),
+            },
+        };
+        resolved.validate().unwrap();
+        let failure = resolved.failure.clone();
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(resolved));
+
+        assert_eq!(
+            machine.mark_failed_stopped(102).unwrap(),
+            StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::Stopped
+            }
+        );
+        assert_eq!(machine.store().snapshot().failure, failure);
     }
 
     #[test]
