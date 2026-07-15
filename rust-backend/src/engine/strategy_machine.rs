@@ -266,6 +266,20 @@ pub struct StrategyState {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug)]
+pub struct ValidatedStrategyState(StrategyState);
+
+impl ValidatedStrategyState {
+    pub fn new(snapshot: StrategyState) -> Result<Self, StrategyStateError> {
+        snapshot.validate()?;
+        Ok(Self(snapshot))
+    }
+
+    pub fn into_inner(self) -> StrategyState {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriggerActivation {
     pub(crate) armed_price: Decimal,
@@ -1906,6 +1920,13 @@ pub enum StrategyTransition {
 pub trait StrategyStateStore {
     fn snapshot(&self) -> &StrategyState;
     fn replace(&mut self, next: StrategyState) -> Result<(), StrategyStoreError>;
+
+    fn replace_validated(
+        &mut self,
+        next: ValidatedStrategyState,
+    ) -> Result<(), StrategyStoreError> {
+        self.replace(next.into_inner())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1947,6 +1968,26 @@ impl StrategyStateStore for MemoryStrategyStateStore {
             return Err(StrategyStoreError::RevisionMismatch);
         }
         next.validate().map_err(StrategyStoreError::InvalidState)?;
+        self.snapshot = next;
+        Ok(())
+    }
+
+    fn replace_validated(
+        &mut self,
+        next: ValidatedStrategyState,
+    ) -> Result<(), StrategyStoreError> {
+        self.write_attempts = self
+            .write_attempts
+            .checked_add(1)
+            .ok_or(StrategyStoreError::WriteAttemptOverflow)?;
+        if self.fail_write_attempt == Some(self.write_attempts) {
+            self.fail_write_attempt = None;
+            return Err(StrategyStoreError::InjectedWriteFailure);
+        }
+        let next = next.into_inner();
+        if self.snapshot.revision.checked_add(1) != Some(next.revision) {
+            return Err(StrategyStoreError::RevisionMismatch);
+        }
         self.snapshot = next;
         Ok(())
     }
@@ -2517,8 +2558,7 @@ fn finalize_and_store<S: StrategyStateStore>(
         return Err(StrategyStateError::TimestampRegression.into());
     }
     next.updated_at_ms = now_ms;
-    next.validate()?;
-    store.replace(next)?;
+    store.replace_validated(ValidatedStrategyState::new(next)?)?;
     Ok(transition)
 }
 
@@ -4282,6 +4322,36 @@ mod tests {
         persistence::FileStrategyStateStore,
     };
     use tempfile::tempdir;
+
+    struct ValidatedWriteStore {
+        snapshot: StrategyState,
+        ordinary_replace_calls: u64,
+        validated_replace_calls: u64,
+    }
+
+    impl StrategyStateStore for ValidatedWriteStore {
+        fn snapshot(&self) -> &StrategyState {
+            &self.snapshot
+        }
+
+        fn replace(&mut self, _next: StrategyState) -> Result<(), StrategyStoreError> {
+            self.ordinary_replace_calls += 1;
+            Err(StrategyStoreError::InjectedWriteFailure)
+        }
+
+        fn replace_validated(
+            &mut self,
+            next: ValidatedStrategyState,
+        ) -> Result<(), StrategyStoreError> {
+            self.validated_replace_calls += 1;
+            let next = next.into_inner();
+            if self.snapshot.revision.checked_add(1) != Some(next.revision) {
+                return Err(StrategyStoreError::RevisionMismatch);
+            }
+            self.snapshot = next;
+            Ok(())
+        }
+    }
 
     fn decimal(value: i64) -> Decimal {
         Decimal::from(value)
@@ -8754,6 +8824,45 @@ mod tests {
             store.replace(current),
             Err(StrategyStoreError::RevisionMismatch)
         ));
+    }
+
+    #[test]
+    fn machine_commits_each_transition_through_the_validated_store_path() {
+        let snapshot = state(Direction::Short, PositionBaseline::flat());
+        let now_ms = snapshot.updated_at_ms + 1;
+        let store = ValidatedWriteStore {
+            snapshot,
+            ordinary_replace_calls: 0,
+            validated_replace_calls: 0,
+        };
+        let mut machine = StrategyMachine::new(store);
+
+        machine.request_stop(now_ms).unwrap();
+
+        assert_eq!(machine.store().ordinary_replace_calls, 0);
+        assert_eq!(machine.store().validated_replace_calls, 1);
+        assert_eq!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::StopRequested
+        );
+    }
+
+    #[test]
+    fn ordinary_store_replace_still_rejects_unvalidated_state() {
+        let snapshot = state(Direction::Short, PositionBaseline::flat());
+        let original = snapshot.clone();
+        let mut store = MemoryStrategyStateStore::new(snapshot.clone());
+        let mut corrupted = snapshot;
+        corrupted.revision += 1;
+        corrupted.updated_at_ms = corrupted.created_at_ms - 1;
+
+        assert!(matches!(
+            store.replace(corrupted),
+            Err(StrategyStoreError::InvalidState(
+                StrategyStateError::TimestampRegression
+            ))
+        ));
+        assert_eq!(store.snapshot(), &original);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::{
     domain::InstrumentRules,
     engine::{
         ArmedStrategyState, MarketSnapshot, PositionBaseline, PreparedStrategy, StrategyState,
-        StrategyStateStore, StrategyStoreError,
+        StrategyStateStore, StrategyStoreError, ValidatedStrategyState,
     },
 };
 
@@ -273,6 +273,19 @@ impl StrategyStateStore for FileStrategyStateStore {
             return Err(StrategyStoreError::RevisionMismatch);
         }
         next.validate().map_err(StrategyStoreError::InvalidState)?;
+        self.commit_snapshot(&next)?;
+        self.snapshot = next;
+        Ok(())
+    }
+
+    fn replace_validated(
+        &mut self,
+        next: ValidatedStrategyState,
+    ) -> Result<(), StrategyStoreError> {
+        let next = next.into_inner();
+        if self.snapshot.revision.checked_add(1) != Some(next.revision) {
+            return Err(StrategyStoreError::RevisionMismatch);
+        }
         self.commit_snapshot(&next)?;
         self.snapshot = next;
         Ok(())

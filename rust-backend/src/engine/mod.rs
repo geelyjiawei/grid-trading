@@ -74,7 +74,7 @@ pub use strategy_machine::{
     PositionBaseline, ReplacementObligation, ReplacementObligationKind, RiskExitReason,
     StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
     StrategyOrderRecord, StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError,
-    StrategyStateStore, StrategyStoreError, StrategyTransition,
+    StrategyStateStore, StrategyStoreError, StrategyTransition, ValidatedStrategyState,
 };
 pub use submission::{SubmissionError, SubmissionResult, SubmissionService, submit_with};
 pub use supervisor::{
