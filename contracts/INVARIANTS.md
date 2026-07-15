@@ -335,6 +335,11 @@ the OpenAPI schema.
 - A crash, incomplete reservation, command timeout, unknown command result, or response
   persistence failure remains an unknown outcome and is never authorized for automatic
   re-execution. A completed request replays the exact stored status and JSON response.
+- Aggregate stop reads one stable, anomaly-free runtime catalog. The symbol-free stop is
+  valid only when exactly one live strategy exists; stop-all uses a deterministic target
+  order and durably requests each strategy stop without creating a position-closing order.
+  Any failure after a prior strategy changed remains an unknown outcome and is never
+  automatically replayed.
 - Idempotency files contain request hashes, timestamps, and bounded command responses,
   never raw request bodies or exchange credentials. Symbolic links, malformed records,
   oversized records, timestamp regression, and completion mutation fail closed.

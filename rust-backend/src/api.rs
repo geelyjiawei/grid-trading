@@ -724,6 +724,138 @@ async fn stop_grid_web(
         Err(error) => return error.response(),
     };
     let exchange = selected_exchange(&state, selection);
+    execute_stop_grid(state, key, method, uri, body, exchange, symbol).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stop_only_grid_web(
+    _session: AuthenticatedWebSession,
+    _trading: TradingEnabled,
+    IdempotencyHeader(key): IdempotencyHeader,
+    _content_type: JsonContentType,
+    State(state): State<ApiState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = parse_json_object(&body) {
+        return *response;
+    }
+    let (catalog, _) = match stable_runtime_catalog(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let live = catalog
+        .entries()
+        .iter()
+        .filter(|entry| entry.is_live())
+        .map(|entry| (entry.exchange(), entry.symbol().to_owned()))
+        .collect::<Vec<_>>();
+    let [(exchange, symbol)] = live.as_slice() else {
+        return if live.is_empty() {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "grid_not_running",
+                "No running strategy exists",
+            )
+        } else {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "multiple_grids_running",
+                "Multiple strategies are running; stop one by exchange and symbol",
+            )
+        };
+    };
+    execute_stop_grid(state, key, method, uri, body, *exchange, symbol.clone()).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stop_all_grids_web(
+    _session: AuthenticatedWebSession,
+    _trading: TradingEnabled,
+    IdempotencyHeader(key): IdempotencyHeader,
+    _content_type: JsonContentType,
+    State(state): State<ApiState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = parse_json_object(&body) {
+        return *response;
+    }
+    let (catalog, _) = match stable_runtime_catalog(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let mut targets = catalog
+        .entries()
+        .iter()
+        .filter(|entry| entry.is_live())
+        .map(|entry| (entry.exchange(), entry.symbol().to_owned()))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "grid_not_running",
+            "No running strategy exists",
+        );
+    }
+    targets.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| (left.0 as u8).cmp(&(right.0 as u8)))
+    });
+    let Some(runtime) = state.runtime.clone() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_unavailable",
+            "The Rust trading runtime is unavailable",
+        );
+    };
+    let now_ms = match unix_time_ms() {
+        Ok(now_ms) => now_ms,
+        Err(ClockUnavailable) => return clock_unavailable(),
+    };
+    run_idempotent_command(state, key, method, uri, body, async move {
+        let mut stopped = Vec::with_capacity(targets.len());
+        for (exchange, symbol) in targets {
+            match runtime.request_stop(exchange, &symbol, now_ms).await {
+                Ok(receipt) => {
+                    let lifecycle = stop_lifecycle(&receipt.outcome)?;
+                    stopped.push(json!({
+                        "run_id": receipt.run_id.as_str(),
+                        "exchange": receipt.exchange,
+                        "symbol": receipt.symbol,
+                        "lifecycle": lifecycle,
+                    }));
+                }
+                Err(error) if stopped.is_empty() => return stop_error_response(error),
+                Err(_) => return Err(CommandOutcomeUnknown),
+            }
+        }
+        StoredCommandResponse::new(
+            StatusCode::ACCEPTED.as_u16(),
+            json!({
+                "ok": true,
+                "message": "All stop requests are durable; strategy orders will be cancelled without closing positions",
+                "count": stopped.len(),
+                "strategies": stopped,
+            }),
+        )
+        .map_err(|_| CommandOutcomeUnknown)
+    })
+    .await
+}
+
+async fn execute_stop_grid(
+    state: ApiState,
+    key: IdempotencyKey,
+    method: Method,
+    uri: axum::http::Uri,
+    body: Bytes,
+    exchange: Exchange,
+    symbol: String,
+) -> Response {
     let Some(runtime) = state.runtime.clone() else {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -738,40 +870,52 @@ async fn stop_grid_web(
     run_idempotent_command(state, key, method, uri, body, async move {
         match runtime.request_stop(exchange, &symbol, now_ms).await {
             Ok(receipt) => stop_response(receipt),
-            Err(RuntimeCoordinatorError::MarketNotRunning { .. }) => command_response(
-                StatusCode::NOT_FOUND,
-                "grid_not_running",
-                "No running strategy owns the selected exchange and symbol",
-            ),
-            Err(
-                RuntimeCoordinatorError::CatalogTask
-                | RuntimeCoordinatorError::CatalogLease(_)
-                | RuntimeCoordinatorError::Catalog(_)
-                | RuntimeCoordinatorError::CatalogAnomalies { .. }
-                | RuntimeCoordinatorError::CatalogSelection(_)
-                | RuntimeCoordinatorError::RegistryCatalogMismatch { .. },
-            ) => command_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "strategy_state_inconsistent",
-                "The strategy state could not be reconciled safely",
-            ),
-            Err(_) => Err(CommandOutcomeUnknown),
+            Err(error) => stop_error_response(error),
         }
     })
     .await
 }
 
+fn stop_error_response(
+    error: RuntimeCoordinatorError,
+) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
+    match error {
+        RuntimeCoordinatorError::MarketNotRunning { .. } => command_response(
+            StatusCode::NOT_FOUND,
+            "grid_not_running",
+            "No running strategy owns the selected exchange and symbol",
+        ),
+        RuntimeCoordinatorError::CatalogTask
+        | RuntimeCoordinatorError::CatalogLease(_)
+        | RuntimeCoordinatorError::Catalog(_)
+        | RuntimeCoordinatorError::CatalogAnomalies { .. }
+        | RuntimeCoordinatorError::CatalogSelection(_)
+        | RuntimeCoordinatorError::RegistryCatalogMismatch { .. } => command_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy_state_inconsistent",
+            "The strategy state could not be reconciled safely",
+        ),
+        _ => Err(CommandOutcomeUnknown),
+    }
+}
+
+fn stop_lifecycle(
+    outcome: &PreparedStrategyStopOutcome,
+) -> Result<&'static str, CommandOutcomeUnknown> {
+    match outcome {
+        PreparedStrategyStopOutcome::ArmedCancelled => Ok("cancelled"),
+        PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
+            lifecycle: StrategyLifecycle::StopRequested,
+        }) => Ok("stop_requested"),
+        PreparedStrategyStopOutcome::Active(StrategyTransition::NoChange) => Ok("unchanged"),
+        PreparedStrategyStopOutcome::Active(_) => Err(CommandOutcomeUnknown),
+    }
+}
+
 fn stop_response(
     receipt: crate::engine::RuntimeStopReceipt,
 ) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
-    let lifecycle = match receipt.outcome {
-        PreparedStrategyStopOutcome::ArmedCancelled => "cancelled",
-        PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
-            lifecycle: StrategyLifecycle::StopRequested,
-        }) => "stop_requested",
-        PreparedStrategyStopOutcome::Active(StrategyTransition::NoChange) => "unchanged",
-        PreparedStrategyStopOutcome::Active(_) => return Err(CommandOutcomeUnknown),
-    };
+    let lifecycle = stop_lifecycle(&receipt.outcome)?;
     StoredCommandResponse::new(
         StatusCode::ACCEPTED.as_u16(),
         json!({
@@ -811,6 +955,53 @@ async fn grid_status(_session: AuthenticatedWebSession, State(state): State<ApiS
             "grids": grids,
         }),
     )
+}
+
+async fn grid_symbol_status(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+) -> Response {
+    let symbol = match normalize_symbol(&symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let exchange = selected_exchange(&state, selection);
+    let (catalog, runtime_entries) = match stable_runtime_catalog(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let selected = match catalog.select_live(exchange, &symbol) {
+        Ok(selected) => selected,
+        Err(error) => {
+            tracing::error!(?exchange, symbol, error = %error, "strategy status selection is ambiguous");
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_selection_ambiguous",
+                "Multiple live strategies exist for this exchange and symbol",
+            );
+        }
+    };
+    let Some(snapshot) = selected else {
+        return no_store_json(
+            StatusCode::OK,
+            json!({
+                "running": false,
+                "engine_running": false,
+                "exchange": exchange,
+                "symbol": symbol,
+                "trading_enabled": state.trading_enabled,
+            }),
+        );
+    };
+    let runtime_entry = runtime_entries
+        .iter()
+        .find(|entry| entry.run_id.as_str() == snapshot.run_id());
+    match strategy_status_response(&snapshot, runtime_entry) {
+        Ok(response) => no_store_json(StatusCode::OK, response),
+        Err(response) => *response,
+    }
 }
 
 async fn grid_preview(
@@ -2652,9 +2843,12 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/trades/{symbol}", get(strategy_trades))
         .route("/api/risk/{symbol}", get(exchange_risk))
         .route("/api/grid/status", get(grid_status))
+        .route("/api/grid/status/{symbol}", get(grid_symbol_status))
         .route("/api/grid/history", get(strategy_history))
         .route("/api/grid/preview", post(grid_preview))
         .route("/api/grid/start", post(start_grid_web))
+        .route("/api/grid/stop", post(stop_only_grid_web))
+        .route("/api/grid/stop-all", post(stop_all_grids_web))
         .route("/api/grid/stop/{symbol}", post(stop_grid_web))
         .route("/api/v1/grid/start", post(start_grid_admin))
         .route("/api", any(api_not_found))
@@ -3155,9 +3349,17 @@ mod tests {
     fn persist_clean_running_strategy(
         root: &std::path::Path,
     ) -> (StrategyState, StrategyRiskGateway) {
+        persist_clean_running_strategy_for(root, "RISKAPI1", "ANSEMUSDT")
+    }
+
+    fn persist_clean_running_strategy_for(
+        root: &std::path::Path,
+        run_id: &str,
+        symbol: &str,
+    ) -> (StrategyState, StrategyRiskGateway) {
         let config = GridConfig {
             exchange: Some(Exchange::Aster),
-            symbol: "ANSEMUSDT".into(),
+            symbol: symbol.into(),
             direction: Direction::Neutral,
             upper_price: Decimal::from_str_exact("0.42000").unwrap(),
             lower_price: Decimal::from_str_exact("0.38000").unwrap(),
@@ -3201,7 +3403,7 @@ mod tests {
         )
         .unwrap();
         let mut state = StrategyState::from_plan(
-            StrategyRunId::parse("RISKAPI1").unwrap(),
+            StrategyRunId::parse(run_id).unwrap(),
             config,
             rules,
             plan,
@@ -3267,6 +3469,50 @@ mod tests {
                 open_orders,
                 position,
             },
+        )
+    }
+
+    async fn recovered_stop_app(directory: &std::path::Path) -> (Router, StrategyState, PathBuf) {
+        let strategy_root = directory.join("strategies");
+        let (strategy, _) = persist_clean_running_strategy(&strategy_root);
+        let app = recovered_stop_app_from_root(directory, strategy_root.clone(), 1).await;
+        (app, strategy, strategy_root)
+    }
+
+    async fn recovered_stop_app_from_root(
+        directory: &std::path::Path,
+        strategy_root: PathBuf,
+        expected_count: usize,
+    ) -> Router {
+        let settings = RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap();
+        let runtime = Arc::new(RuntimeCoordinator::new(
+            strategy_root.clone(),
+            settings.clone(),
+        ));
+        let configured_gateway = ExchangeGatewayFactory::standard(ExchangeEnvironment::Testnet)
+            .unwrap()
+            .build(ExchangeCredentials::aster("1".repeat(64)).unwrap())
+            .unwrap()
+            .shared();
+        let report = runtime
+            .recover(&ConfiguredTestRuntimeProvider {
+                gateway: configured_gateway,
+                settings,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.registered.len(), expected_count);
+        assert!(report.discovery_anomalies.is_empty());
+        assert!(report.failures.is_empty());
+        router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(directory.join("idempotency"))),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_strategy_root(strategy_root.clone())
+            .with_runtime(runtime),
         )
     }
 
@@ -3758,6 +4004,195 @@ mod tests {
         assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
         assert_eq!(risk["profit_calculation_error"], Value::Null);
         assert_eq!(risk["has_risk"], false);
+    }
+
+    #[tokio::test]
+    async fn symbol_status_route_selects_one_exact_market_and_reports_absence() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (strategy, _) = persist_clean_running_strategy(&strategy_root);
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_strategy_root(strategy_root),
+        );
+
+        let selected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/status/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.status(), StatusCode::OK);
+        let selected = response_json(selected).await;
+        assert_eq!(selected["run_id"], strategy.run_id.as_str());
+        assert_eq!(selected["exchange"], "aster");
+        assert_eq!(selected["symbol"], "ANSEMUSDT");
+        assert_eq!(selected["running"], true);
+
+        let absent = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/status/MISSINGUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(absent.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(absent).await,
+            json!({
+                "running": false,
+                "engine_running": false,
+                "exchange": "aster",
+                "symbol": "MISSINGUSDT",
+                "trading_enabled": false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_stop_routes_are_guarded_before_body_processing() {
+        for path in ["/api/grid/stop", "/api/grid/stop-all"] {
+            let response = super::super::app()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::from("not-json"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(
+                response_json(response).await["error"]["code"],
+                "rust_trading_disabled",
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_stop_routes_durably_request_stop_and_replay_the_same_response() {
+        for path in ["/api/grid/stop", "/api/grid/stop-all"] {
+            let directory = tempdir().unwrap();
+            let (app, strategy, strategy_root) = recovered_stop_app(directory.path()).await;
+            let make_request = || {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(IDEMPOTENCY_KEY_HEADER, KEY)
+                    .body(Body::from("{}"))
+                    .unwrap()
+            };
+
+            let first = app.clone().oneshot(make_request()).await.unwrap();
+            assert_eq!(first.status(), StatusCode::ACCEPTED, "{path}");
+            let first_payload = response_json(first).await;
+            assert_eq!(first_payload["ok"], true, "{path}");
+            if path.ends_with("stop-all") {
+                assert_eq!(first_payload["count"], 1);
+                assert_eq!(
+                    first_payload["strategies"][0]["run_id"],
+                    strategy.run_id.as_str()
+                );
+                assert_eq!(
+                    first_payload["strategies"][0]["lifecycle"],
+                    "stop_requested"
+                );
+            } else {
+                assert_eq!(first_payload["run_id"], strategy.run_id.as_str());
+                assert_eq!(first_payload["lifecycle"], "stop_requested");
+            }
+
+            let replay = app.clone().oneshot(make_request()).await.unwrap();
+            assert_eq!(replay.status(), StatusCode::ACCEPTED, "{path}");
+            assert_eq!(response_json(replay).await, first_payload, "{path}");
+
+            let paths = StrategyFilePaths::new(strategy_root, strategy.run_id.clone()).unwrap();
+            let persisted = FileStrategyStateStore::load(paths.state()).unwrap();
+            assert_eq!(
+                persisted.snapshot().lifecycle,
+                StrategyLifecycle::StopRequested,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_one_rejects_ambiguity_and_stop_all_durably_stops_every_strategy() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (ansem, _) =
+            persist_clean_running_strategy_for(&strategy_root, "RISKAPI1", "ANSEMUSDT");
+        let (mu, _) = persist_clean_running_strategy_for(&strategy_root, "RISKAPI2", "MUUSDT");
+        let app = recovered_stop_app_from_root(directory.path(), strategy_root.clone(), 2).await;
+
+        let ambiguous = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/grid/stop")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(IDEMPOTENCY_KEY_HEADER, "01J2X0W2F8E4Q8MNNNNNNNNNNP")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ambiguous.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(ambiguous).await["error"]["code"],
+            "multiple_grids_running"
+        );
+        for strategy in [&ansem, &mu] {
+            let paths = StrategyFilePaths::new(&strategy_root, strategy.run_id.clone()).unwrap();
+            let persisted = FileStrategyStateStore::load(paths.state()).unwrap();
+            assert_eq!(persisted.snapshot().lifecycle, StrategyLifecycle::Running);
+        }
+
+        let stop_all_request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/grid/stop-all")
+                .header(CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, KEY)
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        let stopped = app.clone().oneshot(stop_all_request()).await.unwrap();
+        assert_eq!(stopped.status(), StatusCode::ACCEPTED);
+        let stopped_payload = response_json(stopped).await;
+        assert_eq!(stopped_payload["count"], 2);
+        assert_eq!(stopped_payload["strategies"][0]["symbol"], "ANSEMUSDT");
+        assert_eq!(stopped_payload["strategies"][1]["symbol"], "MUUSDT");
+
+        let replay = app.clone().oneshot(stop_all_request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(response_json(replay).await, stopped_payload);
+        for strategy in [&ansem, &mu] {
+            let paths = StrategyFilePaths::new(&strategy_root, strategy.run_id.clone()).unwrap();
+            let persisted = FileStrategyStateStore::load(paths.state()).unwrap();
+            assert_eq!(
+                persisted.snapshot().lifecycle,
+                StrategyLifecycle::StopRequested
+            );
+        }
     }
 
     #[tokio::test]
