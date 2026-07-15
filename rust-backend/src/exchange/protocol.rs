@@ -193,11 +193,15 @@ impl HttpTransport for ReqwestTransport {
 
 fn classify_reqwest_error(error: reqwest::Error) -> TransportError {
     if error.is_timeout() {
-        TransportError::Timeout(error.to_string())
+        TransportError::Timeout("HTTP request timed out".into())
     } else if error.is_connect() {
-        TransportError::Connection(error.to_string())
+        TransportError::Connection("HTTP connection failed".into())
     } else {
-        TransportError::Other(error.to_string())
+        let message = error.status().map_or_else(
+            || "HTTP transport operation failed".to_owned(),
+            |status| format!("HTTP transport operation failed with status {status}"),
+        );
+        TransportError::Other(message)
     }
 }
 
@@ -308,6 +312,34 @@ mod tests {
         assert!(!rendered.contains("secret-key"));
         assert!(!rendered.contains("secret-signature"));
         assert!(rendered.contains("[REDACTED JSON BODY]"));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_never_disclose_the_signed_request_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let transport = ReqwestTransport::new(Duration::from_secs(2)).unwrap();
+        let request = PreparedHttpRequest {
+            method: HttpMethod::Get,
+            base_url: format!("http://{address}"),
+            path: "/signed-order".into(),
+            query: vec![("signature".into(), "secret-signature".into())],
+            body: vec![],
+            raw_body: None,
+            headers: vec![],
+        };
+
+        let error = transport.execute(request).await.unwrap_err();
+        server.join().unwrap();
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains("secret-signature"));
+        assert!(!rendered.contains("signature="));
+        assert!(!rendered.contains("/signed-order"));
     }
 
     #[test]
