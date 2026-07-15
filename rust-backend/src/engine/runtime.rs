@@ -1367,7 +1367,32 @@ where
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        let lookup_ids = ledger_ids
+        let reconciliation_ids = ledger_ids
+            .iter()
+            .filter_map(|client_order_id| {
+                let intent = self.intent_store.snapshot().intents.get(client_order_id)?;
+                let has_matching_progress = open_progress
+                    .as_ref()
+                    .and_then(|progress| progress.get(client_order_id))
+                    .is_some_and(|progress| accepted_progress_matches(intent, progress));
+                let strategy_is_synchronized = self
+                    .machine
+                    .store()
+                    .snapshot()
+                    .orders
+                    .get(client_order_id)
+                    .is_some_and(|order| {
+                        matches!(
+                            &order.tracking,
+                            StrategyOrderTracking::Intent { state } if state == &intent.state
+                        )
+                    });
+                (intent_requires_lookup(intent) && !has_matching_progress
+                    || !strategy_is_synchronized)
+                    .then_some(client_order_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let lookup_ids = reconciliation_ids
             .iter()
             .filter_map(|client_order_id| {
                 let intent = self.intent_store.snapshot().intents.get(client_order_id)?;
@@ -1392,7 +1417,7 @@ where
             .collect::<BTreeMap<_, _>>()
             .await;
         let mut exact_open_progress = BTreeMap::new();
-        for client_order_id in &ledger_ids {
+        for client_order_id in &reconciliation_ids {
             let current_intent = self
                 .intent_store
                 .snapshot()
@@ -1435,7 +1460,7 @@ where
                 .get(client_order_id)
                 .cloned()
                 .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
-            let transition = self.machine.synchronize_intent(&intent, now_ms)?;
+            let transition = self.machine.synchronize_intent_if_needed(&intent, now_ms)?;
             if matches!(result, ReconciliationResult::StillUnknown { .. }) {
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::LedgerReconciliation,
@@ -4559,6 +4584,7 @@ mod tests {
         let idle = runtime.tick(1_300).await.unwrap();
 
         assert!(!idle.is_blocked(), "{idle:?}");
+        assert_eq!(idle.ledger_reconciliations, 0);
         assert_eq!(gateway.open_progress_call_count(), 1);
         assert_eq!(gateway.order_lookup_call_count(), lookup_before_idle);
         assert_eq!(
@@ -4585,6 +4611,7 @@ mod tests {
         let filled = runtime.tick(1_400).await.unwrap();
 
         assert!(!filled.is_blocked(), "{filled:?}");
+        assert_eq!(filled.ledger_reconciliations, 0);
         assert_eq!(gateway.open_progress_call_count(), 2);
         assert_eq!(gateway.order_lookup_call_count(), lookup_before_fill);
         assert_eq!(

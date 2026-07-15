@@ -1982,6 +1982,30 @@ where
         finalize_and_store(&mut self.store, next, now_ms, transition)
     }
 
+    pub fn synchronize_intent_if_needed(
+        &mut self,
+        intent: &OrderIntent,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        let state = self.store.snapshot();
+        if intent.validate().is_ok()
+            && intent.exchange == state.exchange
+            && state
+                .orders
+                .get(&intent.client_order_id)
+                .is_some_and(|order| {
+                    intent.shape == order.shape
+                        && matches!(
+                            &order.tracking,
+                            StrategyOrderTracking::Intent { state } if state == &intent.state
+                        )
+                })
+        {
+            return Ok(StrategyTransition::NoChange);
+        }
+        self.synchronize_intent(intent, now_ms)
+    }
+
     pub fn apply_execution(
         &mut self,
         report: &ExecutionReport,
