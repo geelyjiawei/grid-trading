@@ -22,8 +22,8 @@ use crate::{
     exchange::{
         ActiveOrderStatus, ExchangeIdentityGateway, ExecutionSnapshotGateway,
         HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway,
-        OpenOrderExecutionProgress, OrderCancellationGateway, OrderLifecycle, OrderLookupGateway,
-        OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
+        OpenOrderExecutionProgress, OrderCancellationGateway, OrderLifecycle, OrderLookup,
+        OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
     },
     persistence::{
         FileArmedStrategyStateStore, FileOrderIntentStore, FilePreparedStrategyStore,
@@ -1390,6 +1390,7 @@ where
             .buffered(MAX_CONCURRENT_ORDER_LOOKUPS)
             .collect::<BTreeMap<_, _>>()
             .await;
+        let mut exact_open_progress = BTreeMap::new();
         for client_order_id in &ledger_ids {
             let current_intent = self
                 .intent_store
@@ -1412,6 +1413,17 @@ where
                 let lookup = lookup_results
                     .remove(client_order_id)
                     .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+                if let Ok(OrderLookup::Found(order)) = &lookup
+                    && let Some(cumulative_quantity) = order.executed_quantity
+                {
+                    let progress = OpenOrderExecutionProgress {
+                        order: order.clone(),
+                        cumulative_quantity,
+                    };
+                    if let Some(mut indexed) = index_open_order_progress(vec![progress]) {
+                        exact_open_progress.append(&mut indexed);
+                    }
+                }
                 reconcile_lookup_with(&mut self.intent_store, client_order_id, lookup, now_ms)?
             };
             report.ledger_reconciliations += 1;
@@ -1485,9 +1497,13 @@ where
                     .orders
                     .get(client_order_id)
                     .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
-                open_progress
-                    .as_ref()
-                    .and_then(|progress| progress.get(client_order_id))
+                exact_open_progress
+                    .get(client_order_id)
+                    .or_else(|| {
+                        open_progress
+                            .as_ref()
+                            .and_then(|progress| progress.get(client_order_id))
+                    })
                     .is_some_and(|progress| {
                         execution_progress_matches(state.exchange, order, progress)
                             && progress.cumulative_quantity == order.cumulative_quantity
@@ -4372,6 +4388,7 @@ mod tests {
             machine(config(None), &rules),
         );
         deploy_running_short_grid(&mut runtime, &gateway).await;
+        let execution_snapshots_before = gateway.execution_snapshot_call_count();
         gateway.measure_delayed_order_lookups(Duration::from_millis(20));
 
         let report = runtime.tick(1_300).await.unwrap();
@@ -4380,6 +4397,11 @@ mod tests {
         assert_eq!(gateway.order_lookup_call_count(), 20);
         assert!(gateway.maximum_concurrent_order_lookup_count() > 1);
         assert!(gateway.maximum_concurrent_order_lookup_count() <= MAX_CONCURRENT_ORDER_LOOKUPS);
+        assert_eq!(
+            gateway.execution_snapshot_call_count(),
+            execution_snapshots_before
+        );
+        assert_eq!(report.execution_syncs, 0);
     }
 
     #[tokio::test]
