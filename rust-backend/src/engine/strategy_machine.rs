@@ -3701,8 +3701,200 @@ fn materialize_non_reduce_obligations(
     rules: &InstrumentRules,
     created: &mut Vec<ClientOrderId>,
 ) -> Result<(), String> {
+    let planned_buckets = plan_non_reduce_obligation_buckets(state, obligation_ids, rules)?;
+    for bucket in planned_buckets {
+        materialize_obligation_bucket(state, &bucket, rules, created)?;
+    }
+    Ok(())
+}
+
+const MAX_EXACT_REPLACEMENT_PARTITION_ITEMS: usize = 64;
+const MAX_EXACT_REPLACEMENT_PARTITION_STATES: usize = 1_000_000;
+
+#[derive(Clone)]
+struct PlannedObligationBucket {
+    obligation_ids: Vec<u64>,
+    quantity: Decimal,
+}
+
+struct ExactObligationPartition<'a> {
+    template: OrderShape,
+    rules: &'a InstrumentRules,
+    items: Vec<(u64, Decimal)>,
+    total_quantity: Decimal,
+    best_quantity: Decimal,
+    best_buckets: Vec<Vec<u64>>,
+    visited: BTreeSet<(usize, Vec<Decimal>)>,
+    explored_states: usize,
+    search_limit_reached: bool,
+}
+
+impl ExactObligationPartition<'_> {
+    fn explore(&mut self, index: usize, buckets: &mut Vec<PlannedObligationBucket>) {
+        if self.best_quantity == self.total_quantity || self.search_limit_reached {
+            return;
+        }
+        self.explored_states = self.explored_states.saturating_add(1);
+        if self.explored_states > MAX_EXACT_REPLACEMENT_PARTITION_STATES {
+            self.search_limit_reached = true;
+            return;
+        }
+
+        // Every item in this search has the same immutable order shape, so future
+        // feasibility depends on bucket quantities rather than source identities.
+        let mut canonical_quantities = buckets
+            .iter()
+            .map(|bucket| bucket.quantity)
+            .collect::<Vec<_>>();
+        canonical_quantities.sort();
+        if !self.visited.insert((index, canonical_quantities)) {
+            return;
+        }
+
+        if index == self.items.len() {
+            let mut valid_buckets = Vec::new();
+            let mut assigned_quantity = Decimal::ZERO;
+            for bucket in buckets.iter() {
+                if replacement_quantity_is_valid(
+                    &order_shape_with_quantity(&self.template, bucket.quantity),
+                    self.rules,
+                ) {
+                    assigned_quantity += bucket.quantity;
+                    valid_buckets.push(bucket.obligation_ids.clone());
+                }
+            }
+            if assigned_quantity > self.best_quantity
+                || (assigned_quantity == self.best_quantity
+                    && !valid_buckets.is_empty()
+                    && (self.best_buckets.is_empty()
+                        || valid_buckets.len() < self.best_buckets.len()))
+            {
+                self.best_quantity = assigned_quantity;
+                self.best_buckets = valid_buckets;
+            }
+            return;
+        }
+
+        let (obligation_id, quantity) = self.items[index];
+        let maximum = self.rules.limit_quantity.max;
+        let mut attempted_quantities = BTreeSet::new();
+        for bucket_index in 0..buckets.len() {
+            let current_quantity = buckets[bucket_index].quantity;
+            if !attempted_quantities.insert(current_quantity) {
+                continue;
+            }
+            let Some(combined_quantity) = current_quantity.checked_add(quantity) else {
+                self.search_limit_reached = true;
+                return;
+            };
+            if maximum.is_some_and(|limit| combined_quantity > limit) {
+                continue;
+            }
+            buckets[bucket_index].quantity = combined_quantity;
+            buckets[bucket_index].obligation_ids.push(obligation_id);
+            self.explore(index + 1, buckets);
+            buckets[bucket_index].obligation_ids.pop();
+            buckets[bucket_index].quantity = current_quantity;
+            if self.best_quantity == self.total_quantity || self.search_limit_reached {
+                return;
+            }
+        }
+
+        buckets.push(PlannedObligationBucket {
+            obligation_ids: vec![obligation_id],
+            quantity,
+        });
+        self.explore(index + 1, buckets);
+        buckets.pop();
+    }
+}
+
+fn order_shape_with_quantity(template: &OrderShape, quantity: Decimal) -> OrderShape {
+    let mut shape = template.clone();
+    shape.quantity = quantity;
+    shape
+}
+
+fn plan_non_reduce_obligation_buckets(
+    state: &StrategyState,
+    obligation_ids: Vec<u64>,
+    rules: &InstrumentRules,
+) -> Result<Vec<Vec<u64>>, String> {
+    if obligation_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let combined = combined_obligation_shape(state, &obligation_ids)
+        .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?;
+    let total_quantity = combined.quantity;
+    if replacement_quantity_is_valid(&combined, rules) {
+        return Ok(vec![obligation_ids]);
+    }
+
+    let greedy = greedy_non_reduce_obligation_buckets(state, &obligation_ids, rules)?;
+    let greedy_quantity = greedy.iter().try_fold(Decimal::ZERO, |total, bucket| {
+        combined_obligation_shape(state, bucket).and_then(|shape| total.checked_add(shape.quantity))
+    });
+    let Some(greedy_quantity) = greedy_quantity else {
+        return Err("replacement obligation quantity overflowed during planning".into());
+    };
+    if greedy_quantity == combined.quantity {
+        return Ok(greedy);
+    }
+    if obligation_ids.len() > MAX_EXACT_REPLACEMENT_PARTITION_ITEMS {
+        return Err(format!(
+            "replacement obligation partition requires more than {MAX_EXACT_REPLACEMENT_PARTITION_ITEMS} exact items"
+        ));
+    }
+
+    let mut items = obligation_ids
+        .iter()
+        .map(|id| {
+            state
+                .replacement_obligations
+                .get(id)
+                .map(|obligation| (*id, obligation.shape.quantity))
+                .ok_or_else(|| "replacement obligation is missing".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    items.sort_by(|(left_id, left_quantity), (right_id, right_quantity)| {
+        right_quantity
+            .cmp(left_quantity)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let mut search = ExactObligationPartition {
+        template: combined,
+        rules,
+        items,
+        total_quantity,
+        best_quantity: greedy_quantity,
+        best_buckets: greedy,
+        visited: BTreeSet::new(),
+        explored_states: 0,
+        search_limit_reached: false,
+    };
+    search.explore(0, &mut Vec::new());
+    if search.search_limit_reached && search.best_quantity < search.total_quantity {
+        return Err(format!(
+            "replacement obligation partition exceeded {MAX_EXACT_REPLACEMENT_PARTITION_STATES} deterministic states"
+        ));
+    }
+    for bucket in &mut search.best_buckets {
+        bucket.sort_unstable();
+    }
+    search
+        .best_buckets
+        .sort_by_key(|bucket| bucket.first().copied().unwrap_or(u64::MAX));
+    Ok(search.best_buckets)
+}
+
+fn greedy_non_reduce_obligation_buckets(
+    state: &StrategyState,
+    obligation_ids: &[u64],
+    rules: &InstrumentRules,
+) -> Result<Vec<Vec<u64>>, String> {
     let mut residual_buckets = Vec::<Vec<u64>>::new();
-    for id in obligation_ids {
+    let mut ready_buckets = Vec::<Vec<u64>>::new();
+    for id in obligation_ids.iter().copied() {
         let mut submit_bucket = None;
         for (index, residual) in residual_buckets.iter().enumerate() {
             let mut candidate = residual.clone();
@@ -3716,7 +3908,7 @@ fn materialize_non_reduce_obligations(
         }
         if let Some((index, candidate)) = submit_bucket {
             residual_buckets.remove(index);
-            materialize_obligation_bucket(state, &candidate, rules, created)?;
+            ready_buckets.push(candidate);
             continue;
         }
 
@@ -3725,7 +3917,7 @@ fn materialize_non_reduce_obligations(
                 .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?,
             rules,
         ) {
-            materialize_obligation_bucket(state, &[id], rules, created)?;
+            ready_buckets.push(vec![id]);
             continue;
         }
 
@@ -3749,7 +3941,7 @@ fn materialize_non_reduce_obligations(
             residual_buckets.push(vec![id]);
         }
     }
-    Ok(())
+    Ok(ready_buckets)
 }
 
 fn obligations_are_compatible(
@@ -7774,6 +7966,228 @@ mod tests {
                 .all(|obligation| obligation.assigned_client_order_id.is_some())
         );
         assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn later_sub_minimum_residual_combines_with_an_earlier_submit_safe_obligation() {
+        let mut machine = small_neutral_machine_with_max(Some(decimal(30)));
+        let initial_sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
+        machine
+            .apply_execution(
+                &report(
+                    initial_sell,
+                    "initial-sell",
+                    decimal(20),
+                    decimal(6),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                101,
+            )
+            .unwrap();
+        machine
+            .materialize_replacements(&machine.store().snapshot().instrument_rules.clone(), 102)
+            .unwrap();
+        let replacement_buy = replacement_orders(machine.store().snapshot())
+            .into_iter()
+            .find(|order| order.shape.side == OrderSide::Buy)
+            .unwrap()
+            .client_order_id
+            .clone();
+        accept_strategy_order(&mut machine, &replacement_buy, "replacement-buy", 103);
+
+        machine
+            .apply_execution(
+                &report(
+                    replacement_buy,
+                    "replacement-buy",
+                    decimal(17),
+                    Decimal::new(476, 2),
+                    None,
+                ),
+                104,
+            )
+            .unwrap();
+        let initial_buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        machine
+            .apply_execution(
+                &report(
+                    initial_buy,
+                    "initial-buy",
+                    decimal(8),
+                    Decimal::new(224, 2),
+                    None,
+                ),
+                105,
+            )
+            .unwrap();
+
+        let transition = machine
+            .materialize_replacements(&machine.store().snapshot().instrument_rules.clone(), 106)
+            .unwrap();
+
+        assert!(matches!(
+            transition,
+            StrategyTransition::ReplacementOrdersReady { ref client_order_ids }
+                if client_order_ids.len() == 1
+        ));
+        let state = machine.store().snapshot();
+        let combined = replacement_orders(state)
+            .into_iter()
+            .filter(|order| {
+                order.shape.side == OrderSide::Sell && order.shape.quantity == decimal(25)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(combined.len(), 1);
+        assert!(
+            state
+                .replacement_obligations
+                .values()
+                .all(|obligation| obligation.assigned_client_order_id.is_some())
+        );
+        assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn exact_partition_avoids_an_order_dependent_residual_above_exchange_maximum() {
+        let machine = small_neutral_machine_with_max(Some(decimal(25)));
+        let mut state = machine.store().snapshot().clone();
+        let source_client_order_id = grid_id(&state, 1, OrderSide::Buy, false);
+        let source_shape = state
+            .orders
+            .get(&source_client_order_id)
+            .unwrap()
+            .shape
+            .clone();
+        let mut obligation_ids = Vec::new();
+        for quantity in [decimal(8), decimal(17), decimal(9)] {
+            let shape = counter_shape(&state, 1, &source_shape, quantity).unwrap();
+            obligation_ids.push(
+                add_obligation(
+                    &mut state,
+                    ReplacementObligationKind::Counter,
+                    source_client_order_id.clone(),
+                    1,
+                    shape,
+                    100,
+                )
+                .unwrap(),
+            );
+        }
+
+        let buckets = plan_non_reduce_obligation_buckets(
+            &state,
+            obligation_ids.clone(),
+            &state.instrument_rules,
+        )
+        .unwrap();
+
+        let mut quantities = buckets
+            .iter()
+            .map(|bucket| combined_obligation_shape(&state, bucket).unwrap().quantity)
+            .collect::<Vec<_>>();
+        quantities.sort();
+        assert_eq!(quantities, vec![decimal(17), decimal(17)]);
+        let mut assigned_ids = buckets.into_iter().flatten().collect::<Vec<_>>();
+        assigned_ids.sort_unstable();
+        assert_eq!(assigned_ids, obligation_ids);
+    }
+
+    #[test]
+    fn exact_partition_matches_brute_force_for_small_quantity_sequences() {
+        fn brute_force_best(
+            quantities: &[Decimal],
+            index: usize,
+            buckets: &mut Vec<Decimal>,
+            best: &mut Decimal,
+        ) {
+            if index == quantities.len() {
+                let assigned = buckets
+                    .iter()
+                    .filter(|quantity| **quantity >= decimal(2) && **quantity <= decimal(3))
+                    .copied()
+                    .sum::<Decimal>();
+                *best = (*best).max(assigned);
+                return;
+            }
+            let quantity = quantities[index];
+            let mut attempted = BTreeSet::new();
+            for bucket_index in 0..buckets.len() {
+                let original = buckets[bucket_index];
+                if !attempted.insert(original) || original + quantity > decimal(3) {
+                    continue;
+                }
+                buckets[bucket_index] += quantity;
+                brute_force_best(quantities, index + 1, buckets, best);
+                buckets[bucket_index] = original;
+            }
+            buckets.push(quantity);
+            brute_force_best(quantities, index + 1, buckets, best);
+            buckets.pop();
+        }
+
+        let machine = small_neutral_machine();
+        let mut state = machine.store().snapshot().clone();
+        let source_client_order_id = grid_id(&state, 1, OrderSide::Buy, false);
+        let symbol = state.symbol.clone();
+        let rules = InstrumentRules {
+            tick_size: Decimal::new(1, 2),
+            limit_quantity: QuantityRules {
+                step: Decimal::ONE,
+                min: decimal(2),
+                max: Some(decimal(3)),
+            },
+            market_quantity: QuantityRules {
+                step: Decimal::ONE,
+                min: decimal(2),
+                max: Some(decimal(3)),
+            },
+            min_notional: Decimal::ZERO,
+        };
+
+        for length in 1..=5 {
+            for encoded in 0..3_usize.pow(length) {
+                let mut value = encoded;
+                let mut quantities = Vec::with_capacity(length as usize);
+                for _ in 0..length {
+                    quantities.push(decimal((value % 3 + 1) as i64));
+                    value /= 3;
+                }
+                state.replacement_obligations.clear();
+                state.next_obligation_sequence = 1;
+                let mut obligation_ids = Vec::new();
+                for quantity in &quantities {
+                    obligation_ids.push(
+                        add_obligation(
+                            &mut state,
+                            ReplacementObligationKind::Counter,
+                            source_client_order_id.clone(),
+                            1,
+                            OrderShape {
+                                symbol: symbol.clone(),
+                                side: OrderSide::Sell,
+                                price: Some(Decimal::new(30, 2)),
+                                quantity: *quantity,
+                                reduce_only: false,
+                                kind: OrderKind::Limit,
+                                time_in_force: crate::domain::TimeInForce::Gtc,
+                            },
+                            100,
+                        )
+                        .unwrap(),
+                    );
+                }
+
+                let planned =
+                    plan_non_reduce_obligation_buckets(&state, obligation_ids, &rules).unwrap();
+                let assigned = planned
+                    .iter()
+                    .map(|bucket| combined_obligation_shape(&state, bucket).unwrap().quantity)
+                    .sum::<Decimal>();
+                let mut expected = Decimal::ZERO;
+                brute_force_best(&quantities, 0, &mut Vec::new(), &mut expected);
+                assert_eq!(assigned, expected, "quantities={quantities:?}");
+            }
+        }
     }
 
     #[test]

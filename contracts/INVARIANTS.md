@@ -200,10 +200,12 @@ the OpenAPI schema.
   replacement chain is accepted; the cancelled order itself never counts as coverage.
 - Replacement orders exactly equal their assigned durable obligations. Quantity, side,
   price, reduce-only, level, and exchange rules are revalidated on every state write.
-- A sub-minimum replacement residual cannot absorb and block a later obligation that is
-  independently submit-safe. Compatible obligations are partitioned deterministically:
-  submit-safe combinations are assigned exactly, while only the still-unplaceable residual
-  remains pending for a future compatible fill.
+- Compatible non-reduce-only replacement obligations are planned as one batch, independent of
+  exchange-fill arrival order. The whole batch is combined when it fits one valid order; batches
+  above the exchange maximum use a bounded exact partition whose assigned quantity matches the
+  optimum for the indivisible durable obligations. Only a proven unplaceable residual may remain
+  pending. If the exact planner cannot prove a result within its explicit complexity boundary, the
+  strategy fails closed instead of silently omitting a submit-safe quantity.
 - Last price and mark price come from their distinct exchange fields. A missing mark
   price never falls back to last price, and stale or future-dated market snapshots are
   rejected before planning or risk evaluation.

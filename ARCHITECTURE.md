@@ -101,11 +101,13 @@ Exact trade events cannot be mixed with legacy aggregate-only inventory evidence
 in an active strategy because their relative chronology is unknowable; that
 condition retains the authoritative fill but fails the strategy closed. The
 whole cumulative delta still creates at most one counter-order obligation, so
-per-trade accounting cannot multiply replacement orders. Non-reduce-only
-obligations are partitioned into deterministic submit-safe buckets. A small
-residual may combine with a compatible later fill, but it cannot trap a later
-obligation that is valid on its own merely because their sum exceeds the
-exchange maximum quantity. Before an active
+per-trade accounting cannot multiply replacement orders. Compatible
+non-reduce-only obligations are planned as an order-independent batch. The
+machine combines the whole batch when it fits one exchange order and otherwise
+uses a bounded exact partition that maximizes assigned durable quantity under
+the exchange minimum, notional, step, and maximum rules. An unproven heuristic
+result is never submitted: planner complexity exhaustion fails the strategy
+closed instead of silently leaving a submit-safe residual. Before an active
 strategy can be loaded, the events must exactly
 reproduce the opening allocation, every per-level directional lot, neutral FIFO
 lots, net grid position, and gross realized profit. Aggregate totals alone are
