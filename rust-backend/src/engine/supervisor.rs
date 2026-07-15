@@ -264,7 +264,8 @@ impl<G> RuntimeRegistry<G> {
         // A stop request is safety-critical: wait for the current atomic tick instead of
         // returning a transient busy error that would force the caller to guess or retry.
         let mut strategy = slot.strategy.lock().await;
-        strategy.request_stop(now_ms).map_err(Into::into)
+        let effective_now_ms = now_ms.max(strategy.updated_at_ms());
+        strategy.request_stop(effective_now_ms).map_err(Into::into)
     }
 }
 

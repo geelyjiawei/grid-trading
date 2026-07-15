@@ -344,6 +344,18 @@ impl<G> PreparedLeasedFileStrategy<G> {
         }
     }
 
+    pub(crate) fn updated_at_ms(&self) -> u64 {
+        match self.inner.as_ref() {
+            Some(PreparedLeasedFileStrategyInner::Armed { strategy, .. }) => {
+                strategy.snapshot().updated_at_ms
+            }
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => {
+                runtime.runtime().machine().store().snapshot().updated_at_ms
+            }
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         self.lifecycle().is_terminal()
     }
@@ -3967,8 +3979,11 @@ mod tests {
 
         let stopping_registry = Arc::clone(&registry);
         let stopping_run = first_run.clone();
+        // The HTTP request may capture its timestamp before a newer scheduler tick
+        // acquires the strategy lock. Waiting for that tick must not make stop fail
+        // with a timestamp regression.
         let stop =
-            tokio::spawn(async move { stopping_registry.request_stop(&stopping_run, 1_201).await });
+            tokio::spawn(async move { stopping_registry.request_stop(&stopping_run, 1_199).await });
         tokio::task::yield_now().await;
         assert!(
             !stop.is_finished(),
