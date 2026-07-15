@@ -135,6 +135,12 @@ jobs:
           cp .env.example .env
           trap 'rm -f .env' EXIT
           GRID_RUST_PREVIEW_VALIDATE_ONLY=true sh scripts/deploy-rust-preview.sh
+          if GRID_RUST_PREVIEW_EXPECTED_COMMIT=0000000000000000000000000000000000000000 \
+            sh scripts/deploy-rust-preview.sh > /tmp/stale-preview.log 2>&1; then
+            echo 'preview deployment unexpectedly accepted an unavailable commit' >&2
+            exit 1
+          fi
+          grep --fixed-strings 'expected Git commit is unavailable' /tmp/stale-preview.log
 
       - name: Build locked production image
         run: docker build --file Dockerfile.rust-vue --tag grid-trading-vue-rust:test .
@@ -145,7 +151,8 @@ jobs:
           cp .env.example .env
           sed --in-place 's/^AUTH_REQUIRED=true$/AUTH_REQUIRED=false/' .env
           trap 'docker compose --project-name grid-trading-rust-preview --file docker-compose.rust-vue.yml down --volumes; rm -f .env' EXIT
-          sh scripts/deploy-rust-preview.sh
+          GRID_RUST_PREVIEW_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+            sh scripts/deploy-rust-preview.sh
 
       - name: Verify image contains only the production stack
         run: |

@@ -39,6 +39,24 @@ if test "${GRID_RUST_PREVIEW_VALIDATE_ONLY:-false}" = "true"; then
     exit 0
 fi
 
+expected_commit=${GRID_RUST_PREVIEW_EXPECTED_COMMIT:-}
+test -n "$expected_commit" \
+    || fail "GRID_RUST_PREVIEW_EXPECTED_COMMIT is required for a real deployment"
+expected_commit=$(git rev-parse --verify "${expected_commit}^{commit}" 2>/dev/null) \
+    || fail "the expected Git commit is unavailable in this checkout"
+actual_commit=$(git rev-parse --verify HEAD) \
+    || fail "the current Git commit cannot be resolved"
+test "$actual_commit" = "$expected_commit" \
+    || fail "current Git commit $actual_commit does not match expected commit $expected_commit"
+worktree_status=$(git status --porcelain --untracked-files=all) \
+    || fail "the preview worktree status cannot be inspected"
+test -z "$worktree_status" \
+    || fail "the preview worktree contains uncommitted source files"
+GRID_RUST_PREVIEW_EXPECTED_COMMIT=$expected_commit
+export GRID_RUST_PREVIEW_EXPECTED_COMMIT
+
+printf 'Deploying Rust preview commit %s with trading disabled.\n' "$expected_commit"
+
 command -v cmp >/dev/null 2>&1 || fail "cmp is unavailable"
 command -v mktemp >/dev/null 2>&1 || fail "mktemp is unavailable"
 

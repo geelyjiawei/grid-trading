@@ -9,6 +9,7 @@ compose_file=${GRID_RUST_PREVIEW_COMPOSE:-docker-compose.rust-vue.yml}
 base_url=${GRID_RUST_PREVIEW_URL:-http://127.0.0.1:8001}
 preview_project=${GRID_RUST_PREVIEW_PROJECT:-grid-trading-rust-preview}
 expected_binding=${GRID_RUST_PREVIEW_EXPECTED_BINDING:-127.0.0.1:8001}
+expected_commit=${GRID_RUST_PREVIEW_EXPECTED_COMMIT:-}
 service_name=grid-trading-rust-preview
 
 fail() {
@@ -25,6 +26,16 @@ require_text() {
 command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
 command -v curl >/dev/null 2>&1 || fail "curl is unavailable"
 test -f "$compose_file" || fail "$compose_file does not exist"
+
+if test -n "$expected_commit"; then
+    command -v git >/dev/null 2>&1 || fail "git is unavailable"
+    expected_commit=$(git rev-parse --verify "${expected_commit}^{commit}" 2>/dev/null) \
+        || fail "the expected Git commit is unavailable in this checkout"
+    actual_commit=$(git rev-parse --verify HEAD) \
+        || fail "the current Git commit cannot be resolved"
+    test "$actual_commit" = "$expected_commit" \
+        || fail "current Git commit $actual_commit does not match expected commit $expected_commit"
+fi
 
 container_id=${GRID_RUST_PREVIEW_CONTAINER_ID:-}
 if test -z "$container_id"; then
@@ -130,5 +141,5 @@ else
     auth_mode=disabled
 fi
 
-printf 'Rust preview verified: container=%s url=%s auth=%s trading_enabled=false\n' \
-    "$container_id" "$base_url" "$auth_mode"
+printf 'Rust preview verified: container=%s commit=%s url=%s auth=%s trading_enabled=false\n' \
+    "$container_id" "${expected_commit:-unchecked}" "$base_url" "$auth_mode"
