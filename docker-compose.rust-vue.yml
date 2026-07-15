@@ -1,0 +1,23 @@
+services:
+  grid-trading-rust-preview:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust-vue
+    container_name: grid-trading-rust-preview
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      GRID_BIND: 0.0.0.0:8000
+      GRID_WEB_ROOT: /app/web
+      GRID_RUST_CONTROL_ROOT: /app/data/rust-control/idempotency
+      GRID_RUST_STRATEGY_ROOT: /app/data/rust-control/strategies
+      GRID_RUST_TRADING_ENABLED: "false"
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - rust-preview-data:/app/data
+
+volumes:
+  rust-preview-data:

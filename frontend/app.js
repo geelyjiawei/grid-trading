@@ -5,12 +5,14 @@ let toastTimer = null;
 let latestPrice = NaN;
 let authRequired = false;
 let activeDetailPanel = "positions";
-let activeExchange = "bybit";
+let activeExchange = "";
 let currentRiskSymbol = "";
 let previewRequestSeq = 0;
 let exchangeOpenOrders = [];
 let exchangeTrades = [];
 let exchangeConfigs = {};
+let feeRateRequestSeq = 0;
+let feeRateState = { verified: false, exchange: "", symbol: "" };
 
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
@@ -116,6 +118,7 @@ function bindEvents() {
   updateSizingModeVisibility(false);
 
   document.getElementById("symbol-input").addEventListener("change", async () => {
+    await loadFeeRates();
     await fetchPrice();
     updatePreview();
     if (!isSymbolRunning(getSymbol())) {
@@ -127,6 +130,7 @@ function bindEvents() {
   document.getElementById("active-exchange-select").addEventListener("change", async () => {
     activeExchange = document.getElementById("active-exchange-select").value;
     syncExchangeInputs();
+    await loadFeeRates();
     await fetchPrice();
     await fetchBalance();
     await pollGridStatus();
@@ -158,6 +162,71 @@ function withExchange(url, exchange = activeExchange) {
   return `${url}${url.includes("?") ? "&" : "?"}${exchangeQuery(exchange)}`;
 }
 
+function formatFeeRatePercent(rate) {
+  const percent = Number(rate) * 100;
+  if (!Number.isFinite(percent)) return "";
+  return percent.toFixed(6).replace(/0+$/, "").replace(/\.$/, "") || "0";
+}
+
+function clearFeeRates(message) {
+  previewRequestSeq += 1;
+  document.getElementById("maker-fee-rate").value = "";
+  document.getElementById("taker-fee-rate").value = "";
+  document.getElementById("fee-rate-hint").textContent = message;
+  feeRateState = { verified: false, exchange: activeExchange, symbol: getSymbol() };
+}
+
+function applyFeeRates(data, exchange, symbol) {
+  document.getElementById("maker-fee-rate").value = formatFeeRatePercent(data.maker_fee_rate);
+  document.getElementById("taker-fee-rate").value = formatFeeRatePercent(data.taker_fee_rate);
+  const source = data.source === "exchange_cache" ? "账户实际费率（短时缓存）" : "账户实际费率";
+  document.getElementById("fee-rate-hint").textContent = `${exchangeDisplayName(exchange)} ${symbol} ${source}；目标限价预估按 Maker，若实际吃单会按成交明细的 Taker 费用记账；正式启动时后端会再次校验。`;
+  feeRateState = { verified: true, exchange, symbol };
+}
+
+function feeRatesReady() {
+  return feeRateState.verified
+    && feeRateState.exchange === activeExchange
+    && feeRateState.symbol === getSymbol();
+}
+
+async function loadFeeRates({ notify = false } = {}) {
+  const exchange = activeExchange;
+  const symbol = getSymbol();
+  const requestSeq = ++feeRateRequestSeq;
+  if (!symbol) {
+    clearFeeRates("请先输入交易对，再读取账户实际费率。");
+    return false;
+  }
+  if (!exchangeConfigs[exchange]?.configured) {
+    clearFeeRates(`请先保存 ${exchangeDisplayName(exchange)} 账户配置，再读取实际手续费率。`);
+    return false;
+  }
+
+  clearFeeRates(`正在读取 ${exchangeDisplayName(exchange)} ${symbol} 的账户实际费率…`);
+  try {
+    const data = await api(withExchange(`/api/fees/${symbol}`, exchange));
+    if (requestSeq !== feeRateRequestSeq || exchange !== activeExchange || symbol !== getSymbol()) {
+      return false;
+    }
+    applyFeeRates(data, exchange, symbol);
+    updatePreview();
+    return true;
+  } catch (error) {
+    if (requestSeq !== feeRateRequestSeq || exchange !== activeExchange || symbol !== getSymbol()) {
+      return false;
+    }
+    clearFeeRates(`账户实际费率读取失败：${error.message}。为避免利润误算，当前不能启动网格。`);
+    document.getElementById("grid-preview").classList.add("hidden");
+    if (notify) showToast(`手续费率读取失败：${error.message}`, "error");
+    return false;
+  }
+}
+
+async function ensureFeeRates() {
+  return feeRatesReady() || loadFeeRates({ notify: true });
+}
+
 function syncExchangeInputs() {
   const activeSelect = document.getElementById("active-exchange-select");
   const configSelect = document.getElementById("cfg-exchange");
@@ -182,6 +251,7 @@ async function loadConfig() {
     syncExchangeInputs();
     renderConfigStatus(config);
     renderConfigDraftHint();
+    await loadFeeRates({ notify: false });
     if (config.configs?.[activeExchange]?.configured || config.configured) {
       await fetchBalance();
     }
@@ -193,6 +263,12 @@ async function loadConfig() {
 function renderConfigStatus(config) {
   const statusEl = document.getElementById("cfg-status");
   if (!statusEl) return;
+
+  if (config.storage_error) {
+    statusEl.textContent = "API 加密配置文件无法安全读取。原文件已保留，新的配置保存已暂停；请先检查服务器配置文件和加密密钥。";
+    statusEl.className = "config-status";
+    return;
+  }
 
   if (!config.configured) {
     const configured = Object.values(config.configs || {}).filter((item) => item.configured);
@@ -228,6 +304,7 @@ function setDirection(direction) {
   document.getElementById("btn-long").className = `dir-btn${direction === "long" ? " active long" : ""}`;
   document.getElementById("btn-short").className = `dir-btn${direction === "short" ? " active short" : ""}`;
   document.getElementById("btn-neutral").className = `dir-btn${direction === "neutral" ? " active" : ""}`;
+  updatePreview();
 }
 
 async function updatePreview() {
@@ -243,6 +320,12 @@ async function updatePreview() {
   const gridMode = document.getElementById("grid-mode").value;
   const box = document.getElementById("grid-preview");
   const symbol = getSymbol();
+  const exchange = activeExchange;
+
+  if (!feeRatesReady()) {
+    box.classList.add("hidden");
+    return;
+  }
 
   const hasSizingInput = sizingMode === "fixed_grid_qty"
     ? gridOrderQty > 0
@@ -255,7 +338,7 @@ async function updatePreview() {
   const requestSeq = ++previewRequestSeq;
   try {
     const preview = await api("/api/grid/preview", "POST", {
-      exchange: activeExchange,
+      exchange,
       symbol,
       direction: currentDirection,
       grid_mode: gridMode,
@@ -276,7 +359,21 @@ async function updatePreview() {
       stop_loss_price: parseOptionalNumber("stop-loss-price"),
       take_profit_price: parseOptionalNumber("take-profit-price"),
     });
-    if (requestSeq !== previewRequestSeq) return;
+    if (
+      requestSeq !== previewRequestSeq
+      || exchange !== activeExchange
+      || symbol !== getSymbol()
+    ) return;
+
+    applyFeeRates(
+      {
+        maker_fee_rate: preview.maker_fee_rate,
+        taker_fee_rate: preview.taker_fee_rate,
+        source: preview.fee_rate_source,
+      },
+      exchange,
+      symbol,
+    );
 
     const minQty = Number(preview.qty_per_grid_min || 0);
     const maxQty = Number(preview.qty_per_grid_max || 0);
@@ -293,10 +390,15 @@ async function updatePreview() {
     document.getElementById("prev-profit").textContent = Number(preview.per_grid_net_profit).toFixed(4);
     document.getElementById("prev-active-count").textContent = `${preview.active_grid_count} / ${preview.grid_count}`;
     document.getElementById("prev-qty").textContent = qtyText;
+    document.getElementById("prev-min-notional").textContent = Number(preview.min_notional || 0).toFixed(4);
     document.getElementById("prev-total-qty").textContent = formatOrderQty(preview.total_qty);
     box.classList.remove("hidden");
   } catch (_) {
-    box.classList.add("hidden");
+    if (
+      requestSeq === previewRequestSeq
+      && exchange === activeExchange
+      && symbol === getSymbol()
+    ) box.classList.add("hidden");
   }
 }
 
@@ -344,6 +446,8 @@ async function fetchBalance() {
 }
 
 async function startGrid() {
+  if (!(await ensureFeeRates())) return;
+
   const sizingMode = document.getElementById("position-sizing-mode").value;
   const payload = {
     exchange: activeExchange,
@@ -474,7 +578,11 @@ async function fetchRiskSnapshot(symbol) {
     const risk = await api(withExchange(`/api/risk/${symbol}`));
     renderRiskSnapshot(risk);
   } catch (_) {
-    renderRiskSnapshot({ has_risk: false });
+    renderRiskSnapshot({
+      has_risk: true,
+      symbol,
+      snapshot_error: true,
+    });
   }
 }
 
@@ -499,6 +607,42 @@ function renderRiskSnapshot(risk) {
     .join("；");
   const messages = [];
   const reduceProtection = risk.reduce_protection || {};
+  const gridCoverage = risk.grid_coverage || {};
+  const pendingSubmissionCount = Number(risk.pending_submission_count || 0);
+  const queuedReplacementCount = Number(risk.queued_replacement_count || 0);
+  const acceptedShapeMismatchCount = Number(risk.accepted_shape_mismatch_count || 0);
+  const stateStoreError = String(risk.state_store_error || "");
+  const historyStoreError = String(risk.history_store_error || "");
+  if (risk.snapshot_error) {
+    messages.push("<div>暂时无法从服务器和交易所核对挂单与持仓。当前状态不能视为安全或无风险，请稍后刷新并检查服务连接。</div>");
+  }
+  if (stateStoreError) {
+    messages.push("<div>交易账本文件无法安全读取。系统已禁止启动新网格，避免把旧订单或旧持仓误认为空账户；请先检查并恢复服务器上的网格状态文件。</div>");
+  }
+  if (historyStoreError) {
+    messages.push("<div>开仓历史文件无法安全读取。程序已保留原文件并暂停覆盖历史记录；现有交易状态仍会正常保存，请检查并恢复服务器上的历史文件。</div>");
+  }
+  if (risk.initialization_in_progress) {
+    messages.push("<div>策略正在完成开仓后的网格部署；在全部挂单确认前不会标记为运行就绪。</div>");
+  }
+  if (risk.initialization_failed) {
+    messages.push("<div>策略启动未完整完成，程序正在保留交易所现场并阻止重复启动。请先执行停止并完成核对，不要直接再次启动。</div>");
+  }
+  if (pendingSubmissionCount > 0) {
+    messages.push(`<div>有 ${pendingSubmissionCount} 个下单结果尚未被交易所权威确认，程序不会猜测成交，也不会重复发送未知结果的市价单。</div>`);
+  }
+  if (queuedReplacementCount > 0) {
+    messages.push(`<div>有 ${queuedReplacementCount} 个网格挂单重建尚未被交易所确认，程序已保留原价、原方向和原数量并持续安全重试。</div>`);
+  }
+  if (acceptedShapeMismatchCount > 0) {
+    messages.push(`<div>有 ${acceptedShapeMismatchCount} 个订单的交易所实际价格、数量或方向与程序请求不一致。程序已停止继续下单并保留请求值与实际值供核对。</div>`);
+  }
+  if (risk.risk_shutdown_pending) {
+    messages.push("<div>止盈/止损清理尚未完成，程序正在等待撤单或平仓成交确认。</div>");
+  }
+  if (risk.manual_stop_pending) {
+    messages.push("<div>手动停止清理尚未完成，仍有订单状态需要交易所确认。</div>");
+  }
   if (reduceProtection.has_risk) {
     const missing = reduceProtection.missing_by_level || [];
     const missingText = missing
@@ -510,13 +654,39 @@ function renderRiskSnapshot(risk) {
       : "平仓保护挂单价位不完整";
     messages.push(`<div>${reason}${missingText ? `，缺口 ${missingText}` : ""}。</div>`);
   }
+  if (gridCoverage.has_risk) {
+    const missingText = (gridCoverage.missing_by_level || [])
+      .slice(0, 8)
+      .map((item) => `L${item.level}: ${fmtQty(item.missing_qty)}`)
+      .join("，");
+    const excessText = (gridCoverage.excess_by_level || [])
+      .slice(0, 8)
+      .map((item) => `L${item.level}: ${fmtQty(item.excess_qty)}`)
+      .join("，");
+    const details = [
+      missingText ? `缺失 ${missingText}` : "",
+      excessText ? `超量 ${excessText}` : "",
+    ].filter(Boolean).join("；");
+    const reason = gridCoverage.ledger_ok === false
+      ? `固定网格持仓账本异常：${gridCoverage.ledger_reason || "无法核对逐格数量"}`
+      : `固定网格逐格数量不一致：目标 ${fmtQty(gridCoverage.target_qty)}，当前覆盖 ${fmtQty(gridCoverage.coverage_qty)}，净差 ${fmtQty(gridCoverage.net_delta_qty)}`;
+    messages.push(`<div>${reason}${details ? `；${details}` : ""}。</div>`);
+  }
   if (orphanCount > 0) {
     messages.push(`<div><strong>${currentRiskSymbol}</strong> 有 ${orphanCount} 个程序历史挂单未被当前网格托管。</div>`);
   }
   if (risk.unmanaged_position && positionText) {
     messages.push(`<div>当前还有未托管持仓：${positionText}。</div>`);
   }
-  messages.push("<div>建议先撤销孤儿挂单，再决定是否手动保留或平掉持仓。</div>");
+  if (orphanCount > 0) {
+    messages.push("<div>建议先撤销孤儿挂单，再决定是否手动保留或平掉持仓。</div>");
+  } else if (gridCoverage.has_risk) {
+    messages.push("<div>建议先停止策略并核对成交清单，避免异常格继续按错误数量循环。</div>");
+  } else if (queuedReplacementCount > 0) {
+    messages.push("<div>请等待挂单重建完成；若持续失败，请停止策略并核对交易所拒单原因。</div>");
+  } else if (risk.unmanaged_position) {
+    messages.push("<div>请确认该持仓是否需要手动保留或平掉。</div>");
+  }
   body.innerHTML = messages.join("");
   cancelBtn.classList.toggle("hidden", orphanCount <= 0);
 }
@@ -642,6 +812,7 @@ async function selectGridSymbol(exchange, symbol) {
   syncExchangeInputs();
   document.getElementById("symbol-input").value = symbol;
   showToast(`已切换到 ${exchangeDisplayName(activeExchange)} · ${symbol}`, "success");
+  await loadFeeRates();
   await fetchPrice();
   await fetchBalance();
   await pollGridStatus();
@@ -802,7 +973,7 @@ function renderGridHistory(runs) {
   }
 
   tbody.innerHTML = runs.map((run) => {
-    const profit = Number(run.net_profit || 0);
+    const profit = Number(run.total_equity_profit ?? run.net_profit ?? 0);
     const initialType = run.initial_order_type === "post_only"
       ? "Post Only"
       : run.initial_order_type === "limit"
@@ -960,6 +1131,7 @@ function mapRunStatus(status) {
   if (status === "stopped") return "已停止";
   if (status === "closed") return "已关闭";
   if (status === "saved") return "已保存";
+  if (status === "failed") return "启动失败";
   return status || "--";
 }
 

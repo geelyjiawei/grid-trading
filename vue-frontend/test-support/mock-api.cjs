@@ -1,0 +1,208 @@
+const http = require("node:http");
+
+function send(response, body, status = 200) {
+  response.writeHead(status, { "Content-Type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+http
+  .createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    if (url.pathname === "/api/auth/status") {
+      return send(response, { required: false, configured: true, authenticated: true });
+    }
+    if (url.pathname === "/api/config") {
+      return send(response, {
+        configured: true,
+        active_exchange: "aster",
+        configs: {
+          aster: {
+            exchange: "aster",
+            configured: true,
+            api_key: "0x12...89",
+            testnet: false,
+            source: "file",
+          },
+          binance: {
+            exchange: "binance",
+            configured: true,
+            api_key: "BIN...123",
+            testnet: false,
+            source: "file",
+          },
+          bybit: { exchange: "bybit", configured: false },
+        },
+      });
+    }
+    if (url.pathname === "/api/grid/status") {
+      return send(response, {
+        running: true,
+        count: 2,
+        running_count: 2,
+        grids: [
+          {
+            exchange: "aster",
+            symbol: "ANSEMUSDT",
+            running: true,
+            direction: "long",
+            grid_mode: "arithmetic",
+            total_equity_profit: 12.9112,
+            total_profit: 11.204,
+            total_fee: 1.7072,
+            realized_net_profit: 10.9821,
+            unrealised_pnl: 1.9291,
+            total_volume: 28342.11,
+            grid_position_net_qty: 3000,
+            completed_pairs: 1408,
+            current_price: 0.381,
+          },
+          {
+            exchange: "binance",
+            symbol: "MUUSDT",
+            running: true,
+            direction: "short",
+            grid_mode: "arithmetic",
+            total_equity_profit: -0.4182,
+            total_profit: 1.12,
+            total_fee: 0.38,
+            realized_net_profit: 0.74,
+            unrealised_pnl: -1.1582,
+            total_volume: 8120.5,
+            grid_position_net_qty: -1.4,
+            completed_pairs: 83,
+            current_price: 1012.4,
+          },
+        ],
+      });
+    }
+    if (url.pathname.startsWith("/api/price/")) {
+      return send(response, {
+        last_price: "0.3810000",
+        mark_price: "0.3809200",
+        price_24h_pcnt: "0.0271",
+        volume_24h: "4938192.2",
+      });
+    }
+    if (url.pathname === "/api/balance") {
+      return send(response, {
+        available: "1842.5521",
+        equity: "2018.4409",
+        unrealised_pnl: "1.9291",
+      });
+    }
+    if (url.pathname.startsWith("/api/fees/")) {
+      return send(response, {
+        maker_fee_rate: 0.0002,
+        taker_fee_rate: 0.0005,
+        source: "exchange",
+      });
+    }
+    if (url.pathname.startsWith("/api/risk/")) {
+      return send(response, {
+        has_risk: false,
+        unmanaged_position: false,
+        unmanaged_delta_qty: 0,
+      });
+    }
+    if (url.pathname.startsWith("/api/positions/")) {
+      return send(response, {
+        positions: [
+          {
+            side: "Buy",
+            size: "3000",
+            entry_price: "0.3772",
+            mark_price: "0.38092",
+            unrealised_pnl: "11.16",
+            leverage: "3",
+            liq_price: "0.201",
+          },
+        ],
+      });
+    }
+    if (url.pathname.startsWith("/api/orders/open/")) {
+      return send(response, {
+        orders: [
+          {
+            order_id: "101",
+            order_link_id: "g_7_B_mock",
+            side: "Buy",
+            price: "0.3800000",
+            qty: "100",
+            status: "NEW",
+            reduce_only: true,
+          },
+          {
+            order_id: "102",
+            order_link_id: "g_8_S_mock",
+            side: "Sell",
+            price: "0.3820000",
+            qty: "100",
+            status: "NEW",
+            reduce_only: false,
+          },
+        ],
+      });
+    }
+    if (url.pathname.startsWith("/api/trades/")) {
+      return send(response, {
+        trades: [
+          {
+            order_id: "99",
+            trade_id: "9901",
+            side: "Buy",
+            price: "0.3800",
+            qty: "100",
+            volume: "38",
+            fee_usdt: "0.0076",
+            fee_asset: "USDT",
+            realized_pnl: "0.2",
+            is_maker: true,
+            time: 1783890000000,
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/api/grid/history") {
+      return send(response, {
+        runs: [
+          {
+            started_at: 1783890000,
+            exchange: "aster",
+            symbol: "ANSEMUSDT",
+            direction: "long",
+            grid_mode: "arithmetic",
+            status: "stopped",
+            total_equity_profit: "4.2",
+            total_fee: "0.8",
+            total_volume: "8200",
+            completed_pairs: 41,
+          },
+        ],
+      });
+    }
+    if (url.pathname === "/api/grid/preview") {
+      return send(response, {
+        grid_step: 1,
+        grid_profit_pct: 0.099,
+        per_grid_gross_profit: 0.247,
+        per_grid_fee: 0.0998,
+        per_grid_open_fee: 0.0499,
+        per_grid_close_fee: 0.0499,
+        per_grid_net_profit: 0.1472,
+        active_grid_count: 10,
+        grid_count: 20,
+        qty_per_grid_min: 0.2,
+        qty_per_grid_max: 0.2,
+        qty_per_grid_avg: 0.2,
+        min_notional: 5,
+        total_qty: 2,
+        maker_fee_rate: 0.0002,
+        taker_fee_rate: 0.0005,
+        fee_rate_source: "exchange",
+      });
+    }
+    return send(response, { detail: "mock endpoint not found" }, 404);
+  })
+  .listen(8000, "127.0.0.1", () => {
+    console.log("Vue visual QA mock API: http://127.0.0.1:8000");
+  });

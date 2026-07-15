@@ -1,0 +1,253 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.12"
+          - "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run test suite
+        env:
+          PYTHONHASHSEED: "776531419"
+        run: python -m unittest discover --start-directory tests --pattern "test_*.py"
+
+      - name: Compile Python sources
+        run: python -m compileall -q backend tests
+
+      - name: Check frontend syntax
+        if: matrix.python-version == '3.12'
+        run: node --check frontend/app.js
+
+      - name: Verify compatibility contract
+        if: matrix.python-version == '3.12'
+        env:
+          PYTHONPATH: backend
+        run: |
+          python contracts/export_contract.py
+          git diff --exit-code -- contracts/openapi-v1.json contracts/frontend-api-v1.json
+
+  rust:
+    name: Rust backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --workspace --all-targets
+
+  vue:
+    name: Vue frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: vue-frontend/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: vue-frontend
+        run: npm ci
+
+      - name: Audit dependencies
+        working-directory: vue-frontend
+        run: npm audit --audit-level=high
+
+      - name: Test Vue
+        working-directory: vue-frontend
+        run: npm test
+
+      - name: Type-check Vue
+        working-directory: vue-frontend
+        run: npm run typecheck
+
+      - name: Build Vue
+        working-directory: vue-frontend
+        run: npm run build
+
+  container:
+    name: Vue + Rust container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Validate isolated deployment guards
+        run: |
+          set -euo pipefail
+          sh -n \
+            scripts/deploy-rust-preview.sh \
+            scripts/verify-rust-preview.sh \
+            scripts/deploy-rust-production.sh \
+            scripts/verify-rust-production.sh \
+            scripts/rollback-to-python.sh
+          python -m py_compile \
+            scripts/provision-rust-auth.py \
+            scripts/verify-rust-login.py \
+            scripts/legacy-cutover-audit.py
+          cp .env.example .env
+          trap 'rm -f .env /tmp/grid-rust-ci-credentials.txt' EXIT
+          GRID_RUST_PREVIEW_VALIDATE_ONLY=true sh scripts/deploy-rust-preview.sh
+          if GRID_RUST_PREVIEW_EXPECTED_COMMIT=0000000000000000000000000000000000000000 \
+            sh scripts/deploy-rust-preview.sh > /tmp/stale-preview.log 2>&1; then
+            echo 'preview deployment unexpectedly accepted an unavailable commit' >&2
+            exit 1
+          fi
+          grep --fixed-strings 'expected Git commit is unavailable' /tmp/stale-preview.log
+          sed --in-place 's/^GRID_CONFIG_KEY=$/GRID_CONFIG_KEY=ci-validation-only-key/' .env
+          python scripts/provision-rust-auth.py \
+            --env-file .env \
+            --credentials-file /tmp/grid-rust-ci-credentials.txt
+          test "$(stat --format='%a' .env)" = "600"
+          test "$(stat --format='%a' /tmp/grid-rust-ci-credentials.txt)" = "600"
+          GRID_RUST_PRODUCTION_VALIDATE_ONLY=true sh scripts/deploy-rust-production.sh
+
+      - name: Build locked production image
+        run: docker build --file Dockerfile.rust-vue --tag grid-trading-vue-rust:test .
+
+      - name: Exercise authenticated Rust production image in isolation
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          sed --in-place 's/^GRID_CONFIG_KEY=$/GRID_CONFIG_KEY=ci-production-only-key/' .env
+          python scripts/provision-rust-auth.py \
+            --env-file .env \
+            --credentials-file /tmp/grid-rust-production-credentials.txt
+          mkdir -p data-rust-production/rust-control/idempotency data-rust-production/rust-control/strategies
+          sudo chown --recursive 10001:10001 data-rust-production
+          export GRID_RUST_IMAGE=grid-trading-vue-rust:test
+          export GRID_RUST_PRODUCTION_PROJECT=grid-trading-rust-production-ci
+          export GRID_RUST_PRODUCTION_CONTAINER=grid-trading-rust-production-ci
+          export GRID_RUST_PRODUCTION_PORT=18002
+          export GRID_RUST_PRODUCTION_DATA="$PWD/data-rust-production"
+          trap 'docker compose --project-name "$GRID_RUST_PRODUCTION_PROJECT" --file docker-compose.rust-production.yml down --remove-orphans; sudo rm -rf data-rust-production; rm -f .env /tmp/grid-rust-production-credentials.txt' EXIT
+          docker compose --project-name "$GRID_RUST_PRODUCTION_PROJECT" \
+            --file docker-compose.rust-production.yml up --detach --no-build
+          GRID_RUST_PRODUCTION_URL=http://127.0.0.1:18002 \
+          GRID_RUST_PRODUCTION_EXPECTED_BINDING=127.0.0.1:18002 \
+          GRID_RUST_EXPECT_LEGACY_STATE=ignore \
+            sh scripts/verify-rust-production.sh
+          python scripts/verify-rust-login.py \
+            --credentials-file /tmp/grid-rust-production-credentials.txt \
+            --base-url http://127.0.0.1:18002
+
+      - name: Exercise isolated Compose deployment end to end
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          sed --in-place 's/^AUTH_REQUIRED=true$/AUTH_REQUIRED=false/' .env
+          trap 'docker compose --project-name grid-trading-rust-preview --file docker-compose.rust-vue.yml down --volumes; rm -f .env' EXIT
+          GRID_RUST_PREVIEW_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+            sh scripts/deploy-rust-preview.sh
+
+      - name: Verify image contains only the production stack
+        run: |
+          docker run --rm grid-trading-vue-rust:test sh -eu -c '
+            test "$(id -u)" = "10001"
+            test -x /usr/local/bin/grid-trading-server
+            test -f /app/web/index.html
+            test ! -d /app/backend
+            test ! -d /app/frontend
+            ! command -v python
+            ! command -v node
+          '
+
+      - name: Smoke-test Rust API contract and Vue entrypoint
+        run: |
+          set -euo pipefail
+          container_id="$(docker run --detach --publish 127.0.0.1:18000:8000 grid-trading-vue-rust:test)"
+          trap 'docker logs "$container_id"; docker rm --force "$container_id"' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18000/healthz > /tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+          grep --fixed-strings '"ok":true' /tmp/health.json
+          grep --fixed-strings '"runtime":"rust"' /tmp/health.json
+          grep --fixed-strings '"trading_enabled":false' /tmp/health.json
+          grep --fixed-strings '"runtime_ready":true' /tmp/health.json
+          grep --fixed-strings '"active_strategies":0' /tmp/health.json
+          curl --fail --silent http://127.0.0.1:18000/api/auth/status > /tmp/auth.json
+          grep --fixed-strings '"required":false' /tmp/auth.json
+          grep --fixed-strings '"authenticated":true' /tmp/auth.json
+          curl --fail --silent http://127.0.0.1:18000/api/config > /tmp/config.json
+          grep --fixed-strings '"active_exchange":"bybit"' /tmp/config.json
+          grep --fixed-strings '"configured":false' /tmp/config.json
+          curl --fail --silent http://127.0.0.1:18000/api/grid/status > /tmp/status.json
+          grep --fixed-strings '"running":false' /tmp/status.json
+          grep --fixed-strings '"count":0' /tmp/status.json
+          grep --fixed-strings '"grids":[]' /tmp/status.json
+          curl --fail --silent 'http://127.0.0.1:18000/api/grid/history?limit=100' > /tmp/history.json
+          grep --fixed-strings '"source":"durable_strategy_state"' /tmp/history.json
+          grep --fixed-strings '"runs":[]' /tmp/history.json
+          curl --fail --silent 'http://127.0.0.1:18000/api/trades/MUUSDT?exchange=binance&limit=100' > /tmp/trades.json
+          grep --fixed-strings '"source":"durable_exchange_execution_audit"' /tmp/trades.json
+          grep --fixed-strings '"scope":"strategy"' /tmp/trades.json
+          grep --fixed-strings '"trades":[]' /tmp/trades.json
+          test "$(curl --silent --output /tmp/risk.json --write-out '%{http_code}' 'http://127.0.0.1:18000/api/risk/MUUSDT?exchange=binance')" = "503"
+          grep --fixed-strings '"code":"exchange_not_configured"' /tmp/risk.json
+          test "$(curl --silent --output /tmp/missing.json --write-out '%{http_code}' http://127.0.0.1:18000/api/not-a-real-route)" = "404"
+          grep --fixed-strings '"code":"api_route_not_found"' /tmp/missing.json
+          curl --fail --silent http://127.0.0.1:18000/ > /tmp/index.html
+          grep --fixed-strings '<div id="app"></div>' /tmp/index.html
+          GRID_RUST_PREVIEW_CONTAINER_ID="$container_id" \
+          GRID_RUST_PREVIEW_URL=http://127.0.0.1:18000 \
+          GRID_RUST_PREVIEW_EXPECTED_BINDING=127.0.0.1:18000 \
+            sh scripts/verify-rust-preview.sh

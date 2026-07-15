@@ -1,0 +1,41 @@
+[workspace]
+members = ["rust-backend"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+atomic-write-file = "0.3.0"
+axum = "0.8.9"
+base64 = "0.22.1"
+data-encoding = "2.9.0"
+getrandom = "0.3.4"
+futures = "0.3.31"
+fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+k256 = { version = "0.13.4", features = ["ecdsa"] }
+libc = "0.2.186"
+pbkdf2 = "0.12.2"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+rust_decimal = { version = "1.42.1", features = ["maths-nopanic", "serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+sha3 = "0.10.8"
+subtle = "2.6.1"
+thiserror = "2.0.18"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["fs", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+zeroize = "1.8.2"

@@ -1,3 +1,4 @@
+import socket
 import subprocess
 import sys
 import time
@@ -12,8 +13,21 @@ BACKEND_DIR = ROOT_DIR / "backend"
 
 class ServerSmokeTests(unittest.TestCase):
     def test_server_starts_and_serves_root_and_status(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+
         proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8012"],
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "main:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
             cwd=BACKEND_DIR,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -22,9 +36,15 @@ class ServerSmokeTests(unittest.TestCase):
             deadline = time.time() + 15
             while time.time() < deadline:
                 try:
-                    with urllib.request.urlopen("http://127.0.0.1:8012/", timeout=2) as response:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/",
+                        timeout=2,
+                    ) as response:
                         self.assertEqual(response.status, 200)
-                    with urllib.request.urlopen("http://127.0.0.1:8012/api/grid/status", timeout=2) as response:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/grid/status",
+                        timeout=2,
+                    ) as response:
                         self.assertEqual(response.status, 200)
                     break
                 except Exception:

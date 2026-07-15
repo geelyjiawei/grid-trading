@@ -1,0 +1,2148 @@
+{
+  "version": 1,
+  "results": [
+    {
+      "name": "short_fixed_limit_1014",
+      "plan": {
+        "reference_price": "1014",
+        "levels": [
+          "1000",
+          "1001",
+          "1002",
+          "1003",
+          "1004",
+          "1005",
+          "1006",
+          "1007",
+          "1008",
+          "1009",
+          "1010",
+          "1011",
+          "1012",
+          "1013",
+          "1014",
+          "1015",
+          "1016",
+          "1017",
+          "1018",
+          "1019",
+          "1020"
+        ],
+        "active_grid_count": 14,
+        "participating_level_count": 20,
+        "total_quantity": "2.8",
+        "opening_order": {
+          "side": "sell",
+          "price": "1014",
+          "quantity": "2.8",
+          "kind": "limit",
+          "time_in_force": "gtc"
+        },
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "1000",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "1001",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "1002",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "1003",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "1004",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "1005",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "1006",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "1007",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 8,
+            "side": "buy",
+            "price": "1008",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 9,
+            "side": "buy",
+            "price": "1009",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 10,
+            "side": "buy",
+            "price": "1010",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 11,
+            "side": "buy",
+            "price": "1011",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 12,
+            "side": "buy",
+            "price": "1012",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 13,
+            "side": "buy",
+            "price": "1013",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "1015",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "1016",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "1017",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "1018",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "1019",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "1020",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "long_fixed_limit_1006",
+      "plan": {
+        "reference_price": "1006",
+        "levels": [
+          "1000",
+          "1001",
+          "1002",
+          "1003",
+          "1004",
+          "1005",
+          "1006",
+          "1007",
+          "1008",
+          "1009",
+          "1010",
+          "1011",
+          "1012",
+          "1013",
+          "1014",
+          "1015",
+          "1016",
+          "1017",
+          "1018",
+          "1019",
+          "1020"
+        ],
+        "active_grid_count": 14,
+        "participating_level_count": 20,
+        "total_quantity": "2.8",
+        "opening_order": {
+          "side": "buy",
+          "price": "1006",
+          "quantity": "2.8",
+          "kind": "limit",
+          "time_in_force": "gtc"
+        },
+        "grid_orders": [
+          {
+            "level_index": 6,
+            "side": "sell",
+            "price": "1007",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "sell",
+            "price": "1008",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 8,
+            "side": "sell",
+            "price": "1009",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 9,
+            "side": "sell",
+            "price": "1010",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 10,
+            "side": "sell",
+            "price": "1011",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 11,
+            "side": "sell",
+            "price": "1012",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 12,
+            "side": "sell",
+            "price": "1013",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 13,
+            "side": "sell",
+            "price": "1014",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "1015",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "1016",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "1017",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "1018",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "1019",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "1020",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "1000",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "1001",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "1002",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "1003",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "1004",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "1005",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "short_post_only_crossing",
+      "plan": {
+        "reference_price": "1014.1",
+        "levels": [
+          "1000",
+          "1001",
+          "1002",
+          "1003",
+          "1004",
+          "1005",
+          "1006",
+          "1007",
+          "1008",
+          "1009",
+          "1010",
+          "1011",
+          "1012",
+          "1013",
+          "1014",
+          "1015",
+          "1016",
+          "1017",
+          "1018",
+          "1019",
+          "1020"
+        ],
+        "active_grid_count": 15,
+        "participating_level_count": 20,
+        "total_quantity": "3",
+        "opening_order": {
+          "side": "sell",
+          "price": "1014.1",
+          "quantity": "3",
+          "kind": "limit",
+          "time_in_force": "post_only"
+        },
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "1000",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "1001",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "1002",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "1003",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "1004",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "1005",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "1006",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "1007",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 8,
+            "side": "buy",
+            "price": "1008",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 9,
+            "side": "buy",
+            "price": "1009",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 10,
+            "side": "buy",
+            "price": "1010",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 11,
+            "side": "buy",
+            "price": "1011",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 12,
+            "side": "buy",
+            "price": "1012",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 13,
+            "side": "buy",
+            "price": "1013",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 14,
+            "side": "buy",
+            "price": "1014",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "1015",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "1016",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "1017",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "1018",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "1019",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "1020",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "long_post_only_crossing",
+      "plan": {
+        "reference_price": "1013.9",
+        "levels": [
+          "1000",
+          "1001",
+          "1002",
+          "1003",
+          "1004",
+          "1005",
+          "1006",
+          "1007",
+          "1008",
+          "1009",
+          "1010",
+          "1011",
+          "1012",
+          "1013",
+          "1014",
+          "1015",
+          "1016",
+          "1017",
+          "1018",
+          "1019",
+          "1020"
+        ],
+        "active_grid_count": 7,
+        "participating_level_count": 20,
+        "total_quantity": "1.4",
+        "opening_order": {
+          "side": "buy",
+          "price": "1013.9",
+          "quantity": "1.4",
+          "kind": "limit",
+          "time_in_force": "post_only"
+        },
+        "grid_orders": [
+          {
+            "level_index": 13,
+            "side": "sell",
+            "price": "1014",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "1015",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "1016",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "1017",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "1018",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "1019",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "1020",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "1000",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "1001",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "1002",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "1003",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "1004",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "1005",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "1006",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "1007",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 8,
+            "side": "buy",
+            "price": "1008",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 9,
+            "side": "buy",
+            "price": "1009",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 10,
+            "side": "buy",
+            "price": "1010",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 11,
+            "side": "buy",
+            "price": "1011",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 12,
+            "side": "buy",
+            "price": "1012",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 13,
+            "side": "buy",
+            "price": "1013",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "neutral_fixed_mid_interval",
+      "plan": {
+        "reference_price": "1014.5",
+        "levels": [
+          "1000",
+          "1001",
+          "1002",
+          "1003",
+          "1004",
+          "1005",
+          "1006",
+          "1007",
+          "1008",
+          "1009",
+          "1010",
+          "1011",
+          "1012",
+          "1013",
+          "1014",
+          "1015",
+          "1016",
+          "1017",
+          "1018",
+          "1019",
+          "1020"
+        ],
+        "active_grid_count": 21,
+        "participating_level_count": 20,
+        "total_quantity": "4.2",
+        "opening_order": null,
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "1000",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "1001",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "1002",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "1003",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "1004",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "1005",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "1006",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "1007",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 8,
+            "side": "buy",
+            "price": "1008",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 9,
+            "side": "buy",
+            "price": "1009",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 10,
+            "side": "buy",
+            "price": "1010",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 11,
+            "side": "buy",
+            "price": "1011",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 12,
+            "side": "buy",
+            "price": "1012",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 13,
+            "side": "buy",
+            "price": "1013",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 14,
+            "side": "buy",
+            "price": "1014",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "1015",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "1016",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "1017",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "1018",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "1019",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "1020",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "short_investment_post_only",
+      "plan": {
+        "reference_price": "1011",
+        "levels": [
+          "1000",
+          "1001",
+          "1002",
+          "1003",
+          "1004",
+          "1005",
+          "1006",
+          "1007",
+          "1008",
+          "1009",
+          "1010",
+          "1011",
+          "1012",
+          "1013",
+          "1014",
+          "1015",
+          "1016",
+          "1017",
+          "1018",
+          "1019",
+          "1020"
+        ],
+        "active_grid_count": 11,
+        "participating_level_count": 20,
+        "total_quantity": "2.47",
+        "opening_order": {
+          "side": "sell",
+          "price": "1011",
+          "quantity": "2.47",
+          "kind": "limit",
+          "time_in_force": "post_only"
+        },
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "1000",
+            "quantity": "0.23",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "1001",
+            "quantity": "0.23",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "1002",
+            "quantity": "0.23",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "1003",
+            "quantity": "0.23",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "1004",
+            "quantity": "0.23",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "1005",
+            "quantity": "0.22",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "1006",
+            "quantity": "0.22",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "1007",
+            "quantity": "0.22",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 8,
+            "side": "buy",
+            "price": "1008",
+            "quantity": "0.22",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 9,
+            "side": "buy",
+            "price": "1009",
+            "quantity": "0.22",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 10,
+            "side": "buy",
+            "price": "1010",
+            "quantity": "0.22",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 11,
+            "side": "sell",
+            "price": "1012",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 12,
+            "side": "sell",
+            "price": "1013",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 13,
+            "side": "sell",
+            "price": "1014",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "1015",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "1016",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "1017",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "1018",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "1019",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "1020",
+            "quantity": "0.22",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "short_fixed_market",
+      "plan": {
+        "reference_price": "1011",
+        "levels": [
+          "1000",
+          "1001",
+          "1002",
+          "1003",
+          "1004",
+          "1005",
+          "1006",
+          "1007",
+          "1008",
+          "1009",
+          "1010",
+          "1011",
+          "1012",
+          "1013",
+          "1014",
+          "1015",
+          "1016",
+          "1017",
+          "1018",
+          "1019",
+          "1020"
+        ],
+        "active_grid_count": 11,
+        "participating_level_count": 20,
+        "total_quantity": "2.2",
+        "opening_order": {
+          "side": "sell",
+          "price": null,
+          "quantity": "2.2",
+          "kind": "market",
+          "time_in_force": "gtc"
+        },
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "1000",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "1001",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "1002",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "1003",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "1004",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "1005",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "1006",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "1007",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 8,
+            "side": "buy",
+            "price": "1008",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 9,
+            "side": "buy",
+            "price": "1009",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 10,
+            "side": "buy",
+            "price": "1010",
+            "quantity": "0.2",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 11,
+            "side": "sell",
+            "price": "1012",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 12,
+            "side": "sell",
+            "price": "1013",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 13,
+            "side": "sell",
+            "price": "1014",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "1015",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "1016",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "1017",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "1018",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "1019",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "1020",
+            "quantity": "0.2",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "aster_small_price_fixed_short",
+      "plan": {
+        "reference_price": "0.4",
+        "levels": [
+          "0.38",
+          "0.382",
+          "0.384",
+          "0.386",
+          "0.388",
+          "0.39",
+          "0.392",
+          "0.394",
+          "0.396",
+          "0.398",
+          "0.4",
+          "0.402",
+          "0.404",
+          "0.406",
+          "0.408",
+          "0.41",
+          "0.412",
+          "0.414",
+          "0.416",
+          "0.418",
+          "0.42"
+        ],
+        "active_grid_count": 10,
+        "participating_level_count": 20,
+        "total_quantity": "1000",
+        "opening_order": {
+          "side": "sell",
+          "price": "0.4",
+          "quantity": "1000",
+          "kind": "limit",
+          "time_in_force": "gtc"
+        },
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "0.38",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "0.382",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "0.384",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "0.386",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "0.388",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "0.39",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "0.392",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "0.394",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 8,
+            "side": "buy",
+            "price": "0.396",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 9,
+            "side": "buy",
+            "price": "0.398",
+            "quantity": "100",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 10,
+            "side": "sell",
+            "price": "0.402",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 11,
+            "side": "sell",
+            "price": "0.404",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 12,
+            "side": "sell",
+            "price": "0.406",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 13,
+            "side": "sell",
+            "price": "0.408",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "0.41",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "0.412",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "0.414",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "0.416",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "0.418",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "0.42",
+            "quantity": "100",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "mu_fixed_3_14_regression",
+      "plan": {
+        "reference_price": "15.95",
+        "levels": [
+          "15.8",
+          "15.82",
+          "15.84",
+          "15.86",
+          "15.88",
+          "15.9",
+          "15.92",
+          "15.94",
+          "15.96",
+          "15.98",
+          "16",
+          "16.02",
+          "16.04",
+          "16.06",
+          "16.08",
+          "16.1",
+          "16.12",
+          "16.14",
+          "16.16",
+          "16.18",
+          "16.2"
+        ],
+        "active_grid_count": 8,
+        "participating_level_count": 20,
+        "total_quantity": "25.12",
+        "opening_order": {
+          "side": "sell",
+          "price": "15.95",
+          "quantity": "25.12",
+          "kind": "limit",
+          "time_in_force": "gtc"
+        },
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "15.8",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "15.82",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "15.84",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "15.86",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "15.88",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "15.9",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 6,
+            "side": "buy",
+            "price": "15.92",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "buy",
+            "price": "15.94",
+            "quantity": "3.14",
+            "reduce_only": true,
+            "time_in_force": "gtc",
+            "role": "profit"
+          },
+          {
+            "level_index": 7,
+            "side": "sell",
+            "price": "15.96",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 8,
+            "side": "sell",
+            "price": "15.98",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 9,
+            "side": "sell",
+            "price": "16",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 10,
+            "side": "sell",
+            "price": "16.02",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 11,
+            "side": "sell",
+            "price": "16.04",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 12,
+            "side": "sell",
+            "price": "16.06",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 13,
+            "side": "sell",
+            "price": "16.08",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 14,
+            "side": "sell",
+            "price": "16.1",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 15,
+            "side": "sell",
+            "price": "16.12",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 16,
+            "side": "sell",
+            "price": "16.14",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 17,
+            "side": "sell",
+            "price": "16.16",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 18,
+            "side": "sell",
+            "price": "16.18",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 19,
+            "side": "sell",
+            "price": "16.2",
+            "quantity": "3.14",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    },
+    {
+      "name": "geometric_neutral_quantized",
+      "plan": {
+        "reference_price": "0.145",
+        "levels": [
+          "0.1",
+          "0.1071",
+          "0.1148",
+          "0.1231",
+          "0.1319",
+          "0.1414",
+          "0.1515",
+          "0.1624",
+          "0.1741",
+          "0.1866",
+          "0.2"
+        ],
+        "active_grid_count": 11,
+        "participating_level_count": 10,
+        "total_quantity": "13.53",
+        "opening_order": null,
+        "grid_orders": [
+          {
+            "level_index": 0,
+            "side": "buy",
+            "price": "0.1",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 1,
+            "side": "buy",
+            "price": "0.1071",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 2,
+            "side": "buy",
+            "price": "0.1148",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 3,
+            "side": "buy",
+            "price": "0.1231",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 4,
+            "side": "buy",
+            "price": "0.1319",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 5,
+            "side": "buy",
+            "price": "0.1414",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 5,
+            "side": "sell",
+            "price": "0.1515",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 6,
+            "side": "sell",
+            "price": "0.1624",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 7,
+            "side": "sell",
+            "price": "0.1741",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 8,
+            "side": "sell",
+            "price": "0.1866",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          },
+          {
+            "level_index": 9,
+            "side": "sell",
+            "price": "0.2",
+            "quantity": "1.23",
+            "reduce_only": false,
+            "time_in_force": "gtc",
+            "role": "add"
+          }
+        ]
+      }
+    }
+  ]
+}

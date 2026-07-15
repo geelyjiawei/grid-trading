@@ -231,6 +231,11 @@ h2 {
   transform: translateY(-1px);
 }
 
+.form-input[readonly] {
+  color: var(--muted);
+  cursor: default;
+}
+
 .symbol-input {
   font-size: 20px;
   font-weight: 700;

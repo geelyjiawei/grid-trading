@@ -2,6 +2,10 @@
 __pycache__/
 backend/__pycache__/
 tests/__pycache__/
+.pytest_cache/
+target/
+vue-frontend/node_modules/
+vue-frontend/dist/
 data/
 backend/api_config.json
 .env

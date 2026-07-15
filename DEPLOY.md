@@ -68,11 +68,13 @@ SESSION_SECRET=上面生成的会话密钥
 AUTH_COOKIE_SECURE=false
 ```
 
+`SESSION_SECRET` 仅供当前 Python 生产服务使用。Vue + Rust 候选服务采用服务端不透明随机会话，只保存令牌摘要，不读取该值；在正式切换完成前仍需保留它，避免影响旧服务。
+
 然后在 Google Authenticator 里选择“输入设置密钥”，账户名可填 `grid-trading`，密钥填 `TOTP_SECRET`。
 
 如果以后配置了 HTTPS，把 `AUTH_COOKIE_SECURE=true`。
 
-如果你确实要在网页里保存 API，需要生成 `GRID_CONFIG_KEY`：
+网页保存 API 配置前必须生成 `GRID_CONFIG_KEY`。Python 与 Vue + Rust 共用 Fernet 兼容的加密文件，密钥只放在服务器 `.env`，不得提交到 GitHub：
 
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -87,6 +89,32 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 公网服务器不建议直接用 HTTP 在网页里输入 API Key。生产环境请使用 Caddy / Nginx 配置 HTTPS，并把 `AUTH_COOKIE_SECURE=true`。
+
+## 2.2 Vue + Rust 候选服务
+
+候选服务与当前生产服务隔离，默认监听服务器本机 `127.0.0.1:8001`，并使用独立的 Docker 持久化卷 `rust-preview-data`：
+
+```bash
+sh scripts/deploy-rust-preview.sh
+```
+
+脚本会构建候选容器，比较启动前后除候选 Compose 项目外全部容器的 ID、状态、启动时间和重启次数，并调用 `scripts/verify-rust-preview.sh` 检查本机端口、非 root 用户、运行时文件、认证边界和关闭的交易写入开关。任何生产或旁路容器变化都会让部署失败，而候选项目自身的首次创建或更新不会被误判为生产变化。单独复核可执行：
+
+```bash
+sh scripts/verify-rust-preview.sh
+```
+
+第一阶段必须保持：
+
+```bash
+GRID_RUST_TRADING_ENABLED=false
+```
+
+此时可以核对 Vue 页面、交易所配置状态和只读 API，但所有启动/停止写请求都会拒绝执行。候选服务会先读取 Binance、AsterDEX 和 Bybit 的环境变量，再用 `GRID_CONFIG_FILE` 中的同交易所加密配置覆盖；真实 `.env` 和加密配置文件均不得提交到 GitHub。
+
+三个交易所的凭据独立保存，不需要全部配置后才能切换。网页保存会先向所选交易所读取账户余额验证凭据，再原子加密写盘；Aster 只填写生产钱包私钥，钱包地址由 Rust 推导。若该交易所有任何未结束策略，后端会拒绝更换凭据。提交真实密钥必须使用 HTTPS 或服务器本机回环地址。
+
+启用 Rust 实盘写入前必须同时满足：网页登录保护配置完整、交易所凭据有效、持久状态恢复无异常、隔离影子核验通过，并已准备生产回滚方案。不要让 Python 与 Rust 两个引擎同时管理同一交易所和交易对。
 
 ## 3. Docker Compose 启动
 
