@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import type { BalanceSnapshot, Exchange, FeeRates, PriceSnapshot } from "../api/types";
-import { exchangeName, finiteNumber, formatNumber, formatPercent } from "../format";
+import {
+  exchangeName,
+  finiteNumber,
+  formatExactDecimal,
+  formatNumber,
+  formatPercent,
+} from "../format";
 
 const props = defineProps<{
   exchange: Exchange;
@@ -27,7 +33,7 @@ function balanceUnit(): string {
     <header class="section-header">
       <div>
         <p class="eyebrow">{{ exchangeName(exchange) }} · {{ symbol }}</p>
-        <h2>{{ formatNumber(price?.last_price, 8) }}</h2>
+        <h2>{{ formatExactDecimal(price?.last_price) }}</h2>
       </div>
       <span
         class="market-change"
@@ -38,7 +44,7 @@ function balanceUnit(): string {
     </header>
 
     <div class="metric-grid compact-grid">
-      <div><span>标记价格</span><strong>{{ formatNumber(price?.mark_price, 8) }}</strong></div>
+      <div><span>标记价格</span><strong>{{ formatExactDecimal(price?.mark_price) }}</strong></div>
       <div><span>24H 成交量</span><strong>{{ formatNumber(price?.volume_24h, 2) }}</strong></div>
       <div><span>可用余额{{ balanceUnit() }}</span><strong>{{ configured ? formatNumber(balance?.available ?? balance?.available_balance, 4) : "未配置" }}</strong></div>
       <div><span>账户权益{{ balanceUnit() }}</span><strong>{{ configured ? formatNumber(balance?.equity ?? balance?.wallet_balance, 4) : "未配置" }}</strong></div>

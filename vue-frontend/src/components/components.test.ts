@@ -328,7 +328,10 @@ describe("Vue migration components", () => {
         exchange: "aster",
         symbol: "ANSEMUSDT",
         configured: true,
-        price: null,
+        price: {
+          last_price: "0.40010",
+          mark_price: "0.399999999999",
+        },
         balance: { available: "123.4567", equity: "140", unit: "USDT" },
         fees: null,
         loading: false,
@@ -336,11 +339,13 @@ describe("Vue migration components", () => {
     });
 
     expect(wrapper.text()).toContain("123.4567");
+    expect(wrapper.text()).toContain("0.40010");
+    expect(wrapper.text()).toContain("0.399999999999");
     expect(wrapper.text()).toContain("可用余额 (USDT)");
     expect(wrapper.text()).toContain("账户权益 (USDT)");
   });
 
-  it("shows authoritative order decimals without rounding them", async () => {
+  it("shows authoritative position and order decimals without rounding them", async () => {
     const wrapper = mount(StrategyDetailsPanel, {
       props: {
         exchange: "aster",
@@ -348,7 +353,14 @@ describe("Vue migration components", () => {
         configured: true,
         loading: false,
         error: "",
-        positions: [],
+        positions: [{
+          side: "Sell",
+          size: "1326.000",
+          entry_price: "0.40010",
+          mark_price: "0.399999999999",
+          unrealised_pnl: "26.7866000001",
+          liq_price: "9.815391690",
+        }],
         orders: [
           {
             order_id: "123",
@@ -364,6 +376,11 @@ describe("Vue migration components", () => {
         history: [],
       },
     });
+    expect(wrapper.text()).toContain("1,326.000");
+    expect(wrapper.text()).toContain("0.40010");
+    expect(wrapper.text()).toContain("0.399999999999");
+    expect(wrapper.text()).toContain("26.7866000001");
+    expect(wrapper.text()).toContain("9.815391690");
     const orderTab = wrapper
       .findAll(".detail-tabs button")
       .find((button) => button.text().startsWith("挂单"));

@@ -97,11 +97,11 @@ function feeDisplayAsset(trade: GridTrade): string {
           <span>{{ position.leverage ? `${position.leverage}x` : "--" }}</span>
         </header>
         <div class="detail-metrics">
-          <div><span>数量</span><strong>{{ formatNumber(position.size, 8) }}</strong></div>
-          <div><span>开仓均价</span><strong>{{ formatNumber(position.entry_price, 8) }}</strong></div>
-          <div><span>标记价</span><strong>{{ formatNumber(position.mark_price, 8) }}</strong></div>
-          <div><span>未实现盈亏</span><strong>{{ formatNumber(position.unrealised_pnl, 6) }}</strong></div>
-          <div><span>强平价</span><strong>{{ formatNumber(position.liq_price, 8) }}</strong></div>
+          <div><span>数量</span><strong>{{ formatExactDecimal(position.size) }}</strong></div>
+          <div><span>开仓均价</span><strong>{{ formatExactDecimal(position.entry_price) }}</strong></div>
+          <div><span>标记价</span><strong>{{ formatExactDecimal(position.mark_price) }}</strong></div>
+          <div><span>未实现盈亏</span><strong>{{ formatExactDecimal(position.unrealised_pnl) }}</strong></div>
+          <div><span>强平价</span><strong>{{ formatExactDecimal(position.liq_price) }}</strong></div>
         </div>
       </article>
     </div>
