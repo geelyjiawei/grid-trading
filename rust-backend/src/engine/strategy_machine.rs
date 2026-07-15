@@ -543,6 +543,25 @@ impl StrategyState {
         }
         self.baseline.validate()?;
         self.baseline.validate_for_direction(self.direction)?;
+        match self.failure.as_deref() {
+            Some(message) if message.trim().is_empty() => {
+                return Err(StrategyStateError::InvalidFailureState);
+            }
+            Some(_)
+                if !matches!(
+                    self.lifecycle,
+                    StrategyLifecycle::Failed
+                        | StrategyLifecycle::Stopped
+                        | StrategyLifecycle::Closed
+                ) =>
+            {
+                return Err(StrategyStateError::InvalidFailureState);
+            }
+            None if self.lifecycle == StrategyLifecycle::Failed => {
+                return Err(StrategyStateError::InvalidFailureState);
+            }
+            _ => {}
+        }
         self.plan
             .validate_snapshot(&self.config, &self.instrument_rules)
             .map_err(StrategyStateError::InvalidPlan)?;
@@ -2398,7 +2417,7 @@ where
             .as_deref()
             .is_none_or(|message| message.trim().is_empty())
         {
-            return Err(StrategyStateError::InvalidLifecycleTransition.into());
+            return Err(StrategyStateError::InvalidFailureState.into());
         }
         next.lifecycle = StrategyLifecycle::Stopped;
         finalize_and_store(
@@ -4164,6 +4183,8 @@ pub enum StrategyStateError {
     ObligationSequenceMismatch,
     #[error("strategy lifecycle transition is not allowed")]
     InvalidLifecycleTransition,
+    #[error("strategy failure reason does not match its lifecycle")]
+    InvalidFailureState,
     #[error("strategy still has accepted or uncertain exchange orders")]
     OrdersNotTerminal,
     #[error("strategy cannot be closed while grid position, lots, or orders remain")]
@@ -8838,6 +8859,45 @@ mod tests {
             }
         );
         assert_eq!(machine.store().snapshot().failure, failure);
+    }
+
+    #[test]
+    fn persisted_failure_reason_must_match_the_failure_lifecycle() {
+        let mut missing = state(Direction::Short, PositionBaseline::flat());
+        missing.lifecycle = StrategyLifecycle::Failed;
+        assert_eq!(
+            missing.validate(),
+            Err(StrategyStateError::InvalidFailureState)
+        );
+
+        let mut blank = state(Direction::Short, PositionBaseline::flat());
+        blank.fail("   ");
+        assert_eq!(
+            blank.validate(),
+            Err(StrategyStateError::InvalidFailureState)
+        );
+
+        let mut misplaced = state(Direction::Short, PositionBaseline::flat());
+        misplaced.failure = Some("stale failure".into());
+        assert_eq!(
+            misplaced.validate(),
+            Err(StrategyStateError::InvalidFailureState)
+        );
+
+        let mut failed = state(Direction::Short, PositionBaseline::flat());
+        failed.fail("replacement planning failed");
+        failed.validate().unwrap();
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(failed));
+        machine.mark_failed_stopped(101).unwrap();
+        machine.mark_closed(102).unwrap();
+
+        let archived = machine.store().snapshot();
+        assert_eq!(archived.lifecycle, StrategyLifecycle::Closed);
+        assert_eq!(
+            archived.failure.as_deref(),
+            Some("replacement planning failed")
+        );
+        archived.validate().unwrap();
     }
 
     #[test]
