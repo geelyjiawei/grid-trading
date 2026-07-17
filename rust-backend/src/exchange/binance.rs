@@ -512,7 +512,7 @@ where
         let body = self
             .execute_snapshot(request, "Binance position snapshot")
             .await?;
-        parse_position_snapshot(&body, Exchange::Binance, &symbol).map_err(|error| {
+        parse_position_snapshot(&body, Exchange::Binance, &symbol, None).map_err(|error| {
             SnapshotError::new(format!("invalid Binance position snapshot: {error}"))
         })
     }

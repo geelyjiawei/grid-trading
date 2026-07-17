@@ -529,6 +529,8 @@ where
     ) -> Result<PositionSnapshot, SnapshotError> {
         validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
         let symbol = symbol.to_ascii_uppercase();
+        let market =
+            <Self as MarketSnapshotGateway>::market_snapshot(self, exchange, &symbol).await?;
         let request = self
             .signed_request(
                 HttpMethod::Get,
@@ -539,9 +541,9 @@ where
         let body = self
             .execute_snapshot(request, "Aster position snapshot")
             .await?;
-        parse_position_snapshot(&body, Exchange::Aster, &symbol).map_err(|error| {
-            SnapshotError::new(format!("invalid Aster position snapshot: {error}"))
-        })
+        parse_position_snapshot(&body, Exchange::Aster, &symbol, Some(market.mark_price)).map_err(
+            |error| SnapshotError::new(format!("invalid Aster position snapshot: {error}")),
+        )
     }
 }
 
@@ -1372,14 +1374,26 @@ mod tests {
 
     #[tokio::test]
     async fn signed_hedge_position_snapshot_is_rejected_as_one_way_baseline() {
-        let transport = MockTransport::with_response(Ok(HttpResponse {
-            status: 200,
-            body: r#"[
-                {"symbol":"ANSEMUSDT","positionSide":"LONG","positionAmt":"200","entryPrice":"0.38","markPrice":"0.381","unRealizedProfit":"0.2"},
-                {"symbol":"ANSEMUSDT","positionSide":"SHORT","positionAmt":"-100","entryPrice":"0.39","markPrice":"0.381","unRealizedProfit":"0.9"}
-            ]"#
-            .into(),
-        }));
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"ANSEMUSDT","lastPrice":"0.381"}"#.into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"ANSEMUSDT","markPrice":"0.3809","time":1700000000000}"#
+                    .into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"[
+                    {"symbol":"ANSEMUSDT","positionSide":"LONG","positionAmt":"200","entryPrice":"0.38","markPrice":"0.381","unRealizedProfit":"0.2"},
+                    {"symbol":"ANSEMUSDT","positionSide":"SHORT","positionAmt":"-100","entryPrice":"0.39","markPrice":"0.381","unRealizedProfit":"0.9"}
+                ]"#
+                .into(),
+            }),
+        ]);
         let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
         let snapshot = adapter(transport.clone(), signer)
             .position_snapshot(Exchange::Aster, "ANSEMUSDT")
@@ -1387,9 +1401,42 @@ mod tests {
             .unwrap();
 
         assert!(snapshot.one_way_position().is_err());
-        let request = transport.request();
+        let request = transport.all_requests()[2].clone();
         assert_eq!(request.path, "/fapi/v3/positionRisk");
         assert!(request.query_string().contains("signature="));
+    }
+
+    #[tokio::test]
+    async fn flat_position_uses_the_same_symbol_market_mark_price() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"BTCUSDT","lastPrice":"118000"}"#.into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"symbol":"BTCUSDT","markPrice":"117999.5","time":1700000000000}"#.into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"[{
+                    "symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0.000",
+                    "entryPrice":"0.0","markPrice":"0.00000000",
+                    "unRealizedProfit":"0.00000000","leverage":"20"
+                }]"#
+                .into(),
+            }),
+        ]);
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let snapshot = adapter(transport.clone(), signer)
+            .position_snapshot(Exchange::Aster, "BTCUSDT")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
+        assert_eq!(snapshot.legs[0].mark_price, Decimal::new(1179995, 1));
+        assert_eq!(transport.all_requests()[2].path, "/fapi/v3/positionRisk");
     }
 
     #[tokio::test]

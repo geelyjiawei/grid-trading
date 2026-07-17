@@ -142,7 +142,11 @@ pub(super) fn parse_position_snapshot(
     body: &str,
     exchange: Exchange,
     expected_symbol: &str,
+    fallback_flat_mark_price: Option<Decimal>,
 ) -> Result<PositionSnapshot, CodecError> {
+    if fallback_flat_mark_price.is_some_and(|price| price <= Decimal::ZERO) {
+        return Err(CodecError::InvalidField("fallbackMarkPrice"));
+    }
     let root = parse_json(body)?;
     let rows = root
         .as_array()
@@ -184,10 +188,20 @@ pub(super) fn parse_position_snapshot(
         } else {
             return Err(CodecError::InvalidField("entryPrice"));
         };
-        let mark_price = required_decimal(row, "markPrice")?;
-        if mark_price <= Decimal::ZERO {
-            return Err(CodecError::InvalidField("markPrice"));
-        }
+        let raw_mark_price = row
+            .get("markPrice")
+            .map(|_| required_decimal(row, "markPrice"))
+            .transpose()?;
+        let mark_price = match raw_mark_price {
+            Some(price) if price > Decimal::ZERO => price,
+            Some(price) if price.is_zero() && signed_quantity.is_zero() => {
+                fallback_flat_mark_price.ok_or(CodecError::InvalidField("markPrice"))?
+            }
+            None if signed_quantity.is_zero() => {
+                fallback_flat_mark_price.ok_or(CodecError::InvalidField("markPrice"))?
+            }
+            _ => return Err(CodecError::InvalidField("markPrice")),
+        };
         let unrealized_profit = decimal_from_first(
             row,
             &["unRealizedProfit", "unrealizedProfit", "unrealisedPnl"],
@@ -1105,6 +1119,7 @@ mod tests {
             }]"#,
             Exchange::Binance,
             "MUUSDT",
+            None,
         )
         .unwrap();
 
@@ -1123,6 +1138,7 @@ mod tests {
             ]"#,
             Exchange::Aster,
             "MUUSDT",
+            None,
         )
         .unwrap();
 
@@ -1139,8 +1155,42 @@ mod tests {
             }]"#,
             Exchange::Binance,
             "MUUSDT",
+            None,
         )
         .unwrap();
         assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
+    }
+
+    #[test]
+    fn flat_position_can_use_an_authoritative_market_mark_price() {
+        let snapshot = parse_position_snapshot(
+            r#"[{
+                "symbol":"ANSEMUSDT","positionSide":"BOTH","positionAmt":"0",
+                "entryPrice":"0","markPrice":"0","unRealizedProfit":"0"
+            }]"#,
+            Exchange::Aster,
+            "ANSEMUSDT",
+            Some(Decimal::new(3809, 4)),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.legs[0].mark_price, Decimal::new(3809, 4));
+        assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
+    }
+
+    #[test]
+    fn occupied_position_never_uses_the_flat_mark_price_fallback() {
+        assert!(
+            parse_position_snapshot(
+                r#"[{
+                    "symbol":"ANSEMUSDT","positionSide":"BOTH","positionAmt":"100",
+                    "entryPrice":"0.38","markPrice":"0","unRealizedProfit":"0"
+                }]"#,
+                Exchange::Aster,
+                "ANSEMUSDT",
+                Some(Decimal::new(3809, 4)),
+            )
+            .is_err()
+        );
     }
 }
