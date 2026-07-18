@@ -524,8 +524,10 @@ fn compare_order(
         });
     }
     let exact_active = exact && matches!(actual.lifecycle, OrderLifecycle::Active(_));
+    // A partial lifecycle is safe once its cumulative execution is durably accounted.
     let partial_execution_pending = exact_active
-        && actual.lifecycle == OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        && actual.lifecycle == OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+        && actual.executed_quantity != Some(expected.cumulative_quantity);
     if partial_execution_pending {
         exact = false;
         issues.push(ShadowAuditIssue::PartialExecutionRequiresAccounting {
@@ -989,6 +991,7 @@ mod tests {
         let state = running_neutral_state(Decimal::new(100, 0));
         let mut orders = observations(&state);
         orders[0].lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        orders[0].executed_quantity = Some(Decimal::new(30, 0));
 
         let report = audit_strategy_shadow(&state, &position(&state, Decimal::ZERO), &orders);
 
@@ -997,6 +1000,76 @@ mod tests {
         assert_eq!(report.orders.mismatched_order_count, 0);
         assert!(report.level_coverage.missing_levels.is_empty());
         assert!(report.issues.iter().any(|issue| matches!(
+            issue,
+            ShadowAuditIssue::PartialExecutionRequiresAccounting { .. }
+        )));
+    }
+
+    #[test]
+    fn accounted_partial_execution_is_not_reported_as_pending() {
+        let mut state = running_neutral_state(Decimal::new(100, 0));
+        let client_order_id = state.orders.keys().next().unwrap().clone();
+        let expected = {
+            let expected = state.orders.get_mut(&client_order_id).unwrap();
+            expected.cumulative_quantity = Decimal::new(70, 0);
+            expected.clone()
+        };
+        let exchange_order_id = expected.exchange_order_id.clone().unwrap();
+        let actual = AuthoritativeOrder {
+            client_order_id,
+            exchange_order_id: exchange_order_id.clone(),
+            exchange: state.exchange,
+            shape: expected.shape.clone(),
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+            executed_quantity: Some(Decimal::new(70, 0)),
+        };
+        let mut issues = Vec::new();
+
+        let comparison = compare_order(
+            &state,
+            &expected,
+            Some(&exchange_order_id),
+            LifecycleExpectation::Active,
+            &actual,
+            &mut issues,
+        );
+
+        assert!(comparison.exact);
+        assert!(comparison.exact_active);
+        assert!(!comparison.mismatch);
+        assert!(!comparison.partial_execution_pending);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn partial_execution_without_authoritative_quantity_remains_pending() {
+        let state = running_neutral_state(Decimal::new(100, 0));
+        let expected = state.orders.values().next().unwrap();
+        let exchange_order_id = expected.exchange_order_id.clone().unwrap();
+        let actual = AuthoritativeOrder {
+            client_order_id: expected.client_order_id.clone(),
+            exchange_order_id: exchange_order_id.clone(),
+            exchange: state.exchange,
+            shape: expected.shape.clone(),
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+            executed_quantity: None,
+        };
+        let mut issues = Vec::new();
+
+        let comparison = compare_order(
+            &state,
+            expected,
+            Some(&exchange_order_id),
+            LifecycleExpectation::Active,
+            &actual,
+            &mut issues,
+        );
+
+        assert!(!comparison.exact);
+        assert!(comparison.exact_active);
+        assert!(!comparison.mismatch);
+        assert!(comparison.partial_execution_pending);
+        assert!(issues.iter().any(|issue| matches!(
             issue,
             ShadowAuditIssue::PartialExecutionRequiresAccounting { .. }
         )));
