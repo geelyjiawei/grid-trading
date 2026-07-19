@@ -566,6 +566,7 @@ pub(super) fn parse_instrument_rules(
     let step = required_decimal(lot_filter, "qtyStep")?;
     let rules = InstrumentRules {
         tick_size: required_decimal(price_filter, "tickSize")?,
+        max_price_significant_digits: None,
         limit_quantity: QuantityRules {
             step,
             min,

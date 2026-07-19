@@ -24,7 +24,7 @@ const privateKey = ref("");
 const testnet = ref(false);
 
 const summaries = computed(() =>
-  (["binance", "aster", "bybit"] as Exchange[]).map((item) => ({
+  (["binance", "aster", "bybit", "trade_xyz"] as Exchange[]).map((item) => ({
     exchange: item,
     config: props.config?.configs[item],
   })),
@@ -50,6 +50,9 @@ function submit(): void {
     testnet: testnet.value,
   };
   if (exchange.value === "aster") {
+    request.private_key = privateKey.value;
+  } else if (exchange.value === "trade_xyz") {
+    request.api_key = apiKey.value;
     request.private_key = privateKey.value;
   } else {
     request.api_key = apiKey.value;
@@ -121,6 +124,32 @@ watch(
             />
           </label>
           <p class="form-hint">钱包地址由 Rust 从私钥推导并核对，无需单独填写。</p>
+        </template>
+        <template v-else-if="exchange === 'trade_xyz'">
+          <label>
+            <span>TRADE.XYZ 主账户地址</span>
+            <input
+              v-model="apiKey"
+              autocomplete="off"
+              placeholder="0x…"
+              :disabled="busy"
+              required
+            />
+          </label>
+          <label>
+            <span>Hyperliquid Agent 私钥</span>
+            <input
+              v-model="privateKey"
+              type="password"
+              autocomplete="new-password"
+              placeholder="0x…"
+              :disabled="busy"
+              required
+            />
+          </label>
+          <p class="form-hint">
+            主账户地址用于读取 TRADE.XYZ 持仓；Agent 私钥只用于签名。保存时会核对授权关系；暂不支持子账户或 Vault。
+          </p>
         </template>
         <template v-else>
           <label>

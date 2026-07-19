@@ -2119,6 +2119,7 @@ async fn exchange_config(
                 "binance": state.exchange_gateways.summary(Exchange::Binance),
                 "aster": state.exchange_gateways.summary(Exchange::Aster),
                 "bybit": state.exchange_gateways.summary(Exchange::Bybit),
+                "trade_xyz": state.exchange_gateways.summary(Exchange::TradeXyz),
             }
         }),
     )
@@ -2365,10 +2366,52 @@ fn prepare_exchange_configuration(
                 environment,
             })
         }
+        Exchange::TradeXyz => {
+            let api_secret =
+                normalized_optional_secret(request.api_secret.take(), "agent private key")?;
+            let private_key = normalized_optional_secret(
+                request.private_key.take(),
+                "TRADE.XYZ agent private key",
+            )?;
+            let agent_private_key = match (api_secret, private_key) {
+                (Some(api_secret), Some(private_key)) if api_secret != private_key => {
+                    return Err(invalid_exchange_config(
+                        "TRADE.XYZ API secret and agent private key do not match",
+                    ));
+                }
+                (Some(api_secret), _) => api_secret,
+                (_, Some(private_key)) => private_key,
+                (None, None) => {
+                    return Err(invalid_exchange_config(
+                        "TRADE.XYZ agent private key is required",
+                    ));
+                }
+            };
+            let account_address =
+                required_config_secret(request.api_key.take(), "TRADE.XYZ account address")?;
+            let stored = StoredExchangeConfiguration::new(
+                Exchange::TradeXyz,
+                account_address.as_str().to_owned(),
+                agent_private_key.as_str().to_owned(),
+                request.testnet,
+            )
+            .map_err(|_| invalid_exchange_config("TRADE.XYZ credentials are invalid"))?;
+            let credentials = ExchangeCredentials::trade_xyz(
+                account_address.as_str().to_owned(),
+                agent_private_key.as_str().to_owned(),
+            )
+            .map_err(|_| invalid_exchange_config("TRADE.XYZ credentials are invalid"))?;
+            Ok(PreparedExchangeConfiguration {
+                stored,
+                credentials,
+                masked_identifier: mask_identifier(account_address.as_str()),
+                environment,
+            })
+        }
         Exchange::Binance | Exchange::Bybit => {
             if request.private_key.is_some() {
                 return Err(invalid_exchange_config(
-                    "Private key is only supported for Aster",
+                    "Private key is only supported for Aster and TRADE.XYZ",
                 ));
             }
             let api_key = required_config_secret(request.api_key.take(), "API key")?;
@@ -2390,6 +2433,7 @@ fn prepare_exchange_configuration(
                     api_secret.as_str().to_owned(),
                 ),
                 Exchange::Aster => unreachable!("Aster is handled separately"),
+                Exchange::TradeXyz => unreachable!("TRADE.XYZ is handled separately"),
             }
             .map_err(|_| invalid_exchange_config("Exchange credentials are invalid"))?;
             Ok(PreparedExchangeConfiguration {
@@ -4453,6 +4497,7 @@ mod tests {
         };
         let rules = InstrumentRules {
             tick_size: Decimal::from_str_exact("0.00010").unwrap(),
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::from_str_exact("1.000").unwrap(),
                 min: Decimal::from_str_exact("1.000").unwrap(),
@@ -4984,6 +5029,41 @@ mod tests {
         assert!(prepared.stored.api_key().starts_with("0x"));
         assert_eq!(prepared.stored.api_key().len(), 42);
         assert!(!prepared.masked_identifier.contains(&"1".repeat(32)));
+    }
+
+    #[test]
+    fn exchange_config_prepares_trade_xyz_account_and_agent_credentials() {
+        let account_address = format!("0x{}", "2".repeat(40));
+        let private_key = "1".repeat(64);
+        let prepared = prepare_exchange_configuration(ExchangeConfigRequest {
+            exchange: Exchange::TradeXyz,
+            api_key: Some(account_address.clone()),
+            api_secret: None,
+            private_key: Some(private_key.clone()),
+            testnet: true,
+        })
+        .unwrap();
+
+        assert_eq!(prepared.stored.exchange(), Exchange::TradeXyz);
+        assert_eq!(prepared.stored.api_key(), account_address);
+        assert_eq!(prepared.stored.api_secret(), private_key);
+        assert!(prepared.stored.testnet());
+        assert!(!prepared.masked_identifier.contains(&"2".repeat(20)));
+    }
+
+    #[test]
+    fn exchange_config_rejects_conflicting_trade_xyz_private_keys() {
+        let error = prepare_exchange_configuration(ExchangeConfigRequest {
+            exchange: Exchange::TradeXyz,
+            api_key: Some(format!("0x{}", "2".repeat(40))),
+            api_secret: Some("1".repeat(64)),
+            private_key: Some("3".repeat(64)),
+            testnet: false,
+        })
+        .err()
+        .unwrap();
+
+        assert!(error.message.contains("do not match"));
     }
 
     #[test]

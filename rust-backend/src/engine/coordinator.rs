@@ -162,10 +162,11 @@ where
                 actual: gateway.exchange(),
             });
         }
-        if !has_quote_asset(&config.symbol, self.settings.quote_asset()) {
+        let quote_asset = self.settings.quote_asset_for(exchange);
+        if !has_quote_asset(&config.symbol, quote_asset) {
             return Err(RuntimeCoordinatorError::UnsupportedQuoteAsset {
                 symbol: config.symbol,
-                quote_asset: self.settings.quote_asset().to_owned(),
+                quote_asset: quote_asset.to_owned(),
             });
         }
 

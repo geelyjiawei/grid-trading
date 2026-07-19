@@ -1,4 +1,4 @@
-export type Exchange = "binance" | "aster" | "bybit";
+export type Exchange = "binance" | "aster" | "bybit" | "trade_xyz";
 export type Direction = "long" | "short" | "neutral";
 export type GridMode = "arithmetic" | "geometric";
 export type PositionSizingMode = "investment" | "fixed_grid_qty";
@@ -137,7 +137,7 @@ export interface PriceSnapshot {
 
 export interface BalanceSnapshot {
   exchange?: Exchange;
-  unit?: "USDT" | "USD";
+  unit?: "USDT" | "USDC" | "USD";
   source?: string;
   available?: string | number;
   available_balance?: string | number;

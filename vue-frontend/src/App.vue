@@ -26,9 +26,9 @@ import MarketOverview from "./components/MarketOverview.vue";
 import StrategyList from "./components/StrategyList.vue";
 import StrategyDetailsPanel from "./components/StrategyDetailsPanel.vue";
 import StrategyOverview from "./components/StrategyOverview.vue";
-import { exchangeName, strategyCanStop } from "./format";
+import { exchangeName, quoteAsset, strategyCanStop } from "./format";
 
-const exchanges: Exchange[] = ["binance", "aster", "bybit"];
+const exchanges: Exchange[] = ["binance", "aster", "bybit", "trade_xyz"];
 const authStatus = ref<AuthStatus | null>(null);
 const authenticated = ref(false);
 const authBusy = ref(false);
@@ -116,6 +116,13 @@ function normalizeSymbol(): void {
   symbol.value = symbol.value.trim().toUpperCase();
 }
 
+function alignSymbolWithExchange(exchange: Exchange): void {
+  const expectedQuote = quoteAsset(exchange);
+  const current = symbol.value.trim().toUpperCase();
+  if (current.endsWith(expectedQuote) && current.length > expectedQuote.length) return;
+  symbol.value = exchange === "trade_xyz" ? "MUUSDC" : "BTCUSDT";
+}
+
 function prepareWorkspaceContext(): void {
   const exchange = activeExchange.value;
   const context = `${exchange}:${symbol.value}`;
@@ -153,7 +160,10 @@ async function loadConfig(): Promise<void> {
   const response = await api.config();
   config.value = response;
   const preferred = response.active_exchange ?? response.exchange;
-  if (preferred && exchanges.includes(preferred)) activeExchange.value = preferred;
+  if (preferred && exchanges.includes(preferred)) {
+    activeExchange.value = preferred;
+    alignSymbolWithExchange(preferred);
+  }
 }
 
 async function refreshStrategies(): Promise<void> {
@@ -432,6 +442,7 @@ async function login(credentials: LoginRequest): Promise<void> {
 
 async function selectExchange(exchange: Exchange): Promise<void> {
   activeExchange.value = exchange;
+  alignSymbolWithExchange(exchange);
   selectedStatus.value = null;
   prepareWorkspaceContext();
   preview.value = null;
@@ -451,6 +462,7 @@ async function saveExchangeConfig(request: ExchangeConfigRequest): Promise<void>
     await api.saveConfig(request);
     await loadConfig();
     activeExchange.value = request.exchange;
+    alignSymbolWithExchange(request.exchange);
     configMessage.value = `${exchangeName(request.exchange)} API 配置已验证并加密保存`;
     await refreshWorkspace();
   } catch (reason) {

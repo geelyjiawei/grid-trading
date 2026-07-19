@@ -4626,6 +4626,7 @@ mod tests {
     fn instrument() -> InstrumentRules {
         InstrumentRules {
             tick_size: Decimal::new(1, 1),
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::new(1, 1),
                 min: Decimal::new(1, 1),
@@ -4945,6 +4946,7 @@ mod tests {
         };
         let instrument = InstrumentRules {
             tick_size: Decimal::new(1, 2),
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::ONE,
                 min: Decimal::ONE,
@@ -5138,6 +5140,7 @@ mod tests {
         config.take_profit_price = Some(Decimal::new(31, 2));
         let instrument = InstrumentRules {
             tick_size: Decimal::new(1, 2),
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::ONE,
                 min: Decimal::ONE,
@@ -8901,6 +8904,7 @@ mod tests {
         let symbol = state.symbol.clone();
         let rules = InstrumentRules {
             tick_size: Decimal::new(1, 2),
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::ONE,
                 min: decimal(2),

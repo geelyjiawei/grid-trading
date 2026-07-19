@@ -35,6 +35,8 @@ pub mod configured;
 mod execution;
 pub mod protocol;
 pub mod registry;
+pub mod trade_xyz;
+mod trade_xyz_codec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementAcknowledgement {
@@ -423,6 +425,7 @@ pub trait TradingFeeRateGateway: Send + Sync {
 pub enum AccountBalanceUnit {
     Usdt,
     Usd,
+    Usdc,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -440,6 +443,7 @@ impl AccountBalanceSnapshot {
         let expected_unit = match self.exchange {
             Exchange::Binance | Exchange::Aster => AccountBalanceUnit::Usdt,
             Exchange::Bybit => AccountBalanceUnit::Usd,
+            Exchange::TradeXyz => AccountBalanceUnit::Usdc,
         };
         if self.unit != expected_unit {
             return Err(SnapshotError::new(

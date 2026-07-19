@@ -21,6 +21,7 @@ k256.workspace = true
 libc.workspace = true
 pbkdf2.workspace = true
 reqwest.workspace = true
+rmp-serde.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true

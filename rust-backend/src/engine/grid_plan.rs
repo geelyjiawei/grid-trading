@@ -748,6 +748,7 @@ mod tests {
     fn rules() -> InstrumentRules {
         InstrumentRules {
             tick_size: Decimal::new(1, 1),
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::new(1, 1),
                 min: Decimal::new(1, 1),
@@ -925,6 +926,22 @@ mod tests {
         rules.tick_size = decimal(1);
         assert_eq!(
             build_grid_plan(&config, &market(decimal(1012)), &rules),
+            Err(GridPlanError::CollapsedExchangePrices)
+        );
+    }
+
+    #[test]
+    fn significant_digit_price_collisions_fail_before_any_order_plan_exists() {
+        let mut config = fixed_config(Direction::Short);
+        config.lower_price = Decimal::new(9_995, 1);
+        config.upper_price = Decimal::new(10_005, 1);
+        config.initial_order_price = Some(decimal(1000));
+        let mut rules = rules();
+        rules.tick_size = Decimal::new(1, 3);
+        rules.max_price_significant_digits = Some(5);
+
+        assert_eq!(
+            build_grid_plan(&config, &market(decimal(1000)), &rules),
             Err(GridPlanError::CollapsedExchangePrices)
         );
     }

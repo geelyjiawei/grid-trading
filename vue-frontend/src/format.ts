@@ -3,7 +3,12 @@ import type { Direction, Exchange, GridStatus } from "./api/types";
 export function exchangeName(exchange: Exchange): string {
   if (exchange === "binance") return "Binance";
   if (exchange === "aster") return "AsterDEX";
-  return "Bybit";
+  if (exchange === "bybit") return "Bybit";
+  return "TRADE.XYZ";
+}
+
+export function quoteAsset(exchange: Exchange): "USDT" | "USDC" {
+  return exchange === "trade_xyz" ? "USDC" : "USDT";
 }
 
 export function directionName(direction?: Direction): string {

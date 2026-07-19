@@ -401,6 +401,7 @@ fn parse_exchange(value: &str) -> Result<Exchange, ExchangeConfigStoreError> {
         "binance" => Ok(Exchange::Binance),
         "aster" => Ok(Exchange::Aster),
         "bybit" => Ok(Exchange::Bybit),
+        "trade_xyz" => Ok(Exchange::TradeXyz),
         _ => Err(ExchangeConfigStoreError::UnsupportedExchange),
     }
 }
@@ -410,6 +411,7 @@ fn exchange_name(exchange: Exchange) -> &'static str {
         Exchange::Binance => "binance",
         Exchange::Aster => "aster",
         Exchange::Bybit => "bybit",
+        Exchange::TradeXyz => "trade_xyz",
     }
 }
 
@@ -521,13 +523,37 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+        store
+            .upsert(
+                &StoredExchangeConfiguration::new(
+                    Exchange::Bybit,
+                    "bybit-visible-key",
+                    "bybit-secret-value",
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .upsert(
+                &StoredExchangeConfiguration::new(
+                    Exchange::TradeXyz,
+                    format!("0x{}", "2".repeat(40)),
+                    "trade-xyz-agent-private-key",
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("binance-visible-key"));
         assert!(!text.contains("binance-secret-value"));
         assert!(!text.contains("aster-private-key"));
+        assert!(!text.contains("bybit-secret-value"));
+        assert!(!text.contains("trade-xyz-agent-private-key"));
         let loaded = store.load().unwrap();
-        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.len(), 4);
         let binance = loaded
             .iter()
             .find(|item| item.exchange() == Exchange::Binance)
@@ -536,8 +562,13 @@ mod tests {
             .iter()
             .find(|item| item.exchange() == Exchange::Aster)
             .unwrap();
+        let trade_xyz = loaded
+            .iter()
+            .find(|item| item.exchange() == Exchange::TradeXyz)
+            .unwrap();
         assert_eq!(binance.api_key(), "binance-visible-key");
         assert!(aster.testnet());
+        assert_eq!(trade_xyz.api_secret(), "trade-xyz-agent-private-key");
     }
 
     #[test]

@@ -348,6 +348,7 @@ fn exchange_code(exchange: Exchange) -> u8 {
         Exchange::Binance => 0,
         Exchange::Aster => 1,
         Exchange::Bybit => 2,
+        Exchange::TradeXyz => 3,
     }
 }
 

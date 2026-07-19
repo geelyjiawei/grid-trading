@@ -141,6 +141,13 @@ impl RuntimeSettings {
         &self.quote_asset
     }
 
+    pub fn quote_asset_for(&self, exchange: Exchange) -> &str {
+        match exchange {
+            Exchange::TradeXyz => "USDC",
+            Exchange::Binance | Exchange::Aster | Exchange::Bybit => &self.quote_asset,
+        }
+    }
+
     pub fn maximum_market_age_ms(&self) -> u64 {
         self.maximum_market_age_ms
     }
@@ -487,6 +494,7 @@ where
             actual: actual_exchange,
         });
     }
+    let quote_asset = settings.quote_asset_for(expected_exchange).to_owned();
     let paths = StrategyFilePaths::new(root, run_id.clone())?;
     let lease = StrategyRuntimeLease::acquire(paths.lease())?;
     if paths
@@ -530,7 +538,7 @@ where
                 gateway,
                 intent_store,
                 StrategyMachine::new(*store),
-                &settings.quote_asset,
+                &quote_asset,
                 settings.maximum_market_age_ms,
                 settings.maximum_future_skew_ms,
                 settings.maximum_submissions_per_tick,
@@ -617,7 +625,9 @@ impl LeasedFileStrategyRecovery {
     where
         G: ExchangeIdentityGateway,
     {
-        verify_gateway_identity(&gateway, self.exchange())?;
+        let exchange = self.exchange();
+        verify_gateway_identity(&gateway, exchange)?;
+        let quote_asset = settings.quote_asset_for(exchange).to_owned();
         match self.inner {
             LeasedFileStrategyRecoveryInner::Armed(store) => Ok(PreparedLeasedFileStrategy::armed(
                 LeasedFileArmedStrategy {
@@ -633,7 +643,7 @@ impl LeasedFileStrategyRecovery {
                     gateway,
                     intents,
                     StrategyMachine::new(*store),
-                    &settings.quote_asset,
+                    &quote_asset,
                     settings.maximum_market_age_ms,
                     settings.maximum_future_skew_ms,
                     settings.maximum_submissions_per_tick,
@@ -911,7 +921,7 @@ impl LeasedFileArmedStrategy {
                 return Err(FileArmedActivationError::IntentLedgerMismatch);
             }
         };
-        let execution_sync = ExecutionSyncService::new(&self.settings.quote_asset)
+        let execution_sync = ExecutionSyncService::new(self.settings.quote_asset_for(expected))
             .map_err(RuntimeBuildError::from)?;
         Ok(PreparedArmedActivation {
             active,
@@ -1010,12 +1020,13 @@ impl<G> LeasedFileStrategyRuntime<G> {
         if expected != actual {
             return Err(FileRuntimeLoadError::GatewayMismatch { expected, actual });
         }
+        let quote_asset = settings.quote_asset_for(expected).to_owned();
         let intent_store = FileOrderIntentStore::load(paths.intents())?;
         let runtime = StrategyRuntime::new(
             gateway,
             intent_store,
             StrategyMachine::new(state_store),
-            &settings.quote_asset,
+            &quote_asset,
             settings.maximum_market_age_ms,
             settings.maximum_future_skew_ms,
             settings.maximum_submissions_per_tick,
@@ -2112,6 +2123,16 @@ mod tests {
     };
 
     #[test]
+    fn runtime_uses_usdc_only_for_trade_xyz() {
+        let settings = RuntimeSettings::new("USDT", 5_000, 1_000, 10).unwrap();
+
+        assert_eq!(settings.quote_asset_for(Exchange::TradeXyz), "USDC");
+        assert_eq!(settings.quote_asset_for(Exchange::Binance), "USDT");
+        assert_eq!(settings.quote_asset_for(Exchange::Aster), "USDT");
+        assert_eq!(settings.quote_asset_for(Exchange::Bybit), "USDT");
+    }
+
+    #[test]
     fn resolved_cancellation_accepts_only_exact_or_legacy_missing_terminal_identity() {
         let exact = IntentState::Terminal {
             status: TerminalOrderStatus::Cancelled,
@@ -2887,6 +2908,7 @@ mod tests {
     fn rules() -> InstrumentRules {
         InstrumentRules {
             tick_size: Decimal::ONE,
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::new(1, 1),
                 min: Decimal::new(1, 1),

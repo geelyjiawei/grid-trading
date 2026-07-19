@@ -314,6 +314,19 @@ fn exchange_gateways_from_environment() -> Result<ExchangeGatewayRegistry, AppCo
         registry.register_configured(gateway, environment, "env", Some(masked))?;
     }
 
+    if let Some((account_address, agent_private_key)) = read_credential_pair(
+        "TRADE_XYZ_ACCOUNT_ADDRESS",
+        "TRADE_XYZ_AGENT_PRIVATE_KEY",
+        "TRADE.XYZ",
+    )? {
+        let masked = mask_identifier(&account_address);
+        let environment = exchange_environment("TRADE_XYZ_TESTNET")?;
+        let gateway = ExchangeGatewayFactory::standard(environment)?.build(
+            ExchangeCredentials::trade_xyz(account_address, agent_private_key)?,
+        )?;
+        registry.register_configured(gateway, environment, "env", Some(masked))?;
+    }
+
     Ok(registry)
 }
 
@@ -376,6 +389,10 @@ fn credentials_from_stored_configuration(
             configuration.api_key().to_owned(),
             configuration.api_secret().to_owned(),
         )?,
+        Exchange::TradeXyz => ExchangeCredentials::trade_xyz(
+            configuration.api_key().to_owned(),
+            configuration.api_secret().to_owned(),
+        )?,
     };
     Ok(credentials)
 }
@@ -391,6 +408,7 @@ fn parse_preferred_exchange(value: Option<String>) -> Result<Exchange, AppConfig
         "binance" => Ok(Exchange::Binance),
         "aster" => Ok(Exchange::Aster),
         "bybit" => Ok(Exchange::Bybit),
+        "trade_xyz" | "tradexyz" | "trade.xyz" => Ok(Exchange::TradeXyz),
         _ => Err(AppConfigurationError::InvalidExchange),
     }
 }
@@ -537,7 +555,7 @@ pub enum AppConfigurationError {
     InvalidBoolean(&'static str),
     #[error("{0} must not contain leading or trailing whitespace")]
     EnvironmentWhitespace(&'static str),
-    #[error("GRID_EXCHANGE or EXCHANGE must be binance, aster, or bybit")]
+    #[error("GRID_EXCHANGE or EXCHANGE must be binance, aster, bybit, or trade_xyz")]
     InvalidExchange,
     #[error("GRID_CONFIG_KEY is required when GRID_CONFIG_FILE already exists")]
     MissingExchangeConfigKey,
@@ -714,6 +732,10 @@ mod tests {
         assert_eq!(
             parse_preferred_exchange(Some("aster".into())).unwrap(),
             Exchange::Aster
+        );
+        assert_eq!(
+            parse_preferred_exchange(Some("TRADE.XYZ".into())).unwrap(),
+            Exchange::TradeXyz
         );
         assert!(matches!(
             parse_preferred_exchange(Some("unknown".into())),

@@ -25,9 +25,10 @@ use crate::{
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
         protocol::{
-            BinanceRequestGovernor, MonotonicMicrosecondNonce, ReqwestTransport, SystemClock,
-            TransportBuildError,
+            BinanceRequestGovernor, HyperliquidRequestGovernor, MonotonicMicrosecondNonce,
+            MonotonicMillisecondNonce, ReqwestTransport, SystemClock, TransportBuildError,
         },
+        trade_xyz::{TradeXyzAdapter, TradeXyzAdapterError},
     },
 };
 
@@ -35,10 +36,13 @@ type BinanceGateway =
     BinanceAdapter<BinanceRequestGovernor<ReqwestTransport>, HmacSha256Signer, SystemClock>;
 type AsterGateway = AsterAdapter<ReqwestTransport, LocalEip712Signer, MonotonicMicrosecondNonce>;
 type BybitGateway = BybitAdapter<ReqwestTransport, BybitHmacSha256Signer, SystemClock>;
+type TradeXyzGateway =
+    TradeXyzAdapter<HyperliquidRequestGovernor<ReqwestTransport>, MonotonicMillisecondNonce>;
 
 // Leave account-wide headroom below each exchange's published order limit.
 const BINANCE_ASTER_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(60);
 const BYBIT_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(110);
+const TRADE_XYZ_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(75);
 const BINANCE_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
 const INSTRUMENT_RULES_CACHE_TTL: Duration = Duration::from_secs(60);
 const TRADING_FEE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -111,6 +115,7 @@ impl OrderPlacementPacer {
         let interval = match exchange {
             Exchange::Binance | Exchange::Aster => BINANCE_ASTER_ORDER_PLACEMENT_INTERVAL,
             Exchange::Bybit => BYBIT_ORDER_PLACEMENT_INTERVAL,
+            Exchange::TradeXyz => TRADE_XYZ_ORDER_PLACEMENT_INTERVAL,
         };
         Self {
             interval,
@@ -155,6 +160,10 @@ pub enum ExchangeCredentials {
         api_key: Zeroizing<String>,
         api_secret: Zeroizing<String>,
     },
+    TradeXyz {
+        account_address: Zeroizing<String>,
+        agent_private_key: Zeroizing<String>,
+    },
 }
 
 impl ExchangeCredentials {
@@ -188,11 +197,22 @@ impl ExchangeCredentials {
         })
     }
 
+    pub fn trade_xyz(
+        account_address: impl Into<String>,
+        agent_private_key: impl Into<String>,
+    ) -> Result<Self, CredentialError> {
+        Ok(Self::TradeXyz {
+            account_address: required_secret(account_address, "TRADE.XYZ account address")?,
+            agent_private_key: required_secret(agent_private_key, "TRADE.XYZ agent private key")?,
+        })
+    }
+
     pub fn exchange(&self) -> Exchange {
         match self {
             Self::Binance { .. } => Exchange::Binance,
             Self::Aster { .. } => Exchange::Aster,
             Self::Bybit { .. } => Exchange::Bybit,
+            Self::TradeXyz { .. } => Exchange::TradeXyz,
         }
     }
 }
@@ -233,6 +253,7 @@ pub struct ExchangeGatewayFactory {
     environment: ExchangeEnvironment,
     transport: ReqwestTransport,
     binance_transport: BinanceRequestGovernor<ReqwestTransport>,
+    trade_xyz_transport: HyperliquidRequestGovernor<ReqwestTransport>,
 }
 
 impl ExchangeGatewayFactory {
@@ -247,6 +268,7 @@ impl ExchangeGatewayFactory {
                 transport.clone(),
                 BINANCE_REQUEST_INTERVAL,
             ),
+            trade_xyz_transport: HyperliquidRequestGovernor::new(transport.clone()),
             transport,
         })
     }
@@ -321,6 +343,26 @@ impl ExchangeGatewayFactory {
                 };
                 ConfiguredExchangeGateway::Bybit(adapter)
             }
+            ExchangeCredentials::TradeXyz {
+                account_address,
+                agent_private_key,
+            } => {
+                let adapter = match self.environment {
+                    ExchangeEnvironment::Production => TradeXyzAdapter::production_wallet(
+                        self.trade_xyz_transport.clone(),
+                        MonotonicMillisecondNonce::default(),
+                        account_address.as_str(),
+                        agent_private_key.as_str(),
+                    )?,
+                    ExchangeEnvironment::Testnet => TradeXyzAdapter::testnet_wallet(
+                        self.trade_xyz_transport.clone(),
+                        MonotonicMillisecondNonce::default(),
+                        account_address.as_str(),
+                        agent_private_key.as_str(),
+                    )?,
+                };
+                ConfiguredExchangeGateway::TradeXyz(adapter)
+            }
         })
     }
 }
@@ -335,12 +377,15 @@ pub enum ExchangeGatewayBuildError {
     Aster(#[from] AsterSignatureError),
     #[error(transparent)]
     Bybit(#[from] BybitSignatureError),
+    #[error(transparent)]
+    TradeXyz(#[from] TradeXyzAdapterError),
 }
 
 pub enum ConfiguredExchangeGateway {
     Binance(BinanceGateway),
     Aster(AsterGateway),
     Bybit(BybitGateway),
+    TradeXyz(TradeXyzGateway),
 }
 
 impl ConfiguredExchangeGateway {
@@ -349,6 +394,7 @@ impl ConfiguredExchangeGateway {
             Self::Binance(_) => Exchange::Binance,
             Self::Aster(_) => Exchange::Aster,
             Self::Bybit(_) => Exchange::Bybit,
+            Self::TradeXyz(_) => Exchange::TradeXyz,
         }
     }
 
@@ -403,6 +449,7 @@ impl OrderPlacementGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.place_order(intent).await,
             Self::Aster(gateway) => gateway.place_order(intent).await,
             Self::Bybit(gateway) => gateway.place_order(intent).await,
+            Self::TradeXyz(gateway) => gateway.place_order(intent).await,
         }
     }
 }
@@ -419,6 +466,7 @@ impl LeverageGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
             Self::Aster(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
             Self::Bybit(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
+            Self::TradeXyz(gateway) => gateway.set_leverage(exchange, symbol, leverage).await,
         }
     }
 }
@@ -434,6 +482,7 @@ impl TradingFeeRateGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
             Self::Aster(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
             Self::Bybit(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
+            Self::TradeXyz(gateway) => gateway.trading_fee_rates(exchange, symbol).await,
         }
     }
 }
@@ -448,6 +497,7 @@ impl AccountBalanceSnapshotGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.account_balance_snapshot(exchange).await,
             Self::Aster(gateway) => gateway.account_balance_snapshot(exchange).await,
             Self::Bybit(gateway) => gateway.account_balance_snapshot(exchange).await,
+            Self::TradeXyz(gateway) => gateway.account_balance_snapshot(exchange).await,
         }
     }
 }
@@ -473,6 +523,11 @@ impl OrderCancellationGateway for ConfiguredExchangeGateway {
                     .await
             }
             Self::Bybit(gateway) => {
+                gateway
+                    .cancel_order(exchange, symbol, client_order_id, exchange_order_id)
+                    .await
+            }
+            Self::TradeXyz(gateway) => {
                 gateway
                     .cancel_order(exchange, symbol, client_order_id, exchange_order_id)
                     .await
@@ -505,6 +560,11 @@ impl OrderLookupGateway for ConfiguredExchangeGateway {
                     .lookup_order_by_client_id(exchange, symbol, client_order_id)
                     .await
             }
+            Self::TradeXyz(gateway) => {
+                gateway
+                    .lookup_order_by_client_id(exchange, symbol, client_order_id)
+                    .await
+            }
         }
     }
 }
@@ -520,6 +580,7 @@ impl OpenOrderSnapshotGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.open_orders_snapshot(exchange, symbol).await,
             Self::Aster(gateway) => gateway.open_orders_snapshot(exchange, symbol).await,
             Self::Bybit(gateway) => gateway.open_orders_snapshot(exchange, symbol).await,
+            Self::TradeXyz(gateway) => gateway.open_orders_snapshot(exchange, symbol).await,
         }
     }
 }
@@ -544,6 +605,11 @@ impl OrderHistorySnapshotGateway for ConfiguredExchangeGateway {
                     .await
             }
             Self::Bybit(gateway) => {
+                gateway
+                    .order_history_snapshot(exchange, symbol, limit)
+                    .await
+            }
+            Self::TradeXyz(gateway) => {
                 gateway
                     .order_history_snapshot(exchange, symbol, limit)
                     .await
@@ -576,6 +642,11 @@ impl ExecutionSnapshotGateway for ConfiguredExchangeGateway {
                     .open_order_execution_progress_snapshot(exchange, symbol)
                     .await
             }
+            Self::TradeXyz(gateway) => {
+                gateway
+                    .open_order_execution_progress_snapshot(exchange, symbol)
+                    .await
+            }
         }
     }
 
@@ -598,6 +669,11 @@ impl ExecutionSnapshotGateway for ConfiguredExchangeGateway {
                     .await
             }
             Self::Bybit(gateway) => {
+                gateway
+                    .execution_snapshot(exchange, symbol, client_order_id, exchange_order_id)
+                    .await
+            }
+            Self::TradeXyz(gateway) => {
                 gateway
                     .execution_snapshot(exchange, symbol, client_order_id, exchange_order_id)
                     .await
@@ -630,6 +706,11 @@ impl HistoricalPriceGateway for ConfiguredExchangeGateway {
                     .historical_minute_open(exchange, symbol, minute_start_ms)
                     .await
             }
+            Self::TradeXyz(gateway) => {
+                gateway
+                    .historical_minute_open(exchange, symbol, minute_start_ms)
+                    .await
+            }
         }
     }
 }
@@ -645,6 +726,7 @@ impl MarketSnapshotGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.market_snapshot(exchange, symbol).await,
             Self::Aster(gateway) => gateway.market_snapshot(exchange, symbol).await,
             Self::Bybit(gateway) => gateway.market_snapshot(exchange, symbol).await,
+            Self::TradeXyz(gateway) => gateway.market_snapshot(exchange, symbol).await,
         }
     }
 }
@@ -660,6 +742,7 @@ impl InstrumentRulesGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.instrument_rules(exchange, symbol).await,
             Self::Aster(gateway) => gateway.instrument_rules(exchange, symbol).await,
             Self::Bybit(gateway) => gateway.instrument_rules(exchange, symbol).await,
+            Self::TradeXyz(gateway) => gateway.instrument_rules(exchange, symbol).await,
         }
     }
 }
@@ -675,6 +758,7 @@ impl PositionSnapshotGateway for ConfiguredExchangeGateway {
             Self::Binance(gateway) => gateway.position_snapshot(exchange, symbol).await,
             Self::Aster(gateway) => gateway.position_snapshot(exchange, symbol).await,
             Self::Bybit(gateway) => gateway.position_snapshot(exchange, symbol).await,
+            Self::TradeXyz(gateway) => gateway.position_snapshot(exchange, symbol).await,
         }
     }
 }
@@ -916,11 +1000,18 @@ mod tests {
         let bybit = factory
             .build(ExchangeCredentials::bybit("key", "secret").unwrap())
             .unwrap();
+        let trade_xyz = factory
+            .build(
+                ExchangeCredentials::trade_xyz(format!("0x{}", "2".repeat(40)), "1".repeat(64))
+                    .unwrap(),
+            )
+            .unwrap();
 
         assert_eq!(factory.environment(), ExchangeEnvironment::Testnet);
         assert_eq!(binance.exchange(), Exchange::Binance);
         assert_eq!(aster.exchange(), Exchange::Aster);
         assert_eq!(bybit.exchange(), Exchange::Bybit);
+        assert_eq!(trade_xyz.exchange(), Exchange::TradeXyz);
     }
 
     #[test]

@@ -25,6 +25,7 @@ function installWorkspaceMocks(grids: GridStatus[]): void {
       aster: { exchange: "aster", configured: true },
       binance: { exchange: "binance", configured: true },
       bybit: { exchange: "bybit", configured: true },
+      trade_xyz: { exchange: "trade_xyz", configured: true },
     },
   });
   vi.spyOn(api, "gridStatus").mockResolvedValue({

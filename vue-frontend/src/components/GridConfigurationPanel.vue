@@ -9,7 +9,7 @@ import type {
   InitialOrderType,
   PositionSizingMode,
 } from "../api/types";
-import { formatNumber } from "../format";
+import { formatNumber, quoteAsset } from "../format";
 
 const props = withDefaults(defineProps<{
   exchange: Exchange;
@@ -77,6 +77,7 @@ const form = reactive<FormState>({
 const localError = ref("");
 
 const fixedQuantity = computed(() => form.positionSizingMode === "fixed_grid_qty");
+const settlementAsset = computed(() => quoteAsset(props.exchange));
 const canPreview = computed(
   () => props.configured && Boolean(props.fees) && !props.busy && !props.startBusy && Boolean(props.symbol),
 );
@@ -289,7 +290,7 @@ function quantityText(): string {
             <input v-model="form.gridOrderQty" data-testid="grid-order-qty" type="number" min="0" step="any" />
           </label>
           <label v-else>
-            <span>总投入金额（USDT）</span>
+            <span>总投入金额（{{ settlementAsset }}）</span>
             <input v-model="form.totalInvestment" data-testid="total-investment" type="number" min="0" step="any" />
           </label>
           <label>
@@ -339,10 +340,10 @@ function quantityText(): string {
           <div><span>单格收益率</span><strong>{{ formatNumber(preview.grid_profit_pct, 4) }}%</strong></div>
           <div><span>每格数量</span><strong>{{ quantityText() }}</strong></div>
           <div><span>总预估开仓量</span><strong>{{ formatNumber(preview.total_qty, 8) }}</strong></div>
-          <div><span>单格毛收益</span><strong>{{ formatNumber(preview.per_grid_gross_profit, 6) }} USDT</strong></div>
-          <div><span>单格手续费</span><strong>{{ formatNumber(preview.per_grid_fee, 6) }} USDT</strong></div>
-          <div><span>单格净收益</span><strong>{{ formatNumber(preview.per_grid_net_profit, 6) }} USDT</strong></div>
-          <div><span>交易所最低金额</span><strong>{{ formatNumber(preview.min_notional, 4) }} USDT</strong></div>
+          <div><span>单格毛收益</span><strong>{{ formatNumber(preview.per_grid_gross_profit, 6) }} {{ settlementAsset }}</strong></div>
+          <div><span>单格手续费</span><strong>{{ formatNumber(preview.per_grid_fee, 6) }} {{ settlementAsset }}</strong></div>
+          <div><span>单格净收益</span><strong>{{ formatNumber(preview.per_grid_net_profit, 6) }} {{ settlementAsset }}</strong></div>
+          <div><span>交易所最低金额</span><strong>{{ formatNumber(preview.min_notional, 4) }} {{ settlementAsset }}</strong></div>
         </div>
         <p v-if="preview && !previewMatchesForm" class="form-error">参数已变化，本次预览已失效。</p>
         <p v-if="strategyRunning" class="form-hint">当前交易所与交易对已有活动策略（含停止确认中），不能重复启动。</p>

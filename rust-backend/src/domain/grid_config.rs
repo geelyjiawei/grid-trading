@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Exchange {
+    #[serde(rename = "binance")]
     Binance,
+    #[serde(rename = "aster")]
     Aster,
+    #[serde(rename = "bybit")]
     Bybit,
+    #[serde(rename = "trade_xyz")]
+    TradeXyz,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

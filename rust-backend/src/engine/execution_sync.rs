@@ -227,6 +227,7 @@ mod tests {
     fn rules() -> InstrumentRules {
         InstrumentRules {
             tick_size: Decimal::ONE,
+            max_price_significant_digits: None,
             limit_quantity: QuantityRules {
                 step: Decimal::new(1, 1),
                 min: Decimal::new(1, 1),

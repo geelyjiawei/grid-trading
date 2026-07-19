@@ -68,6 +68,38 @@ describe("Vue migration components", () => {
     });
   });
 
+  it("saves TRADE.XYZ with an account address and agent private key", async () => {
+    const wrapper = mount(ExchangeSettingsDialog, {
+      props: {
+        open: true,
+        config: {
+          configured: true,
+          active_exchange: "trade_xyz",
+          configs: {
+            trade_xyz: { exchange: "trade_xyz", configured: false },
+          },
+        },
+        activeExchange: "trade_xyz",
+        busy: false,
+        error: "",
+        message: "",
+      },
+    });
+    const accountAddress = `0x${"2".repeat(40)}`;
+    const privateKey = "1".repeat(64);
+    const inputs = wrapper.findAll("form input");
+    await inputs[0]!.setValue(accountAddress);
+    await inputs[1]!.setValue(privateKey);
+    await wrapper.find("form").trigger("submit");
+
+    expect(wrapper.emitted("save")?.[0]?.[0]).toEqual({
+      exchange: "trade_xyz",
+      api_key: accountAddress,
+      private_key: privateKey,
+      testnet: false,
+    });
+  });
+
   it("selects a strategy with its exchange identity intact", async () => {
     const grid: GridStatus = {
       exchange: "binance",
@@ -150,6 +182,24 @@ describe("Vue migration components", () => {
     await wrapper.find('[data-testid="sizing-mode"]').setValue("investment");
     expect(wrapper.find('[data-testid="grid-order-qty"]').exists()).toBe(false);
     expect(wrapper.find('[data-testid="total-investment"]').exists()).toBe(true);
+  });
+
+  it("labels TRADE.XYZ strategy amounts in USDC", async () => {
+    const wrapper = mount(GridConfigurationPanel, {
+      props: {
+        exchange: "trade_xyz",
+        symbol: "MUUSDC",
+        configured: true,
+        fees: { maker_fee_rate: 0.0001, taker_fee_rate: 0.0003 },
+        preview: null,
+        busy: false,
+        error: "",
+      },
+    });
+    await wrapper.find('[data-testid="sizing-mode"]').setValue("investment");
+
+    expect(wrapper.text()).toContain("USDC");
+    expect(wrapper.text()).not.toContain("USDT");
   });
 
   it("directs missing exchange credentials to server configuration", () => {

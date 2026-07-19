@@ -82,6 +82,7 @@ struct RegistryState {
     binance: Option<GatewayEntry>,
     aster: Option<GatewayEntry>,
     bybit: Option<GatewayEntry>,
+    trade_xyz: Option<GatewayEntry>,
 }
 
 #[derive(Clone)]
@@ -97,6 +98,7 @@ impl ExchangeGatewayRegistry {
                 binance: None,
                 aster: None,
                 bybit: None,
+                trade_xyz: None,
             })),
         }
     }
@@ -265,11 +267,12 @@ impl ExchangeGatewayRegistry {
         }
     }
 
-    pub fn summaries(&self) -> [ExchangeConfigurationSummary; 3] {
+    pub fn summaries(&self) -> [ExchangeConfigurationSummary; 4] {
         [
             self.summary(Exchange::Binance),
             self.summary(Exchange::Aster),
             self.summary(Exchange::Bybit),
+            self.summary(Exchange::TradeXyz),
         ]
     }
 }
@@ -280,6 +283,7 @@ impl RegistryState {
             Exchange::Binance => self.binance.as_ref(),
             Exchange::Aster => self.aster.as_ref(),
             Exchange::Bybit => self.bybit.as_ref(),
+            Exchange::TradeXyz => self.trade_xyz.as_ref(),
         }
     }
 
@@ -288,6 +292,7 @@ impl RegistryState {
             Exchange::Binance => &mut self.binance,
             Exchange::Aster => &mut self.aster,
             Exchange::Bybit => &mut self.bybit,
+            Exchange::TradeXyz => &mut self.trade_xyz,
         }
     }
 }
@@ -323,6 +328,7 @@ impl fmt::Debug for ExchangeGatewayRegistry {
             .field("binance_configured", &state.binance.is_some())
             .field("aster_configured", &state.aster.is_some())
             .field("bybit_configured", &state.bybit.is_some())
+            .field("trade_xyz_configured", &state.trade_xyz.is_some())
             .finish()
     }
 }
@@ -364,6 +370,8 @@ mod tests {
 
         assert!(registry.is_configured(Exchange::Binance));
         assert!(!registry.is_configured(Exchange::Aster));
+        assert_eq!(registry.summaries().len(), 4);
+        assert_eq!(registry.summaries()[3].exchange, Exchange::TradeXyz);
         assert_eq!(
             registry.summaries()[0].api_key.as_deref(),
             Some("visi****-key")

@@ -128,6 +128,7 @@ pub(super) fn parse_instrument_rules(
     };
     let rules = InstrumentRules {
         tick_size: required_decimal(price_filter, "tickSize")?,
+        max_price_significant_digits: None,
         limit_quantity: quantity_rules(lot_filter)?,
         market_quantity: quantity_rules(market_filter)?,
         min_notional,

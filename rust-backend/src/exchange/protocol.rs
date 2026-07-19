@@ -337,6 +337,153 @@ fn binance_cooldown_response(cooldown: Duration) -> HttpResponse {
     }
 }
 
+const HYPERLIQUID_WEIGHT_INTERVAL: Duration = Duration::from_millis(60);
+const HYPERLIQUID_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct HyperliquidRequestState {
+    next_request_at: Option<Instant>,
+}
+
+/// Serializes Hyperliquid REST traffic using the published request weights.
+/// A 60 ms interval per weight unit caps this process at 1,000 weight/minute,
+/// leaving headroom below Hyperliquid's 1,200 weight/minute IP limit.
+#[derive(Clone)]
+pub struct HyperliquidRequestGovernor<T> {
+    inner: T,
+    state: Arc<tokio::sync::Mutex<HyperliquidRequestState>>,
+}
+
+impl<T> HyperliquidRequestGovernor<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            state: Arc::new(tokio::sync::Mutex::new(HyperliquidRequestState::default())),
+        }
+    }
+}
+
+impl<T> fmt::Debug for HyperliquidRequestGovernor<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HyperliquidRequestGovernor")
+            .field("weight_interval", &HYPERLIQUID_WEIGHT_INTERVAL)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl<T> HttpTransport for HyperliquidRequestGovernor<T>
+where
+    T: HttpTransport,
+{
+    async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError> {
+        // Keep the guard through the response so concurrent snapshots cannot
+        // independently consume the same IP-level budget.
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if let Some(next_request_at) = state.next_request_at
+            && next_request_at > now
+        {
+            tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
+        }
+
+        let base_weight = hyperliquid_request_weight(&request);
+        let requested_at = Instant::now();
+        state.next_request_at =
+            Some(requested_at + HYPERLIQUID_WEIGHT_INTERVAL.saturating_mul(base_weight));
+        let response = self.inner.execute(request.clone()).await?;
+        let responded_at = Instant::now();
+        let extra_weight = hyperliquid_response_extra_weight(&request, &response);
+        if extra_weight > 0 {
+            let next = state
+                .next_request_at
+                .unwrap_or(responded_at)
+                .max(responded_at);
+            state.next_request_at =
+                Some(next + HYPERLIQUID_WEIGHT_INTERVAL.saturating_mul(extra_weight));
+        }
+        if response.status == 429 {
+            state.next_request_at = Some(responded_at + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
+        }
+        Ok(response)
+    }
+}
+
+fn hyperliquid_request_weight(request: &PreparedHttpRequest) -> u32 {
+    if request.path == "/exchange" {
+        let batch_length = request
+            .raw_body
+            .as_deref()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .and_then(|value| {
+                let action = value.get("action")?;
+                ["orders", "cancels", "modifies"]
+                    .into_iter()
+                    .find_map(|field| action.get(field).and_then(serde_json::Value::as_array))
+                    .map(Vec::len)
+            })
+            .unwrap_or(1);
+        return 1_u32.saturating_add(u32::try_from(batch_length / 40).unwrap_or(u32::MAX));
+    }
+    if request.path != "/info" {
+        return 20;
+    }
+    match hyperliquid_info_type(request).as_deref() {
+        Some(
+            "l2Book"
+            | "allMids"
+            | "clearinghouseState"
+            | "orderStatus"
+            | "spotClearinghouseState"
+            | "exchangeStatus",
+        ) => 2,
+        Some("userRole") => 60,
+        _ => 20,
+    }
+}
+
+fn hyperliquid_info_type(request: &PreparedHttpRequest) -> Option<String> {
+    request
+        .raw_body
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+}
+
+fn hyperliquid_response_extra_weight(
+    request: &PreparedHttpRequest,
+    response: &HttpResponse,
+) -> u32 {
+    if !(200..300).contains(&response.status) {
+        return 0;
+    }
+    let divisor = match hyperliquid_info_type(request).as_deref() {
+        Some(
+            "recentTrades"
+            | "historicalOrders"
+            | "userFills"
+            | "userFillsByTime"
+            | "fundingHistory"
+            | "userFunding"
+            | "nonUserFundingUpdates"
+            | "twapHistory"
+            | "userTwapSliceFills"
+            | "userTwapSliceFillsByTime"
+            | "delegatorHistory"
+            | "delegatorRewards"
+            | "validatorStats",
+        ) => 20,
+        Some("candleSnapshot") => 60,
+        _ => return 0,
+    };
+    serde_json::from_str::<serde_json::Value>(&response.body)
+        .ok()
+        .and_then(|value| value.as_array().map(Vec::len))
+        .and_then(|length| u32::try_from(length.div_ceil(divisor)).ok())
+        .unwrap_or(0)
+}
+
 fn binance_request_cost(request: &PreparedHttpRequest) -> BinanceRequestCost {
     let has_symbol = request
         .query
@@ -709,6 +856,27 @@ impl NonceSource for MonotonicMicrosecondNonce {
     }
 }
 
+/// Hyperliquid accepts millisecond nonces and retains only a bounded recent
+/// nonce window per signer. Keep one monotonic source per configured wallet so
+/// concurrent orders cannot reuse a timestamp.
+#[derive(Debug, Default)]
+pub struct MonotonicMillisecondNonce {
+    last: Mutex<u64>,
+}
+
+impl NonceSource for MonotonicMillisecondNonce {
+    fn next_nonce(&self) -> u64 {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let observed = unix_duration_millis();
+        let next = observed.max(last.saturating_add(1));
+        *last = next;
+        next
+    }
+}
+
 fn unix_duration_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -815,6 +983,18 @@ mod tests {
         }
     }
 
+    fn hyperliquid_request(path: &str, body: &str) -> PreparedHttpRequest {
+        PreparedHttpRequest {
+            method: HttpMethod::Post,
+            base_url: "https://api.hyperliquid.test".into(),
+            path: path.into(),
+            query: vec![],
+            body: vec![],
+            raw_body: Some(body.into()),
+            headers: vec![],
+        }
+    }
+
     #[test]
     fn form_encoding_preserves_insertion_order_and_escapes_values() {
         let params = vec![
@@ -865,6 +1045,84 @@ mod tests {
         assert!(!rendered.contains("secret-key"));
         assert!(!rendered.contains("secret-signature"));
         assert!(rendered.contains("[REDACTED JSON BODY]"));
+    }
+
+    #[test]
+    fn hyperliquid_weights_match_the_published_endpoint_contract() {
+        assert_eq!(
+            hyperliquid_request_weight(&hyperliquid_request(
+                "/info",
+                r#"{"type":"clearinghouseState"}"#,
+            )),
+            2
+        );
+        assert_eq!(
+            hyperliquid_request_weight(&hyperliquid_request("/info", r#"{"type":"userRole"}"#,)),
+            60
+        );
+        assert_eq!(
+            hyperliquid_request_weight(&hyperliquid_request(
+                "/info",
+                r#"{"type":"metaAndAssetCtxs"}"#,
+            )),
+            20
+        );
+        let orders = (0..79)
+            .map(|index| serde_json::json!({"a": index}))
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({"action": {"orders": orders}}).to_string();
+        assert_eq!(
+            hyperliquid_request_weight(&hyperliquid_request("/exchange", &body)),
+            2
+        );
+    }
+
+    #[test]
+    fn hyperliquid_history_and_candles_charge_response_row_weight() {
+        let history = hyperliquid_request("/info", r#"{"type":"historicalOrders"}"#);
+        let candles = hyperliquid_request("/info", r#"{"type":"candleSnapshot"}"#);
+        let history_response = HttpResponse {
+            status: 200,
+            body: serde_json::Value::Array(vec![serde_json::Value::Null; 41]).to_string(),
+        };
+        let candle_response = HttpResponse {
+            status: 200,
+            body: serde_json::Value::Array(vec![serde_json::Value::Null; 61]).to_string(),
+        };
+
+        assert_eq!(
+            hyperliquid_response_extra_weight(&history, &history_response),
+            3
+        );
+        assert_eq!(
+            hyperliquid_response_extra_weight(&candles, &candle_response),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_governor_opens_a_cooldown_after_429() {
+        let transport = ScriptedTransport::new([HttpResponse {
+            status: 429,
+            body: "rate limited".into(),
+        }]);
+        let governor = HyperliquidRequestGovernor::new(transport.clone());
+        let before = Instant::now();
+
+        let response = governor
+            .execute(hyperliquid_request(
+                "/exchange",
+                r#"{"action":{"orders":[{}]}}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 429);
+        assert_eq!(transport.call_count(), 1);
+        let state = governor.state.lock().await;
+        let next_request_at = state.next_request_at.unwrap();
+        assert!(next_request_at >= before + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
+        assert!(next_request_at <= Instant::now() + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
     }
 
     #[tokio::test]

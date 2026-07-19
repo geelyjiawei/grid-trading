@@ -4,6 +4,7 @@ import type { GridStatus, RiskSnapshot } from "../api/types";
 import {
   directionName,
   formatNumber,
+  quoteAsset,
   strategyCanStop,
   strategyStatusLabel,
   strategyStatusTone,
@@ -50,6 +51,7 @@ const statusTone = computed(() => strategyStatusTone(props.status));
 const manualStopPending = computed(
   () => props.status?.manual_stop_pending === true || props.status?.lifecycle === "stop_requested",
 );
+const settlementAsset = computed(() => props.status ? quoteAsset(props.status.exchange) : "USDT");
 
 watch(
   () => [props.status?.run_id, props.status?.lifecycle, canStop.value, props.stopBusy],
@@ -103,11 +105,11 @@ function requestStop(): void {
       <div class="metric-grid">
         <div><span>方向</span><strong>{{ directionName(status.direction) }}</strong></div>
         <div><span>模式</span><strong>{{ status.grid_mode === "geometric" ? "等比" : "等差" }}</strong></div>
-        <div><span>总权益利润</span><strong :class="Number(totalEquityProfit ?? 0) >= 0 ? 'positive' : 'negative'">{{ formatNumber(totalEquityProfit, 4) }} USDT</strong></div>
-        <div><span>已实现净利润</span><strong>{{ formatNumber(realizedNetProfit, 4) }} USDT</strong></div>
-        <div><span>网格未实现盈亏</span><strong>{{ formatNumber(gridUnrealizedProfit, 4) }} USDT</strong></div>
-        <div><span>手续费</span><strong>{{ formatNumber(totalFee, 4) }} USDT</strong></div>
-        <div><span>总交易量</span><strong>{{ formatNumber(totalVolume, 2) }} USDT</strong></div>
+        <div><span>总权益利润</span><strong :class="Number(totalEquityProfit ?? 0) >= 0 ? 'positive' : 'negative'">{{ formatNumber(totalEquityProfit, 4) }} {{ settlementAsset }}</strong></div>
+        <div><span>已实现净利润</span><strong>{{ formatNumber(realizedNetProfit, 4) }} {{ settlementAsset }}</strong></div>
+        <div><span>网格未实现盈亏</span><strong>{{ formatNumber(gridUnrealizedProfit, 4) }} {{ settlementAsset }}</strong></div>
+        <div><span>手续费</span><strong>{{ formatNumber(totalFee, 4) }} {{ settlementAsset }}</strong></div>
+        <div><span>总交易量</span><strong>{{ formatNumber(totalVolume, 2) }} {{ settlementAsset }}</strong></div>
         <div><span>网格净持仓</span><strong>{{ formatNumber(status.grid_position_net_qty, 8) }}</strong></div>
         <div><span>完成配对</span><strong>{{ completedPairs }}</strong></div>
       </div>
