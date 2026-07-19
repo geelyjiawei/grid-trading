@@ -52,6 +52,12 @@ const trades = ref<GridTrade[]>([]);
 const history = ref<GridHistoryRun[]>([]);
 const detailsLoading = ref(false);
 const detailsError = ref("");
+const detailAvailability = ref({
+  positions: false,
+  orders: false,
+  trades: false,
+  history: false,
+});
 const preview = ref<GridPreview | null>(null);
 const previewContext = ref("");
 const previewConfig = ref<GridConfigRequest | null>(null);
@@ -131,6 +137,13 @@ function prepareWorkspaceContext(): void {
     positions.value = [];
     openOrders.value = [];
     trades.value = [];
+    history.value = [];
+    detailAvailability.value = {
+      positions: false,
+      orders: false,
+      trades: false,
+      history: false,
+    };
     detailsError.value = "";
     detailsLoading.value = false;
   }
@@ -241,6 +254,13 @@ async function refreshDetails(): Promise<void> {
     positions.value = [];
     openOrders.value = [];
     trades.value = [];
+    history.value = [];
+    detailAvailability.value = {
+      positions: false,
+      orders: false,
+      trades: false,
+      history: false,
+    };
     detailsLoading.value = false;
     detailsError.value = "";
     return;
@@ -265,20 +285,24 @@ async function refreshDetails(): Promise<void> {
   }
 
   const [positionResult, orderResult, tradeResult, historyResult] = results;
-  positions.value = positionResult.status === "fulfilled"
-    ? positionResult.value.positions
-    : [];
+  if (positionResult.status === "fulfilled") {
+    positions.value = positionResult.value.positions;
+  }
   if (orderResult.status === "fulfilled") {
     openOrders.value = orderResult.value.orders ?? orderResult.value.result?.list ?? [];
-  } else {
-    openOrders.value = [];
   }
   if (tradeResult.status === "fulfilled") {
     trades.value = tradeResult.value.trades ?? tradeResult.value.result?.list ?? [];
-  } else {
-    trades.value = [];
   }
-  history.value = historyResult.status === "fulfilled" ? historyResult.value.runs : [];
+  if (historyResult.status === "fulfilled") {
+    history.value = historyResult.value.runs;
+  }
+  detailAvailability.value = {
+    positions: positionResult.status === "fulfilled",
+    orders: orderResult.status === "fulfilled",
+    trades: tradeResult.status === "fulfilled",
+    history: historyResult.status === "fulfilled",
+  };
 
   const failures = results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -549,6 +573,7 @@ onUnmounted(() => {
         :configured="configured"
         :loading="detailsLoading"
         :error="detailsError"
+        :availability="detailAvailability"
         :positions="positions"
         :orders="openOrders"
         :trades="trades"

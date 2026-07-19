@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -23,17 +24,81 @@ use crate::{
         aster::{AsterAdapter, AsterSignatureError, LocalEip712Signer},
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
-        protocol::{MonotonicMicrosecondNonce, ReqwestTransport, SystemClock, TransportBuildError},
+        protocol::{
+            BinanceRequestGovernor, MonotonicMicrosecondNonce, ReqwestTransport, SystemClock,
+            TransportBuildError,
+        },
     },
 };
 
-type BinanceGateway = BinanceAdapter<ReqwestTransport, HmacSha256Signer, SystemClock>;
+type BinanceGateway =
+    BinanceAdapter<BinanceRequestGovernor<ReqwestTransport>, HmacSha256Signer, SystemClock>;
 type AsterGateway = AsterAdapter<ReqwestTransport, LocalEip712Signer, MonotonicMicrosecondNonce>;
 type BybitGateway = BybitAdapter<ReqwestTransport, BybitHmacSha256Signer, SystemClock>;
 
 // Leave account-wide headroom below each exchange's published order limit.
 const BINANCE_ASTER_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(60);
 const BYBIT_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(110);
+const BINANCE_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
+const INSTRUMENT_RULES_CACHE_TTL: Duration = Duration::from_secs(60);
+const TRADING_FEE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+struct TimedSnapshotCache<T> {
+    ttl: Duration,
+    values: Mutex<HashMap<String, (Instant, T)>>,
+}
+
+impl<T> TimedSnapshotCache<T>
+where
+    T: Clone,
+{
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            values: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &str, now: Instant) -> Option<T> {
+        let mut values = self
+            .values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (cached_at, value) = values.get(key)?;
+        if now.saturating_duration_since(*cached_at) < self.ttl {
+            return Some(value.clone());
+        }
+        values.remove(key);
+        None
+    }
+
+    fn insert(&self, key: String, value: T, now: Instant) {
+        self.values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, (now, value));
+    }
+}
+
+#[derive(Debug)]
+struct GatewaySnapshotCaches {
+    instrument_rules: TimedSnapshotCache<InstrumentRules>,
+    trading_fees: TimedSnapshotCache<TradingFeeRates>,
+}
+
+impl GatewaySnapshotCaches {
+    fn new() -> Self {
+        Self {
+            instrument_rules: TimedSnapshotCache::new(INSTRUMENT_RULES_CACHE_TTL),
+            trading_fees: TimedSnapshotCache::new(TRADING_FEE_CACHE_TTL),
+        }
+    }
+}
+
+fn snapshot_cache_key(exchange: Exchange, symbol: &str) -> String {
+    format!("{exchange:?}:{}", symbol.to_ascii_uppercase())
+}
 
 #[derive(Debug)]
 struct OrderPlacementPacer {
@@ -167,6 +232,7 @@ pub enum CredentialError {
 pub struct ExchangeGatewayFactory {
     environment: ExchangeEnvironment,
     transport: ReqwestTransport,
+    binance_transport: BinanceRequestGovernor<ReqwestTransport>,
 }
 
 impl ExchangeGatewayFactory {
@@ -174,9 +240,14 @@ impl ExchangeGatewayFactory {
         environment: ExchangeEnvironment,
         timeout: Duration,
     ) -> Result<Self, ExchangeGatewayBuildError> {
+        let transport = ReqwestTransport::new(timeout)?;
         Ok(Self {
             environment,
-            transport: ReqwestTransport::new(timeout)?,
+            binance_transport: BinanceRequestGovernor::new(
+                transport.clone(),
+                BINANCE_REQUEST_INTERVAL,
+            ),
+            transport,
         })
     }
 
@@ -200,13 +271,13 @@ impl ExchangeGatewayFactory {
                 let signer = HmacSha256Signer::new(api_secret.as_bytes())?;
                 let adapter = match self.environment {
                     ExchangeEnvironment::Production => BinanceAdapter::production(
-                        self.transport.clone(),
+                        self.binance_transport.clone(),
                         signer,
                         SystemClock,
                         api_key.as_str().to_owned(),
                     ),
                     ExchangeEnvironment::Testnet => BinanceAdapter::testnet(
-                        self.transport.clone(),
+                        self.binance_transport.clone(),
                         signer,
                         SystemClock,
                         api_key.as_str().to_owned(),
@@ -286,6 +357,7 @@ impl ConfiguredExchangeGateway {
         SharedConfiguredExchangeGateway {
             inner: Arc::new(self),
             order_placement_pacer,
+            snapshot_caches: Arc::new(GatewaySnapshotCaches::new()),
         }
     }
 }
@@ -296,6 +368,7 @@ impl ConfiguredExchangeGateway {
 pub struct SharedConfiguredExchangeGateway {
     inner: Arc<ConfiguredExchangeGateway>,
     order_placement_pacer: Arc<OrderPlacementPacer>,
+    snapshot_caches: Arc<GatewaySnapshotCaches>,
 }
 
 impl SharedConfiguredExchangeGateway {
@@ -642,7 +715,15 @@ impl TradingFeeRateGateway for SharedConfiguredExchangeGateway {
         exchange: Exchange,
         symbol: &str,
     ) -> Result<TradingFeeRates, SnapshotError> {
-        self.inner.trading_fee_rates(exchange, symbol).await
+        let key = snapshot_cache_key(exchange, symbol);
+        if let Some(cached) = self.snapshot_caches.trading_fees.get(&key, Instant::now()) {
+            return Ok(cached);
+        }
+        let rates = self.inner.trading_fee_rates(exchange, symbol).await?;
+        self.snapshot_caches
+            .trading_fees
+            .insert(key, rates.clone(), Instant::now());
+        Ok(rates)
     }
 }
 
@@ -768,7 +849,19 @@ impl InstrumentRulesGateway for SharedConfiguredExchangeGateway {
         exchange: Exchange,
         symbol: &str,
     ) -> Result<InstrumentRules, SnapshotError> {
-        self.inner.instrument_rules(exchange, symbol).await
+        let key = snapshot_cache_key(exchange, symbol);
+        if let Some(cached) = self
+            .snapshot_caches
+            .instrument_rules
+            .get(&key, Instant::now())
+        {
+            return Ok(cached);
+        }
+        let rules = self.inner.instrument_rules(exchange, symbol).await?;
+        self.snapshot_caches
+            .instrument_rules
+            .insert(key, rules.clone(), Instant::now());
+        Ok(rules)
     }
 }
 
@@ -844,10 +937,30 @@ mod tests {
             &gateway.order_placement_pacer,
             &clone.order_placement_pacer
         ));
+        assert!(Arc::ptr_eq(
+            &gateway.snapshot_caches,
+            &clone.snapshot_caches
+        ));
         assert_eq!(gateway.order_placement_pacer.reserve(now), Duration::ZERO);
         assert_eq!(
             clone.order_placement_pacer.reserve(now),
             BYBIT_ORDER_PLACEMENT_INTERVAL
+        );
+    }
+
+    #[test]
+    fn timed_snapshot_cache_expires_values_at_the_configured_deadline() {
+        let cache = TimedSnapshotCache::new(Duration::from_secs(10));
+        let inserted_at = Instant::now();
+        cache.insert("MUUSDT".into(), "cached", inserted_at);
+
+        assert_eq!(
+            cache.get("MUUSDT", inserted_at + Duration::from_secs(9)),
+            Some("cached")
+        );
+        assert_eq!(
+            cache.get("MUUSDT", inserted_at + Duration::from_secs(10)),
+            None
         );
     }
 

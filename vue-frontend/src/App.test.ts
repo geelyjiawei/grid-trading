@@ -1,7 +1,7 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App.vue";
-import { api } from "./api/client";
+import { ApiError, api } from "./api/client";
 import type { GridStatus, PriceSnapshot, RiskSnapshot } from "./api/types";
 
 function deferred<T>() {
@@ -164,6 +164,62 @@ describe("workspace request isolation", () => {
       expect(wrapper.find(".strategy-overview").text()).toContain("总权益利润等待当前策略");
     });
     expect(wrapper.find(".strategy-overview").text()).not.toContain("987");
+    wrapper.unmount();
+  });
+
+  it("keeps the last successful detail snapshot and never renders a failed read as zero", async () => {
+    const grid: GridStatus = {
+      run_id: "run-detail-current",
+      exchange: "binance",
+      symbol: "ESPORTSUSDT",
+      running: true,
+      realized_net_profit: "1",
+    };
+    installWorkspaceMocks([grid]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "0.42", mark_price: "0.42" });
+    vi.spyOn(api, "risk").mockResolvedValue({
+      run_id: grid.run_id,
+      exchange: grid.exchange,
+      symbol: grid.symbol,
+      has_risk: false,
+    });
+    vi.mocked(api.positions)
+      .mockResolvedValueOnce({
+        positions: [{ side: "Sell", size: "125", entry_price: "0.43" }],
+      })
+      .mockRejectedValueOnce(new ApiError(
+        "Binance 请求频率受限，服务器正在冷却；实时快照暂不可用，不能将持仓或挂单视为 0",
+        503,
+      ));
+    vi.mocked(api.openOrders)
+      .mockResolvedValueOnce({
+        orders: [{
+          order_id: "42",
+          side: "Buy",
+          price: "0.41",
+          qty: "125",
+          status: "NEW",
+          reduce_only: true,
+        }],
+      })
+      .mockRejectedValueOnce(new ApiError(
+        "Binance 请求频率受限，服务器正在冷却；实时快照暂不可用，不能将持仓或挂单视为 0",
+        503,
+      ));
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => {
+      expect(wrapper.find(".detail-tabs").text()).toContain("持仓 1");
+      expect(wrapper.find(".detail-tabs").text()).toContain("挂单 1");
+    });
+    await wrapper.find(".detail-header button").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".detail-tabs").text()).toContain("持仓 --");
+    expect(wrapper.find(".detail-tabs").text()).toContain("挂单 --");
+    expect(wrapper.find(".detail-panel").text()).toContain("不能将持仓或挂单视为 0");
+    expect(wrapper.find(".detail-panel").text()).toContain("保留上次成功快照");
+    expect(wrapper.find(".position-item").text()).toContain("125");
     wrapper.unmount();
   });
 });

@@ -1370,7 +1370,17 @@ where
             .await
         {
             Ok(Some(progress)) => index_open_order_progress(progress),
-            Ok(None) | Err(_) => None,
+            Ok(None) => None,
+            Err(error) => {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::LedgerReconciliation,
+                    client_order_id: None,
+                    message: format!(
+                        "authoritative open-order progress snapshot is unavailable: {error}"
+                    ),
+                });
+                return Ok(report);
+            }
         };
         let ledger_ids = self
             .intent_store
@@ -2158,6 +2168,7 @@ mod tests {
         maximum_concurrent_execution_snapshots: usize,
         execution_snapshot_delay: Option<Duration>,
         open_progress_enabled: bool,
+        next_open_progress_error: Option<ExecutionSnapshotError>,
         open_progress_calls: usize,
         fee_rate_calls: usize,
         leverage_write_calls: usize,
@@ -2220,6 +2231,7 @@ mod tests {
                     maximum_concurrent_execution_snapshots: 0,
                     execution_snapshot_delay: None,
                     open_progress_enabled: false,
+                    next_open_progress_error: None,
                     open_progress_calls: 0,
                     fee_rate_calls: 0,
                     leverage_write_calls: 0,
@@ -2270,6 +2282,11 @@ mod tests {
 
         fn enable_open_progress(&self) {
             self.state.lock().unwrap().open_progress_enabled = true;
+        }
+
+        fn fail_next_open_progress(&self, message: &str) {
+            self.state.lock().unwrap().next_open_progress_error =
+                Some(ExecutionSnapshotError::new(message));
         }
 
         fn order_lookup_call_count(&self) -> usize {
@@ -2666,6 +2683,10 @@ mod tests {
             _symbol: &str,
         ) -> Result<Option<Vec<OpenOrderExecutionProgress>>, ExecutionSnapshotError> {
             let mut state = self.state.lock().unwrap();
+            if let Some(error) = state.next_open_progress_error.take() {
+                state.open_progress_calls += 1;
+                return Err(error);
+            }
             if !state.open_progress_enabled {
                 return Ok(None);
             }
@@ -4649,6 +4670,47 @@ mod tests {
                 .sum::<Decimal>(),
             partial_quantity
         );
+    }
+
+    #[tokio::test]
+    async fn failed_batched_open_progress_fails_closed_without_per_order_request_fanout() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+        let stable = runtime.tick(1_300).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+
+        let strategy_before = runtime.machine().store().snapshot().clone();
+        let placement_before = gateway.placement_call_count();
+        let cancellation_before = gateway.cancellation_call_count();
+        let lookup_before = gateway.order_lookup_call_count();
+        let execution_before = gateway.execution_snapshot_call_count();
+        let inputs_before = gateway.all_bootstrap_call_count();
+        gateway.fail_next_open_progress("HTTP 418: Binance IP ban is active");
+
+        let blocked = runtime.tick(1_400).await.unwrap();
+
+        assert!(blocked.is_blocked(), "{blocked:?}");
+        assert_eq!(blocked.blockers.len(), 1);
+        assert_eq!(
+            blocked.blockers[0].stage,
+            RuntimeStage::LedgerReconciliation
+        );
+        assert!(blocked.blockers[0].client_order_id.is_none());
+        assert!(blocked.submissions.is_empty());
+        assert!(blocked.cancellations.is_empty());
+        assert_eq!(runtime.machine().store().snapshot(), &strategy_before);
+        assert_eq!(gateway.placement_call_count(), placement_before);
+        assert_eq!(gateway.cancellation_call_count(), cancellation_before);
+        assert_eq!(gateway.order_lookup_call_count(), lookup_before);
+        assert_eq!(gateway.execution_snapshot_call_count(), execution_before);
+        assert_eq!(gateway.all_bootstrap_call_count(), inputs_before);
     }
 
     #[tokio::test]
