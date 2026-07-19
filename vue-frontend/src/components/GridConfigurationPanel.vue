@@ -345,7 +345,7 @@ function quantityText(): string {
           <div><span>交易所最低金额</span><strong>{{ formatNumber(preview.min_notional, 4) }} USDT</strong></div>
         </div>
         <p v-if="preview && !previewMatchesForm" class="form-error">参数已变化，本次预览已失效。</p>
-        <p v-if="strategyRunning" class="form-hint">当前交易所与交易对已有运行策略，不能重复启动。</p>
+        <p v-if="strategyRunning" class="form-hint">当前交易所与交易对已有活动策略（含停止确认中），不能重复启动。</p>
         <p v-else-if="!tradingEnabled" class="form-hint">Rust 实盘写入开关尚未启用，只能预览。</p>
         <button class="primary-button" type="button" :disabled="!canStart" @click="submitStart">
           {{ startBusy ? "正在持久化并启动…" : "启动已预览策略" }}

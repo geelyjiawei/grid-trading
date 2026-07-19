@@ -1,4 +1,4 @@
-import type { Direction, Exchange } from "./api/types";
+import type { Direction, Exchange, GridStatus } from "./api/types";
 
 export function exchangeName(exchange: Exchange): string {
   if (exchange === "binance") return "Binance";
@@ -11,6 +11,31 @@ export function directionName(direction?: Direction): string {
   if (direction === "short") return "做空";
   if (direction === "neutral") return "中性";
   return "--";
+}
+
+export function strategyStatusLabel(status?: GridStatus | null): string {
+  if (!status) return "未运行";
+  if (status.waiting_initial_order || status.lifecycle === "awaiting_opening") return "等待开仓";
+  if (status.waiting_trigger || status.lifecycle === "waiting_trigger") return "等待触发";
+  if (status.lifecycle === "deploying_grid") return "部署网格中";
+  if (status.lifecycle === "stop_requested") return "停止确认中";
+  if (status.lifecycle === "risk_exit_requested") return "风险退出中";
+  if (status.lifecycle === "failed") return "异常待处理";
+  if (["stopped", "closed", "cancelled"].includes(status.lifecycle ?? "")) return "已停止";
+  return status.running ? "运行中" : "未运行";
+}
+
+export function strategyStatusTone(status?: GridStatus | null): "running" | "pending" | "stopped" {
+  if (["stop_requested", "risk_exit_requested", "failed"].includes(status?.lifecycle ?? "")) {
+    return "pending";
+  }
+  return status?.running ? "running" : "stopped";
+}
+
+export function strategyCanStop(status?: GridStatus | null): boolean {
+  return status?.running === true
+    && !["stop_requested", "risk_exit_requested", "failed", "stopped", "closed", "cancelled"]
+      .includes(status.lifecycle ?? "");
 }
 
 export function finiteNumber(value: unknown): number | null {

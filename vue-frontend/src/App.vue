@@ -26,7 +26,7 @@ import MarketOverview from "./components/MarketOverview.vue";
 import StrategyList from "./components/StrategyList.vue";
 import StrategyDetailsPanel from "./components/StrategyDetailsPanel.vue";
 import StrategyOverview from "./components/StrategyOverview.vue";
-import { exchangeName } from "./format";
+import { exchangeName, strategyCanStop } from "./format";
 
 const exchanges: Exchange[] = ["binance", "aster", "bybit"];
 const authStatus = ref<AuthStatus | null>(null);
@@ -98,9 +98,9 @@ const visiblePreview = computed(() =>
 const visiblePreviewKey = computed(() =>
   previewContext.value === currentPreviewContext.value ? previewKey.value : "",
 );
-const strategyRunning = computed(() =>
+const strategyPresent = computed(() =>
   grids.value.some(
-    (grid) => grid.running && grid.exchange === activeExchange.value && grid.symbol === symbol.value,
+    (grid) => grid.exchange === activeExchange.value && grid.symbol === symbol.value,
   ),
 );
 
@@ -162,9 +162,9 @@ async function refreshStrategies(): Promise<void> {
   try {
     const response = await api.gridStatus();
     tradingEnabled.value = response.trading_enabled === true;
-    grids.value = (response.grids ?? []).filter((grid) => grid.running);
+    grids.value = response.grids ?? [];
     selectedStatus.value =
-      response.grids.find(
+      grids.value.find(
         (grid) => grid.exchange === activeExchange.value && grid.symbol === symbol.value,
       ) ?? null;
     strategyError.value = "";
@@ -347,8 +347,8 @@ async function startStrategy(configRequest: GridConfigRequest): Promise<void> {
     startError.value = "Rust 实盘写入尚未启用";
     return;
   }
-  if (strategyRunning.value) {
-    startError.value = "当前交易所与交易对已有运行策略";
+  if (strategyPresent.value) {
+    startError.value = "当前交易所与交易对已有活动策略（可能正在停止确认）";
     return;
   }
   if (
@@ -374,7 +374,7 @@ async function startStrategy(configRequest: GridConfigRequest): Promise<void> {
 
 async function stopStrategy(): Promise<void> {
   const status = selectedStatus.value;
-  if (!status?.running || stopBusy.value) return;
+  if (!status || !strategyCanStop(status) || stopBusy.value) return;
   stopBusy.value = true;
   stopError.value = "";
   startMessage.value = "";
@@ -554,7 +554,7 @@ onUnmounted(() => {
         :start-busy="startBusy"
         :start-error="startError"
         :start-message="startMessage"
-        :strategy-running="strategyRunning"
+        :strategy-running="strategyPresent"
         :trading-enabled="tradingEnabled"
         @preview="requestPreview"
         @start="startStrategy"

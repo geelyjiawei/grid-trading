@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use thiserror::Error;
 
 use crate::{
     domain::{ClientOrderId, IntentState},
     exchange::{
-        AuthoritativeOrder, OpenOrderSnapshotGateway, OrderLifecycle, OrderLookup,
-        OrderLookupGateway, PositionSnapshot, PositionSnapshotGateway,
+        AuthoritativeOrder, OpenOrderSnapshotGateway, OrderLifecycle, PositionSnapshot,
+        PositionSnapshotGateway,
     },
 };
 
@@ -76,7 +76,7 @@ pub async fn collect_strategy_shadow<G>(
     strategy: &StrategyState,
 ) -> Result<ShadowAuditReport, ShadowCollectionError>
 where
-    G: OpenOrderSnapshotGateway + OrderLookupGateway + PositionSnapshotGateway + ?Sized,
+    G: OpenOrderSnapshotGateway + PositionSnapshotGateway + ?Sized,
 {
     Ok(collect_strategy_shadow_view(gateway, strategy)
         .await?
@@ -88,7 +88,7 @@ pub async fn collect_strategy_shadow_view<G>(
     strategy: &StrategyState,
 ) -> Result<CollectedStrategyShadow, ShadowCollectionError>
 where
-    G: OpenOrderSnapshotGateway + OrderLookupGateway + PositionSnapshotGateway + ?Sized,
+    G: OpenOrderSnapshotGateway + PositionSnapshotGateway + ?Sized,
 {
     strategy
         .validate()
@@ -111,28 +111,18 @@ where
         .map(|order| order.client_order_id.clone())
         .collect::<BTreeSet<_>>();
 
-    let mut terminal_observations = Vec::new();
-    for order in strategy.orders.values().filter(|order| {
-        !open_client_order_ids.contains(&order.client_order_id)
-            && should_lookup_missing_order(order)
-    }) {
-        let lookup = gateway
-            .lookup_order_by_client_id(strategy.exchange, &strategy.symbol, &order.client_order_id)
-            .await
-            .map_err(|error| ShadowCollectionError::OrderLookup {
-                client_order_id: order.client_order_id.clone(),
-                message: error.to_string(),
-            })?;
-        let OrderLookup::Found(observed) = lookup else {
-            continue;
-        };
-        validate_lookup_identity(strategy, &order.client_order_id, &observed)?;
-        if matches!(observed.lifecycle, OrderLifecycle::Active(_)) {
-            return Err(ShadowCollectionError::ActiveLookupMissingFromOpenOrders {
-                client_order_id: order.client_order_id.clone(),
-            });
-        }
-        terminal_observations.push(observed);
+    let pending_accounting_count = strategy
+        .orders
+        .values()
+        .filter(|order| {
+            !open_client_order_ids.contains(&order.client_order_id)
+                && should_lookup_missing_order(order)
+        })
+        .count();
+    if pending_accounting_count > 0 {
+        return Err(ShadowCollectionError::StrategyOrderAccountingPending {
+            count: pending_accounting_count,
+        });
     }
 
     let position = gateway
@@ -156,8 +146,6 @@ where
     }
 
     let mut observed_orders = owned_open_orders;
-    observed_orders.extend(terminal_observations);
-    validate_combined_observations(&observed_orders)?;
     observed_orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
     let report = audit_strategy_shadow(strategy, &position, &observed_orders);
     Ok(CollectedStrategyShadow {
@@ -237,44 +225,6 @@ fn validate_position_identity(
     Ok(())
 }
 
-fn validate_lookup_identity(
-    strategy: &StrategyState,
-    expected_client_order_id: &ClientOrderId,
-    observed: &AuthoritativeOrder,
-) -> Result<(), ShadowCollectionError> {
-    if observed.client_order_id != *expected_client_order_id
-        || observed.exchange != strategy.exchange
-        || observed.shape.symbol != strategy.symbol
-        || observed.exchange_order_id.trim().is_empty()
-        || observed.shape.validate().is_err()
-    {
-        return Err(ShadowCollectionError::InvalidLookupIdentity {
-            client_order_id: expected_client_order_id.clone(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_combined_observations(
-    observations: &[AuthoritativeOrder],
-) -> Result<(), ShadowCollectionError> {
-    let mut client_order_ids = BTreeSet::new();
-    let mut exchange_order_ids = BTreeMap::<String, ClientOrderId>::new();
-    for order in observations {
-        if !client_order_ids.insert(order.client_order_id.clone())
-            || exchange_order_ids
-                .insert(
-                    order.exchange_order_id.clone(),
-                    order.client_order_id.clone(),
-                )
-                .is_some()
-        {
-            return Err(ShadowCollectionError::DuplicateObservationIdentity);
-        }
-    }
-    Ok(())
-}
-
 fn belongs_to_run(client_order_id: &ClientOrderId, run_id: &str) -> bool {
     ["o", "g", "c", "r"].iter().any(|prefix| {
         client_order_id
@@ -293,29 +243,20 @@ pub enum ShadowCollectionError {
     PositionSnapshot { message: String },
     #[error("position snapshot belongs to another exchange or symbol")]
     InvalidPositionIdentity,
-    #[error("order lookup failed for {client_order_id:?}: {message}")]
-    OrderLookup {
-        client_order_id: ClientOrderId,
-        message: String,
-    },
+    #[error("{count} strategy orders are waiting for runtime execution accounting")]
+    StrategyOrderAccountingPending { count: usize },
     #[error("open-order snapshot contains an invalid owned order")]
     InvalidOpenOrder { client_order_id: ClientOrderId },
     #[error("open-order snapshot contains duplicate client or exchange identities")]
     DuplicateOpenOrderIdentity,
-    #[error("order lookup returned a foreign or malformed identity")]
-    InvalidLookupIdentity { client_order_id: ClientOrderId },
-    #[error("an active per-order lookup was absent from the complete open-order snapshot")]
-    ActiveLookupMissingFromOpenOrders { client_order_id: ClientOrderId },
     #[error("open orders changed between the two read-only collection passes")]
     OpenOrdersChangedDuringCollection,
-    #[error("combined open and terminal observations contain duplicate identities")]
-    DuplicateObservationIdentity,
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::VecDeque,
         sync::{Arc, Mutex},
     };
 
@@ -332,10 +273,7 @@ mod tests {
             MarketSnapshot, PositionBaseline, StrategyLifecycle, StrategyRunId, StrategyState,
             build_grid_plan,
         },
-        exchange::{
-            ActiveOrderStatus, LookupError, PositionLeg, PositionSide, PositionSnapshot,
-            SnapshotError,
-        },
+        exchange::{ActiveOrderStatus, PositionLeg, PositionSide, PositionSnapshot, SnapshotError},
     };
 
     type OpenOrderResponses = Arc<Mutex<VecDeque<Result<Vec<AuthoritativeOrder>, SnapshotError>>>>;
@@ -344,7 +282,6 @@ mod tests {
     struct ReadOnlyGateway {
         open_orders: OpenOrderResponses,
         position: Result<PositionSnapshot, SnapshotError>,
-        lookups: Arc<Mutex<BTreeMap<ClientOrderId, Result<OrderLookup, LookupError>>>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -356,7 +293,6 @@ mod tests {
                     Ok(open_orders),
                 ]))),
                 position: Ok(position),
-                lookups: Arc::new(Mutex::new(BTreeMap::new())),
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -391,27 +327,6 @@ mod tests {
         ) -> Result<PositionSnapshot, SnapshotError> {
             self.calls.lock().unwrap().push("position".into());
             self.position.clone()
-        }
-    }
-
-    #[async_trait]
-    impl OrderLookupGateway for ReadOnlyGateway {
-        async fn lookup_order_by_client_id(
-            &self,
-            _exchange: Exchange,
-            _symbol: &str,
-            client_order_id: &ClientOrderId,
-        ) -> Result<OrderLookup, LookupError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("lookup:{}", client_order_id.as_str()));
-            self.lookups
-                .lock()
-                .unwrap()
-                .get(client_order_id)
-                .cloned()
-                .unwrap_or(Ok(OrderLookup::NotFound))
         }
     }
 
@@ -557,7 +472,6 @@ mod tests {
         let gateway = ReadOnlyGateway {
             open_orders: Arc::new(Mutex::new(VecDeque::from([Ok(first), Ok(second)]))),
             position: Ok(flat_position(&state)),
-            lookups: Arc::new(Mutex::new(BTreeMap::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -576,7 +490,6 @@ mod tests {
         let gateway = ReadOnlyGateway {
             open_orders: Arc::new(Mutex::new(VecDeque::from([Ok(first), Ok(second)]))),
             position: Ok(flat_position(&state)),
-            lookups: Arc::new(Mutex::new(BTreeMap::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -587,59 +500,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_order_is_looked_up_and_not_found_remains_an_explicit_gap() {
+    async fn missing_order_defers_to_runtime_accounting_without_per_order_reads() {
         let state = strategy();
         let mut opens = open_orders(&state);
-        let missing = opens.remove(0).client_order_id;
+        opens.remove(0);
         let gateway = ReadOnlyGateway::stable(opens, flat_position(&state));
-
-        let report = collect_strategy_shadow(&gateway, &state).await.unwrap();
-
-        assert!(!report.clean);
-        assert_eq!(report.orders.missing_order_count, 1);
-        assert!(
-            gateway
-                .calls()
-                .contains(&format!("lookup:{}", missing.as_str()))
-        );
-    }
-
-    #[tokio::test]
-    async fn active_lookup_missing_from_complete_open_orders_is_inconclusive() {
-        let state = strategy();
-        let mut opens = open_orders(&state);
-        let missing_order = opens.remove(0);
-        let gateway = ReadOnlyGateway::stable(opens, flat_position(&state));
-        gateway.lookups.lock().unwrap().insert(
-            missing_order.client_order_id.clone(),
-            Ok(OrderLookup::Found(missing_order.clone())),
-        );
 
         assert_eq!(
             collect_strategy_shadow(&gateway, &state).await,
-            Err(ShadowCollectionError::ActiveLookupMissingFromOpenOrders {
-                client_order_id: missing_order.client_order_id,
-            })
+            Err(ShadowCollectionError::StrategyOrderAccountingPending { count: 1 })
         );
+        assert_eq!(gateway.calls(), vec!["open"]);
     }
 
     #[tokio::test]
-    async fn terminal_lookup_is_compared_but_never_treated_as_an_active_order() {
-        let state = strategy();
+    async fn terminal_unprocessed_order_defers_to_runtime_accounting() {
+        let mut state = strategy();
         let mut opens = open_orders(&state);
-        let mut terminal = opens.remove(0);
-        terminal.lifecycle = OrderLifecycle::Terminal(crate::domain::TerminalOrderStatus::Filled);
+        let missing_order = opens.remove(0);
+        let record = state
+            .orders
+            .get_mut(&missing_order.client_order_id)
+            .unwrap();
+        record.tracking = StrategyOrderTracking::Intent {
+            state: IntentState::Terminal {
+                status: crate::domain::TerminalOrderStatus::Filled,
+                exchange_order_id: Some(missing_order.exchange_order_id),
+            },
+        };
+        state.validate().unwrap();
         let gateway = ReadOnlyGateway::stable(opens, flat_position(&state));
-        gateway.lookups.lock().unwrap().insert(
-            terminal.client_order_id.clone(),
-            Ok(OrderLookup::Found(terminal)),
+
+        assert_eq!(
+            collect_strategy_shadow(&gateway, &state).await,
+            Err(ShadowCollectionError::StrategyOrderAccountingPending { count: 1 })
         );
-
-        let report = collect_strategy_shadow(&gateway, &state).await.unwrap();
-
-        assert!(!report.clean);
-        assert_eq!(report.orders.missing_order_count, 0);
-        assert_eq!(report.orders.mismatched_order_count, 1);
+        assert_eq!(gateway.calls(), vec!["open"]);
     }
 
     #[tokio::test]
@@ -689,7 +585,7 @@ mod tests {
     fn collector_signature_requires_only_read_gateways() {
         fn accepts_collector_gateway<G>()
         where
-            G: OpenOrderSnapshotGateway + OrderLookupGateway + PositionSnapshotGateway,
+            G: OpenOrderSnapshotGateway + PositionSnapshotGateway,
         {
         }
 

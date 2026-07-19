@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { GridStatus, RiskSnapshot } from "../api/types";
-import { directionName, formatNumber } from "../format";
+import {
+  directionName,
+  formatNumber,
+  strategyCanStop,
+  strategyStatusLabel,
+  strategyStatusTone,
+} from "../format";
 
 const props = withDefaults(defineProps<{
   status: GridStatus | null;
@@ -38,16 +44,22 @@ const totalVolume = computed(() => currentRisk.value?.total_volume ?? props.stat
 const completedPairs = computed(
   () => currentRisk.value?.completed_pairs ?? props.status?.completed_pairs ?? 0,
 );
+const canStop = computed(() => strategyCanStop(props.status));
+const statusLabel = computed(() => strategyStatusLabel(props.status));
+const statusTone = computed(() => strategyStatusTone(props.status));
+const manualStopPending = computed(
+  () => props.status?.manual_stop_pending === true || props.status?.lifecycle === "stop_requested",
+);
 
 watch(
-  () => [props.status?.run_id, props.status?.running, props.stopBusy],
+  () => [props.status?.run_id, props.status?.lifecycle, canStop.value, props.stopBusy],
   () => {
-    if (!props.status?.running || props.stopBusy) stopConfirmation.value = false;
+    if (!canStop.value || props.stopBusy) stopConfirmation.value = false;
   },
 );
 
 function requestStop(): void {
-  if (!props.status?.running || props.stopBusy) return;
+  if (!canStop.value || props.stopBusy) return;
   if (!stopConfirmation.value) {
     stopConfirmation.value = true;
     return;
@@ -65,11 +77,11 @@ function requestStop(): void {
         <h2>{{ status?.symbol || "未选择策略" }}</h2>
       </div>
       <div class="strategy-actions">
-        <span class="live-pill" :class="status?.running ? 'running' : 'stopped'">
-          {{ status?.waiting_initial_order ? "等待开仓" : status?.waiting_trigger ? "等待触发" : status?.running ? "运行中" : "未运行" }}
+        <span class="live-pill" :class="statusTone">
+          {{ statusLabel }}
         </span>
         <button
-          v-if="status?.running"
+          v-if="canStop"
           class="ghost-button stop-button"
           type="button"
           :disabled="stopBusy"
@@ -82,6 +94,9 @@ function requestStop(): void {
 
     <p v-if="!status" class="empty-state">从上方策略列表选择一个交易对查看明细。</p>
     <template v-else>
+      <div v-if="manualStopPending" class="callout">
+        停止请求已保存。程序正在核对成交、手续费并确认策略订单全部终态；期间不会继续补单，也不会主动平仓。
+      </div>
       <div v-if="currentRisk?.has_risk" class="callout danger">
         风险核对未通过。当前页面仅展示状态，不执行自动补救操作。
       </div>

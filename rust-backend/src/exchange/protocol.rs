@@ -178,6 +178,7 @@ struct BinanceUsageEvent {
 struct BinanceRequestState {
     next_request_at: Option<Instant>,
     cooldown_until: Option<Instant>,
+    order_cooldown_until: Option<Instant>,
     consecutive_rate_limits: u32,
     request_weight_limit: u32,
     order_limit_10s: u32,
@@ -190,6 +191,7 @@ impl Default for BinanceRequestState {
         Self {
             next_request_at: None,
             cooldown_until: None,
+            order_cooldown_until: None,
             consecutive_rate_limits: 0,
             request_weight_limit: BINANCE_DEFAULT_REQUEST_WEIGHT_LIMIT,
             order_limit_10s: BINANCE_DEFAULT_ORDER_LIMIT_10S,
@@ -253,9 +255,27 @@ where
         }
 
         let request_cost = binance_request_cost(&request);
+        if let Some(cooldown_until) = state.order_cooldown_until {
+            if cooldown_until > now && request_cost.orders > 0 {
+                let cooldown = cooldown_until.saturating_duration_since(now);
+                return Ok(binance_cooldown_response(cooldown));
+            }
+            if cooldown_until <= now {
+                state.order_cooldown_until = None;
+            }
+        }
         prune_binance_usage(&mut state, now);
-        if let Some(cooldown) = binance_budget_cooldown(&state, request_cost, now) {
-            state.cooldown_until = Some(now + cooldown);
+        if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
+            let cooldown = match limit {
+                BinanceBudgetCooldown::AllRequests(cooldown) => {
+                    state.cooldown_until = Some(now + cooldown);
+                    cooldown
+                }
+                BinanceBudgetCooldown::Orders(cooldown) => {
+                    state.order_cooldown_until = Some(now + cooldown);
+                    cooldown
+                }
+            };
             return Ok(binance_cooldown_response(cooldown));
         }
 
@@ -297,8 +317,11 @@ where
             }
             200..=399 => {
                 state.consecutive_rate_limits = 0;
-                if binance_header_budget_is_exhausted(&state, &metadata) {
+                if binance_weight_header_is_exhausted(&state, &metadata) {
                     state.cooldown_until = Some(responded_at + BINANCE_RATE_LIMIT_WINDOW);
+                }
+                if let Some(cooldown) = binance_order_header_cooldown(&state, &metadata) {
+                    state.order_cooldown_until = Some(responded_at + cooldown);
                 }
             }
             _ => {}
@@ -366,11 +389,17 @@ fn binance_budget(limit: u32) -> u32 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinanceBudgetCooldown {
+    AllRequests(Duration),
+    Orders(Duration),
+}
+
 fn binance_budget_cooldown(
     state: &BinanceRequestState,
     request_cost: BinanceRequestCost,
     now: Instant,
-) -> Option<Duration> {
+) -> Option<BinanceBudgetCooldown> {
     let (used_weight, used_orders) = state.usage.iter().fold((0_u32, 0_u32), |used, event| {
         (
             used.0.saturating_add(event.cost.weight),
@@ -384,10 +413,11 @@ fn binance_budget_cooldown(
         .fold(0_u32, |used, event| used.saturating_add(event.cost.orders));
     let exceeds_weight = used_weight.saturating_add(request_cost.weight)
         > binance_budget(state.request_weight_limit);
-    let exceeds_orders =
-        used_orders.saturating_add(request_cost.orders) > binance_budget(state.order_limit);
-    let exceeds_orders_10s =
-        used_orders_10s.saturating_add(request_cost.orders) > binance_budget(state.order_limit_10s);
+    let exceeds_orders = request_cost.orders > 0
+        && used_orders.saturating_add(request_cost.orders) > binance_budget(state.order_limit);
+    let exceeds_orders_10s = request_cost.orders > 0
+        && used_orders_10s.saturating_add(request_cost.orders)
+            > binance_budget(state.order_limit_10s);
     if !exceeds_weight && !exceeds_orders && !exceeds_orders_10s {
         return None;
     }
@@ -402,12 +432,12 @@ fn binance_budget_cooldown(
                 window.saturating_sub(now.saturating_duration_since(oldest.at))
             })
     };
-    let mut cooldown = Duration::ZERO;
     if exceeds_weight {
-        cooldown = cooldown.max(remaining_for(BINANCE_RATE_LIMIT_WINDOW, |event| {
-            event.cost.weight > 0
-        }));
+        let cooldown = remaining_for(BINANCE_RATE_LIMIT_WINDOW, |event| event.cost.weight > 0)
+            .saturating_add(Duration::from_millis(1));
+        return Some(BinanceBudgetCooldown::AllRequests(cooldown));
     }
+    let mut cooldown = Duration::ZERO;
     if exceeds_orders {
         cooldown = cooldown.max(remaining_for(BINANCE_RATE_LIMIT_WINDOW, |event| {
             event.cost.orders > 0
@@ -418,22 +448,35 @@ fn binance_budget_cooldown(
             event.cost.orders > 0
         }));
     }
-    Some(cooldown.saturating_add(Duration::from_millis(1)))
+    Some(BinanceBudgetCooldown::Orders(
+        cooldown.saturating_add(Duration::from_millis(1)),
+    ))
 }
 
-fn binance_header_budget_is_exhausted(
+fn binance_weight_header_is_exhausted(
     state: &BinanceRequestState,
     metadata: &HttpResponseMetadata,
 ) -> bool {
     metadata
         .used_weight_1m
         .is_some_and(|used| used >= binance_budget(state.request_weight_limit))
-        || metadata
-            .order_count_10s
-            .is_some_and(|used| used >= binance_budget(state.order_limit_10s))
-        || metadata
-            .order_count_1m
-            .is_some_and(|used| used >= binance_budget(state.order_limit))
+}
+
+fn binance_order_header_cooldown(
+    state: &BinanceRequestState,
+    metadata: &HttpResponseMetadata,
+) -> Option<Duration> {
+    let ten_second_exhausted = metadata
+        .order_count_10s
+        .is_some_and(|used| used >= binance_budget(state.order_limit_10s));
+    let one_minute_exhausted = metadata
+        .order_count_1m
+        .is_some_and(|used| used >= binance_budget(state.order_limit));
+    match (ten_second_exhausted, one_minute_exhausted) {
+        (_, true) => Some(BINANCE_RATE_LIMIT_WINDOW),
+        (true, false) => Some(BINANCE_ORDER_LIMIT_SHORT_WINDOW),
+        (false, false) => None,
+    }
 }
 
 fn binance_exchange_limits(body: &str) -> Option<(u32, u32, u32)> {
@@ -978,16 +1021,21 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status, 200);
         }
+        let read = governor
+            .execute(symbol_request(HttpMethod::Get, "/fapi/v1/openOrders"))
+            .await
+            .unwrap();
         let blocked = governor
             .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
             .await
             .unwrap();
 
+        assert_eq!(read.status, 200);
         assert_eq!(blocked.status, 429);
-        assert_eq!(transport.call_count(), 3);
+        assert_eq!(transport.call_count(), 4);
         let state = governor.state.lock().await;
         let remaining = state
-            .cooldown_until
+            .order_cooldown_until
             .unwrap()
             .saturating_duration_since(Instant::now());
         assert!(remaining <= BINANCE_ORDER_LIMIT_SHORT_WINDOW + Duration::from_millis(1));
@@ -1015,7 +1063,11 @@ mod tests {
             });
         }
 
-        let cooldown = binance_budget_cooldown(&state, order_cost, now).unwrap();
+        let BinanceBudgetCooldown::Orders(cooldown) =
+            binance_budget_cooldown(&state, order_cost, now).unwrap()
+        else {
+            panic!("the order window must not pause read requests");
+        };
 
         assert!(cooldown >= Duration::from_secs(9));
         assert!(cooldown <= Duration::from_secs(9) + Duration::from_millis(1));
@@ -1105,6 +1157,31 @@ mod tests {
                 retry_after: Some(Duration::from_secs(42)),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn exchange_order_headers_pause_writes_without_blocking_reads() {
+        let mut transport = ScriptedTransport::new((0..2).map(|_| HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }));
+        transport.metadata = HttpResponseMetadata {
+            order_count_10s: Some(binance_budget(BINANCE_DEFAULT_ORDER_LIMIT_10S)),
+            ..HttpResponseMetadata::default()
+        };
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+
+        let first_read = governor.execute(test_request()).await.unwrap();
+        let second_read = governor.execute(test_request()).await.unwrap();
+        let blocked_order = governor
+            .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+            .await
+            .unwrap();
+
+        assert_eq!(first_read.status, 200);
+        assert_eq!(second_read.status, 200);
+        assert_eq!(blocked_order.status, 429);
+        assert_eq!(transport.call_count(), 2);
     }
 
     #[test]

@@ -245,6 +245,28 @@ describe("Vue migration components", () => {
     expect(wrapper.emitted("stop")).toHaveLength(1);
   });
 
+  it("shows a durable stop request as pending instead of running", () => {
+    const wrapper = mount(StrategyOverview, {
+      props: {
+        status: {
+          run_id: "run-stop-pending",
+          exchange: "binance",
+          symbol: "ESPORTSUSDT",
+          running: false,
+          lifecycle: "stop_requested",
+          manual_stop_pending: true,
+        },
+        risk: null,
+      },
+    });
+
+    expect(wrapper.find(".live-pill").text()).toBe("停止确认中");
+    expect(wrapper.find(".live-pill").classes()).toContain("pending");
+    expect(wrapper.text()).toContain("停止请求已保存");
+    expect(wrapper.text()).toContain("不会继续补单，也不会主动平仓");
+    expect(wrapper.find("button.stop-button").exists()).toBe(false);
+  });
+
   it("shows total equity only from the matching authoritative risk snapshot", () => {
     const status: GridStatus = {
       run_id: "run-profit-1",
