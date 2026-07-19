@@ -1154,12 +1154,16 @@ async fn grid_status(_session: AuthenticatedWebSession, State(state): State<ApiS
             Err(response) => return *response,
         }
     }
+    let running_count = grids
+        .iter()
+        .filter(|grid| grid.get("running").and_then(Value::as_bool) == Some(true))
+        .count();
     no_store_json(
         StatusCode::OK,
         json!({
-            "running": !grids.is_empty(),
+            "running": running_count > 0,
             "count": grids.len(),
-            "running_count": grids.len(),
+            "running_count": running_count,
             "trading_enabled": state.trading_enabled,
             "grids": grids,
         }),
@@ -1834,6 +1838,8 @@ fn strategy_status_response(
             "upper_price": state.config.upper_price.to_string(),
             "waiting_trigger": true,
             "waiting_initial_order": false,
+            "manual_stop_pending": false,
+            "risk_shutdown_pending": false,
             "trigger_price": state.trigger_price.to_string(),
             "trigger_message": "Waiting for the configured trigger price",
             "grid_ready": false,
@@ -1877,7 +1883,12 @@ fn strategy_status_response(
                 "run_id": state.run_id.as_str(),
                 "exchange": state.exchange,
                 "symbol": state.symbol,
-                "running": !matches!(state.lifecycle, StrategyLifecycle::Stopped | StrategyLifecycle::Closed),
+                "running": matches!(
+                    state.lifecycle,
+                    StrategyLifecycle::AwaitingOpening
+                        | StrategyLifecycle::DeployingGrid
+                        | StrategyLifecycle::Running
+                ),
                 "engine_running": engine_running,
                 "runtime_advancing": runtime_advancing,
                 "lifecycle": state.lifecycle,
@@ -1891,6 +1902,8 @@ fn strategy_status_response(
                 "reference_price": state.plan.reference_price.to_string(),
                 "waiting_trigger": false,
                 "waiting_initial_order": state.lifecycle == StrategyLifecycle::AwaitingOpening,
+                "manual_stop_pending": state.lifecycle == StrategyLifecycle::StopRequested,
+                "risk_shutdown_pending": state.lifecycle == StrategyLifecycle::RiskExitRequested,
                 "grid_ready": state.initial_deployment_complete,
                 "completed_pairs": state.completed_pairs,
                 "gross_profit": state.gross_realized_profit.to_string(),
@@ -3502,6 +3515,15 @@ fn risk_collection_failure(
     error: ShadowCollectionError,
 ) -> Response {
     tracing::warn!(?exchange, symbol, error = %error, "risk shadow collection was inconclusive");
+    if let ShadowCollectionError::StrategyOrderAccountingPending { count } = error {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy_accounting_pending",
+            format!(
+                "The strategy runtime is reconciling {count} order execution record(s); retry shortly"
+            ),
+        );
+    }
     api_error(
         StatusCode::BAD_GATEWAY,
         "risk_snapshot_unavailable",
@@ -5422,6 +5444,24 @@ mod tests {
                 assert_eq!(first_payload["lifecycle"], "stop_requested");
             }
 
+            let status = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/grid/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK, "{path}");
+            let status = response_json(status).await;
+            assert_eq!(status["count"], 1, "{path}");
+            assert_eq!(status["running"], false, "{path}");
+            assert_eq!(status["running_count"], 0, "{path}");
+            assert_eq!(status["grids"][0]["running"], false, "{path}");
+            assert_eq!(status["grids"][0]["manual_stop_pending"], true, "{path}");
+
             let replay = app.clone().oneshot(make_request()).await.unwrap();
             assert_eq!(replay.status(), StatusCode::ACCEPTED, "{path}");
             assert_eq!(response_json(replay).await, first_payload, "{path}");
@@ -5798,7 +5838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_strategy_risk_endpoint_reports_a_missing_grid_order_without_repairing_it() {
+    async fn active_strategy_risk_endpoint_defers_missing_order_accounting_to_the_runtime() {
         let directory = tempdir().unwrap();
         let strategy_root = directory.path().join("strategies");
         let (_strategy, mut gateway) = persist_clean_running_strategy(&strategy_root);
@@ -5835,17 +5875,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let risk = response_json(response).await;
-        assert_eq!(risk["shadow_audit"]["orders"]["missing_order_count"], 1);
-        assert_eq!(
-            risk["grid_coverage"]["missing_levels"]
-                .as_array()
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error = response_json(response).await;
+        assert_eq!(error["error"]["code"], "strategy_accounting_pending");
+        assert!(
+            error["error"]["message"]
+                .as_str()
                 .unwrap()
-                .len(),
-            1
+                .contains("1 order execution record")
         );
-        assert_eq!(risk["has_risk"], true);
     }
 
     #[tokio::test]

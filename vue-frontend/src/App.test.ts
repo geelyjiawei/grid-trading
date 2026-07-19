@@ -56,6 +56,33 @@ afterEach(() => {
 });
 
 describe("workspace request isolation", () => {
+  it("keeps a stop-pending strategy visible until runtime accounting finishes", async () => {
+    installWorkspaceMocks([{
+      run_id: "run-esports-stop",
+      exchange: "binance",
+      symbol: "ESPORTSUSDT",
+      running: false,
+      lifecycle: "stop_requested",
+      manual_stop_pending: true,
+      realized_net_profit: "1",
+    }]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "0.42", mark_price: "0.42" });
+    vi.spyOn(api, "risk").mockRejectedValue(new Error("strategy accounting pending"));
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => {
+      expect(wrapper.findAll("button.strategy-row")).toHaveLength(1);
+    });
+
+    expect(wrapper.find("button.strategy-row").text()).toContain("ESPORTSUSDT");
+    expect(wrapper.find("button.strategy-row").text()).toContain("停止确认中");
+    await wrapper.find("button.strategy-row").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".strategy-overview").text()).toContain("停止请求已保存");
+    expect(wrapper.find("button.stop-button").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("ignores a previous exchange response that arrives after strategy switching", async () => {
     const grids: GridStatus[] = [
       {

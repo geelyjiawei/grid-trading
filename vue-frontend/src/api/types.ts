@@ -51,6 +51,8 @@ export interface GridStatus {
   trigger_message?: string;
   waiting_initial_order?: boolean;
   waiting_trigger?: boolean;
+  manual_stop_pending?: boolean;
+  risk_shutdown_pending?: boolean;
   total_equity_profit?: DecimalValue;
   gross_profit?: DecimalValue;
   total_fee?: DecimalValue;

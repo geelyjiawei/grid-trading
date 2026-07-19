@@ -228,6 +228,7 @@ h2 { margin-bottom: 0; font-size: clamp(1.55rem, 2.5vw, 2rem); }
   font-size: 0.72rem;
 }
 .live-pill.running { border-color: rgba(67, 214, 160, 0.6); color: var(--mint); }
+.live-pill.pending { border-color: rgba(246, 200, 86, 0.65); color: var(--amber); }
 .strategy-overview .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
 .preview-lock {
