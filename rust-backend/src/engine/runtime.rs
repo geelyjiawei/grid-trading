@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,8 @@ use crate::{
         StrategyFilePathError, StrategyFilePaths, StrategyRuntimeLease,
     },
 };
+
+use super::exchange_inputs::advance_reference_time_ms;
 
 const MAX_CONCURRENT_ORDER_LOOKUPS: usize = 8;
 const MAX_CONCURRENT_EXECUTION_SNAPSHOTS: usize = 8;
@@ -1356,6 +1358,7 @@ where
     S: StrategyStateStore,
 {
     pub async fn tick(&mut self, now_ms: u64) -> Result<RuntimeTickReport, RuntimeTickError> {
+        let tick_started = Instant::now();
         self.validate_ledger_ownership()?;
         self.converge_accounted_terminal_intents(now_ms)?;
         self.validate_ledger_ownership()?;
@@ -1642,7 +1645,13 @@ where
             (state.exchange, state.symbol.clone(), state.lifecycle)
         };
         if lifecycle == StrategyLifecycle::Failed {
-            return self.drive_exit(report, lifecycle, now_ms).await;
+            return self
+                .drive_exit(
+                    report,
+                    lifecycle,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
+                .await;
         }
         if report.is_blocked() {
             return Ok(report);
@@ -1651,14 +1660,20 @@ where
             lifecycle,
             StrategyLifecycle::StopRequested | StrategyLifecycle::RiskExitRequested
         ) {
-            return self.drive_exit(report, lifecycle, now_ms).await;
+            return self
+                .drive_exit(
+                    report,
+                    lifecycle,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
+                .await;
         }
 
         let inputs = match load_strategy_inputs(
             &self.gateway,
             exchange,
             &symbol,
-            now_ms,
+            advance_reference_time_ms(now_ms, tick_started.elapsed()),
             self.maximum_market_age_ms,
             self.maximum_future_skew_ms,
         )
@@ -1684,7 +1699,11 @@ where
                 message: "exchange instrument rules changed".into(),
             });
             return self
-                .drive_exit(report, StrategyLifecycle::Failed, now_ms)
+                .drive_exit(
+                    report,
+                    StrategyLifecycle::Failed,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
                 .await;
         }
         let expected_position = self
@@ -1711,7 +1730,11 @@ where
             StrategyTransition::RiskExitRequested { .. }
         ) {
             return self
-                .drive_exit(report, StrategyLifecycle::RiskExitRequested, now_ms)
+                .drive_exit(
+                    report,
+                    StrategyLifecycle::RiskExitRequested,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
                 .await;
         }
         let replacement_transition = self
@@ -1725,14 +1748,22 @@ where
             });
             self.validate_ledger_ownership()?;
             return self
-                .drive_exit(report, StrategyLifecycle::Failed, now_ms)
+                .drive_exit(
+                    report,
+                    StrategyLifecycle::Failed,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
                 .await;
         }
         self.submit_ready_orders(&mut report, now_ms).await?;
         self.validate_ledger_ownership()?;
         if self.machine.store().snapshot().lifecycle == StrategyLifecycle::Failed {
             return self
-                .drive_exit(report, StrategyLifecycle::Failed, now_ms)
+                .drive_exit(
+                    report,
+                    StrategyLifecycle::Failed,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
                 .await;
         }
         Ok(report)
@@ -1797,6 +1828,7 @@ where
         lifecycle: StrategyLifecycle,
         now_ms: u64,
     ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        let exit_started = Instant::now();
         let (exchange, symbol, cancellation_targets) = {
             let state = self.machine.store().snapshot();
             let targets = state
@@ -1961,7 +1993,7 @@ where
             &self.gateway,
             exchange,
             &symbol,
-            now_ms,
+            advance_reference_time_ms(now_ms, exit_started.elapsed()),
             self.maximum_market_age_ms,
             self.maximum_future_skew_ms,
         )
