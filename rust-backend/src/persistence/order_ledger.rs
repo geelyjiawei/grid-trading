@@ -353,17 +353,20 @@ fn validate_transition(current: &IntentState, next: &IntentState) -> Result<(), 
     let allowed = match (current, next) {
         (
             IntentState::Prepared,
-            IntentState::SubmitUnknown { .. }
+            IntentState::RetryableNotSubmitted { .. }
+            | IntentState::SubmitUnknown { .. }
             | IntentState::Accepted { .. }
             | IntentState::Rejected { .. }
             | IntentState::OwnershipConflict { .. },
         )
         | (
             IntentState::SubmitUnknown { .. },
-            IntentState::Accepted { .. }
+            IntentState::RetryableNotSubmitted { .. }
+            | IntentState::Accepted { .. }
             | IntentState::Rejected { .. }
             | IntentState::OwnershipConflict { .. },
         )
+        | (IntentState::RetryableNotSubmitted { .. }, IntentState::Prepared)
         | (IntentState::Accepted { .. }, IntentState::OwnershipConflict { .. }) => true,
         (
             IntentState::Accepted {
@@ -548,6 +551,45 @@ mod tests {
             Err(LedgerError::DuplicateClientOrderId(_))
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn locally_unsent_intent_can_only_return_to_prepared_for_an_exact_retry() {
+        let mut store = MemoryOrderIntentStore::default();
+        let order = intent("g_1_S_retryable");
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::RetryableNotSubmitted {
+                    message: "local request cooldown".into(),
+                },
+                101,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.transition(
+                &order.client_order_id,
+                IntentState::Accepted {
+                    exchange_order_id: "exchange-1".into(),
+                },
+                102,
+            ),
+            Err(LedgerError::InvalidTransition)
+        ));
+        store
+            .transition(&order.client_order_id, IntentState::Prepared, 103)
+            .unwrap();
+        assert_eq!(
+            store
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::Prepared
+        );
     }
 
     #[test]

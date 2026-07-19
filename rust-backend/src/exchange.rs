@@ -44,6 +44,8 @@ pub struct PlacementAcknowledgement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PlacementError {
+    #[error("order was not submitted to the exchange: {message}")]
+    NotSubmitted { message: String },
     #[error("exchange definitively rejected the order: {message}")]
     Definitive {
         code: Option<String>,

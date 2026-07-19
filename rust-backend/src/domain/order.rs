@@ -94,6 +94,9 @@ impl OrderShape {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IntentState {
     Prepared,
+    RetryableNotSubmitted {
+        message: String,
+    },
     SubmitUnknown {
         message: String,
     },
@@ -126,9 +129,9 @@ impl IntentState {
                 exchange_order_id: Some(exchange_order_id),
                 ..
             } => !exchange_order_id.trim().is_empty(),
-            Self::SubmitUnknown { message } | Self::OwnershipConflict { message } => {
-                !message.trim().is_empty()
-            }
+            Self::RetryableNotSubmitted { message }
+            | Self::SubmitUnknown { message }
+            | Self::OwnershipConflict { message } => !message.trim().is_empty(),
             Self::Accepted { exchange_order_id } => !exchange_order_id.trim().is_empty(),
             Self::Rejected { message, .. } => !message.trim().is_empty(),
         };

@@ -9,6 +9,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionResult {
     Accepted { exchange_order_id: String },
+    NotSubmitted,
     SubmitUnknown,
     Rejected,
 }
@@ -51,7 +52,21 @@ where
     S: IntentStore,
 {
     let client_order_id = intent.client_order_id.clone();
-    store.insert_prepared(intent.clone())?;
+    match store.snapshot().intents.get(&client_order_id).cloned() {
+        None => store.insert_prepared(intent.clone())?,
+        Some(existing)
+            if matches!(existing.state, IntentState::RetryableNotSubmitted { .. })
+                && existing.exchange == intent.exchange
+                && existing.shape == intent.shape =>
+        {
+            store.transition(&client_order_id, IntentState::Prepared, result_time_ms)?;
+        }
+        Some(_) => {
+            return Err(
+                LedgerError::DuplicateClientOrderId(client_order_id.as_str().to_owned()).into(),
+            );
+        }
+    }
 
     match gateway.place_order(&intent).await {
         Ok(acknowledgement) => {
@@ -77,6 +92,14 @@ where
                 result_time_ms,
             )?;
             Ok(SubmissionResult::Accepted { exchange_order_id })
+        }
+        Err(PlacementError::NotSubmitted { message }) => {
+            store.transition(
+                &client_order_id,
+                IntentState::RetryableNotSubmitted { message },
+                result_time_ms,
+            )?;
+            Ok(SubmissionResult::NotSubmitted)
         }
         Err(PlacementError::Unknown { message }) => {
             store.transition(
@@ -105,7 +128,10 @@ pub enum SubmissionError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     use async_trait::async_trait;
     use rust_decimal::Decimal;
@@ -122,6 +148,11 @@ mod tests {
         result: Result<PlacementAcknowledgement, PlacementError>,
     }
 
+    struct ScriptedGateway {
+        calls: Arc<Mutex<Vec<String>>>,
+        results: Mutex<VecDeque<Result<PlacementAcknowledgement, PlacementError>>>,
+    }
+
     #[async_trait]
     impl OrderPlacementGateway for FakeGateway {
         async fn place_order(
@@ -133,6 +164,24 @@ mod tests {
                 .unwrap()
                 .push(intent.client_order_id.as_str().to_owned());
             self.result.clone()
+        }
+    }
+
+    #[async_trait]
+    impl OrderPlacementGateway for ScriptedGateway {
+        async fn place_order(
+            &self,
+            intent: &OrderIntent,
+        ) -> Result<PlacementAcknowledgement, PlacementError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(intent.client_order_id.as_str().to_owned());
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted placement result")
         }
     }
 
@@ -189,6 +238,53 @@ mod tests {
             ))
         ));
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn locally_unsent_order_retries_with_the_exact_same_identity_and_shape() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let order = intent("g_0_B_local_cooldown");
+        let gateway = ScriptedGateway {
+            calls: calls.clone(),
+            results: Mutex::new(VecDeque::from([
+                Err(PlacementError::NotSubmitted {
+                    message: "local request cooldown".into(),
+                }),
+                Ok(PlacementAcknowledgement {
+                    client_order_id: order.client_order_id.clone(),
+                    exchange_order_id: "exchange-123".into(),
+                }),
+            ])),
+        };
+        let mut service = SubmissionService::new(gateway, MemoryOrderIntentStore::default());
+
+        assert_eq!(
+            service.submit(order.clone(), 101).await.unwrap(),
+            SubmissionResult::NotSubmitted
+        );
+        assert!(matches!(
+            service
+                .store()
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::RetryableNotSubmitted { .. }
+        ));
+        assert_eq!(
+            service.submit(order.clone(), 102).await.unwrap(),
+            SubmissionResult::Accepted {
+                exchange_order_id: "exchange-123".into()
+            }
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                order.client_order_id.as_str(),
+                order.client_order_id.as_str()
+            ]
+        );
     }
 
     #[tokio::test]

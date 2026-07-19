@@ -1761,6 +1761,7 @@ where
             });
             match result {
                 SubmissionResult::Accepted { .. } => {}
+                SubmissionResult::NotSubmitted => break,
                 SubmissionResult::SubmitUnknown => {
                     report.blockers.push(RuntimeBlocker {
                         stage: RuntimeStage::SubmissionUnknown,
@@ -1782,7 +1783,7 @@ where
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::StrategyFailed,
                     client_order_id: Some(client_order_id),
-                    message: "accepted intent failed strategy synchronization".into(),
+                    message: "submitted intent failed strategy synchronization".into(),
                 });
                 break;
             }
@@ -4739,6 +4740,47 @@ mod tests {
         assert_eq!(second.blockers[0].stage, RuntimeStage::LedgerReconciliation);
         assert!(second.submissions.is_empty());
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn locally_unsent_placement_retries_next_tick_with_the_same_client_order_id() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.fail_next_placement(PlacementError::NotSubmitted {
+            message: "local request cooldown".into(),
+        });
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+
+        let first = runtime.tick(1_100).await.unwrap();
+        assert!(!first.is_blocked(), "{first:?}");
+        assert_eq!(first.submissions.len(), 1);
+        assert_eq!(first.submissions[0].result, SubmissionResult::NotSubmitted);
+        assert!(matches!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .get(&opening_id)
+                .unwrap()
+                .state,
+            IntentState::RetryableNotSubmitted { .. }
+        ));
+
+        let second = runtime.tick(1_200).await.unwrap();
+        assert!(!second.is_blocked(), "{second:?}");
+        assert!(matches!(
+            second.submissions.as_slice(),
+            [RuntimeSubmission {
+                client_order_id,
+                result: SubmissionResult::Accepted { .. },
+            }] if client_order_id == &opening_id
+        ));
+        assert_eq!(
+            gateway.placement_ids(),
+            vec![opening_id.clone(), opening_id]
+        );
     }
 
     #[tokio::test]
