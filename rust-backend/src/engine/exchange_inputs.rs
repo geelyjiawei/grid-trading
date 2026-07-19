@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use thiserror::Error;
 
 use crate::{
@@ -87,6 +89,7 @@ where
         return Err(StrategyInputError::InvalidSymbol);
     }
     let symbol = symbol.to_ascii_uppercase();
+    let collection_started = Instant::now();
     let (market, instrument_rules, position) = tokio::try_join!(
         gateway.market_snapshot(exchange, &symbol),
         gateway.instrument_rules(exchange, &symbol),
@@ -100,7 +103,11 @@ where
     {
         return Err(StrategyInputError::IdentityMismatch);
     }
-    market.ensure_fresh(now_ms, maximum_market_age_ms, maximum_future_skew_ms)?;
+    market.ensure_fresh(
+        advance_reference_time_ms(now_ms, collection_started.elapsed()),
+        maximum_market_age_ms,
+        maximum_future_skew_ms,
+    )?;
     instrument_rules
         .validate()
         .map_err(|error| StrategyInputError::InvalidInstrument(error.to_string()))?;
@@ -117,6 +124,13 @@ where
         instrument_rules,
         position,
     })
+}
+
+pub(super) fn advance_reference_time_ms(reference_ms: u64, elapsed: Duration) -> u64 {
+    // Preserve the caller's wall-clock reference while accounting for async work
+    // with a monotonic duration, so an exchange timestamp collected later is valid.
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    reference_ms.saturating_add(elapsed_ms)
 }
 
 #[derive(Debug, Error)]
@@ -137,6 +151,8 @@ pub enum StrategyInputError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use async_trait::async_trait;
     use rust_decimal::Decimal;
 
@@ -151,6 +167,7 @@ mod tests {
         market: Result<ExchangeMarketSnapshot, SnapshotError>,
         rules: Result<InstrumentRules, SnapshotError>,
         position: Result<PositionSnapshot, SnapshotError>,
+        market_delay: Duration,
     }
 
     #[async_trait]
@@ -160,6 +177,7 @@ mod tests {
             _exchange: Exchange,
             _symbol: &str,
         ) -> Result<ExchangeMarketSnapshot, SnapshotError> {
+            tokio::time::sleep(self.market_delay).await;
             self.market.clone()
         }
     }
@@ -229,6 +247,7 @@ mod tests {
             }),
             rules: Ok(rules()),
             position: Ok(one_way_position()),
+            market_delay: Duration::ZERO,
         }
     }
 
@@ -254,6 +273,33 @@ mod tests {
             .load(Exchange::Binance, "MUUSDT", 10_500)
             .await;
         assert!(matches!(result, Err(StrategyInputError::Snapshot(_))));
+    }
+
+    #[tokio::test]
+    async fn snapshot_observed_during_collection_uses_the_completion_time() {
+        let mut gateway = gateway();
+        gateway.market_delay = Duration::from_millis(40);
+        gateway.market.as_mut().unwrap().observed_at_ms = 10_035;
+
+        let inputs = StrategyInputService::new(gateway, 1_000, 5)
+            .unwrap()
+            .load(Exchange::Binance, "MUUSDT", 10_000)
+            .await
+            .unwrap();
+
+        assert_eq!(inputs.market.mark_price, Decimal::new(1010, 0));
+    }
+
+    #[test]
+    fn elapsed_reference_time_saturates_instead_of_wrapping() {
+        assert_eq!(
+            advance_reference_time_ms(10_000, Duration::from_millis(250)),
+            10_250
+        );
+        assert_eq!(
+            advance_reference_time_ms(u64::MAX - 1, Duration::from_millis(2)),
+            u64::MAX
+        );
     }
 
     #[tokio::test]

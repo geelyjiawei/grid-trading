@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use thiserror::Error;
 
 use crate::{
@@ -8,6 +10,7 @@ use crate::{
     },
 };
 
+use super::exchange_inputs::advance_reference_time_ms;
 use super::{
     ArmedStrategyError, ArmedStrategyState, FeeRateConfigError, GridPlanError, MarketSnapshot,
     StrategyInputError, StrategyRunId, StrategyState, StrategyStateError, build_grid_plan,
@@ -124,6 +127,7 @@ where
         + MarketSnapshotGateway
         + InstrumentRulesGateway,
 {
+    let bootstrap_started = Instant::now();
     let exchange = requested_config
         .exchange
         .ok_or(StrategyBootstrapError::MissingExchange)?;
@@ -139,7 +143,7 @@ where
         gateway,
         exchange,
         &requested_config.symbol,
-        now_ms,
+        advance_reference_time_ms(now_ms, bootstrap_started.elapsed()),
         maximum_market_age_ms,
         maximum_future_skew_ms,
     )
