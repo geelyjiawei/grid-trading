@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -108,6 +109,20 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpResponseMetadata {
+    pub used_weight_1m: Option<u32>,
+    pub order_count_10s: Option<u32>,
+    pub order_count_1m: Option<u32>,
+    pub retry_after: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpTransportResponse {
+    pub response: HttpResponse,
+    pub metadata: HttpResponseMetadata,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TransportError {
     #[error("request timed out: {0}")]
@@ -121,23 +136,73 @@ pub enum TransportError {
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError>;
+
+    async fn execute_with_metadata(
+        &self,
+        request: PreparedHttpRequest,
+    ) -> Result<HttpTransportResponse, TransportError> {
+        let response = self.execute(request).await?;
+        Ok(HttpTransportResponse {
+            response,
+            metadata: HttpResponseMetadata::default(),
+        })
+    }
 }
 
+const BINANCE_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const BINANCE_ORDER_LIMIT_SHORT_WINDOW: Duration = Duration::from_secs(10);
+const BINANCE_DEFAULT_REQUEST_WEIGHT_LIMIT: u32 = 2_400;
+const BINANCE_DEFAULT_ORDER_LIMIT_10S: u32 = 300;
+const BINANCE_DEFAULT_ORDER_LIMIT: u32 = 1_200;
+const BINANCE_BUDGET_NUMERATOR: u32 = 3;
+const BINANCE_BUDGET_DENOMINATOR: u32 = 4;
 const BINANCE_DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const BINANCE_DEFAULT_IP_BAN_COOLDOWN: Duration = Duration::from_secs(2 * 60);
-const BINANCE_WAF_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const BINANCE_WAF_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const BINANCE_MAX_WAF_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const BINANCE_MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinanceRequestCost {
+    weight: u32,
+    orders: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BinanceUsageEvent {
+    at: Instant,
+    cost: BinanceRequestCost,
+}
+
+#[derive(Debug)]
 struct BinanceRequestState {
     next_request_at: Option<Instant>,
     cooldown_until: Option<Instant>,
     consecutive_rate_limits: u32,
+    request_weight_limit: u32,
+    order_limit_10s: u32,
+    order_limit: u32,
+    usage: VecDeque<BinanceUsageEvent>,
 }
 
-/// Serializes Binance REST traffic and opens a fail-fast circuit after 429/418.
-/// The shared state is deliberately below every adapter operation so reads and
-/// writes cannot bypass the same IP-level protection.
+impl Default for BinanceRequestState {
+    fn default() -> Self {
+        Self {
+            next_request_at: None,
+            cooldown_until: None,
+            consecutive_rate_limits: 0,
+            request_weight_limit: BINANCE_DEFAULT_REQUEST_WEIGHT_LIMIT,
+            order_limit_10s: BINANCE_DEFAULT_ORDER_LIMIT_10S,
+            order_limit: BINANCE_DEFAULT_ORDER_LIMIT,
+            usage: VecDeque::new(),
+        }
+    }
+}
+
+/// Serializes Binance REST traffic, enforces the published weight/order windows,
+/// and opens a fail-fast circuit after 403/418/429 responses. The shared state is
+/// deliberately below every adapter operation so reads and writes cannot bypass
+/// the same IP-level protection.
 #[derive(Clone)]
 pub struct BinanceRequestGovernor<T> {
     inner: T,
@@ -187,34 +252,245 @@ where
             state.cooldown_until = None;
         }
 
+        let request_cost = binance_request_cost(&request);
+        prune_binance_usage(&mut state, now);
+        if let Some(cooldown) = binance_budget_cooldown(&state, request_cost, now) {
+            state.cooldown_until = Some(now + cooldown);
+            return Ok(binance_cooldown_response(cooldown));
+        }
+
         if let Some(next_request_at) = state.next_request_at
             && next_request_at > now
         {
             tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
         }
 
-        let response = self.inner.execute(request).await?;
-        state.next_request_at = Some(Instant::now() + self.minimum_interval);
+        let is_exchange_info = request.path == "/fapi/v1/exchangeInfo";
+        let requested_at = Instant::now();
+        state.next_request_at = Some(requested_at + self.minimum_interval);
+        state.usage.push_back(BinanceUsageEvent {
+            at: requested_at,
+            cost: request_cost,
+        });
+        let transport_response = self.inner.execute_with_metadata(request).await?;
+        let response = transport_response.response;
+        let metadata = transport_response.metadata;
+        let responded_at = Instant::now();
+        if is_exchange_info
+            && let Some((request_weight_limit, order_limit_10s, order_limit)) =
+                binance_exchange_limits(&response.body)
+        {
+            state.request_weight_limit = request_weight_limit;
+            state.order_limit_10s = order_limit_10s;
+            state.order_limit = order_limit;
+        }
         match response.status {
             403 | 418 | 429 => {
                 state.consecutive_rate_limits = state.consecutive_rate_limits.saturating_add(1);
                 let cooldown = rate_limit_cooldown(
                     response.status,
                     &response.body,
+                    metadata.retry_after,
                     state.consecutive_rate_limits,
                 );
-                state.cooldown_until = Some(Instant::now() + cooldown);
+                state.cooldown_until = Some(responded_at + cooldown);
             }
-            200..=399 => state.consecutive_rate_limits = 0,
+            200..=399 => {
+                state.consecutive_rate_limits = 0;
+                if binance_header_budget_is_exhausted(&state, &metadata) {
+                    state.cooldown_until = Some(responded_at + BINANCE_RATE_LIMIT_WINDOW);
+                }
+            }
             _ => {}
         }
         Ok(response)
     }
 }
 
-fn rate_limit_cooldown(status: u16, body: &str, consecutive_rate_limits: u32) -> Duration {
+fn binance_cooldown_response(cooldown: Duration) -> HttpResponse {
+    let remaining_ms = cooldown.as_millis();
+    HttpResponse {
+        status: 429,
+        body: format!(
+            "{{\"code\":-1003,\"msg\":\"Binance request cooldown is active; retry after {remaining_ms} ms\"}}"
+        ),
+    }
+}
+
+fn binance_request_cost(request: &PreparedHttpRequest) -> BinanceRequestCost {
+    let has_symbol = request
+        .query
+        .iter()
+        .chain(request.body.iter())
+        .any(|(key, value)| key == "symbol" && !value.is_empty());
+    let weight = match (request.method, request.path.as_str()) {
+        (_, "/fapi/v1/commissionRate") => 20,
+        (_, "/fapi/v3/account")
+        | (_, "/fapi/v2/positionRisk")
+        | (_, "/fapi/v1/allOrders")
+        | (_, "/fapi/v1/userTrades") => 5,
+        (_, "/fapi/v1/openOrders") if !has_symbol => 40,
+        (_, "/fapi/v1/ticker/24hr") if !has_symbol => 40,
+        (_, "/fapi/v1/premiumIndex") if !has_symbol => 10,
+        (HttpMethod::Post, "/fapi/v1/order") => 0,
+        (_, "/fapi/v1/order")
+        | (_, "/fapi/v1/openOrders")
+        | (_, "/fapi/v1/ticker/24hr")
+        | (_, "/fapi/v1/premiumIndex")
+        | (_, "/fapi/v1/exchangeInfo")
+        | (_, "/fapi/v1/klines")
+        | (_, "/fapi/v1/leverage") => 1,
+        _ => 20,
+    };
+    let orders = u32::from(matches!(
+        (request.method, request.path.as_str()),
+        (HttpMethod::Post | HttpMethod::Delete, "/fapi/v1/order")
+    ));
+    BinanceRequestCost { weight, orders }
+}
+
+fn prune_binance_usage(state: &mut BinanceRequestState, now: Instant) {
+    while state
+        .usage
+        .front()
+        .is_some_and(|event| now.saturating_duration_since(event.at) >= BINANCE_RATE_LIMIT_WINDOW)
+    {
+        state.usage.pop_front();
+    }
+}
+
+fn binance_budget(limit: u32) -> u32 {
+    limit
+        .saturating_mul(BINANCE_BUDGET_NUMERATOR)
+        .checked_div(BINANCE_BUDGET_DENOMINATOR)
+        .unwrap_or(0)
+}
+
+fn binance_budget_cooldown(
+    state: &BinanceRequestState,
+    request_cost: BinanceRequestCost,
+    now: Instant,
+) -> Option<Duration> {
+    let (used_weight, used_orders) = state.usage.iter().fold((0_u32, 0_u32), |used, event| {
+        (
+            used.0.saturating_add(event.cost.weight),
+            used.1.saturating_add(event.cost.orders),
+        )
+    });
+    let used_orders_10s = state
+        .usage
+        .iter()
+        .filter(|event| now.saturating_duration_since(event.at) < BINANCE_ORDER_LIMIT_SHORT_WINDOW)
+        .fold(0_u32, |used, event| used.saturating_add(event.cost.orders));
+    let exceeds_weight = used_weight.saturating_add(request_cost.weight)
+        > binance_budget(state.request_weight_limit);
+    let exceeds_orders =
+        used_orders.saturating_add(request_cost.orders) > binance_budget(state.order_limit);
+    let exceeds_orders_10s =
+        used_orders_10s.saturating_add(request_cost.orders) > binance_budget(state.order_limit_10s);
+    if !exceeds_weight && !exceeds_orders && !exceeds_orders_10s {
+        return None;
+    }
+
+    let remaining_for = |window: Duration, includes: fn(&BinanceUsageEvent) -> bool| {
+        state
+            .usage
+            .iter()
+            .filter(|event| now.saturating_duration_since(event.at) < window)
+            .find(|event| includes(event))
+            .map_or(window, |oldest| {
+                window.saturating_sub(now.saturating_duration_since(oldest.at))
+            })
+    };
+    let mut cooldown = Duration::ZERO;
+    if exceeds_weight {
+        cooldown = cooldown.max(remaining_for(BINANCE_RATE_LIMIT_WINDOW, |event| {
+            event.cost.weight > 0
+        }));
+    }
+    if exceeds_orders {
+        cooldown = cooldown.max(remaining_for(BINANCE_RATE_LIMIT_WINDOW, |event| {
+            event.cost.orders > 0
+        }));
+    }
+    if exceeds_orders_10s {
+        cooldown = cooldown.max(remaining_for(BINANCE_ORDER_LIMIT_SHORT_WINDOW, |event| {
+            event.cost.orders > 0
+        }));
+    }
+    Some(cooldown.saturating_add(Duration::from_millis(1)))
+}
+
+fn binance_header_budget_is_exhausted(
+    state: &BinanceRequestState,
+    metadata: &HttpResponseMetadata,
+) -> bool {
+    metadata
+        .used_weight_1m
+        .is_some_and(|used| used >= binance_budget(state.request_weight_limit))
+        || metadata
+            .order_count_10s
+            .is_some_and(|used| used >= binance_budget(state.order_limit_10s))
+        || metadata
+            .order_count_1m
+            .is_some_and(|used| used >= binance_budget(state.order_limit))
+}
+
+fn binance_exchange_limits(body: &str) -> Option<(u32, u32, u32)> {
+    let payload: serde_json::Value = serde_json::from_str(body).ok()?;
+    let limits = payload.get("rateLimits")?.as_array()?;
+    let mut request_weight = None;
+    let mut orders_10s = None;
+    let mut orders = None;
+    for limit in limits {
+        let Some(rate_type) = limit
+            .get("rateLimitType")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(interval) = limit.get("interval").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(interval_num) = limit.get("intervalNum").and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        let Some(value) = limit
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            continue;
+        };
+        match (rate_type, interval, interval_num) {
+            ("REQUEST_WEIGHT", "MINUTE", 1) => request_weight = Some(value),
+            ("ORDERS", "SECOND", 10) => orders_10s = Some(value),
+            ("ORDERS", "MINUTE", 1) => orders = Some(value),
+            _ => {}
+        }
+    }
+    Some((
+        request_weight?,
+        orders_10s.unwrap_or(BINANCE_DEFAULT_ORDER_LIMIT_10S),
+        orders?,
+    ))
+}
+
+fn rate_limit_cooldown(
+    status: u16,
+    body: &str,
+    retry_after: Option<Duration>,
+    consecutive_rate_limits: u32,
+) -> Duration {
+    if let Some(retry_after) = retry_after.filter(|duration| !duration.is_zero()) {
+        return retry_after.saturating_add(Duration::from_secs(1));
+    }
     if status == 403 {
-        return BINANCE_WAF_COOLDOWN;
+        let exponent = consecutive_rate_limits.saturating_sub(1).min(4);
+        return BINANCE_WAF_COOLDOWN
+            .saturating_mul(1_u32 << exponent)
+            .min(BINANCE_MAX_WAF_COOLDOWN);
     }
     if status == 418 {
         if let Some(ban_until_ms) = binance_ban_until_ms(body) {
@@ -265,6 +541,37 @@ impl ReqwestTransport {
     pub fn standard() -> Result<Self, TransportBuildError> {
         Self::new(Duration::from_secs(10))
     }
+
+    async fn send(
+        &self,
+        request: PreparedHttpRequest,
+    ) -> Result<HttpTransportResponse, TransportError> {
+        let method = match request.method {
+            HttpMethod::Get => reqwest::Method::GET,
+            HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Delete => reqwest::Method::DELETE,
+        };
+        let mut builder = self.client.request(method, request.url());
+        for (name, value) in &request.headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| TransportError::Other(format!("invalid header name: {error}")))?;
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|error| TransportError::Other(format!("invalid header value: {error}")))?;
+            builder = builder.header(name, value);
+        }
+        let body = request.body_string();
+        if !body.is_empty() {
+            builder = builder.body(body);
+        }
+        let response = builder.send().await.map_err(classify_reqwest_error)?;
+        let status = response.status().as_u16();
+        let metadata = response_metadata(response.headers());
+        let body = response.text().await.map_err(classify_reqwest_error)?;
+        Ok(HttpTransportResponse {
+            response: HttpResponse { status, body },
+            metadata,
+        })
+    }
 }
 
 impl fmt::Debug for ReqwestTransport {
@@ -286,28 +593,31 @@ pub enum TransportBuildError {
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError> {
-        let method = match request.method {
-            HttpMethod::Get => reqwest::Method::GET,
-            HttpMethod::Post => reqwest::Method::POST,
-            HttpMethod::Delete => reqwest::Method::DELETE,
-        };
-        let mut builder = self.client.request(method, request.url());
-        for (name, value) in &request.headers {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|error| TransportError::Other(format!("invalid header name: {error}")))?;
-            let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|error| TransportError::Other(format!("invalid header value: {error}")))?;
-            builder = builder.header(name, value);
-        }
-        let body = request.body_string();
-        if !body.is_empty() {
-            builder = builder.body(body);
-        }
-        let response = builder.send().await.map_err(classify_reqwest_error)?;
-        let status = response.status().as_u16();
-        let body = response.text().await.map_err(classify_reqwest_error)?;
-        Ok(HttpResponse { status, body })
+        Ok(self.send(request).await?.response)
     }
+
+    async fn execute_with_metadata(
+        &self,
+        request: PreparedHttpRequest,
+    ) -> Result<HttpTransportResponse, TransportError> {
+        self.send(request).await
+    }
+}
+
+fn response_metadata(headers: &reqwest::header::HeaderMap) -> HttpResponseMetadata {
+    HttpResponseMetadata {
+        used_weight_1m: decimal_header(headers, "x-mbx-used-weight-1m"),
+        order_count_10s: decimal_header(headers, "x-mbx-order-count-10s"),
+        order_count_1m: decimal_header(headers, "x-mbx-order-count-1m"),
+        retry_after: decimal_header::<u64>(headers, "retry-after").map(Duration::from_secs),
+    }
+}
+
+fn decimal_header<T>(headers: &reqwest::header::HeaderMap, name: &'static str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    headers.get(name)?.to_str().ok()?.parse().ok()
 }
 
 fn classify_reqwest_error(error: reqwest::Error) -> TransportError {
@@ -390,6 +700,7 @@ mod tests {
     struct ScriptedTransport {
         calls: Arc<AtomicUsize>,
         responses: Arc<Mutex<VecDeque<HttpResponse>>>,
+        metadata: HttpResponseMetadata,
     }
 
     impl ScriptedTransport {
@@ -397,6 +708,15 @@ mod tests {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                metadata: HttpResponseMetadata::default(),
+            }
+        }
+
+        fn with_metadata(response: HttpResponse, metadata: HttpResponseMetadata) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                responses: Arc::new(Mutex::new(VecDeque::from([response]))),
+                metadata,
             }
         }
 
@@ -418,6 +738,17 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| TransportError::Other("script is exhausted".into()))
         }
+
+        async fn execute_with_metadata(
+            &self,
+            request: PreparedHttpRequest,
+        ) -> Result<HttpTransportResponse, TransportError> {
+            let response = self.execute(request).await?;
+            Ok(HttpTransportResponse {
+                response,
+                metadata: self.metadata.clone(),
+            })
+        }
     }
 
     fn test_request() -> PreparedHttpRequest {
@@ -426,6 +757,18 @@ mod tests {
             base_url: "https://fapi.binance.test".into(),
             path: "/fapi/v1/openOrders".into(),
             query: vec![],
+            body: vec![],
+            raw_body: None,
+            headers: vec![],
+        }
+    }
+
+    fn symbol_request(method: HttpMethod, path: &str) -> PreparedHttpRequest {
+        PreparedHttpRequest {
+            method,
+            base_url: "https://fapi.binance.test".into(),
+            path: path.into(),
+            query: vec![("symbol".into(), "ESPORTSUSDT".into())],
             body: vec![],
             raw_body: None,
             headers: vec![],
@@ -562,6 +905,226 @@ mod tests {
         assert_eq!(first.status, 403);
         assert_eq!(blocked.status, 429);
         assert_eq!(transport.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn binance_governor_honors_the_exchange_retry_after_header() {
+        let transport = ScriptedTransport::with_metadata(
+            HttpResponse {
+                status: 429,
+                body: r#"{"code":-1003,"msg":"Too many requests"}"#.into(),
+            },
+            HttpResponseMetadata {
+                retry_after: Some(Duration::from_secs(37)),
+                ..HttpResponseMetadata::default()
+            },
+        );
+        let governor = BinanceRequestGovernor::new(transport, Duration::ZERO);
+        let before = Instant::now();
+
+        governor.execute(test_request()).await.unwrap();
+
+        let state = governor.state.lock().await;
+        let cooldown_until = state.cooldown_until.unwrap();
+        assert!(cooldown_until >= before + Duration::from_secs(38));
+        assert!(cooldown_until <= Instant::now() + Duration::from_secs(39));
+    }
+
+    #[tokio::test]
+    async fn binance_governor_fails_fast_before_crossing_the_weight_budget() {
+        let transport = ScriptedTransport::new((0..4).map(|_| HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }));
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+        {
+            let mut state = governor.state.lock().await;
+            state.request_weight_limit = 4;
+        }
+
+        for _ in 0..3 {
+            let response = governor
+                .execute(symbol_request(HttpMethod::Get, "/fapi/v1/openOrders"))
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+        }
+        let blocked = governor
+            .execute(symbol_request(HttpMethod::Get, "/fapi/v1/openOrders"))
+            .await
+            .unwrap();
+
+        assert_eq!(blocked.status, 429);
+        assert!(blocked.body.contains("cooldown is active"));
+        assert_eq!(transport.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn binance_governor_enforces_the_ten_second_order_budget() {
+        let transport = ScriptedTransport::new((0..4).map(|_| HttpResponse {
+            status: 200,
+            body: r#"{"orderId":1}"#.into(),
+        }));
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+        {
+            let mut state = governor.state.lock().await;
+            state.order_limit_10s = 4;
+        }
+
+        for _ in 0..3 {
+            let response = governor
+                .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+        }
+        let blocked = governor
+            .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+            .await
+            .unwrap();
+
+        assert_eq!(blocked.status, 429);
+        assert_eq!(transport.call_count(), 3);
+        let state = governor.state.lock().await;
+        let remaining = state
+            .cooldown_until
+            .unwrap()
+            .saturating_duration_since(Instant::now());
+        assert!(remaining <= BINANCE_ORDER_LIMIT_SHORT_WINDOW + Duration::from_millis(1));
+    }
+
+    #[test]
+    fn ten_second_order_cooldown_ignores_older_order_events() {
+        let now = Instant::now();
+        let mut state = BinanceRequestState {
+            order_limit_10s: 4,
+            ..BinanceRequestState::default()
+        };
+        let order_cost = BinanceRequestCost {
+            weight: 0,
+            orders: 1,
+        };
+        state.usage.push_back(BinanceUsageEvent {
+            at: now - Duration::from_secs(20),
+            cost: order_cost,
+        });
+        for _ in 0..3 {
+            state.usage.push_back(BinanceUsageEvent {
+                at: now - Duration::from_secs(1),
+                cost: order_cost,
+            });
+        }
+
+        let cooldown = binance_budget_cooldown(&state, order_cost, now).unwrap();
+
+        assert!(cooldown >= Duration::from_secs(9));
+        assert!(cooldown <= Duration::from_secs(9) + Duration::from_millis(1));
+    }
+
+    #[test]
+    fn binance_request_costs_cover_every_adapter_endpoint_shape() {
+        assert_eq!(
+            binance_request_cost(&symbol_request(HttpMethod::Get, "/fapi/v1/openOrders")),
+            BinanceRequestCost {
+                weight: 1,
+                orders: 0
+            }
+        );
+        assert_eq!(
+            binance_request_cost(&test_request()),
+            BinanceRequestCost {
+                weight: 40,
+                orders: 0
+            }
+        );
+        assert_eq!(
+            binance_request_cost(&symbol_request(HttpMethod::Get, "/fapi/v1/commissionRate")),
+            BinanceRequestCost {
+                weight: 20,
+                orders: 0
+            }
+        );
+        assert_eq!(
+            binance_request_cost(&symbol_request(HttpMethod::Get, "/fapi/v3/account")),
+            BinanceRequestCost {
+                weight: 5,
+                orders: 0
+            }
+        );
+        assert_eq!(
+            binance_request_cost(&symbol_request(HttpMethod::Post, "/fapi/v1/order")),
+            BinanceRequestCost {
+                weight: 0,
+                orders: 1
+            }
+        );
+        assert_eq!(
+            binance_request_cost(&symbol_request(HttpMethod::Delete, "/fapi/v1/order")),
+            BinanceRequestCost {
+                weight: 1,
+                orders: 1
+            }
+        );
+        assert_eq!(
+            binance_request_cost(&symbol_request(HttpMethod::Get, "/unknown")),
+            BinanceRequestCost {
+                weight: 20,
+                orders: 0
+            }
+        );
+    }
+
+    #[test]
+    fn binance_exchange_info_updates_the_official_one_minute_limits() {
+        let body = r#"{
+            "rateLimits": [
+                {"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":2400},
+                {"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200},
+                {"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":300}
+            ]
+        }"#;
+
+        assert_eq!(binance_exchange_limits(body), Some((2_400, 300, 1_200)));
+        assert_eq!(binance_exchange_limits("{}"), None);
+    }
+
+    #[test]
+    fn binance_response_headers_preserve_usage_and_retry_deadline() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-mbx-used-weight-1m", "1789".parse().unwrap());
+        headers.insert("x-mbx-order-count-10s", "45".parse().unwrap());
+        headers.insert("x-mbx-order-count-1m", "321".parse().unwrap());
+        headers.insert("retry-after", "42".parse().unwrap());
+
+        assert_eq!(
+            response_metadata(&headers),
+            HttpResponseMetadata {
+                used_weight_1m: Some(1_789),
+                order_count_10s: Some(45),
+                order_count_1m: Some(321),
+                retry_after: Some(Duration::from_secs(42)),
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_waf_rejections_use_a_bounded_exponential_cooldown() {
+        assert_eq!(
+            rate_limit_cooldown(403, "", None, 1),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            rate_limit_cooldown(403, "", None, 2),
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            rate_limit_cooldown(403, "", None, 3),
+            Duration::from_secs(60 * 60)
+        );
+        assert_eq!(
+            rate_limit_cooldown(403, "", None, 10),
+            Duration::from_secs(60 * 60)
+        );
     }
 
     #[test]
