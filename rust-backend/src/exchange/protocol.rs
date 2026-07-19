@@ -459,7 +459,7 @@ fn binance_weight_header_is_exhausted(
 ) -> bool {
     metadata
         .used_weight_1m
-        .is_some_and(|used| used >= binance_budget(state.request_weight_limit))
+        .is_some_and(|used| used >= state.request_weight_limit)
 }
 
 fn binance_order_header_cooldown(
@@ -468,10 +468,10 @@ fn binance_order_header_cooldown(
 ) -> Option<Duration> {
     let ten_second_exhausted = metadata
         .order_count_10s
-        .is_some_and(|used| used >= binance_budget(state.order_limit_10s));
+        .is_some_and(|used| used >= state.order_limit_10s);
     let one_minute_exhausted = metadata
         .order_count_1m
-        .is_some_and(|used| used >= binance_budget(state.order_limit));
+        .is_some_and(|used| used >= state.order_limit);
     match (ten_second_exhausted, one_minute_exhausted) {
         (_, true) => Some(BINANCE_RATE_LIMIT_WINDOW),
         (true, false) => Some(BINANCE_ORDER_LIMIT_SHORT_WINDOW),
@@ -1160,13 +1160,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_order_headers_pause_writes_without_blocking_reads() {
+    async fn safety_budget_headers_do_not_starve_follow_up_requests() {
+        let mut transport = ScriptedTransport::new((0..3).map(|_| HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }));
+        transport.metadata = HttpResponseMetadata {
+            used_weight_1m: Some(binance_budget(BINANCE_DEFAULT_REQUEST_WEIGHT_LIMIT)),
+            order_count_10s: Some(binance_budget(BINANCE_DEFAULT_ORDER_LIMIT_10S)),
+            order_count_1m: Some(binance_budget(BINANCE_DEFAULT_ORDER_LIMIT)),
+            ..HttpResponseMetadata::default()
+        };
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+
+        let first_read = governor.execute(test_request()).await.unwrap();
+        let second_read = governor.execute(test_request()).await.unwrap();
+        let order = governor
+            .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+            .await
+            .unwrap();
+
+        assert_eq!(first_read.status, 200);
+        assert_eq!(second_read.status, 200);
+        assert_eq!(order.status, 200);
+        assert_eq!(transport.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn exchange_order_headers_at_the_hard_limit_pause_writes_only() {
         let mut transport = ScriptedTransport::new((0..2).map(|_| HttpResponse {
             status: 200,
             body: "[]".into(),
         }));
         transport.metadata = HttpResponseMetadata {
-            order_count_10s: Some(binance_budget(BINANCE_DEFAULT_ORDER_LIMIT_10S)),
+            order_count_10s: Some(BINANCE_DEFAULT_ORDER_LIMIT_10S),
             ..HttpResponseMetadata::default()
         };
         let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
@@ -1182,6 +1209,26 @@ mod tests {
         assert_eq!(second_read.status, 200);
         assert_eq!(blocked_order.status, 429);
         assert_eq!(transport.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn exchange_weight_header_at_the_hard_limit_pauses_all_requests() {
+        let mut transport = ScriptedTransport::new([HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }]);
+        transport.metadata = HttpResponseMetadata {
+            used_weight_1m: Some(BINANCE_DEFAULT_REQUEST_WEIGHT_LIMIT),
+            ..HttpResponseMetadata::default()
+        };
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+
+        let first_read = governor.execute(test_request()).await.unwrap();
+        let blocked_read = governor.execute(test_request()).await.unwrap();
+
+        assert_eq!(first_read.status, 200);
+        assert_eq!(blocked_read.status, 429);
+        assert_eq!(transport.call_count(), 1);
     }
 
     #[test]

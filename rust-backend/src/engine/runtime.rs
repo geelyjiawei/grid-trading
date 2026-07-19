@@ -6137,6 +6137,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_recovers_a_terminal_fill_after_execution_visibility_returns() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        let hidden_execution = gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .remove(&opening_id)
+            .unwrap();
+
+        let unavailable = runtime.tick(1_200).await.unwrap();
+        assert!(unavailable.blockers.iter().any(|blocker| {
+            blocker.stage == RuntimeStage::ExecutionAccounting
+                && blocker.client_order_id.as_ref() == Some(&opening_id)
+        }));
+        let pending = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap();
+        assert!(matches!(
+            &pending.tracking,
+            StrategyOrderTracking::Intent {
+                state: IntentState::Terminal {
+                    status: TerminalOrderStatus::Filled,
+                    ..
+                }
+            }
+        ));
+        assert!(!pending.terminal_processed);
+        runtime.machine_mut().request_stop(1_250).unwrap();
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .insert(opening_id.clone(), hidden_execution);
+
+        let stopped = runtime.tick(1_300).await.unwrap();
+
+        assert!(!stopped.is_blocked(), "{stopped:?}");
+        assert_eq!(gateway.placement_call_count(), 1);
+        assert_eq!(gateway.cancellation_call_count(), 0);
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Stopped);
+        assert_eq!(state.grid_position_net_quantity, -opening_quantity);
+        assert!(state.orders.get(&opening_id).unwrap().terminal_processed);
+    }
+
+    #[tokio::test]
     async fn acknowledged_cancellation_is_not_repeated_while_terminal_status_is_delayed() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
