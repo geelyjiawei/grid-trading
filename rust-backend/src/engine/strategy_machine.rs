@@ -1375,8 +1375,6 @@ fn validate_replacement_obligation_ledger(state: &StrategyState) -> Result<(), S
 fn validate_aggregate_accounting(state: &StrategyState) -> Result<(), StrategyStateError> {
     let mut expected_volume = Decimal::ZERO;
     let mut expected_fee = Decimal::ZERO;
-    let mut buy_quote = Decimal::ZERO;
-    let mut sell_quote = Decimal::ZERO;
     let mut expected_grid_position = Decimal::ZERO;
     let mut expected_completed_pairs = 0_u64;
 
@@ -1394,9 +1392,6 @@ fn validate_aggregate_accounting(state: &StrategyState) -> Result<(), StrategySt
                     .ok_or(StrategyStateError::NumericOverflow(
                         "aggregate buy quantity",
                     ))?;
-                buy_quote = buy_quote
-                    .checked_add(order.cumulative_quote)
-                    .ok_or(StrategyStateError::NumericOverflow("aggregate buy quote"))?;
             }
             OrderSide::Sell => {
                 expected_grid_position = expected_grid_position
@@ -1404,9 +1399,6 @@ fn validate_aggregate_accounting(state: &StrategyState) -> Result<(), StrategySt
                     .ok_or(StrategyStateError::NumericOverflow(
                         "aggregate sell quantity",
                     ))?;
-                sell_quote = sell_quote
-                    .checked_add(order.cumulative_quote)
-                    .ok_or(StrategyStateError::NumericOverflow("aggregate sell quote"))?;
             }
         }
 
@@ -1434,41 +1426,8 @@ fn validate_aggregate_accounting(state: &StrategyState) -> Result<(), StrategySt
         return Err(StrategyStateError::AggregateAccountingMismatch);
     }
 
-    let remaining_entry_value = if state.direction == Direction::Neutral {
-        state
-            .neutral_lots
-            .values()
-            .map(|lot| lot.entry_value)
-            .try_fold(Decimal::ZERO, |total, value| total.checked_add(value))
-    } else {
-        state
-            .lots_by_level
-            .values()
-            .map(|lot| lot.entry_value)
-            .try_fold(Decimal::ZERO, |total, value| total.checked_add(value))
-    }
-    .ok_or(StrategyStateError::NumericOverflow(
-        "aggregate remaining entry value",
-    ))?;
-    let cash_flow =
-        sell_quote
-            .checked_sub(buy_quote)
-            .ok_or(StrategyStateError::NumericOverflow(
-                "aggregate execution cash flow",
-            ))?;
-    let expected_gross_profit = if state.grid_position_net_quantity > Decimal::ZERO {
-        cash_flow.checked_add(remaining_entry_value)
-    } else if state.grid_position_net_quantity < Decimal::ZERO {
-        cash_flow.checked_sub(remaining_entry_value)
-    } else {
-        Some(cash_flow)
-    }
-    .ok_or(StrategyStateError::NumericOverflow(
-        "aggregate gross realized profit",
-    ))?;
-    if expected_gross_profit != state.gross_realized_profit {
-        return Err(StrategyStateError::AggregateAccountingMismatch);
-    }
+    // Profit is checked by deterministic inventory-event replay. A cash-flow
+    // closed form can differ in Decimal's last place after proportional lots.
     Ok(())
 }
 
@@ -6744,7 +6703,6 @@ mod tests {
         let mut mutations: Vec<StateMutation> = vec![
             Box::new(|state| state.total_volume += Decimal::ONE),
             Box::new(|state| state.total_fee += Decimal::ONE),
-            Box::new(|state| state.gross_realized_profit += Decimal::ONE),
             Box::new(|state| state.completed_pairs += 1),
             Box::new(|state| {
                 let lot = state.lots_by_level.values_mut().next().unwrap();
@@ -6779,6 +6737,13 @@ mod tests {
                 Err(StrategyStateError::AggregateAccountingMismatch)
             );
         }
+
+        let mut profit_drift = valid;
+        profit_drift.gross_realized_profit += Decimal::ONE;
+        assert_eq!(
+            profit_drift.validate(),
+            Err(StrategyStateError::InventoryEventLedgerMismatch)
+        );
     }
 
     #[test]
@@ -9720,5 +9685,89 @@ mod tests {
         assert_eq!(state.grid_position_net_quantity, Decimal::new(-28, 1));
         assert_eq!(state.lots_by_level.len(), 14);
         assert!(state.ready_intents(104).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inventory_replay_is_authoritative_when_closed_form_decimal_math_rounds_differently() {
+        let mut config = config(Direction::Short);
+        config.grid_order_qty = Some(Decimal::new(3, 1));
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: decimal(1012),
+                mark_price: decimal(1012),
+            },
+            &instrument(),
+        )
+        .unwrap();
+        let initial = StrategyState::from_plan(
+            StrategyRunId::parse("ROUND001").unwrap(),
+            config,
+            instrument(),
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        let opening = opening_id(&initial);
+        let opening_quantity = initial.orders[&opening].shape.quantity;
+        let opening_price = Decimal::from_str_exact("1014.1234567890123456789012345").unwrap();
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "round-opening",
+                    opening_quantity,
+                    opening_price * opening_quantity,
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                101,
+            )
+            .unwrap();
+        let reduce = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| order.shape.reduce_only)
+            .unwrap()
+            .client_order_id
+            .clone();
+        accept_strategy_order(&mut machine, &reduce, "round-reduce", 102);
+        machine.request_stop(103).unwrap();
+        machine
+            .apply_execution(
+                &report(
+                    reduce,
+                    "round-reduce",
+                    Decimal::new(1, 1),
+                    Decimal::from_str_exact("101.1").unwrap(),
+                    Some(TerminalOrderStatus::Cancelled),
+                ),
+                104,
+            )
+            .unwrap();
+        let state = machine.store().snapshot();
+        let remaining_entry_value = state
+            .lots_by_level
+            .values()
+            .map(|lot| lot.entry_value)
+            .sum::<Decimal>();
+        let buy_quote = state
+            .orders
+            .values()
+            .filter(|order| order.shape.side == OrderSide::Buy)
+            .map(|order| order.cumulative_quote)
+            .sum::<Decimal>();
+        let sell_quote = state
+            .orders
+            .values()
+            .filter(|order| order.shape.side == OrderSide::Sell)
+            .map(|order| order.cumulative_quote)
+            .sum::<Decimal>();
+        let closed_form = sell_quote - buy_quote - remaining_entry_value;
+        assert_ne!(closed_form, state.gross_realized_profit);
+        state.validate().unwrap();
     }
 }
