@@ -15,23 +15,32 @@ import {
   formatTimestamp,
 } from "../format";
 
-defineProps<{
+type DetailTab = "positions" | "orders" | "trades" | "history";
+
+const props = withDefaults(defineProps<{
   exchange: Exchange;
   symbol: string;
   configured: boolean;
   loading: boolean;
   error: string;
+  availability?: Record<DetailTab, boolean>;
   positions: PositionSnapshot[];
   orders: GridOrder[];
   trades: GridTrade[];
   history: GridHistoryRun[];
-}>();
+}>(), {
+  availability: () => ({
+    positions: true,
+    orders: true,
+    trades: true,
+    history: true,
+  }),
+});
 
 const emit = defineEmits<{
   refresh: [];
 }>();
 
-type DetailTab = "positions" | "orders" | "trades" | "history";
 const activeTab = ref<DetailTab>("positions");
 const tabs: Array<{ key: DetailTab; label: string }> = [
   { key: "positions", label: "持仓" },
@@ -39,6 +48,27 @@ const tabs: Array<{ key: DetailTab; label: string }> = [
   { key: "trades", label: "成交" },
   { key: "history", label: "历史" },
 ];
+
+function tabCount(tab: DetailTab): number | string {
+  if (!props.availability[tab]) return "--";
+  if (tab === "positions") return props.positions.length;
+  if (tab === "orders") return props.orders.length;
+  if (tab === "trades") return props.trades.length;
+  return props.history.length;
+}
+
+function unavailableMessage(tab: DetailTab): string {
+  const hasPreviousData = tab === "positions"
+    ? props.positions.length > 0
+    : tab === "orders"
+      ? props.orders.length > 0
+      : tab === "trades"
+        ? props.trades.length > 0
+        : props.history.length > 0;
+  return hasPreviousData
+    ? "本次实时读取失败，以下保留上次成功快照，不能视为当前实时数据。"
+    : "本次实时读取失败，当前数量未知，不能按 0 处理。";
+}
 
 function runProfit(run: GridHistoryRun): string | number | undefined {
   return run.total_equity_profit ?? run.net_profit;
@@ -85,10 +115,7 @@ function feeDisplayAsset(trade: GridTrade): string {
         @click="activeTab = tab.key"
       >
         {{ tab.label }}
-        <span v-if="tab.key === 'positions'">{{ positions.length }}</span>
-        <span v-else-if="tab.key === 'orders'">{{ orders.length }}</span>
-        <span v-else-if="tab.key === 'trades'">{{ trades.length }}</span>
-        <span v-else>{{ history.length }}</span>
+        <span>{{ tabCount(tab.key) }}</span>
       </button>
     </nav>
 
@@ -96,7 +123,8 @@ function feeDisplayAsset(trade: GridTrade): string {
     <p v-else-if="error" class="callout danger">{{ error }}</p>
 
     <div v-if="configured && activeTab === 'positions'" class="detail-content card-list">
-      <p v-if="positions.length === 0" class="empty-state">交易所当前没有该交易对持仓</p>
+      <p v-if="!availability.positions" class="empty-state">{{ unavailableMessage("positions") }}</p>
+      <p v-else-if="positions.length === 0" class="empty-state">交易所当前没有该交易对持仓</p>
       <article v-for="position in positions" :key="`${position.side}:${position.entry_price}`" class="position-item">
         <header>
           <strong :class="position.side === 'Buy' ? 'positive' : 'negative'">
@@ -115,10 +143,11 @@ function feeDisplayAsset(trade: GridTrade): string {
     </div>
 
     <div v-else-if="configured && activeTab === 'orders'" class="detail-content table-scroll">
+      <p v-if="!availability.orders" class="empty-state">{{ unavailableMessage("orders") }}</p>
       <table>
         <thead><tr><th>方向</th><th>价格</th><th>数量</th><th>用途</th><th>状态</th><th>客户端订单号</th></tr></thead>
         <tbody>
-          <tr v-if="orders.length === 0"><td colspan="6" class="empty-state">交易所当前没有挂单</td></tr>
+          <tr v-if="availability.orders && orders.length === 0"><td colspan="6" class="empty-state">交易所当前没有挂单</td></tr>
           <tr v-for="order in orders" :key="order.order_id ?? order.orderId ?? order.order_link_id ?? order.orderLinkId">
             <td :class="order.side === 'Buy' ? 'positive' : 'negative'">{{ order.side }}</td>
             <td>{{ formatExactDecimal(order.price) }}</td>
@@ -132,10 +161,11 @@ function feeDisplayAsset(trade: GridTrade): string {
     </div>
 
     <div v-else-if="configured && activeTab === 'trades'" class="detail-content table-scroll">
+      <p v-if="!availability.trades" class="empty-state">{{ unavailableMessage("trades") }}</p>
       <table>
         <thead><tr><th>方向</th><th>价格</th><th>数量</th><th>交易量</th><th>手续费折算</th><th>流动性</th><th>已实现盈亏</th><th>时间</th></tr></thead>
         <tbody>
-          <tr v-if="trades.length === 0"><td colspan="8" class="empty-state">暂无成交</td></tr>
+          <tr v-if="availability.trades && trades.length === 0"><td colspan="8" class="empty-state">暂无成交</td></tr>
           <tr v-for="trade in trades" :key="`${trade.order_id}:${trade.trade_id}`">
             <td :class="trade.side === 'Buy' ? 'positive' : 'negative'">{{ trade.side }}</td>
             <td>{{ formatExactDecimal(trade.price) }}</td>
@@ -151,10 +181,11 @@ function feeDisplayAsset(trade: GridTrade): string {
     </div>
 
     <div v-else-if="configured" class="detail-content table-scroll">
+      <p v-if="!availability.history" class="empty-state">{{ unavailableMessage("history") }}</p>
       <table>
         <thead><tr><th>开始时间</th><th>交易所</th><th>交易对</th><th>方向</th><th>模式</th><th>状态</th><th>净利润</th><th>手续费</th><th>交易量</th><th>配对</th></tr></thead>
         <tbody>
-          <tr v-if="history.length === 0"><td colspan="10" class="empty-state">暂无历史</td></tr>
+          <tr v-if="availability.history && history.length === 0"><td colspan="10" class="empty-state">暂无历史</td></tr>
           <tr v-for="run in history" :key="`${run.started_at}:${run.exchange}:${run.symbol}`">
             <td>{{ formatTimestamp(run.started_at) }}</td>
             <td>{{ run.exchange ? exchangeName(run.exchange) : "--" }}</td>

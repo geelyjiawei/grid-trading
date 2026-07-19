@@ -3608,6 +3608,21 @@ fn order_side_name(side: OrderSide) -> &'static str {
 
 fn snapshot_failure(context: &'static str, exchange: Exchange, error: SnapshotError) -> Response {
     tracing::warn!(?exchange, context, error = %error, "exchange snapshot failed");
+    let error_text = error.to_string().to_ascii_lowercase();
+    if exchange == Exchange::Binance
+        && (error_text.contains("http 403")
+            || error_text.contains("http 418")
+            || error_text.contains("http 429")
+            || error_text.contains("waf")
+            || error_text.contains("too many requests")
+            || error_text.contains("request cooldown"))
+    {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "exchange_rate_limited",
+            "Binance 请求频率受限，服务器正在冷却；实时快照暂不可用，不能将持仓或挂单视为 0",
+        );
+    }
     api_error(
         StatusCode::BAD_GATEWAY,
         "exchange_snapshot_unavailable",
@@ -3803,6 +3818,28 @@ mod tests {
     async fn response_json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn binance_rate_limit_snapshot_failure_is_explicit_and_never_reports_zero() {
+        for message in [
+            "HTTP 403: request blocked by WAF",
+            "HTTP 418: IP banned until 1784418117158",
+            "HTTP 429: too many requests",
+            "Binance request cooldown is active",
+        ] {
+            let response =
+                snapshot_failure("positions", Exchange::Binance, SnapshotError::new(message));
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["code"], "exchange_rate_limited");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("不能将持仓或挂单视为 0"))
+            );
+        }
     }
 
     struct CountingCommand {

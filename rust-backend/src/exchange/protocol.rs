@@ -1,7 +1,7 @@
 use std::{
     fmt,
-    sync::Mutex,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -121,6 +121,125 @@ pub enum TransportError {
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError>;
+}
+
+const BINANCE_DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+const BINANCE_DEFAULT_IP_BAN_COOLDOWN: Duration = Duration::from_secs(2 * 60);
+const BINANCE_WAF_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const BINANCE_MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Default)]
+struct BinanceRequestState {
+    next_request_at: Option<Instant>,
+    cooldown_until: Option<Instant>,
+    consecutive_rate_limits: u32,
+}
+
+/// Serializes Binance REST traffic and opens a fail-fast circuit after 429/418.
+/// The shared state is deliberately below every adapter operation so reads and
+/// writes cannot bypass the same IP-level protection.
+#[derive(Clone)]
+pub struct BinanceRequestGovernor<T> {
+    inner: T,
+    minimum_interval: Duration,
+    state: Arc<tokio::sync::Mutex<BinanceRequestState>>,
+}
+
+impl<T> BinanceRequestGovernor<T> {
+    pub fn new(inner: T, minimum_interval: Duration) -> Self {
+        Self {
+            inner,
+            minimum_interval,
+            state: Arc::new(tokio::sync::Mutex::new(BinanceRequestState::default())),
+        }
+    }
+}
+
+impl<T> fmt::Debug for BinanceRequestGovernor<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BinanceRequestGovernor")
+            .field("minimum_interval", &self.minimum_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl<T> HttpTransport for BinanceRequestGovernor<T>
+where
+    T: HttpTransport,
+{
+    async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError> {
+        // Keep the guard through the network request. This prevents already queued
+        // requests from escaping after the first response opens the circuit.
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if let Some(cooldown_until) = state.cooldown_until {
+            if cooldown_until > now {
+                let remaining_ms = cooldown_until.saturating_duration_since(now).as_millis();
+                return Ok(HttpResponse {
+                    status: 429,
+                    body: format!(
+                        "{{\"code\":-1003,\"msg\":\"Binance request cooldown is active; retry after {remaining_ms} ms\"}}"
+                    ),
+                });
+            }
+            state.cooldown_until = None;
+        }
+
+        if let Some(next_request_at) = state.next_request_at
+            && next_request_at > now
+        {
+            tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
+        }
+
+        let response = self.inner.execute(request).await?;
+        state.next_request_at = Some(Instant::now() + self.minimum_interval);
+        match response.status {
+            403 | 418 | 429 => {
+                state.consecutive_rate_limits = state.consecutive_rate_limits.saturating_add(1);
+                let cooldown = rate_limit_cooldown(
+                    response.status,
+                    &response.body,
+                    state.consecutive_rate_limits,
+                );
+                state.cooldown_until = Some(Instant::now() + cooldown);
+            }
+            200..=399 => state.consecutive_rate_limits = 0,
+            _ => {}
+        }
+        Ok(response)
+    }
+}
+
+fn rate_limit_cooldown(status: u16, body: &str, consecutive_rate_limits: u32) -> Duration {
+    if status == 403 {
+        return BINANCE_WAF_COOLDOWN;
+    }
+    if status == 418 {
+        if let Some(ban_until_ms) = binance_ban_until_ms(body) {
+            let remaining_ms = ban_until_ms.saturating_sub(unix_duration_millis());
+            if remaining_ms > 0 {
+                return Duration::from_millis(remaining_ms).saturating_add(Duration::from_secs(1));
+            }
+        }
+        return BINANCE_DEFAULT_IP_BAN_COOLDOWN;
+    }
+
+    let exponent = consecutive_rate_limits.saturating_sub(1).min(5);
+    BINANCE_DEFAULT_RATE_LIMIT_COOLDOWN
+        .saturating_mul(1_u32 << exponent)
+        .min(BINANCE_MAX_RATE_LIMIT_COOLDOWN)
+}
+
+fn binance_ban_until_ms(body: &str) -> Option<u64> {
+    let marker = "banned until ";
+    let start = body.find(marker)?.saturating_add(marker.len());
+    let digits = body[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
 #[derive(Clone)]
@@ -260,7 +379,58 @@ fn unix_duration_micros() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
+
+    #[derive(Clone)]
+    struct ScriptedTransport {
+        calls: Arc<AtomicUsize>,
+        responses: Arc<Mutex<VecDeque<HttpResponse>>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(responses: impl IntoIterator<Item = HttpResponse>) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for ScriptedTransport {
+        async fn execute(
+            &self,
+            _request: PreparedHttpRequest,
+        ) -> Result<HttpResponse, TransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| TransportError::Other("script is exhausted".into()))
+        }
+    }
+
+    fn test_request() -> PreparedHttpRequest {
+        PreparedHttpRequest {
+            method: HttpMethod::Get,
+            base_url: "https://fapi.binance.test".into(),
+            path: "/fapi/v1/openOrders".into(),
+            query: vec![],
+            body: vec![],
+            raw_body: None,
+            headers: vec![],
+        }
+    }
 
     #[test]
     fn form_encoding_preserves_insertion_order_and_escapes_values() {
@@ -340,6 +510,68 @@ mod tests {
         assert!(!rendered.contains("secret-signature"));
         assert!(!rendered.contains("signature="));
         assert!(!rendered.contains("/signed-order"));
+    }
+
+    #[tokio::test]
+    async fn binance_governor_stops_queued_network_calls_during_an_ip_ban() {
+        let ban_until_ms = unix_duration_millis() + 60_000;
+        let transport = ScriptedTransport::new([HttpResponse {
+            status: 418,
+            body: format!(
+                "{{\"code\":-1003,\"msg\":\"Way too many requests; IP banned until {ban_until_ms}.\"}}"
+            ),
+        }]);
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+
+        let first = governor.execute(test_request()).await.unwrap();
+        let blocked = governor.execute(test_request()).await.unwrap();
+
+        assert_eq!(first.status, 418);
+        assert_eq!(blocked.status, 429);
+        assert!(blocked.body.contains("cooldown is active"));
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn binance_governor_opens_a_cooldown_after_the_first_429() {
+        let transport = ScriptedTransport::new([HttpResponse {
+            status: 429,
+            body: r#"{"code":-1003,"msg":"Too many requests"}"#.into(),
+        }]);
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+
+        let first = governor.execute(test_request()).await.unwrap();
+        let blocked = governor.execute(test_request()).await.unwrap();
+
+        assert_eq!(first.status, 429);
+        assert_eq!(blocked.status, 429);
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn binance_governor_treats_a_waf_403_as_an_ip_level_cooldown() {
+        let transport = ScriptedTransport::new([HttpResponse {
+            status: 403,
+            body: "request blocked by WAF".into(),
+        }]);
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+
+        let first = governor.execute(test_request()).await.unwrap();
+        let blocked = governor.execute(test_request()).await.unwrap();
+
+        assert_eq!(first.status, 403);
+        assert_eq!(blocked.status, 429);
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[test]
+    fn binance_ip_ban_deadline_is_parsed_without_trusting_other_numbers() {
+        assert_eq!(
+            binance_ban_until_ms(
+                r#"{"code":-1003,"msg":"IP(43.163.232.101) banned until 1784418117158."}"#
+            ),
+            Some(1_784_418_117_158)
+        );
     }
 
     #[test]
