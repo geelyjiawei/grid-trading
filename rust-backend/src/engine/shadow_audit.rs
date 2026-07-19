@@ -225,6 +225,18 @@ pub fn audit_strategy_shadow(
                 );
             }
             StrategyOrderTracking::Intent { state } => match state {
+                IntentState::RetryableNotSubmitted { .. } => {
+                    summary.pending_submission_count += 1;
+                    issues.push(ShadowAuditIssue::OrderAwaitingSubmission {
+                        client_order_id: client_order_id.clone(),
+                        level_index,
+                    });
+                    record_unexpected_observations(
+                        observations,
+                        &mut issues,
+                        &mut summary.unexpected_order_count,
+                    );
+                }
                 IntentState::Accepted { exchange_order_id } => {
                     summary.expected_authoritative_order_count += 1;
                     if let Some(level_index) = level_index {

@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-    domain::{ClientOrderId, IntentState, OrderIntent, TerminalOrderStatus},
+    domain::{ClientOrderId, Exchange, IntentState, OrderIntent, TerminalOrderStatus},
     exchange::{AuthoritativeOrder, OrderLifecycle, OrderLookup, OrderLookupGateway},
     persistence::{IntentStore, LedgerError},
 };
@@ -16,6 +16,9 @@ pub enum ReconciliationResult {
         status: TerminalOrderStatus,
     },
     StillUnknown {
+        message: String,
+    },
+    NotSubmitted {
         message: String,
     },
     OwnershipConflict {
@@ -84,6 +87,9 @@ where
 }
 
 pub(crate) fn intent_requires_lookup(intent: &OrderIntent) -> bool {
+    if matches!(intent.state, IntentState::RetryableNotSubmitted { .. }) {
+        return false;
+    }
     !matches!(
         intent.state,
         IntentState::Rejected { .. } | IntentState::OwnershipConflict { .. }
@@ -117,6 +123,19 @@ where
 
     match lookup {
         Ok(OrderLookup::Found(snapshot)) => reconcile_found(store, intent, snapshot, now_ms),
+        Ok(OrderLookup::NotFound) if legacy_local_cooldown_was_not_submitted(&intent) => {
+            let message =
+                "local Binance cooldown prevented submission; authoritative lookup confirms the order is absent"
+                    .to_owned();
+            store.transition(
+                &intent.client_order_id,
+                IntentState::RetryableNotSubmitted {
+                    message: message.clone(),
+                },
+                now_ms,
+            )?;
+            Ok(ReconciliationResult::NotSubmitted { message })
+        }
         Ok(OrderLookup::NotFound) => preserve_unknown(
             store,
             intent,
@@ -125,6 +144,22 @@ where
         ),
         Err(error) => preserve_unknown(store, intent, &error.message, now_ms),
     }
+}
+
+fn legacy_local_cooldown_was_not_submitted(intent: &OrderIntent) -> bool {
+    let IntentState::SubmitUnknown { message } = &intent.state else {
+        return false;
+    };
+    if intent.exchange != Exchange::Binance {
+        return false;
+    }
+    let Some(delay) = message
+        .strip_prefix("Binance request cooldown is active; retry after ")
+        .and_then(|value| value.strip_suffix(" ms"))
+    else {
+        return false;
+    };
+    !delay.is_empty() && delay.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn preserve_unknown<S: IntentStore>(
@@ -291,10 +326,10 @@ mod tests {
         }
     }
 
-    fn intent(client_order_id: &str) -> OrderIntent {
+    fn intent_on(client_order_id: &str, exchange: Exchange) -> OrderIntent {
         OrderIntent::prepare(
             ClientOrderId::parse(client_order_id).unwrap(),
-            Exchange::Aster,
+            exchange,
             OrderShape {
                 symbol: "ANSEMUSDT".into(),
                 side: OrderSide::Buy,
@@ -307,6 +342,10 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    fn intent(client_order_id: &str) -> OrderIntent {
+        intent_on(client_order_id, Exchange::Aster)
     }
 
     fn found(order: &OrderIntent, lifecycle: OrderLifecycle) -> OrderLookup {
@@ -446,6 +485,102 @@ mod tests {
                 .state,
             IntentState::SubmitUnknown { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_not_found_migrates_the_legacy_local_binance_cooldown() {
+        let order = intent_on("g_0_B_legacy_cooldown", Exchange::Binance);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MemoryOrderIntentStore::default();
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::SubmitUnknown {
+                    message: "Binance request cooldown is active; retry after 5 ms".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let mut service = ReconciliationService::new(
+            FakeLookupGateway {
+                calls: calls.clone(),
+                result: Ok(OrderLookup::NotFound),
+            },
+            store,
+        );
+
+        assert!(matches!(
+            service
+                .reconcile(&order.client_order_id, 102)
+                .await
+                .unwrap(),
+            ReconciliationResult::NotSubmitted { .. }
+        ));
+        assert!(matches!(
+            service
+                .store()
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::RetryableNotSubmitted { .. }
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_cooldown_migration_rejects_other_exchanges_and_inexact_messages() {
+        for (exchange, message) in [
+            (
+                Exchange::Aster,
+                "Binance request cooldown is active; retry after 5 ms",
+            ),
+            (
+                Exchange::Binance,
+                "Binance request cooldown is active; retry after unknown ms",
+            ),
+            (Exchange::Binance, "Too many requests"),
+        ] {
+            let order = intent_on("g_0_B_not_legacy_cooldown", exchange);
+            let mut store = MemoryOrderIntentStore::default();
+            store.insert_prepared(order.clone()).unwrap();
+            store
+                .transition(
+                    &order.client_order_id,
+                    IntentState::SubmitUnknown {
+                        message: message.into(),
+                    },
+                    101,
+                )
+                .unwrap();
+            let mut service = ReconciliationService::new(
+                FakeLookupGateway {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    result: Ok(OrderLookup::NotFound),
+                },
+                store,
+            );
+
+            assert!(matches!(
+                service
+                    .reconcile(&order.client_order_id, 102)
+                    .await
+                    .unwrap(),
+                ReconciliationResult::StillUnknown { .. }
+            ));
+            assert!(matches!(
+                service
+                    .store()
+                    .snapshot()
+                    .intents
+                    .get(&order.client_order_id)
+                    .unwrap()
+                    .state,
+                IntentState::SubmitUnknown { .. }
+            ));
+        }
     }
 
     #[tokio::test]

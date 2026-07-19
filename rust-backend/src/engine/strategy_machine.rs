@@ -533,9 +533,14 @@ impl StrategyState {
         self.orders
             .values()
             .filter(|order| {
-                order.tracking == StrategyOrderTracking::Ready
-                    && (self.lifecycle != StrategyLifecycle::RiskExitRequested
-                        || order.purpose.is_risk_close())
+                matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Ready
+                        | StrategyOrderTracking::Intent {
+                            state: IntentState::RetryableNotSubmitted { .. }
+                        }
+                ) && (self.lifecycle != StrategyLifecycle::RiskExitRequested
+                    || order.purpose.is_risk_close())
             })
             .map(|order| {
                 OrderIntent::prepare(
@@ -2529,6 +2534,9 @@ where
 fn order_may_still_be_live(order: &StrategyOrderRecord) -> bool {
     match &order.tracking {
         StrategyOrderTracking::Intent {
+            state: IntentState::RetryableNotSubmitted { .. },
+        } => false,
+        StrategyOrderTracking::Intent {
             state:
                 IntentState::Prepared | IntentState::SubmitUnknown { .. } | IntentState::Accepted { .. },
         } => true,
@@ -2655,14 +2663,24 @@ fn strategy_intent_transition_allowed(current: &StrategyOrderTracking, next: &In
                 (current, next),
                 (
                     IntentState::Prepared,
-                    IntentState::SubmitUnknown { .. }
+                    IntentState::RetryableNotSubmitted { .. }
+                        | IntentState::SubmitUnknown { .. }
                         | IntentState::Accepted { .. }
                         | IntentState::Rejected { .. }
                         | IntentState::OwnershipConflict { .. }
                         | IntentState::Terminal { .. }
                 ) | (
                     IntentState::SubmitUnknown { .. },
-                    IntentState::Accepted { .. }
+                    IntentState::RetryableNotSubmitted { .. }
+                        | IntentState::Accepted { .. }
+                        | IntentState::Rejected { .. }
+                        | IntentState::OwnershipConflict { .. }
+                        | IntentState::Terminal { .. }
+                ) | (
+                    IntentState::RetryableNotSubmitted { .. },
+                    IntentState::RetryableNotSubmitted { .. }
+                        | IntentState::SubmitUnknown { .. }
+                        | IntentState::Accepted { .. }
                         | IntentState::Rejected { .. }
                         | IntentState::OwnershipConflict { .. }
                         | IntentState::Terminal { .. }

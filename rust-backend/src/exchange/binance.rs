@@ -29,8 +29,8 @@ use crate::{
             parse_historical_minute_open, parse_order_execution_header, parse_trade_page,
         },
         protocol::{
-            HttpMethod, HttpTransport, MillisecondClock, Parameters, PreparedHttpRequest,
-            encode_parameters,
+            BINANCE_LOCAL_COOLDOWN_CODE, HttpMethod, HttpTransport, MillisecondClock, Parameters,
+            PreparedHttpRequest, encode_parameters,
         },
     },
 };
@@ -558,6 +558,11 @@ where
         }
 
         let error = parse_exchange_error(&response.body);
+        if response.status == 429 && error.code.as_deref() == Some(BINANCE_LOCAL_COOLDOWN_CODE) {
+            return Err(PlacementError::NotSubmitted {
+                message: error.message,
+            });
+        }
         if response.status < 400
             || response.status == 408
             || response.status == 429
@@ -1341,6 +1346,29 @@ mod tests {
 
         assert!(matches!(error, PlacementError::Unknown { .. }));
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_the_governors_private_cooldown_code_is_safe_to_retry() {
+        let local = MockTransport::with_response(Ok(HttpResponse {
+            status: 429,
+            body: format!(
+                "{{\"code\":\"{BINANCE_LOCAL_COOLDOWN_CODE}\",\"msg\":\"Binance request cooldown is active; retry after 5 ms\"}}"
+            ),
+        }));
+        assert!(matches!(
+            adapter(local).place_order(&intent()).await,
+            Err(PlacementError::NotSubmitted { .. })
+        ));
+
+        let exchange = MockTransport::with_response(Ok(HttpResponse {
+            status: 429,
+            body: r#"{"code":-1003,"msg":"Too many requests"}"#.into(),
+        }));
+        assert!(matches!(
+            adapter(exchange).place_order(&intent()).await,
+            Err(PlacementError::Unknown { .. })
+        ));
     }
 
     #[tokio::test]

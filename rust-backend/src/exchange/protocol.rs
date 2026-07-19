@@ -161,6 +161,7 @@ const BINANCE_DEFAULT_IP_BAN_COOLDOWN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_WAF_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const BINANCE_MAX_WAF_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const BINANCE_MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+pub(crate) const BINANCE_LOCAL_COOLDOWN_CODE: &str = "LOCAL_REQUEST_COOLDOWN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BinanceRequestCost {
@@ -243,13 +244,9 @@ where
         let now = Instant::now();
         if let Some(cooldown_until) = state.cooldown_until {
             if cooldown_until > now {
-                let remaining_ms = cooldown_until.saturating_duration_since(now).as_millis();
-                return Ok(HttpResponse {
-                    status: 429,
-                    body: format!(
-                        "{{\"code\":-1003,\"msg\":\"Binance request cooldown is active; retry after {remaining_ms} ms\"}}"
-                    ),
-                });
+                return Ok(binance_cooldown_response(
+                    cooldown_until.saturating_duration_since(now),
+                ));
             }
             state.cooldown_until = None;
         }
@@ -335,7 +332,7 @@ fn binance_cooldown_response(cooldown: Duration) -> HttpResponse {
     HttpResponse {
         status: 429,
         body: format!(
-            "{{\"code\":-1003,\"msg\":\"Binance request cooldown is active; retry after {remaining_ms} ms\"}}"
+            "{{\"code\":\"{BINANCE_LOCAL_COOLDOWN_CODE}\",\"msg\":\"Binance request cooldown is active; retry after {remaining_ms} ms\"}}"
         ),
     }
 }
@@ -915,6 +912,7 @@ mod tests {
         assert_eq!(first.status, 418);
         assert_eq!(blocked.status, 429);
         assert!(blocked.body.contains("cooldown is active"));
+        assert!(blocked.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
         assert_eq!(transport.call_count(), 1);
     }
 
@@ -931,6 +929,7 @@ mod tests {
 
         assert_eq!(first.status, 429);
         assert_eq!(blocked.status, 429);
+        assert!(blocked.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
         assert_eq!(transport.call_count(), 1);
     }
 
@@ -999,6 +998,7 @@ mod tests {
 
         assert_eq!(blocked.status, 429);
         assert!(blocked.body.contains("cooldown is active"));
+        assert!(blocked.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
         assert_eq!(transport.call_count(), 3);
     }
 
@@ -1032,6 +1032,7 @@ mod tests {
 
         assert_eq!(read.status, 200);
         assert_eq!(blocked.status, 429);
+        assert!(blocked.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
         assert_eq!(transport.call_count(), 4);
         let state = governor.state.lock().await;
         let remaining = state
