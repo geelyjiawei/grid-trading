@@ -1947,6 +1947,15 @@ where
             return Ok(report);
         }
 
+        // Manual stop only releases orders owned by this strategy. Once every
+        // owned order is authoritative terminal and fully accounted, an
+        // external position change must not keep the stopped strategy alive.
+        if lifecycle == StrategyLifecycle::StopRequested {
+            self.machine.mark_stopped(now_ms)?;
+            self.validate_ledger_ownership()?;
+            return Ok(report);
+        }
+
         let inputs = match load_strategy_inputs(
             &self.gateway,
             exchange,
@@ -1996,9 +2005,6 @@ where
         }
 
         match lifecycle {
-            StrategyLifecycle::StopRequested => {
-                self.machine.mark_stopped(now_ms)?;
-            }
             StrategyLifecycle::RiskExitRequested => {
                 let transition = self.machine.prepare_risk_close(
                     inputs.position.signed_quantity,
@@ -6197,6 +6203,43 @@ mod tests {
         assert!(!stopped.is_blocked(), "{stopped:?}");
         assert_eq!(gateway.placement_call_count(), 1);
         assert_eq!(gateway.cancellation_call_count(), 0);
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(state.lifecycle, StrategyLifecycle::Stopped);
+        assert_eq!(state.grid_position_net_quantity, -opening_quantity);
+        assert!(state.orders.get(&opening_id).unwrap().terminal_processed);
+    }
+
+    #[tokio::test]
+    async fn manual_stop_finishes_after_an_external_position_change() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let machine = machine(config(None), &rules);
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&opening_id)
+            .unwrap()
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        runtime.machine_mut().request_stop(1_150).unwrap();
+        let position_reads_before_stop = gateway.state.lock().unwrap().position_snapshot_calls;
+
+        // The exchange position remains flat because a trade outside this
+        // strategy offset the owned fill before the manual stop converged.
+        let stopped = runtime.tick(1_200).await.unwrap();
+
+        assert!(!stopped.is_blocked(), "{stopped:?}");
+        assert_eq!(gateway.placement_call_count(), 1);
+        assert_eq!(gateway.cancellation_call_count(), 0);
+        assert_eq!(
+            gateway.state.lock().unwrap().position_snapshot_calls,
+            position_reads_before_stop
+        );
         let state = runtime.machine().store().snapshot();
         assert_eq!(state.lifecycle, StrategyLifecycle::Stopped);
         assert_eq!(state.grid_position_net_quantity, -opening_quantity);
