@@ -241,9 +241,20 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                         }
                         Ok(PreparedStrategyStep::Active(report)) => {
                             if report.is_blocked() {
+                                let representative = report
+                                    .blockers
+                                    .first()
+                                    .expect("a blocked report must contain a blocker");
                                 tracing::warn!(
                                     run_id = advance.run_id.as_str(),
                                     blocker_count = report.blockers.len(),
+                                    blocker_stage = ?representative.stage,
+                                    client_order_id = representative
+                                        .client_order_id
+                                        .as_ref()
+                                        .map(|client_order_id| client_order_id.as_str())
+                                        .unwrap_or("-"),
+                                    blocker_message = representative.message.as_str(),
                                     "strategy tick is blocked pending authoritative reconciliation"
                                 );
                             }
