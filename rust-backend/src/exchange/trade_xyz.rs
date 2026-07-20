@@ -45,6 +45,7 @@ const PRODUCTION_BASE_URL: &str = "https://api.hyperliquid.xyz";
 const TESTNET_BASE_URL: &str = "https://api.hyperliquid-testnet.xyz";
 const DEX_NAME: &str = "xyz";
 const MARKET_CACHE_TTL: Duration = Duration::from_millis(750);
+const EXECUTION_FILL_LOOKBACK_MS: u64 = 60_000;
 
 fn minimum_notional() -> Decimal {
     Decimal::new(10, 0)
@@ -80,6 +81,11 @@ struct MarketInfo {
     volume_24h: Option<Decimal>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CachedExecutionFills {
+    rows: Vec<Value>,
+}
+
 pub struct TradeXyzAdapter<T, N> {
     transport: T,
     signer: HyperliquidSigner,
@@ -89,6 +95,7 @@ pub struct TradeXyzAdapter<T, N> {
     mainnet: bool,
     dex_metadata: Arc<tokio::sync::OnceCell<DexMetadata>>,
     market_cache: Arc<tokio::sync::Mutex<HashMap<String, (Instant, MarketInfo)>>>,
+    execution_fill_cache: Arc<tokio::sync::Mutex<CachedExecutionFills>>,
     credentials_verified: Arc<tokio::sync::OnceCell<()>>,
 }
 
@@ -153,6 +160,9 @@ impl<T, N> TradeXyzAdapter<T, N> {
             mainnet,
             dex_metadata: Arc::new(tokio::sync::OnceCell::new()),
             market_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            execution_fill_cache: Arc::new(
+                tokio::sync::Mutex::new(CachedExecutionFills::default()),
+            ),
             credentials_verified: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
@@ -1190,58 +1200,45 @@ where
         let collection_time =
             now_ms().map_err(|error| ExecutionSnapshotError::new(error.message))?;
         let fill_end_time = collection_time.max(status_time);
-        let fills_value = self
-            .post_info(
-                json!({
-                    "type": "userFillsByTime",
-                    "user": self.account_address,
-                    "startTime": order_time.saturating_sub(1),
-                    "endTime": fill_end_time.saturating_add(1),
-                    "aggregateByTime": false,
-                }),
-                "TRADE.XYZ execution lookup failed",
-            )
-            .await
-            .map_err(|error| ExecutionSnapshotError::new(error.message))?;
-        let rows = fills_value
-            .as_array()
-            .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill history is invalid"))?;
-        if rows.len() >= 2_000 {
-            return Err(ExecutionSnapshotError::new(
-                "TRADE.XYZ fill history reached the API page limit",
-            ));
-        }
-        let mut trades = rows
-            .iter()
-            .filter(|fill| id_string(fill.get("oid")).ok().as_deref() == Some(exchange_order_id))
-            .map(|fill| parse_trade_fill(fill, symbol, exchange_order_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        trades.sort_by(|left, right| {
-            compare_trade_chronology(
-                left.trade_time_ms,
-                &left.trade_id,
-                right.trade_time_ms,
-                &right.trade_id,
-            )
-        });
-        let mut cumulative_quantity = Decimal::ZERO;
-        let mut cumulative_quote = Decimal::ZERO;
-        let mut fees_by_asset = BTreeMap::new();
-        for trade in &trades {
-            cumulative_quantity = cumulative_quantity
-                .checked_add(trade.quantity)
-                .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill quantity overflowed"))?;
-            cumulative_quote = cumulative_quote
-                .checked_add(trade.quote_quantity)
-                .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill quote overflowed"))?;
-            let fee = fees_by_asset
-                .entry(trade.commission_asset.clone())
-                .or_insert(Decimal::ZERO);
-            *fee = fee
-                .checked_add(trade.commission_cost)
-                .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill fee overflowed"))?;
-        }
-        if order.executed_quantity != Some(cumulative_quantity) {
+        let expected_quantity = order.executed_quantity.ok_or_else(|| {
+            ExecutionSnapshotError::new("TRADE.XYZ authoritative execution quantity is missing")
+        })?;
+        let trades = if expected_quantity.is_zero() {
+            Vec::new()
+        } else {
+            let cache = Arc::clone(&self.execution_fill_cache);
+            let mut cache = cache.lock().await;
+            let cached = trades_for_order(&cache.rows, symbol, exchange_order_id)?;
+            if trade_quantity(&cached)? == expected_quantity {
+                cached
+            } else {
+                let fills_value = self
+                    .post_info(
+                        json!({
+                            "type": "userFillsByTime",
+                            "user": self.account_address,
+                            "startTime": order_time.saturating_sub(EXECUTION_FILL_LOOKBACK_MS),
+                            "endTime": fill_end_time.saturating_add(1),
+                            "aggregateByTime": false,
+                        }),
+                        "TRADE.XYZ execution lookup failed",
+                    )
+                    .await
+                    .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+                let rows = fills_value.as_array().ok_or_else(|| {
+                    ExecutionSnapshotError::new("TRADE.XYZ fill history is invalid")
+                })?;
+                if rows.len() >= 2_000 {
+                    return Err(ExecutionSnapshotError::new(
+                        "TRADE.XYZ fill history reached the API page limit",
+                    ));
+                }
+                cache.rows.clone_from(rows);
+                trades_for_order(&cache.rows, symbol, exchange_order_id)?
+            }
+        };
+        let (cumulative_quantity, cumulative_quote, fees_by_asset) = summarize_trades(&trades)?;
+        if cumulative_quantity != expected_quantity {
             return Err(ExecutionSnapshotError::new(
                 "TRADE.XYZ fills do not reconcile to the authoritative order quantity",
             ));
@@ -1636,6 +1633,55 @@ fn parse_trade_fill(
             .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill liquidity is invalid"))?,
         trade_time_ms: u64_field(row, "time").map_err(snapshot_to_execution)?,
     })
+}
+
+fn trades_for_order(
+    rows: &[Value],
+    symbol: &str,
+    exchange_order_id: &str,
+) -> Result<Vec<TradeFill>, ExecutionSnapshotError> {
+    let mut trades = rows
+        .iter()
+        .filter(|fill| id_string(fill.get("oid")).ok().as_deref() == Some(exchange_order_id))
+        .map(|fill| parse_trade_fill(fill, symbol, exchange_order_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    trades.sort_by(|left, right| {
+        compare_trade_chronology(
+            left.trade_time_ms,
+            &left.trade_id,
+            right.trade_time_ms,
+            &right.trade_id,
+        )
+    });
+    Ok(trades)
+}
+
+fn trade_quantity(trades: &[TradeFill]) -> Result<Decimal, ExecutionSnapshotError> {
+    trades.iter().try_fold(Decimal::ZERO, |total, trade| {
+        total
+            .checked_add(trade.quantity)
+            .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill quantity overflowed"))
+    })
+}
+
+fn summarize_trades(
+    trades: &[TradeFill],
+) -> Result<(Decimal, Decimal, BTreeMap<String, Decimal>), ExecutionSnapshotError> {
+    let cumulative_quantity = trade_quantity(trades)?;
+    let mut cumulative_quote = Decimal::ZERO;
+    let mut fees_by_asset = BTreeMap::new();
+    for trade in trades {
+        cumulative_quote = cumulative_quote
+            .checked_add(trade.quote_quantity)
+            .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill quote overflowed"))?;
+        let fee = fees_by_asset
+            .entry(trade.commission_asset.clone())
+            .or_insert(Decimal::ZERO);
+        *fee = fee
+            .checked_add(trade.commission_cost)
+            .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ fill fee overflowed"))?;
+    }
+    Ok((cumulative_quantity, cumulative_quote, fees_by_asset))
 }
 
 fn snapshot_to_execution(error: SnapshotError) -> ExecutionSnapshotError {
@@ -2168,5 +2214,81 @@ mod tests {
         let fill_query: Value =
             serde_json::from_str(requests[1].raw_body.as_deref().unwrap()).unwrap();
         assert!(fill_query["endTime"].as_u64().unwrap() > 3);
+    }
+
+    #[tokio::test]
+    async fn execution_snapshots_share_one_exact_fill_batch() {
+        let first_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
+        let second_id = ClientOrderId::parse("g_012345abcdef_16_S_10").unwrap();
+        let status = |client_order_id: &ClientOrderId, order_id: u64| {
+            response(json!({
+                "status": "order",
+                "order": {
+                    "order": {
+                        "coin": "xyz:MU",
+                        "side": "A",
+                        "limitPx": "850",
+                        "sz": "0.1",
+                        "origSz": "0.2",
+                        "oid": order_id,
+                        "timestamp": 100,
+                        "reduceOnly": false,
+                        "orderType": "Limit",
+                        "tif": "Gtc",
+                        "cloid": encode_cloid(client_order_id).unwrap()
+                    },
+                    "status": "open",
+                    "statusTimestamp": 200
+                }
+            }))
+        };
+        let fill = |order_id: u64, trade_id: u64| {
+            json!({
+                "closedPnl": "0",
+                "coin": "xyz:MU",
+                "crossed": false,
+                "oid": order_id,
+                "px": "850",
+                "side": "A",
+                "sz": "0.1",
+                "time": 201,
+                "fee": "0.01",
+                "tid": trade_id,
+                "feeToken": "USDC"
+            })
+        };
+        let transport = ScriptedTransport::new([
+            status(&first_id, 42),
+            response(json!([fill(42, 7), fill(43, 8)])),
+            status(&second_id, 43),
+        ]);
+        let adapter = test_adapter(transport.clone());
+
+        let first = adapter
+            .execution_snapshot(Exchange::TradeXyz, "MUUSDC", &first_id, "42")
+            .await
+            .unwrap();
+        let second = adapter
+            .execution_snapshot(Exchange::TradeXyz, "MUUSDC", &second_id, "43")
+            .await
+            .unwrap();
+
+        assert_eq!(first.cumulative_quantity, Decimal::new(1, 1));
+        assert_eq!(second.cumulative_quantity, Decimal::new(1, 1));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        let request_types = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_str::<Value>(request.raw_body.as_deref().unwrap()).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_types,
+            vec!["orderStatus", "userFillsByTime", "orderStatus"]
+        );
     }
 }

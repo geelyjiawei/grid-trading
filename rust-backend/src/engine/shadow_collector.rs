@@ -96,6 +96,25 @@ where
             message: error.to_string(),
         })?;
 
+    let locally_pending_accounting_count = strategy
+        .orders
+        .values()
+        .filter(|order| {
+            !order.terminal_processed
+                && matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Terminal { .. }
+                    }
+                )
+        })
+        .count();
+    if locally_pending_accounting_count > 0 {
+        return Err(ShadowCollectionError::StrategyOrderAccountingPending {
+            count: locally_pending_accounting_count,
+        });
+    }
+
     let first_open_orders = gateway
         .open_orders_snapshot(strategy.exchange, &strategy.symbol)
         .await
@@ -536,7 +555,7 @@ mod tests {
             collect_strategy_shadow(&gateway, &state).await,
             Err(ShadowCollectionError::StrategyOrderAccountingPending { count: 1 })
         );
-        assert_eq!(gateway.calls(), vec!["open"]);
+        assert!(gateway.calls().is_empty());
     }
 
     #[tokio::test]

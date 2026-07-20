@@ -1664,6 +1664,40 @@ where
                 )
                 .await;
         }
+        if lifecycle == StrategyLifecycle::Running
+            && report.is_blocked()
+            && report.blockers.iter().all(|blocker| {
+                matches!(
+                    blocker.stage,
+                    RuntimeStage::LedgerReconciliation | RuntimeStage::ExecutionAccounting
+                )
+            })
+        {
+            // One eventually-consistent execution must not delay counters for
+            // other fills that already passed exact authoritative accounting.
+            let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
+            let replacement_transition = self
+                .machine
+                .materialize_replacements(&persisted_rules, now_ms)?;
+            if matches!(replacement_transition, StrategyTransition::Failed { .. }) {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::StrategyFailed,
+                    client_order_id: None,
+                    message: "replacement planning failed before order submission".into(),
+                });
+                self.validate_ledger_ownership()?;
+                return self
+                    .drive_exit(
+                        report,
+                        StrategyLifecycle::Failed,
+                        advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                    )
+                    .await;
+            }
+            self.submit_ready_replacement_orders(&mut report, now_ms)
+                .await?;
+            self.validate_ledger_ownership()?;
+        }
         if report.is_blocked() {
             return Ok(report);
         }
@@ -1785,8 +1819,44 @@ where
         report: &mut RuntimeTickReport,
         now_ms: u64,
     ) -> Result<(), RuntimeTickError> {
-        let ready = self.machine.store().snapshot().ready_intents(now_ms)?;
-        for intent in ready.into_iter().take(self.maximum_submissions_per_tick) {
+        self.submit_ready_orders_matching(report, now_ms, false)
+            .await
+    }
+
+    async fn submit_ready_replacement_orders(
+        &mut self,
+        report: &mut RuntimeTickReport,
+        now_ms: u64,
+    ) -> Result<(), RuntimeTickError> {
+        self.submit_ready_orders_matching(report, now_ms, true)
+            .await
+    }
+
+    async fn submit_ready_orders_matching(
+        &mut self,
+        report: &mut RuntimeTickReport,
+        now_ms: u64,
+        replacements_only: bool,
+    ) -> Result<(), RuntimeTickError> {
+        let ready = {
+            let state = self.machine.store().snapshot();
+            let mut ready = state.ready_intents(now_ms)?;
+            if replacements_only {
+                ready.retain(|intent| {
+                    state
+                        .orders
+                        .get(&intent.client_order_id)
+                        .is_some_and(|order| {
+                            matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
+                        })
+                });
+            }
+            ready
+        };
+        let remaining_submissions = self
+            .maximum_submissions_per_tick
+            .saturating_sub(report.submissions.len());
+        for intent in ready.into_iter().take(remaining_submissions) {
             let client_order_id = intent.client_order_id.clone();
             let result = submit_with(&self.gateway, &mut self.intent_store, intent, now_ms).await?;
             let persisted = self
@@ -4664,6 +4734,105 @@ mod tests {
                 .grid_position_net_quantity,
             -(opening_quantity + partial_total)
         );
+    }
+
+    #[tokio::test]
+    async fn one_lagging_execution_does_not_delay_an_exact_replacement() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let primed = runtime.tick(1_250).await.unwrap();
+        assert!(!primed.is_blocked(), "{primed:?}");
+        let add_orders = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                matches!(
+                    order.purpose,
+                    StrategyOrderPurpose::InitialGrid {
+                        role: GridOrderRole::Add,
+                        ..
+                    }
+                ) && matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. }
+                    }
+                )
+            })
+            .take(2)
+            .map(|order| (order.client_order_id.clone(), order.shape.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(add_orders.len(), 2);
+        for (client_order_id, shape) in &add_orders {
+            gateway.fill_order(client_order_id, shape.price.unwrap(), Decimal::new(1, 2));
+        }
+        let filled_total = add_orders
+            .iter()
+            .map(|(_, shape)| shape.quantity)
+            .sum::<Decimal>();
+        gateway.set_position(
+            -(opening_quantity + filled_total),
+            Some(Decimal::new(1014, 0)),
+        );
+        let lagging_id = add_orders[1].0.clone();
+        let lagging_execution = gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .remove(&lagging_id)
+            .unwrap();
+        let placements_before_fill = gateway.placement_call_count();
+
+        let first = runtime.tick(1_300).await.unwrap();
+
+        assert!(first.is_blocked(), "{first:?}");
+        assert!(first.blockers.iter().any(|blocker| {
+            blocker.stage == RuntimeStage::ExecutionAccounting
+                && blocker.client_order_id.as_ref() == Some(&lagging_id)
+        }));
+        assert_eq!(first.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+        let exact_counter_id = first.submissions[0].client_order_id.clone();
+        let exact_counter = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .get(&exact_counter_id)
+            .unwrap();
+        assert!(matches!(
+            exact_counter.purpose,
+            StrategyOrderPurpose::Replacement { .. }
+        ));
+        assert_eq!(exact_counter.shape.side, OrderSide::Buy);
+        assert_eq!(exact_counter.shape.quantity, add_orders[0].1.quantity);
+        assert!(exact_counter.shape.reduce_only);
+
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .insert(lagging_id, lagging_execution);
+        let recovered = runtime.tick(1_400).await.unwrap();
+
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(recovered.submissions.len(), 1);
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 2);
+        let stable = runtime.tick(1_500).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+        assert!(stable.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 2);
     }
 
     #[tokio::test]
