@@ -496,6 +496,20 @@ where
     }
     let quote_asset = settings.quote_asset_for(expected_exchange).to_owned();
     let paths = StrategyFilePaths::new(root, run_id.clone())?;
+
+    // Exchange preflight can fail without creating durable strategy state. Do it
+    // before reserving the run directory so a transient exchange failure cannot
+    // leave a runtime.lock-only directory that poisons catalog discovery.
+    let prepared = prepare_new_strategy(
+        &gateway,
+        run_id,
+        config,
+        now_ms,
+        settings.maximum_market_age_ms,
+        settings.maximum_future_skew_ms,
+    )
+    .await?;
+
     let lease = StrategyRuntimeLease::acquire(paths.lease())?;
     if paths
         .state()
@@ -511,16 +525,6 @@ where
     {
         return Err(FileStrategyStartError::UnexpectedIntentLedger);
     }
-
-    let prepared = prepare_new_strategy(
-        &gateway,
-        run_id,
-        config,
-        now_ms,
-        settings.maximum_market_age_ms,
-        settings.maximum_future_skew_ms,
-    )
-    .await?;
     let persisted = FilePreparedStrategyStore::create(paths.state(), prepared)?;
     match persisted {
         FilePreparedStrategyStore::Armed(store) => {
@@ -3656,6 +3660,42 @@ mod tests {
         assert_ne!(second.run_id, first.run_id);
         assert_eq!(coordinator.entries().await.len(), 1);
         assert_eq!(gateway.placement_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_bootstrap_failure_leaves_clean_catalog_and_allows_retry() {
+        let directory = tempdir().unwrap();
+        let coordinator =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+        let stale_gateway = MockGateway::new(rules(), 0);
+
+        assert!(matches!(
+            coordinator
+                .start(stale_gateway.clone(), config(None), 20_000)
+                .await,
+            Err(RuntimeCoordinatorError::Start(
+                FileStrategyStartError::Bootstrap(_)
+            ))
+        ));
+        assert_eq!(stale_gateway.placement_call_count(), 0);
+
+        let catalog = load_strategy_catalog(directory.path()).unwrap();
+        assert!(catalog.anomalies().is_empty());
+        assert!(catalog.entries().is_empty());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == STRATEGY_CATALOG_LEASE_FILE_NAME)
+        );
+
+        let fresh_gateway = MockGateway::new(rules(), 20_001);
+        let retry = coordinator
+            .start(fresh_gateway.clone(), config(None), 20_001)
+            .await
+            .unwrap();
+        assert_eq!(retry.lifecycle, PreparedStrategyLifecycle::AwaitingOpening);
+        assert_eq!(fresh_gateway.placement_call_count(), 0);
+        assert_eq!(coordinator.entries().await.len(), 1);
     }
 
     #[tokio::test]

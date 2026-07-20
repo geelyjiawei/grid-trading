@@ -460,7 +460,12 @@ impl StartGridCommand for RuntimeStartGridCommand {
             }
         };
         let now_ms = unix_time_ms().map_err(|_| CommandOutcomeUnknown)?;
-        match self.runtime.start(gateway, config, now_ms).await {
+        let symbol = config.symbol.clone();
+        let start = self.runtime.start(gateway, config, now_ms).await;
+        if let Err(error) = &start {
+            tracing::warn!(?exchange, symbol, error = %error, "strategy start rejected before scheduling");
+        }
+        match start {
             Ok(receipt) => StoredCommandResponse::new(
                 StatusCode::ACCEPTED.as_u16(),
                 json!({
@@ -487,6 +492,23 @@ impl StartGridCommand for RuntimeStartGridCommand {
                 StatusCode::CONFLICT,
                 "grid_already_running",
                 "A strategy already owns this exchange and symbol",
+            ),
+            Err(RuntimeCoordinatorError::Start(_)) => command_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grid_start_preflight_failed",
+                "The exchange and account preflight failed; no strategy orders were scheduled",
+            ),
+            Err(
+                RuntimeCoordinatorError::CatalogTask
+                | RuntimeCoordinatorError::CatalogLease(_)
+                | RuntimeCoordinatorError::Catalog(_)
+                | RuntimeCoordinatorError::CatalogAnomalies { .. }
+                | RuntimeCoordinatorError::CatalogSelection(_)
+                | RuntimeCoordinatorError::RegistryCatalogMismatch { .. },
+            ) => command_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_state_inconsistent",
+                "The strategy state could not be reconciled safely",
             ),
             Err(
                 RuntimeCoordinatorError::RegistrationInvariant
