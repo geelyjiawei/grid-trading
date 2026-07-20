@@ -2625,6 +2625,8 @@ async fn exchange_price(
                 "symbol": snapshot.symbol,
                 "last_price": snapshot.last_price.to_string(),
                 "mark_price": snapshot.mark_price.to_string(),
+                "price_24h_pcnt": snapshot.price_24h_change_ratio.map(|value| value.to_string()),
+                "volume_24h": snapshot.volume_24h.map(|value| value.to_string()),
                 "observed_at_ms": snapshot.observed_at_ms,
             }),
         ),
@@ -4172,6 +4174,8 @@ mod tests {
                 symbol: symbol.into(),
                 last_price: Decimal::from_str_exact("0.38000").unwrap(),
                 mark_price: Decimal::from_str_exact("0.37990").unwrap(),
+                price_24h_change_ratio: None,
+                volume_24h: None,
                 observed_at_ms: 1_780_000_000_000,
             })
         }

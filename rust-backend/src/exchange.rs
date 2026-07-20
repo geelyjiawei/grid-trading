@@ -468,6 +468,10 @@ pub struct ExchangeMarketSnapshot {
     pub symbol: String,
     pub last_price: Decimal,
     pub mark_price: Decimal,
+    #[serde(default)]
+    pub price_24h_change_ratio: Option<Decimal>,
+    #[serde(default)]
+    pub volume_24h: Option<Decimal>,
     pub observed_at_ms: u64,
 }
 
@@ -599,6 +603,8 @@ mod snapshot_tests {
             symbol: "MUUSDT".into(),
             last_price: Decimal::new(1011, 0),
             mark_price: Decimal::new(1010, 0),
+            price_24h_change_ratio: None,
+            volume_24h: None,
             observed_at_ms,
         }
     }

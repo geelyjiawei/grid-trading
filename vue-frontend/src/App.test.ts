@@ -38,7 +38,7 @@ function installWorkspaceMocks(grids: GridStatus[]): void {
     exchange,
     available: exchange === "binance" ? "200" : "100",
     equity: exchange === "binance" ? "220" : "110",
-    unit: "USDT",
+    unit: exchange === "trade_xyz" ? "USDC" : "USDT",
   }));
   vi.spyOn(api, "feeRates").mockImplementation(async (exchange, symbol) => ({
     exchange,
@@ -57,6 +57,105 @@ afterEach(() => {
 });
 
 describe("workspace request isolation", () => {
+  it("renders TRADE.XYZ market data without waiting for a slower risk snapshot", async () => {
+    const grid: GridStatus = {
+      run_id: "run-trade-xyz",
+      exchange: "trade_xyz",
+      symbol: "MUUSDC",
+      running: true,
+      realized_net_profit: "1",
+    };
+    installWorkspaceMocks([grid]);
+    const priceSpy = vi.spyOn(api, "price").mockResolvedValue({
+      last_price: "859.155",
+      mark_price: "858.77",
+      price_24h_pcnt: "0.06244375",
+      volume_24h: "81704.125",
+    });
+    const slowRisk = deferred<RiskSnapshot>();
+    const riskSpy = vi.spyOn(api, "risk").mockReturnValue(slowRisk.promise);
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => {
+      expect(wrapper.find(".market-card").text()).toContain("859.155");
+      expect(wrapper.find(".market-card").text()).toContain("81,704.13");
+    });
+
+    await wrapper.find("button.strategy-row").trigger("click");
+    await vi.waitFor(() => expect(priceSpy).toHaveBeenCalledTimes(2));
+    expect(riskSpy).toHaveBeenCalledTimes(1);
+
+    slowRisk.resolve({
+      run_id: grid.run_id,
+      exchange: grid.exchange,
+      symbol: grid.symbol,
+      has_risk: false,
+    });
+    await flushPromises();
+    wrapper.unmount();
+  });
+
+  it("starts a fresh market read when returning to a context with a stale request", async () => {
+    const grids: GridStatus[] = [
+      {
+        run_id: "run-aster-stale",
+        exchange: "aster",
+        symbol: "BTCUSDT",
+        running: true,
+        realized_net_profit: "1",
+      },
+      {
+        run_id: "run-binance-switch",
+        exchange: "binance",
+        symbol: "MUUSDT",
+        running: true,
+        realized_net_profit: "1",
+      },
+    ];
+    installWorkspaceMocks(grids);
+    const stalePrice = deferred<PriceSnapshot>();
+    const staleRisk = deferred<RiskSnapshot>();
+    let asterPriceCalls = 0;
+    let asterRiskCalls = 0;
+    vi.spyOn(api, "price").mockImplementation((exchange) => {
+      if (exchange !== "aster") {
+        return Promise.resolve({ last_price: "123", mark_price: "123" });
+      }
+      asterPriceCalls += 1;
+      return asterPriceCalls === 1
+        ? stalePrice.promise
+        : Promise.resolve({ last_price: "777", mark_price: "777" });
+    });
+    vi.spyOn(api, "risk").mockImplementation((exchange, symbol) => {
+      if (exchange === "aster") {
+        asterRiskCalls += 1;
+        if (asterRiskCalls === 1) return staleRisk.promise;
+      }
+      return Promise.resolve({ exchange, symbol, has_risk: false });
+    });
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => {
+      expect(wrapper.findAll("button.strategy-row")).toHaveLength(2);
+    });
+    const strategyButtons = wrapper.findAll("button.strategy-row");
+    await strategyButtons.find((button) => button.text().includes("MUUSDT"))!.trigger("click");
+    await flushPromises();
+    await strategyButtons.find((button) => button.text().includes("BTCUSDT"))!.trigger("click");
+
+    await vi.waitFor(() => {
+      expect(wrapper.find(".market-card").text()).toContain("777");
+    });
+    expect(asterPriceCalls).toBe(2);
+
+    stalePrice.resolve({ last_price: "999", mark_price: "999" });
+    staleRisk.resolve({ exchange: "aster", symbol: "BTCUSDT", has_risk: true });
+    await flushPromises();
+    expect(wrapper.find(".market-card").text()).toContain("777");
+    expect(wrapper.find(".market-card").text()).not.toContain("999");
+    wrapper.unmount();
+  });
+
   it("keeps a stop-pending strategy visible until runtime accounting finishes", async () => {
     installWorkspaceMocks([{
       run_id: "run-esports-stop",

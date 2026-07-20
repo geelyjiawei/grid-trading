@@ -82,6 +82,7 @@ let detailsRequestSequence = 0;
 let marketContext = "";
 let balanceContext = "";
 let detailsContext = "";
+const riskRequestsInFlight = new Map<string, Promise<RiskSnapshot>>();
 
 const configured = computed(
   () => Boolean(config.value?.configs[activeExchange.value]?.configured),
@@ -192,7 +193,29 @@ async function refreshMarket(): Promise<void> {
   prepareWorkspaceContext();
   const exchange = activeExchange.value;
   const requestedSymbol = symbol.value;
+  const requestContext = `${exchange}:${requestedSymbol}`;
   const requestSequence = ++marketRequestSequence;
+  const failures: string[] = [];
+  const requestIsCurrent = () => (
+    authenticated.value
+    && requestSequence === marketRequestSequence
+    && exchange === activeExchange.value
+    && requestedSymbol === symbol.value
+  );
+  const settle = async <T>(
+    request: Promise<T>,
+    apply: (value: T) => void,
+    clear: () => void,
+  ): Promise<void> => {
+    try {
+      const value = await request;
+      if (requestIsCurrent()) apply(value);
+    } catch (reason) {
+      if (!requestIsCurrent()) return;
+      clear();
+      failures.push(messageFrom(reason, "交易所数据读取失败"));
+    }
+  };
   try {
     const priceRequest = api.price(exchange, requestedSymbol);
     const balanceRequest = configured.value
@@ -201,40 +224,42 @@ async function refreshMarket(): Promise<void> {
     const feeRequest = configured.value
       ? api.feeRates(exchange, requestedSymbol)
       : Promise.resolve<FeeRates | null>(null);
-    const riskRequest = configured.value
-      ? api.risk(exchange, requestedSymbol)
-      : Promise.resolve<RiskSnapshot | null>(null);
-
-    const results = await Promise.allSettled([
-      priceRequest,
-      balanceRequest,
-      feeRequest,
-      riskRequest,
-    ]);
-    if (
-      requestSequence !== marketRequestSequence
-      || exchange !== activeExchange.value
-      || requestedSymbol !== symbol.value
-    ) {
-      return;
+    let riskRequest: Promise<RiskSnapshot | null> = Promise.resolve(null);
+    if (configured.value) {
+      const existingRiskRequest = riskRequestsInFlight.get(requestContext);
+      if (existingRiskRequest) {
+        riskRequest = existingRiskRequest;
+      } else {
+        const nextRiskRequest = api.risk(exchange, requestedSymbol);
+        riskRequestsInFlight.set(requestContext, nextRiskRequest);
+        void nextRiskRequest.then(
+          () => {
+            if (riskRequestsInFlight.get(requestContext) === nextRiskRequest) {
+              riskRequestsInFlight.delete(requestContext);
+            }
+          },
+          () => {
+            if (riskRequestsInFlight.get(requestContext) === nextRiskRequest) {
+              riskRequestsInFlight.delete(requestContext);
+            }
+          },
+        );
+        riskRequest = nextRiskRequest;
+      }
     }
 
-    const [priceResult, balanceResult, feeResult, riskResult] = results;
-    price.value = priceResult.status === "fulfilled" ? priceResult.value : null;
-    balance.value = balanceResult.status === "fulfilled" ? balanceResult.value : null;
-    fees.value = feeResult.status === "fulfilled" ? feeResult.value : null;
-    risk.value = riskResult.status === "fulfilled" ? riskResult.value : null;
-
-    const failures = results
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => messageFrom(result.reason, "交易所数据读取失败"));
-    marketError.value = [...new Set(failures)].join("；");
+    marketError.value = "";
+    await Promise.all([
+      settle(priceRequest, (value) => { price.value = value; }, () => { price.value = null; }),
+      settle(balanceRequest, (value) => { balance.value = value; }, () => { balance.value = null; }),
+      settle(feeRequest, (value) => { fees.value = value; }, () => { fees.value = null; }),
+      settle(riskRequest, (value) => { risk.value = value; }, () => { risk.value = null; }),
+    ]);
+    if (requestIsCurrent()) {
+      marketError.value = [...new Set(failures)].join("；");
+    }
   } catch (reason) {
-    if (
-      requestSequence === marketRequestSequence
-      && exchange === activeExchange.value
-      && requestedSymbol === symbol.value
-    ) {
+    if (requestIsCurrent()) {
       price.value = null;
       balance.value = null;
       fees.value = null;
@@ -242,7 +267,7 @@ async function refreshMarket(): Promise<void> {
       marketError.value = messageFrom(reason, "交易所数据读取失败");
     }
   } finally {
-    if (requestSequence === marketRequestSequence) loading.value = false;
+    if (requestIsCurrent()) loading.value = false;
   }
 }
 

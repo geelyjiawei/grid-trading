@@ -322,6 +322,8 @@ mod tests {
                 symbol: symbol.into(),
                 last_price: state.market_price,
                 mark_price: state.market_price,
+                price_24h_change_ratio: None,
+                volume_24h: None,
                 observed_at_ms: 10_000,
             })
         }

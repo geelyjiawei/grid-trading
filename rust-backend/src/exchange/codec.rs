@@ -81,6 +81,8 @@ pub(super) fn parse_market_snapshot(
         symbol: expected_symbol.to_ascii_uppercase(),
         last_price,
         mark_price,
+        price_24h_change_ratio: None,
+        volume_24h: None,
         observed_at_ms,
     })
 }

@@ -76,6 +76,8 @@ struct MarketInfo {
     growth_mode: bool,
     mark_price: Decimal,
     mid_price: Decimal,
+    price_24h_change_ratio: Option<Decimal>,
+    volume_24h: Option<Decimal>,
 }
 
 pub struct TradeXyzAdapter<T, N> {
@@ -354,6 +356,24 @@ where
         if mark_price <= Decimal::ZERO || mid_price <= Decimal::ZERO || max_leverage == 0 {
             return Err(SnapshotError::new("TRADE.XYZ market values are invalid"));
         }
+        let price_24h_change_ratio = match optional_decimal(context, "prevDayPx")? {
+            Some(previous_day_price) if previous_day_price > Decimal::ZERO => Some(
+                mid_price
+                    .checked_sub(previous_day_price)
+                    .and_then(|change| change.checked_div(previous_day_price))
+                    .ok_or_else(|| SnapshotError::new("TRADE.XYZ 24H price change overflowed"))?,
+            ),
+            Some(_) => {
+                return Err(SnapshotError::new(
+                    "TRADE.XYZ previous-day price is invalid",
+                ));
+            }
+            None => None,
+        };
+        let volume_24h = optional_decimal(context, "dayBaseVlm")?;
+        if volume_24h.is_some_and(|volume| volume < Decimal::ZERO) {
+            return Err(SnapshotError::new("TRADE.XYZ 24H volume is invalid"));
+        }
         let dex = self.dex_metadata().await?;
         let index = u32::try_from(index)
             .map_err(|_| SnapshotError::new("TRADE.XYZ market index is out of range"))?;
@@ -377,6 +397,8 @@ where
             growth_mode: metadata.get("growthMode").and_then(Value::as_str) == Some("enabled"),
             mark_price,
             mid_price,
+            price_24h_change_ratio,
+            volume_24h,
         })
     }
 
@@ -459,6 +481,8 @@ where
             symbol,
             last_price: market.mid_price,
             mark_price: market.mark_price,
+            price_24h_change_ratio: market.price_24h_change_ratio,
+            volume_24h: market.volume_24h,
             observed_at_ms: now_ms()?,
         })
     }
@@ -1787,7 +1811,12 @@ mod tests {
             "maxLeverage": 10,
             "growthMode": "enabled"
         }));
-        contexts.push(json!({"markPx": "849.84", "midPx": "849.955"}));
+        contexts.push(json!({
+            "markPx": "849.84",
+            "midPx": "849.955",
+            "prevDayPx": "800",
+            "dayBaseVlm": "81704.125"
+        }));
         response(json!([{"universe": universe}, contexts]))
     }
 
@@ -1840,6 +1869,26 @@ mod tests {
         assert_eq!(
             lifecycle("filled", Decimal::ONE).unwrap(),
             OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+        );
+    }
+
+    #[tokio::test]
+    async fn market_snapshot_includes_authoritative_24h_statistics() {
+        let transport = ScriptedTransport::new([market_response(), dex_response()]);
+        let adapter = test_adapter(transport);
+
+        let snapshot = adapter
+            .market_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.price_24h_change_ratio,
+            Some(Decimal::from_str_exact("0.06244375").unwrap())
+        );
+        assert_eq!(
+            snapshot.volume_24h,
+            Some(Decimal::from_str_exact("81704.125").unwrap())
         );
     }
 
