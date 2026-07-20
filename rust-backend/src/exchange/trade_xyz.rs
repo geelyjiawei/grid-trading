@@ -1,15 +1,19 @@
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+#[cfg(not(test))]
+use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
+#[cfg(not(test))]
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
     domain::{
@@ -43,6 +47,8 @@ use crate::{
 
 const PRODUCTION_BASE_URL: &str = "https://api.hyperliquid.xyz";
 const TESTNET_BASE_URL: &str = "https://api.hyperliquid-testnet.xyz";
+const PRODUCTION_WEBSOCKET_URL: &str = "wss://api.hyperliquid.xyz/ws";
+const TESTNET_WEBSOCKET_URL: &str = "wss://api.hyperliquid-testnet.xyz/ws";
 const DEX_NAME: &str = "xyz";
 // One default-weight Hyperliquid info request consumes about 1.2 seconds of our
 // conservative IP budget. Keep the same snapshot through a complete runtime
@@ -51,6 +57,14 @@ const DEX_NAME: &str = "xyz";
 const MARKET_CACHE_TTL: Duration = Duration::from_secs(3);
 const LEVERAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 const EXECUTION_FILL_LOOKBACK_MS: u64 = 60_000;
+const EXECUTION_FILL_CACHE_LIMIT: usize = 10_000;
+#[cfg(not(test))]
+const USER_FILL_STREAM_HEARTBEAT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const USER_FILL_STREAM_RECONNECT_MIN: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
+const USER_FILL_STREAM_RECONNECT_MAX: Duration = Duration::from_secs(30);
+const USER_FILL_STREAM_GRACE: Duration = Duration::from_millis(250);
 
 fn minimum_notional() -> Decimal {
     Decimal::new(10, 0)
@@ -90,6 +104,7 @@ struct MarketInfo {
 #[derive(Debug, Clone, Default)]
 struct CachedExecutionFills {
     rows: Vec<Value>,
+    stream_connected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -166,20 +181,31 @@ impl<T, N> TradeXyzAdapter<T, N> {
         base_url: &str,
         mainnet: bool,
     ) -> Result<Self, TradeXyzAdapterError> {
+        let signer = HyperliquidSigner::from_private_key(agent_private_key)?;
+        let account_address = normalize_address(account_address)?;
+        let execution_fill_cache =
+            Arc::new(tokio::sync::Mutex::new(CachedExecutionFills::default()));
+        spawn_user_fill_stream(
+            if mainnet {
+                PRODUCTION_WEBSOCKET_URL
+            } else {
+                TESTNET_WEBSOCKET_URL
+            },
+            account_address.clone(),
+            Arc::downgrade(&execution_fill_cache),
+        );
         Ok(Self {
             transport,
-            signer: HyperliquidSigner::from_private_key(agent_private_key)?,
+            signer,
             nonce,
-            account_address: normalize_address(account_address)?,
+            account_address,
             base_url: base_url.to_owned(),
             mainnet,
             dex_metadata: Arc::new(tokio::sync::OnceCell::new()),
             market_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             leverage_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             open_execution_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            execution_fill_cache: Arc::new(
-                tokio::sync::Mutex::new(CachedExecutionFills::default()),
-            ),
+            execution_fill_cache,
             credentials_verified: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
@@ -191,6 +217,182 @@ impl<T, N> TradeXyzAdapter<T, N> {
     pub fn agent_address(&self) -> &str {
         self.signer.address()
     }
+}
+
+#[cfg(not(test))]
+fn spawn_user_fill_stream(
+    websocket_url: &'static str,
+    account_address: String,
+    cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("TRADE.XYZ user-fill stream was not started outside a Tokio runtime");
+        return;
+    };
+    runtime.spawn(run_user_fill_stream(websocket_url, account_address, cache));
+}
+
+#[cfg(test)]
+fn spawn_user_fill_stream(
+    _websocket_url: &'static str,
+    _account_address: String,
+    _cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+) {
+}
+
+#[cfg(not(test))]
+async fn run_user_fill_stream(
+    websocket_url: &'static str,
+    account_address: String,
+    cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+) {
+    let mut reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
+    loop {
+        if cache.upgrade().is_none() {
+            return;
+        }
+        let connection = connect_async(websocket_url).await;
+        let (mut socket, _) = match connection {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::warn!(error = %error, "TRADE.XYZ user-fill stream connection failed");
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
+                continue;
+            }
+        };
+        let subscription = json!({
+            "method": "subscribe",
+            "subscription": {
+                "type": "userFills",
+                "user": account_address,
+                "aggregateByTime": false,
+            }
+        });
+        if let Err(error) = socket
+            .send(Message::Text(subscription.to_string().into()))
+            .await
+        {
+            tracing::warn!(error = %error, "TRADE.XYZ user-fill subscription failed");
+            tokio::time::sleep(reconnect_delay).await;
+            reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
+            continue;
+        }
+        if !set_fill_stream_connected(&cache, true).await {
+            return;
+        }
+        tracing::info!("TRADE.XYZ user-fill stream connected");
+        reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
+        let mut heartbeat = tokio::time::interval(USER_FILL_STREAM_HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                message = socket.next() => {
+                    let Some(message) = message else { break };
+                    match message {
+                        Ok(Message::Text(text)) => {
+                            if !cache_user_fill_message(text.as_ref(), &cache).await {
+                                return;
+                            }
+                        }
+                        Ok(Message::Binary(bytes)) => {
+                            if let Ok(text) = std::str::from_utf8(bytes.as_ref())
+                                && !cache_user_fill_message(text, &cache).await
+                            {
+                                return;
+                            }
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "TRADE.XYZ user-fill stream read failed");
+                            break;
+                        }
+                        Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if socket
+                        .send(Message::Text(json!({"method": "ping"}).to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        if !set_fill_stream_connected(&cache, false).await {
+            return;
+        }
+        tracing::warn!("TRADE.XYZ user-fill stream disconnected; REST fallback remains active");
+        tokio::time::sleep(reconnect_delay).await;
+        reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
+    }
+}
+
+#[cfg(not(test))]
+async fn set_fill_stream_connected(
+    cache: &Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+    connected: bool,
+) -> bool {
+    let Some(cache) = cache.upgrade() else {
+        return false;
+    };
+    cache.lock().await.stream_connected = connected;
+    true
+}
+
+#[cfg(not(test))]
+async fn cache_user_fill_message(
+    text: &str,
+    cache: &Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+) -> bool {
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return true;
+    };
+    if message.get("channel").and_then(Value::as_str) != Some("userFills") {
+        return true;
+    }
+    let Some(fills) = message
+        .get("data")
+        .and_then(|data| data.get("fills"))
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    let Some(cache) = cache.upgrade() else {
+        return false;
+    };
+    merge_fill_rows(&mut cache.lock().await.rows, fills.iter().cloned());
+    true
+}
+
+fn merge_fill_rows(rows: &mut Vec<Value>, incoming: impl IntoIterator<Item = Value>) {
+    let mut indexed = BTreeMap::new();
+    for row in rows.drain(..).chain(incoming) {
+        if let Some(identity) = fill_row_identity(&row) {
+            indexed.insert(identity, row);
+        }
+    }
+    let mut merged = indexed.into_values().collect::<Vec<_>>();
+    if merged.len() > EXECUTION_FILL_CACHE_LIMIT {
+        merged.drain(..merged.len() - EXECUTION_FILL_CACHE_LIMIT);
+    }
+    *rows = merged;
+}
+
+fn fill_row_identity(row: &Value) -> Option<(u64, String, String)> {
+    Some((
+        row.get("time").and_then(value_u64)?,
+        id_string(row.get("oid")).ok()?,
+        id_string(row.get("tid")).ok()?,
+    ))
 }
 
 impl<T, N> ExchangeIdentityGateway for TradeXyzAdapter<T, N>
@@ -1271,9 +1473,24 @@ where
             Vec::new()
         } else {
             let cache = Arc::clone(&self.execution_fill_cache);
-            let mut cache = cache.lock().await;
-            let cached = trades_for_order(&cache.rows, symbol, exchange_order_id)?;
-            if trade_quantity(&cached)? == expected_quantity {
+            let (mut cached, stream_connected) = {
+                let cache = cache.lock().await;
+                (
+                    trades_for_order(&cache.rows, symbol, exchange_order_id)?,
+                    cache.stream_connected,
+                )
+            };
+            let mut cached_quantity = trade_quantity(&cached)?;
+            if cached_quantity < expected_quantity && stream_connected {
+                // The order update and fill event are separate stream messages. Give
+                // an already-connected stream a short opportunity to deliver the fill
+                // before consuming a high-weight REST history request.
+                tokio::time::sleep(USER_FILL_STREAM_GRACE).await;
+                let cache = cache.lock().await;
+                cached = trades_for_order(&cache.rows, symbol, exchange_order_id)?;
+                cached_quantity = trade_quantity(&cached)?;
+            }
+            if cached_quantity >= expected_quantity && cached_quantity <= order.shape.quantity {
                 cached
             } else {
                 let fills_value = self
@@ -1297,7 +1514,8 @@ where
                         "TRADE.XYZ fill history reached the API page limit",
                     ));
                 }
-                cache.rows.clone_from(rows);
+                let mut cache = cache.lock().await;
+                merge_fill_rows(&mut cache.rows, rows.iter().cloned());
                 trades_for_order(&cache.rows, symbol, exchange_order_id)?
             }
         };
@@ -2526,6 +2744,81 @@ mod tests {
             snapshot.order.lifecycle,
             OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
         );
+    }
+
+    #[test]
+    fn fill_cache_merges_stream_and_rest_rows_without_double_counting() {
+        let fill = |time: u64, order_id: u64, trade_id: u64, quantity: &str| {
+            json!({
+                "time": time,
+                "oid": order_id,
+                "tid": trade_id,
+                "sz": quantity,
+            })
+        };
+        let mut rows = vec![fill(2, 42, 8, "0.1"), fill(1, 42, 7, "0.1")];
+
+        merge_fill_rows(&mut rows, [fill(1, 42, 7, "0.2"), fill(3, 43, 9, "0.1")]);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["time"], 1);
+        assert_eq!(rows[0]["sz"], "0.2");
+        assert_eq!(rows[2]["oid"], 43);
+    }
+
+    #[tokio::test]
+    async fn websocket_fill_cache_avoids_rest_fill_history_request() {
+        let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
+        let cloid = encode_cloid(&client_order_id).unwrap();
+        let fill = |quantity: &str, trade_id: u64| {
+            json!({
+                "closedPnl": "0",
+                "coin": "xyz:MU",
+                "crossed": false,
+                "oid": 42,
+                "px": "850",
+                "side": "A",
+                "sz": quantity,
+                "time": 3,
+                "fee": "0.01",
+                "tid": trade_id,
+                "feeToken": "USDC"
+            })
+        };
+        let transport = ScriptedTransport::new([response(json!({
+            "status": "order",
+            "order": {
+                "order": {
+                    "coin": "xyz:MU",
+                    "side": "A",
+                    "limitPx": "850",
+                    "sz": "0",
+                    "origSz": "0.2",
+                    "oid": 42,
+                    "timestamp": 1,
+                    "reduceOnly": false,
+                    "orderType": "Limit",
+                    "tif": "Gtc",
+                    "cloid": cloid
+                },
+                "status": "filled",
+                "statusTimestamp": 3
+            }
+        }))]);
+        let adapter = test_adapter(transport.clone());
+        adapter.execution_fill_cache.lock().await.rows = vec![fill("0.1", 7), fill("0.1", 8)];
+
+        let snapshot = adapter
+            .execution_snapshot(Exchange::TradeXyz, "MUUSDC", &client_order_id, "42")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(2, 1));
+        assert_eq!(snapshot.trades.len(), 2);
+        assert_eq!(transport.requests().len(), 1);
+        let request: Value =
+            serde_json::from_str(transport.requests()[0].raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(request["type"], "orderStatus");
     }
 
     #[tokio::test]
