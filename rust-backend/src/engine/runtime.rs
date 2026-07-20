@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Instant};
+use std::{collections::BTreeMap, fs, io, path::PathBuf, time::Instant};
 
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -496,20 +496,6 @@ where
     }
     let quote_asset = settings.quote_asset_for(expected_exchange).to_owned();
     let paths = StrategyFilePaths::new(root, run_id.clone())?;
-
-    // Exchange preflight can fail without creating durable strategy state. Do it
-    // before reserving the run directory so a transient exchange failure cannot
-    // leave a runtime.lock-only directory that poisons catalog discovery.
-    let prepared = prepare_new_strategy(
-        &gateway,
-        run_id,
-        config,
-        now_ms,
-        settings.maximum_market_age_ms,
-        settings.maximum_future_skew_ms,
-    )
-    .await?;
-
     let lease = StrategyRuntimeLease::acquire(paths.lease())?;
     if paths
         .state()
@@ -525,6 +511,25 @@ where
     {
         return Err(FileStrategyStartError::UnexpectedIntentLedger);
     }
+    let prepared = match prepare_new_strategy(
+        &gateway,
+        run_id,
+        config,
+        now_ms,
+        settings.maximum_market_age_ms,
+        settings.maximum_future_skew_ms,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(bootstrap) => {
+            drop(lease);
+            if let Err(cleanup) = rollback_failed_strategy_bootstrap(&paths) {
+                return Err(FileStrategyStartError::BootstrapRollback { bootstrap, cleanup });
+            }
+            return Err(FileStrategyStartError::Bootstrap(bootstrap));
+        }
+    };
     let persisted = FilePreparedStrategyStore::create(paths.state(), prepared)?;
     match persisted {
         FilePreparedStrategyStore::Armed(store) => {
@@ -559,6 +564,17 @@ where
             ))
         }
     }
+}
+
+fn rollback_failed_strategy_bootstrap(paths: &StrategyFilePaths) -> io::Result<()> {
+    let entries = fs::read_dir(paths.directory())?.collect::<Result<Vec<_>, _>>()?;
+    if entries.len() != 1 || entries[0].path() != paths.lease() {
+        return Err(io::Error::other(
+            "refusing to remove a non-empty failed strategy reservation",
+        ));
+    }
+    fs::remove_file(paths.lease())?;
+    fs::remove_dir(paths.directory())
 }
 
 pub fn recover_leased_file_strategy<G>(
@@ -766,6 +782,13 @@ pub enum FileStrategyStartError {
     Lease(#[from] RuntimeLeaseError),
     #[error(transparent)]
     Bootstrap(#[from] StrategyBootstrapError),
+    #[error(
+        "strategy bootstrap failed ({bootstrap}) and its reservation rollback failed: {cleanup}"
+    )]
+    BootstrapRollback {
+        bootstrap: StrategyBootstrapError,
+        cleanup: std::io::Error,
+    },
     #[error(transparent)]
     StrategyState(#[from] StrategyStoreError),
     #[error(transparent)]
