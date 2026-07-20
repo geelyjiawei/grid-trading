@@ -2203,12 +2203,21 @@ async fn save_exchange_config(
     };
     match gateway.account_balance_snapshot(exchange).await {
         Ok(snapshot) if snapshot.exchange == exchange => {}
-        Ok(_) | Err(_) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "exchange_verification_failed",
-                "The exchange rejected the credentials or returned an invalid account response",
+        Ok(_) => {
+            tracing::warn!(
+                ?exchange,
+                "exchange credential verification returned the wrong exchange identity"
             );
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                "exchange_verification_invalid_response",
+                "The exchange returned an invalid account identity",
+            );
+        }
+        Err(error) => {
+            tracing::warn!(?exchange, error = %error, "exchange credential verification failed");
+            let failure = exchange_verification_failure(exchange, &error);
+            return api_error(failure.status, failure.code, failure.message);
         }
     }
 
@@ -2252,6 +2261,67 @@ async fn save_exchange_config(
             "testnet": prepared.environment == ExchangeEnvironment::Testnet,
         }),
     )
+}
+
+struct ExchangeVerificationFailure {
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+}
+
+fn exchange_verification_failure(
+    exchange: Exchange,
+    error: &SnapshotError,
+) -> ExchangeVerificationFailure {
+    const GENERIC: ExchangeVerificationFailure = ExchangeVerificationFailure {
+        status: StatusCode::BAD_REQUEST,
+        code: "exchange_verification_failed",
+        message: "The exchange rejected the credentials or returned an invalid account response",
+    };
+    if exchange != Exchange::TradeXyz {
+        return GENERIC;
+    }
+
+    let detail = error.message.as_str();
+    if detail.contains("agent wallet is not authorized") {
+        return ExchangeVerificationFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: "trade_xyz_agent_not_authorized",
+            message: "TRADE.XYZ Agent is not authorized for this master account. Use the main Hyperliquid account address and an active Agent private key created by that same account; also ensure Mainnet/Testnet matches.",
+        };
+    }
+    if detail.contains("portfolio-margin") {
+        return ExchangeVerificationFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: "trade_xyz_portfolio_margin_unsupported",
+            message: "TRADE.XYZ Portfolio Margin accounts are not supported by this version. Switch the Hyperliquid account to Standard or Unified mode before saving credentials.",
+        };
+    }
+    if detail.contains("timed out")
+        || detail.contains("connection failed")
+        || detail.contains("HTTP 429")
+        || detail.contains("HTTP 5")
+    {
+        return ExchangeVerificationFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "trade_xyz_api_unavailable",
+            message: "The Hyperliquid API is temporarily unavailable or rate limited. The credentials were not saved; retry shortly.",
+        };
+    }
+    if detail.contains("account mode")
+        || detail.contains("account lookup")
+        || detail.contains("margin summary")
+        || detail.contains("balance")
+        || detail.contains("positions are unavailable")
+    {
+        return ExchangeVerificationFailure {
+            status: StatusCode::BAD_GATEWAY,
+            code: "trade_xyz_account_response_invalid",
+            message: "Hyperliquid returned an unsupported or incomplete TRADE.XYZ account response. The credentials were not saved.",
+        };
+    }
+
+    GENERIC
 }
 
 async fn ensure_exchange_configuration_is_mutable(
@@ -5064,6 +5134,49 @@ mod tests {
         .unwrap();
 
         assert!(error.message.contains("do not match"));
+    }
+
+    #[test]
+    fn trade_xyz_verification_reports_agent_account_mismatch() {
+        let failure = exchange_verification_failure(
+            Exchange::TradeXyz,
+            &SnapshotError::new(
+                "TRADE.XYZ agent wallet is not authorized for the configured account",
+            ),
+        );
+
+        assert_eq!(failure.status, StatusCode::BAD_REQUEST);
+        assert_eq!(failure.code, "trade_xyz_agent_not_authorized");
+        assert!(failure.message.contains("master account"));
+        assert!(!failure.message.contains("private key:"));
+    }
+
+    #[test]
+    fn trade_xyz_verification_distinguishes_account_mode_and_transport_failures() {
+        let portfolio = exchange_verification_failure(
+            Exchange::TradeXyz,
+            &SnapshotError::new("TRADE.XYZ portfolio-margin accounts are not supported safely"),
+        );
+        let unavailable = exchange_verification_failure(
+            Exchange::TradeXyz,
+            &SnapshotError::new("TRADE.XYZ agent role lookup failed: HTTP request timed out"),
+        );
+
+        assert_eq!(portfolio.code, "trade_xyz_portfolio_margin_unsupported");
+        assert_eq!(portfolio.status, StatusCode::BAD_REQUEST);
+        assert_eq!(unavailable.code, "trade_xyz_api_unavailable");
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn other_exchange_verification_errors_remain_generic() {
+        let failure = exchange_verification_failure(
+            Exchange::Binance,
+            &SnapshotError::new("must not be exposed"),
+        );
+
+        assert_eq!(failure.code, "exchange_verification_failed");
+        assert!(!failure.message.contains("must not be exposed"));
     }
 
     #[test]
