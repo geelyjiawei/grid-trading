@@ -44,7 +44,11 @@ use crate::{
 const PRODUCTION_BASE_URL: &str = "https://api.hyperliquid.xyz";
 const TESTNET_BASE_URL: &str = "https://api.hyperliquid-testnet.xyz";
 const DEX_NAME: &str = "xyz";
-const MARKET_CACHE_TTL: Duration = Duration::from_millis(750);
+// One default-weight Hyperliquid info request consumes about 1.2 seconds of our
+// conservative IP budget. Keep the same snapshot through a complete runtime
+// collection so position validation and the resulting limit order do not
+// request identical market metadata again.
+const MARKET_CACHE_TTL: Duration = Duration::from_secs(3);
 const LEVERAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 const EXECUTION_FILL_LOOKBACK_MS: u64 = 60_000;
 
@@ -80,6 +84,7 @@ struct MarketInfo {
     mid_price: Decimal,
     price_24h_change_ratio: Option<Decimal>,
     volume_24h: Option<Decimal>,
+    observed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -421,6 +426,7 @@ where
             mid_price,
             price_24h_change_ratio,
             volume_24h,
+            observed_at_ms: now_ms()?,
         })
     }
 
@@ -513,7 +519,7 @@ where
             mark_price: market.mark_price,
             price_24h_change_ratio: market.price_24h_change_ratio,
             volume_24h: market.volume_24h,
-            observed_at_ms: now_ms()?,
+            observed_at_ms: market.observed_at_ms,
         })
     }
 }
@@ -1990,9 +1996,14 @@ mod tests {
     #[tokio::test]
     async fn market_snapshot_includes_authoritative_24h_statistics() {
         let transport = ScriptedTransport::new([market_response(), dex_response()]);
-        let adapter = test_adapter(transport);
+        let adapter = test_adapter(transport.clone());
 
         let snapshot = adapter
+            .market_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let cached = adapter
             .market_snapshot(Exchange::TradeXyz, "MUUSDC")
             .await
             .unwrap();
@@ -2005,6 +2016,65 @@ mod tests {
             snapshot.volume_24h,
             Some(Decimal::from_str_exact("81704.125").unwrap())
         );
+        assert_eq!(cached.observed_at_ms, snapshot.observed_at_ms);
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn one_runtime_collection_reuses_market_metadata_for_limit_replacement() {
+        let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
+            response(json!({"assetPositions": []})),
+            response(json!({"leverage": {"type": "isolated", "value": 5}})),
+            response(json!({
+                "status": "ok",
+                "response": {"data": {"statuses": [{"resting": {"oid": 42}}]}}
+            })),
+        ]);
+        let adapter = test_adapter(transport.clone());
+
+        adapter
+            .market_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap();
+        adapter
+            .market_cache
+            .lock()
+            .await
+            .get_mut("MUUSDC")
+            .unwrap()
+            .0 = Instant::now() - Duration::from_secs(1);
+        adapter
+            .position_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap();
+        adapter
+            .place_order(&limit_intent("g_012345abcdef_15_S_2"))
+            .await
+            .unwrap();
+
+        let request_types = transport
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/info")
+            .map(|request| {
+                serde_json::from_str::<Value>(request.raw_body.as_deref().unwrap()).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_types,
+            vec![
+                "metaAndAssetCtxs",
+                "perpDexs",
+                "clearinghouseState",
+                "activeAssetData",
+            ]
+        );
+        assert_eq!(transport.requests().last().unwrap().path, "/exchange");
     }
 
     #[test]
