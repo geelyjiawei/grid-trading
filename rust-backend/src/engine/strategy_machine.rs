@@ -4018,28 +4018,8 @@ fn materialize_replacement_orders(
             .collect::<Vec<_>>();
         pending_ids.retain(|id| !compatible_ids.contains(id));
 
-        if first.shape.reduce_only {
-            for id in compatible_ids {
-                let Some(obligation) = state.replacement_obligations.get(&id) else {
-                    return fail_transition(state, "replacement obligation is missing");
-                };
-                if !replacement_quantity_is_valid(&obligation.shape, fresh_rules) {
-                    return fail_transition(
-                        state,
-                        "exact reduce-only replacement violates the exchange LOT_SIZE quantity filter",
-                    );
-                }
-                if let Err(message) =
-                    materialize_obligation_bucket(state, &[id], fresh_rules, &mut created)
-                {
-                    return fail_transition(state, message);
-                }
-            }
-            continue;
-        }
-
         if let Err(message) =
-            materialize_non_reduce_obligations(state, compatible_ids, fresh_rules, &mut created)
+            materialize_compatible_obligations(state, compatible_ids, fresh_rules, &mut created)
         {
             return fail_transition(state, message);
         }
@@ -4054,13 +4034,13 @@ fn materialize_replacement_orders(
     }
 }
 
-fn materialize_non_reduce_obligations(
+fn materialize_compatible_obligations(
     state: &mut StrategyState,
     obligation_ids: Vec<u64>,
     rules: &InstrumentRules,
     created: &mut Vec<ClientOrderId>,
 ) -> Result<(), String> {
-    let planned_buckets = plan_non_reduce_obligation_buckets(state, obligation_ids, rules)?;
+    let planned_buckets = plan_compatible_obligation_buckets(state, obligation_ids, rules)?;
     for bucket in planned_buckets {
         materialize_obligation_bucket(state, &bucket, rules, created)?;
     }
@@ -4078,6 +4058,7 @@ struct PlannedObligationBucket {
 
 struct ExactObligationPartition<'a> {
     template: OrderShape,
+    exchange: Exchange,
     rules: &'a InstrumentRules,
     items: Vec<(u64, Decimal)>,
     total_quantity: Decimal,
@@ -4117,6 +4098,7 @@ impl ExactObligationPartition<'_> {
                 if replacement_quantity_is_valid(
                     &order_shape_with_quantity(&self.template, bucket.quantity),
                     self.rules,
+                    self.exchange,
                 ) {
                     assigned_quantity += bucket.quantity;
                     valid_buckets.push(bucket.obligation_ids.clone());
@@ -4174,7 +4156,7 @@ fn order_shape_with_quantity(template: &OrderShape, quantity: Decimal) -> OrderS
     shape
 }
 
-fn plan_non_reduce_obligation_buckets(
+fn plan_compatible_obligation_buckets(
     state: &StrategyState,
     obligation_ids: Vec<u64>,
     rules: &InstrumentRules,
@@ -4185,11 +4167,11 @@ fn plan_non_reduce_obligation_buckets(
     let combined = combined_obligation_shape(state, &obligation_ids)
         .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?;
     let total_quantity = combined.quantity;
-    if replacement_quantity_is_valid(&combined, rules) {
+    if replacement_quantity_is_valid(&combined, rules, state.exchange) {
         return Ok(vec![obligation_ids]);
     }
 
-    let greedy = greedy_non_reduce_obligation_buckets(state, &obligation_ids, rules)?;
+    let greedy = greedy_compatible_obligation_buckets(state, &obligation_ids, rules)?;
     let greedy_quantity = greedy.iter().try_fold(Decimal::ZERO, |total, bucket| {
         combined_obligation_shape(state, bucket).and_then(|shape| total.checked_add(shape.quantity))
     });
@@ -4222,6 +4204,7 @@ fn plan_non_reduce_obligation_buckets(
     });
     let mut search = ExactObligationPartition {
         template: combined,
+        exchange: state.exchange,
         rules,
         items,
         total_quantity,
@@ -4246,7 +4229,7 @@ fn plan_non_reduce_obligation_buckets(
     Ok(search.best_buckets)
 }
 
-fn greedy_non_reduce_obligation_buckets(
+fn greedy_compatible_obligation_buckets(
     state: &StrategyState,
     obligation_ids: &[u64],
     rules: &InstrumentRules,
@@ -4260,7 +4243,7 @@ fn greedy_non_reduce_obligation_buckets(
             candidate.push(id);
             let shape = combined_obligation_shape(state, &candidate)
                 .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?;
-            if replacement_quantity_is_valid(&shape, rules) {
+            if replacement_quantity_is_valid(&shape, rules, state.exchange) {
                 submit_bucket = Some((index, candidate));
                 break;
             }
@@ -4275,6 +4258,7 @@ fn greedy_non_reduce_obligation_buckets(
             &combined_obligation_shape(state, &[id])
                 .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?,
             rules,
+            state.exchange,
         ) {
             ready_buckets.push(vec![id]);
             continue;
@@ -4328,7 +4312,11 @@ fn combined_obligation_shape(state: &StrategyState, obligation_ids: &[u64]) -> O
     Some(shape)
 }
 
-fn replacement_quantity_is_valid(shape: &OrderShape, rules: &InstrumentRules) -> bool {
+fn replacement_quantity_is_valid(
+    shape: &OrderShape,
+    rules: &InstrumentRules,
+    exchange: Exchange,
+) -> bool {
     let quantity = shape.quantity;
     let quantity_rules = &rules.limit_quantity;
     if !quantity_rules.is_aligned(quantity)
@@ -4337,7 +4325,9 @@ fn replacement_quantity_is_valid(shape: &OrderShape, rules: &InstrumentRules) ->
     {
         return false;
     }
-    if shape.reduce_only {
+    // Hyperliquid applies its $10 floor to reduce-only orders as well; the CEX
+    // adapters retain their exchange-specific close-order exemption.
+    if shape.reduce_only && exchange != Exchange::TradeXyz {
         return true;
     }
     if quantity < quantity_rules.min {
@@ -4358,7 +4348,7 @@ fn materialize_obligation_bucket(
 ) -> Result<(), String> {
     let shape = combined_obligation_shape(state, obligation_ids)
         .ok_or_else(|| "replacement obligation bucket is inconsistent".to_owned())?;
-    if !replacement_quantity_is_valid(&shape, rules) {
+    if !replacement_quantity_is_valid(&shape, rules, state.exchange) {
         return Err("replacement obligation quantity is not currently submit-safe".into());
     }
     let first_id = obligation_ids
@@ -8847,7 +8837,7 @@ mod tests {
             );
         }
 
-        let buckets = plan_non_reduce_obligation_buckets(
+        let buckets = plan_compatible_obligation_buckets(
             &state,
             obligation_ids.clone(),
             &state.instrument_rules,
@@ -8952,7 +8942,7 @@ mod tests {
                 }
 
                 let planned =
-                    plan_non_reduce_obligation_buckets(&state, obligation_ids, &rules).unwrap();
+                    plan_compatible_obligation_buckets(&state, obligation_ids, &rules).unwrap();
                 let assigned = planned
                     .iter()
                     .map(|bucket| combined_obligation_shape(&state, bucket).unwrap().quantity)
@@ -9037,7 +9027,7 @@ mod tests {
     }
 
     #[test]
-    fn reduce_only_partial_quantity_below_minimum_fails_closed_without_an_order() {
+    fn reduce_only_partial_quantity_below_minimum_waits_without_stopping_strategy() {
         let mut config = config(Direction::Short);
         config.grid_order_qty = Some(decimal(2));
         let mut instrument = instrument();
@@ -9092,8 +9082,8 @@ mod tests {
         let transition = machine.materialize_replacements(&instrument, 103).unwrap();
 
         let state = machine.store().snapshot();
-        assert!(matches!(transition, StrategyTransition::Failed { .. }));
-        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(transition, StrategyTransition::NoChange);
+        assert_ne!(state.lifecycle, StrategyLifecycle::Failed);
         assert!(replacement_orders(state).is_empty());
         assert_eq!(state.replacement_obligations.len(), 1);
         assert!(
@@ -9102,6 +9092,119 @@ mod tests {
                 .values()
                 .all(|obligation| obligation.assigned_client_order_id.is_none())
         );
+    }
+
+    #[test]
+    fn trade_xyz_reduce_only_partials_wait_then_coalesce_to_minimum_notional() {
+        let mut config = config(Direction::Short);
+        config.exchange = Some(Exchange::TradeXyz);
+        config.grid_order_qty = Some(decimal(2));
+        let mut instrument = instrument();
+        instrument.min_notional = decimal(500);
+        let plan = build_grid_plan(
+            &config,
+            &MarketSnapshot {
+                last_price: decimal(1012),
+                mark_price: decimal(1012),
+            },
+            &instrument,
+        )
+        .unwrap();
+        let state = StrategyState::from_plan(
+            StrategyRunId::parse("TRDMIN01").unwrap(),
+            config,
+            instrument.clone(),
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        let opening = opening_id(&state);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state));
+        machine
+            .apply_execution(
+                &report(
+                    opening,
+                    "opening-large",
+                    decimal(28),
+                    decimal(28392),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                101,
+            )
+            .unwrap();
+        let add = grid_id(machine.store().snapshot(), 14, OrderSide::Sell, false);
+        machine
+            .apply_execution(
+                &report(
+                    add.clone(),
+                    "add-partial",
+                    Decimal::new(1, 1),
+                    Decimal::new(1015, 1),
+                    None,
+                ),
+                102,
+            )
+            .unwrap();
+
+        assert_eq!(
+            machine.materialize_replacements(&instrument, 103).unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_ne!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::Failed
+        );
+        assert!(replacement_orders(machine.store().snapshot()).is_empty());
+        assert_eq!(
+            machine
+                .store()
+                .snapshot()
+                .replacement_obligations
+                .values()
+                .filter(|obligation| obligation.assigned_client_order_id.is_none())
+                .map(|obligation| obligation.shape.quantity)
+                .sum::<Decimal>(),
+            Decimal::new(1, 1)
+        );
+
+        machine
+            .apply_execution(
+                &report(
+                    add,
+                    "add-partial",
+                    decimal(2),
+                    decimal(2030),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                104,
+            )
+            .unwrap();
+        let transition = machine.materialize_replacements(&instrument, 105).unwrap();
+
+        assert!(matches!(
+            transition,
+            StrategyTransition::ReplacementOrdersReady { ref client_order_ids }
+                if client_order_ids.len() == 1
+        ));
+        let state = machine.store().snapshot();
+        assert_ne!(state.lifecycle, StrategyLifecycle::Failed);
+        let replacements = replacement_orders(state);
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].shape.side, OrderSide::Buy);
+        assert_eq!(replacements[0].shape.quantity, decimal(2));
+        assert!(replacements[0].shape.reduce_only);
+        assert_eq!(
+            replacements[0].shape.price.unwrap() * replacements[0].shape.quantity,
+            decimal(2028)
+        );
+        assert!(
+            state
+                .replacement_obligations
+                .values()
+                .all(|obligation| obligation.assigned_client_order_id.is_some())
+        );
+        assert_eq!(state.validate(), Ok(()));
     }
 
     #[test]

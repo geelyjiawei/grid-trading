@@ -2153,7 +2153,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::BTreeMap,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -2374,6 +2374,7 @@ mod tests {
 
         fn with_exchange(mut self, exchange: Exchange) -> Self {
             self.exchange = exchange;
+            self.state.lock().unwrap().market.exchange = exchange;
             self
         }
 
@@ -5502,13 +5503,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsubmitable_reduce_only_fragment_blocks_the_same_tick_without_placing_an_order() {
+    async fn trade_xyz_sub_notional_reduce_only_fragment_keeps_running_without_cancelling_orders() {
         let mut strict_rules = rules();
-        strict_rules.limit_quantity.min = Decimal::new(2, 1);
-        strict_rules.market_quantity.min = Decimal::new(2, 1);
+        strict_rules.min_notional = Decimal::new(500, 0);
         let mut exact_config = config(None);
-        exact_config.grid_order_qty = Some(Decimal::new(4, 1));
-        let gateway = MockGateway::new(strict_rules.clone(), 1_100);
+        exact_config.exchange = Some(Exchange::TradeXyz);
+        exact_config.grid_order_qty = Some(Decimal::new(2, 0));
+        let gateway =
+            MockGateway::new(strict_rules.clone(), 1_100).with_exchange(Exchange::TradeXyz);
         let mut runtime = runtime(
             gateway.clone(),
             MemoryOrderIntentStore::default(),
@@ -5530,36 +5532,16 @@ mod tests {
             -(opening_quantity + partial_quantity),
             Some(Decimal::new(1014, 0)),
         );
-        let accepted_before_failure = runtime
-            .machine()
-            .store()
-            .snapshot()
-            .orders
-            .values()
-            .filter(|order| {
-                matches!(
-                    order.tracking,
-                    StrategyOrderTracking::Intent {
-                        state: IntentState::Accepted { .. }
-                    }
-                )
-            })
-            .map(|order| order.client_order_id.clone())
-            .collect::<BTreeSet<_>>();
-        gateway.set_cancellation_marks_terminal(true);
+        let cancellations_before_fill = gateway.cancellation_call_count();
 
-        let failed = runtime.tick(1_300).await.unwrap();
+        let reconciled = runtime.tick(1_300).await.unwrap();
 
-        assert!(failed.is_blocked(), "{failed:?}");
-        assert!(
-            failed
-                .blockers
-                .iter()
-                .any(|blocker| blocker.stage == RuntimeStage::StrategyFailed)
-        );
+        assert!(!reconciled.is_blocked(), "{reconciled:?}");
+        assert!(reconciled.submissions.is_empty());
         assert_eq!(gateway.placement_call_count(), placements_before_fill);
+        assert_eq!(gateway.cancellation_call_count(), cancellations_before_fill);
         let state = runtime.machine().store().snapshot();
-        assert_eq!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.lifecycle, StrategyLifecycle::Running);
         assert_eq!(
             state.grid_position_net_quantity,
             -(opening_quantity + partial_quantity)
@@ -5575,37 +5557,15 @@ mod tests {
             order.shape.quantity != partial_quantity
                 || !matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
         }));
-        assert_eq!(
-            gateway
-                .cancellation_ids()
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            accepted_before_failure
-        );
-        assert!(
-            state
-                .orders
-                .values()
-                .all(|order| !matches!(order.purpose, StrategyOrderPurpose::RiskClose))
-        );
-
-        let cancellations_after_failure = gateway.cancellation_call_count();
         let settled = runtime.tick(1_400).await.unwrap();
-        assert!(settled.is_blocked(), "{settled:?}");
-        assert_eq!(
-            gateway.cancellation_call_count(),
-            cancellations_after_failure
-        );
+        assert!(!settled.is_blocked(), "{settled:?}");
+        assert!(settled.submissions.is_empty());
+        assert_eq!(gateway.cancellation_call_count(), cancellations_before_fill);
         assert_eq!(gateway.placement_call_count(), placements_before_fill);
-        let settled_state = runtime.machine().store().snapshot();
-        assert_eq!(settled_state.lifecycle, StrategyLifecycle::Stopped);
-        assert!(settled_state.failure.is_some());
-        assert!(accepted_before_failure.iter().all(|client_order_id| {
-            settled_state
-                .orders
-                .get(client_order_id)
-                .is_some_and(|order| order.terminal_processed)
-        }));
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
     }
 
     #[tokio::test]
