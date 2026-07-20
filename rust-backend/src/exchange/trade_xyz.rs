@@ -45,6 +45,7 @@ const PRODUCTION_BASE_URL: &str = "https://api.hyperliquid.xyz";
 const TESTNET_BASE_URL: &str = "https://api.hyperliquid-testnet.xyz";
 const DEX_NAME: &str = "xyz";
 const MARKET_CACHE_TTL: Duration = Duration::from_millis(750);
+const LEVERAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 const EXECUTION_FILL_LOOKBACK_MS: u64 = 60_000;
 
 fn minimum_notional() -> Decimal {
@@ -86,6 +87,12 @@ struct CachedExecutionFills {
     rows: Vec<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedOpenExecution {
+    order: AuthoritativeOrder,
+    order_time_ms: u64,
+}
+
 pub struct TradeXyzAdapter<T, N> {
     transport: T,
     signer: HyperliquidSigner,
@@ -95,6 +102,9 @@ pub struct TradeXyzAdapter<T, N> {
     mainnet: bool,
     dex_metadata: Arc<tokio::sync::OnceCell<DexMetadata>>,
     market_cache: Arc<tokio::sync::Mutex<HashMap<String, (Instant, MarketInfo)>>>,
+    leverage_cache: Arc<tokio::sync::Mutex<HashMap<String, (Instant, u16)>>>,
+    open_execution_cache:
+        Arc<tokio::sync::Mutex<HashMap<String, BTreeMap<ClientOrderId, CachedOpenExecution>>>>,
     execution_fill_cache: Arc<tokio::sync::Mutex<CachedExecutionFills>>,
     credentials_verified: Arc<tokio::sync::OnceCell<()>>,
 }
@@ -160,6 +170,8 @@ impl<T, N> TradeXyzAdapter<T, N> {
             mainnet,
             dex_metadata: Arc::new(tokio::sync::OnceCell::new()),
             market_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            leverage_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            open_execution_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             execution_fill_cache: Arc::new(
                 tokio::sync::Mutex::new(CachedExecutionFills::default()),
             ),
@@ -442,6 +454,13 @@ where
     }
 
     async fn active_asset_leverage(&self, coin: &str) -> Result<u16, SnapshotError> {
+        let mut cache = self.leverage_cache.lock().await;
+        let now = Instant::now();
+        if let Some((cached_at, leverage)) = cache.get(coin)
+            && now.saturating_duration_since(*cached_at) < LEVERAGE_CACHE_TTL
+        {
+            return Ok(*leverage);
+        }
         let value = self
             .post_info(
                 json!({
@@ -459,6 +478,7 @@ where
             .and_then(|value| u16::try_from(value).ok())
             .filter(|value| *value > 0)
             .ok_or_else(|| SnapshotError::new("TRADE.XYZ active leverage is invalid"))?;
+        cache.insert(coin.to_owned(), (Instant::now(), leverage));
         Ok(leverage)
     }
 }
@@ -840,6 +860,10 @@ where
         let value = parse_write_response(response, "TRADE.XYZ leverage update")
             .map_err(write_to_leverage_error)?;
         ensure_action_ok(&value, "TRADE.XYZ leverage update").map_err(write_to_leverage_error)?;
+        self.leverage_cache
+            .lock()
+            .await
+            .insert(market.coin, (Instant::now(), leverage));
         Ok(LeverageAcknowledgement {
             exchange: Exchange::TradeXyz,
             symbol: symbol.to_ascii_uppercase(),
@@ -1091,7 +1115,7 @@ where
         validate_request(exchange, symbol)?;
         let coin = exchange_coin(symbol).map_err(|error| SnapshotError::new(error.to_string()))?;
         let rows = self.frontend_open_orders().await?;
-        let mut orders = Vec::new();
+        let mut cached = BTreeMap::new();
         for row in &rows {
             if row.get("coin").and_then(Value::as_str) != Some(coin.as_str()) {
                 continue;
@@ -1102,13 +1126,34 @@ where
             let Some(client_order_id) = decode_cloid(cloid) else {
                 continue;
             };
-            orders.push(parse_authoritative_order(
-                row,
-                "open",
-                &coin,
-                Some(&client_order_id),
-            )?);
+            let order = parse_authoritative_order(row, "open", &coin, Some(&client_order_id))?;
+            cached.insert(
+                client_order_id,
+                CachedOpenExecution {
+                    order: order.clone(),
+                    order_time_ms: u64_field(row, "timestamp")?,
+                },
+            );
         }
+        let symbol = symbol.to_ascii_uppercase();
+        let mut cache = self.open_execution_cache.lock().await;
+        if let Some(previous) = cache.get(&symbol) {
+            for (client_order_id, current) in &mut cached {
+                let Some(prior) = previous.get(client_order_id) else {
+                    continue;
+                };
+                let prior_quantity = prior.order.executed_quantity.unwrap_or(Decimal::ZERO);
+                let current_quantity = current.order.executed_quantity.unwrap_or(Decimal::ZERO);
+                if prior.order.exchange_order_id == current.order.exchange_order_id
+                    && prior.order.shape == current.order.shape
+                    && prior_quantity > current_quantity
+                {
+                    *current = prior.clone();
+                }
+            }
+        }
+        let orders = cached.values().map(|cached| cached.order.clone()).collect();
+        cache.insert(symbol, cached);
         Ok(orders)
     }
 }
@@ -1178,25 +1223,38 @@ where
     ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
         validate_request(exchange, symbol)
             .map_err(|error| ExecutionSnapshotError::new(error.message))?;
-        let cloid = encode_cloid(client_order_id)
-            .map_err(|error| ExecutionSnapshotError::new(error.to_string()))?;
-        let value = self
-            .order_status_value(&cloid)
+        let cached_open = self
+            .open_execution_cache
+            .lock()
             .await
-            .map_err(|error| ExecutionSnapshotError::new(error.message))?;
-        let (row, status, status_time) = order_status_parts(&value)
-            .map_err(|error| ExecutionSnapshotError::new(error.message))?;
-        let coin = exchange_coin(symbol)
-            .map_err(|error| ExecutionSnapshotError::new(error.to_string()))?;
-        let order = parse_authoritative_order(row, status, &coin, Some(client_order_id))
-            .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+            .get(&symbol.to_ascii_uppercase())
+            .and_then(|orders| orders.get(client_order_id))
+            .cloned()
+            .filter(|cached| cached.order.exchange_order_id == exchange_order_id);
+        let (mut order, order_time, status_time) = if let Some(cached) = cached_open {
+            (cached.order, cached.order_time_ms, cached.order_time_ms)
+        } else {
+            let cloid = encode_cloid(client_order_id)
+                .map_err(|error| ExecutionSnapshotError::new(error.to_string()))?;
+            let value = self
+                .order_status_value(&cloid)
+                .await
+                .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+            let (row, status, status_time) = order_status_parts(&value)
+                .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+            let coin = exchange_coin(symbol)
+                .map_err(|error| ExecutionSnapshotError::new(error.to_string()))?;
+            let order = parse_authoritative_order(row, status, &coin, Some(client_order_id))
+                .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+            let order_time = u64_field(row, "timestamp")
+                .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+            (order, order_time, status_time)
+        };
         if order.exchange_order_id != exchange_order_id {
             return Err(ExecutionSnapshotError::new(
                 "TRADE.XYZ order identity changed during execution collection",
             ));
         }
-        let order_time = u64_field(row, "timestamp")
-            .map_err(|error| ExecutionSnapshotError::new(error.message))?;
         let collection_time =
             now_ms().map_err(|error| ExecutionSnapshotError::new(error.message))?;
         let fill_end_time = collection_time.max(status_time);
@@ -1238,7 +1296,18 @@ where
             }
         };
         let (cumulative_quantity, cumulative_quote, fees_by_asset) = summarize_trades(&trades)?;
-        if cumulative_quantity != expected_quantity {
+        if matches!(order.lifecycle, OrderLifecycle::Active(_))
+            && cumulative_quantity > expected_quantity
+            && cumulative_quantity <= order.shape.quantity
+        {
+            order.executed_quantity = Some(cumulative_quantity);
+            order.lifecycle = if cumulative_quantity == order.shape.quantity {
+                OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+            } else {
+                OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+            };
+        }
+        if order.executed_quantity != Some(cumulative_quantity) {
             return Err(ExecutionSnapshotError::new(
                 "TRADE.XYZ fills do not reconcile to the authoritative order quantity",
             ));
@@ -2162,6 +2231,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_leverage_is_not_reloaded_on_every_runtime_snapshot() {
+        let transport = ScriptedTransport::new([response(json!({
+            "leverage": {"type": "isolated", "value": 5}
+        }))]);
+        let adapter = test_adapter(transport.clone());
+
+        assert_eq!(adapter.active_asset_leverage("xyz:MU").await.unwrap(), 5);
+        assert_eq!(adapter.active_asset_leverage("xyz:MU").await.unwrap(), 5);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_str(requests[0].raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["type"], "activeAssetData");
+        assert_eq!(body["coin"], "xyz:MU");
+    }
+
+    #[tokio::test]
     async fn partial_fill_collection_uses_collection_time_not_open_status_time() {
         let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
         let cloid = encode_cloid(&client_order_id).unwrap();
@@ -2214,6 +2300,162 @@ mod tests {
         let fill_query: Value =
             serde_json::from_str(requests[1].raw_body.as_deref().unwrap()).unwrap();
         assert!(fill_query["endTime"].as_u64().unwrap() > 3);
+    }
+
+    #[tokio::test]
+    async fn open_progress_cannot_be_rolled_back_by_stale_order_status() {
+        let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
+        let cloid = encode_cloid(&client_order_id).unwrap();
+        let transport = ScriptedTransport::new([
+            response(json!([{
+                "coin": "xyz:MU",
+                "side": "A",
+                "limitPx": "850",
+                "sz": "13.1",
+                "origSz": "15.0",
+                "oid": 42,
+                "timestamp": 1,
+                "reduceOnly": false,
+                "orderType": "Limit",
+                "tif": "Gtc",
+                "cloid": cloid
+            }])),
+            response(json!([{
+                "closedPnl": "0",
+                "coin": "xyz:MU",
+                "crossed": false,
+                "oid": 42,
+                "px": "850",
+                "side": "A",
+                "sz": "1.9",
+                "time": 3,
+                "fee": "0.01",
+                "tid": 7,
+                "feeToken": "USDC"
+            }])),
+        ]);
+        let adapter = test_adapter(transport.clone());
+
+        let progress = adapter
+            .open_order_execution_progress_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress[0].cumulative_quantity, Decimal::new(19, 1));
+
+        let snapshot = adapter
+            .execution_snapshot(Exchange::TradeXyz, "MUUSDC", &client_order_id, "42")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(19, 1));
+        assert_eq!(snapshot.order.executed_quantity, Some(Decimal::new(19, 1)));
+        assert_eq!(
+            snapshot.order.lifecycle,
+            OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+        );
+        let request_types = transport
+            .requests()
+            .iter()
+            .map(|request| {
+                serde_json::from_str::<Value>(request.raw_body.as_deref().unwrap()).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(request_types, vec!["frontendOpenOrders", "userFillsByTime"]);
+    }
+
+    #[tokio::test]
+    async fn open_progress_is_monotonic_across_concurrent_exchange_reads() {
+        let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
+        let cloid = encode_cloid(&client_order_id).unwrap();
+        let row = |remaining: &str| {
+            json!([{
+                "coin": "xyz:MU",
+                "side": "A",
+                "limitPx": "850",
+                "sz": remaining,
+                "origSz": "15.0",
+                "oid": 42,
+                "timestamp": 1,
+                "reduceOnly": false,
+                "orderType": "Limit",
+                "tif": "Gtc",
+                "cloid": cloid
+            }])
+        };
+        let transport = ScriptedTransport::new([response(row("13.1")), response(row("15.0"))]);
+        let adapter = test_adapter(transport);
+
+        let first = adapter
+            .open_order_execution_progress_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap()
+            .unwrap();
+        let stale = adapter
+            .open_order_execution_progress_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first[0].cumulative_quantity, Decimal::new(19, 1));
+        assert_eq!(stale[0].cumulative_quantity, Decimal::new(19, 1));
+    }
+
+    #[tokio::test]
+    async fn exact_fills_can_advance_a_just_observed_partial_order() {
+        let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
+        let cloid = encode_cloid(&client_order_id).unwrap();
+        let fill = |quantity: &str, trade_id: u64| {
+            json!({
+                "closedPnl": "0",
+                "coin": "xyz:MU",
+                "crossed": false,
+                "oid": 42,
+                "px": "850",
+                "side": "A",
+                "sz": quantity,
+                "time": 3,
+                "fee": "0.01",
+                "tid": trade_id,
+                "feeToken": "USDC"
+            })
+        };
+        let transport = ScriptedTransport::new([
+            response(json!([{
+                "coin": "xyz:MU",
+                "side": "A",
+                "limitPx": "850",
+                "sz": "0.1",
+                "origSz": "0.2",
+                "oid": 42,
+                "timestamp": 1,
+                "reduceOnly": false,
+                "orderType": "Limit",
+                "tif": "Gtc",
+                "cloid": cloid
+            }])),
+            response(json!([fill("0.1", 7), fill("0.1", 8)])),
+        ]);
+        let adapter = test_adapter(transport);
+        adapter
+            .open_order_execution_progress_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap();
+
+        let snapshot = adapter
+            .execution_snapshot(Exchange::TradeXyz, "MUUSDC", &client_order_id, "42")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(2, 1));
+        assert_eq!(snapshot.order.executed_quantity, Some(Decimal::new(2, 1)));
+        assert_eq!(
+            snapshot.order.lifecycle,
+            OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+        );
     }
 
     #[tokio::test]
