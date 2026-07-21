@@ -73,6 +73,10 @@ impl FileOrderIntentStore {
         Ok(Self { path, snapshot })
     }
 
+    pub(crate) fn relocate(&mut self, path: impl Into<PathBuf>) {
+        self.path = path.into();
+    }
+
     fn commit_snapshot(&self, snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(LedgerError::CreateDirectory)?;

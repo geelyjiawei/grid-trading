@@ -28,7 +28,8 @@ use crate::{
     persistence::{
         FileArmedStrategyStateStore, FileOrderIntentStore, FilePreparedStrategyStore,
         FileStrategyStateStore, IntentStore, LedgerError, LedgerSnapshot, RuntimeLeaseError,
-        StrategyFilePathError, StrategyFilePaths, StrategyRuntimeLease,
+        STRATEGY_START_STAGING_DIRECTORY_NAME, StrategyFilePathError, StrategyFilePaths,
+        StrategyRuntimeLease,
     },
 };
 
@@ -495,23 +496,18 @@ where
         });
     }
     let quote_asset = settings.quote_asset_for(expected_exchange).to_owned();
-    let paths = StrategyFilePaths::new(root, run_id.clone())?;
-    let lease = StrategyRuntimeLease::acquire(paths.lease())?;
-    if paths
-        .state()
-        .try_exists()
-        .map_err(FileStrategyStartError::InspectPath)?
-    {
-        return Err(FileStrategyStartError::StateAlreadyExists);
-    }
-    if paths
-        .intents()
-        .try_exists()
-        .map_err(FileStrategyStartError::InspectPath)?
-    {
-        return Err(FileStrategyStartError::UnexpectedIntentLedger);
-    }
-    let prepared = match prepare_new_strategy(
+    let root = root.into();
+    let paths = StrategyFilePaths::new(&root, run_id.clone())?;
+    ensure_strategy_destination_absent(&paths)?;
+    let staging_paths = StrategyFilePaths::new(
+        root.join(STRATEGY_START_STAGING_DIRECTORY_NAME),
+        run_id.clone(),
+    )?;
+    let reservation = StrategyStartReservation::acquire(staging_paths)?;
+    // A previous contender may have published while this request waited for the
+    // per-run reservation. Recheck before making any exchange request.
+    ensure_strategy_destination_absent(&paths)?;
+    let prepared = prepare_new_strategy(
         &gateway,
         run_id,
         config,
@@ -519,20 +515,12 @@ where
         settings.maximum_market_age_ms,
         settings.maximum_future_skew_ms,
     )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(bootstrap) => {
-            drop(lease);
-            if let Err(cleanup) = rollback_failed_strategy_bootstrap(&paths) {
-                return Err(FileStrategyStartError::BootstrapRollback { bootstrap, cleanup });
-            }
-            return Err(FileStrategyStartError::Bootstrap(bootstrap));
-        }
-    };
-    let persisted = FilePreparedStrategyStore::create(paths.state(), prepared)?;
+    .await?;
+    let persisted = FilePreparedStrategyStore::create(reservation.paths().state(), prepared)?;
     match persisted {
-        FilePreparedStrategyStore::Armed(store) => {
+        FilePreparedStrategyStore::Armed(mut store) => {
+            let lease = reservation.publish(&paths)?;
+            store.relocate(paths.state());
             let strategy = LeasedFileArmedStrategy {
                 paths,
                 lease,
@@ -542,8 +530,8 @@ where
             Ok(PreparedLeasedFileStrategy::armed(strategy, gateway))
         }
         FilePreparedStrategyStore::Active(store) => {
-            let intent_store = FileOrderIntentStore::load(paths.intents())?;
-            let runtime = StrategyRuntime::new(
+            let intent_store = FileOrderIntentStore::load(reservation.paths().intents())?;
+            let mut runtime = StrategyRuntime::new(
                 gateway,
                 intent_store,
                 StrategyMachine::new(*store),
@@ -555,6 +543,9 @@ where
             runtime
                 .verify_ledger_ownership()
                 .map_err(|_| FileStrategyStartError::IntentLedgerMismatch)?;
+            let lease = reservation.publish(&paths)?;
+            runtime.intent_store.relocate(paths.intents());
+            runtime.machine.store_mut().relocate(paths.state());
             Ok(PreparedLeasedFileStrategy::active(
                 LeasedFileStrategyRuntime {
                     paths,
@@ -566,15 +557,179 @@ where
     }
 }
 
-fn rollback_failed_strategy_bootstrap(paths: &StrategyFilePaths) -> io::Result<()> {
-    let entries = fs::read_dir(paths.directory())?.collect::<Result<Vec<_>, _>>()?;
-    if entries.len() != 1 || entries[0].path() != paths.lease() {
-        return Err(io::Error::other(
-            "refusing to remove a non-empty failed strategy reservation",
-        ));
+fn ensure_strategy_destination_absent(
+    paths: &StrategyFilePaths,
+) -> Result<(), FileStrategyStartError> {
+    if path_entry_exists(paths.state())? {
+        return Err(FileStrategyStartError::StateAlreadyExists);
     }
-    fs::remove_file(paths.lease())?;
-    fs::remove_dir(paths.directory())
+    if path_entry_exists(paths.intents())? {
+        return Err(FileStrategyStartError::UnexpectedIntentLedger);
+    }
+    if path_entry_exists(paths.directory())? {
+        return Err(FileStrategyStartError::RunDirectoryAlreadyExists);
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &std::path::Path) -> Result<bool, FileStrategyStartError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(FileStrategyStartError::InspectPath(error)),
+    }
+}
+
+struct StrategyStartReservation {
+    paths: StrategyFilePaths,
+    lease: Option<StrategyRuntimeLease>,
+}
+
+impl StrategyStartReservation {
+    fn acquire(paths: StrategyFilePaths) -> Result<Self, FileStrategyStartError> {
+        ensure_start_staging_root(&paths).map_err(FileStrategyStartError::StartReservation)?;
+        let lease = StrategyRuntimeLease::acquire(paths.lease())?;
+        let reservation = Self {
+            paths,
+            lease: Some(lease),
+        };
+        reservation
+            .reset_abandoned_payload()
+            .map_err(FileStrategyStartError::StartReservation)?;
+        Ok(reservation)
+    }
+
+    fn paths(&self) -> &StrategyFilePaths {
+        &self.paths
+    }
+
+    fn reset_abandoned_payload(&self) -> io::Result<()> {
+        validate_start_reservation_entries(&self.paths)?;
+        remove_regular_file_if_present(self.paths.state())?;
+        remove_regular_file_if_present(self.paths.intents())
+    }
+
+    fn publish(
+        mut self,
+        destination: &StrategyFilePaths,
+    ) -> Result<StrategyRuntimeLease, FileStrategyStartError> {
+        ensure_strategy_destination_absent(destination)?;
+        fs::rename(self.paths.directory(), destination.directory())
+            .map_err(FileStrategyStartError::Publish)?;
+        let lease = self
+            .lease
+            .take()
+            .expect("a live start reservation must own its lease")
+            .relocate(destination.lease());
+        remove_empty_staging_root(&self.paths);
+        Ok(lease)
+    }
+}
+
+impl Drop for StrategyStartReservation {
+    fn drop(&mut self) {
+        if self.lease.is_none() {
+            return;
+        }
+        if let Err(error) = cleanup_start_reservation(&self.paths, self.lease.take()) {
+            tracing::error!(
+                path = %self.paths.directory().display(),
+                error = %error,
+                "failed to clean an unpublished strategy start reservation"
+            );
+        }
+    }
+}
+
+fn ensure_start_staging_root(paths: &StrategyFilePaths) -> io::Result<()> {
+    let staging = paths
+        .directory()
+        .parent()
+        .ok_or_else(|| io::Error::other("strategy start staging root is missing"))?;
+    let root = staging
+        .parent()
+        .ok_or_else(|| io::Error::other("strategy file root is missing"))?;
+    fs::create_dir_all(root)?;
+    ensure_real_directory(root, "strategy file root")?;
+    match fs::create_dir(staging) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    ensure_real_directory(staging, "strategy start staging root")
+}
+
+fn ensure_real_directory(path: &std::path::Path, description: &str) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "{description} must be a real directory"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_start_reservation_entries(paths: &StrategyFilePaths) -> io::Result<()> {
+    for entry in fs::read_dir(paths.directory())? {
+        let entry = entry?;
+        let path = entry.path();
+        if path != paths.lease() && path != paths.state() && path != paths.intents() {
+            return Err(io::Error::other(
+                "strategy start reservation contains an unexpected entry",
+            ));
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(io::Error::other(
+                "strategy start reservation entries must be regular files",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_regular_file_if_present(path: &std::path::Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            io::Error::other("refusing to remove a non-regular reservation entry"),
+        ),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_start_reservation(
+    paths: &StrategyFilePaths,
+    lease: Option<StrategyRuntimeLease>,
+) -> io::Result<()> {
+    validate_start_reservation_entries(paths)?;
+    remove_regular_file_if_present(paths.state())?;
+    remove_regular_file_if_present(paths.intents())?;
+    drop(lease);
+    remove_regular_file_if_present(paths.lease())?;
+    fs::remove_dir(paths.directory())?;
+    remove_empty_staging_root(paths);
+    Ok(())
+}
+
+fn remove_empty_staging_root(paths: &StrategyFilePaths) {
+    let Some(staging) = paths.directory().parent() else {
+        return;
+    };
+    match fs::remove_dir(staging) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => tracing::warn!(
+            path = %staging.display(),
+            error = %error,
+            "failed to remove an empty strategy start staging root"
+        ),
+    }
 }
 
 pub fn recover_leased_file_strategy<G>(
@@ -772,8 +927,14 @@ pub enum FileStrategyStartError {
     StateAlreadyExists,
     #[error("an intent ledger exists without its strategy state")]
     UnexpectedIntentLedger,
+    #[error("an incomplete strategy run directory already exists for this run ID")]
+    RunDirectoryAlreadyExists,
     #[error("failed to inspect strategy files: {0}")]
     InspectPath(std::io::Error),
+    #[error("failed to prepare the isolated strategy start reservation: {0}")]
+    StartReservation(std::io::Error),
+    #[error("failed to atomically publish the prepared strategy: {0}")]
+    Publish(std::io::Error),
     #[error("strategy and order-intent ledgers disagree after creation")]
     IntentLedgerMismatch,
     #[error(transparent)]
@@ -782,13 +943,6 @@ pub enum FileStrategyStartError {
     Lease(#[from] RuntimeLeaseError),
     #[error(transparent)]
     Bootstrap(#[from] StrategyBootstrapError),
-    #[error(
-        "strategy bootstrap failed ({bootstrap}) and its reservation rollback failed: {cleanup}"
-    )]
-    BootstrapRollback {
-        bootstrap: StrategyBootstrapError,
-        cleanup: std::io::Error,
-    },
     #[error(transparent)]
     StrategyState(#[from] StrategyStoreError),
     #[error(transparent)]
@@ -3254,6 +3408,131 @@ mod tests {
             LeasedFileArmedStrategy::load(strategy.paths().clone(), runtime_settings()),
             Err(FileArmedLoadError::Lease(RuntimeLeaseError::AlreadyHeld))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_start_is_invisible_until_atomic_publish() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let gate = gateway.block_market_snapshot();
+        let run_id = StrategyRunId::parse("staging1").unwrap();
+        let starting_root = root.clone();
+        let starting_run_id = run_id.clone();
+        let starting = tokio::spawn(async move {
+            prepare_leased_file_strategy(
+                gateway,
+                starting_root,
+                starting_run_id,
+                config(None),
+                1_100,
+                runtime_settings(),
+            )
+            .await
+        });
+        gate.wait_until_entered().await;
+
+        let discovery = discover_strategy_files(&root).unwrap();
+        assert!(discovery.strategies.is_empty());
+        assert!(discovery.anomalies.is_empty());
+        let final_paths = StrategyFilePaths::new(&root, run_id.clone()).unwrap();
+        let staging_paths =
+            StrategyFilePaths::new(root.join(STRATEGY_START_STAGING_DIRECTORY_NAME), run_id)
+                .unwrap();
+        assert!(!final_paths.directory().exists());
+        assert!(staging_paths.lease().is_file());
+
+        gate.release();
+        let prepared = starting.await.unwrap().unwrap();
+        assert!(prepared.paths().state().is_file());
+        assert_eq!(prepared.paths().directory(), final_paths.directory());
+        assert!(!staging_paths.directory().exists());
+        let published = discover_strategy_files(&root).unwrap();
+        assert_eq!(published.strategies.len(), 1);
+        assert!(published.anomalies.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_start_removes_its_hidden_reservation_and_allows_retry() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let gate = gateway.block_market_snapshot();
+        let run_id = StrategyRunId::parse("staging2").unwrap();
+        let starting_root = root.clone();
+        let starting_run_id = run_id.clone();
+        let starting = tokio::spawn(async move {
+            prepare_leased_file_strategy(
+                gateway,
+                starting_root,
+                starting_run_id,
+                config(None),
+                1_100,
+                runtime_settings(),
+            )
+            .await
+        });
+        gate.wait_until_entered().await;
+        starting.abort();
+        assert!(matches!(starting.await, Err(error) if error.is_cancelled()));
+
+        let final_paths = StrategyFilePaths::new(&root, run_id.clone()).unwrap();
+        let staging_paths = StrategyFilePaths::new(
+            root.join(STRATEGY_START_STAGING_DIRECTORY_NAME),
+            run_id.clone(),
+        )
+        .unwrap();
+        assert!(!final_paths.directory().exists());
+        assert!(!staging_paths.directory().exists());
+        let discovery = discover_strategy_files(&root).unwrap();
+        assert!(discovery.strategies.is_empty());
+        assert!(discovery.anomalies.is_empty());
+
+        let retry = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            &root,
+            run_id,
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        assert!(retry.paths().state().is_file());
+        assert!(!staging_paths.directory().exists());
+    }
+
+    #[tokio::test]
+    async fn abandoned_hidden_payload_is_reset_before_same_run_retry() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let run_id = StrategyRunId::parse("staging3").unwrap();
+        let staging_paths = StrategyFilePaths::new(
+            root.join(STRATEGY_START_STAGING_DIRECTORY_NAME),
+            run_id.clone(),
+        )
+        .unwrap();
+        fs::create_dir_all(staging_paths.directory()).unwrap();
+        fs::write(staging_paths.lease(), b"").unwrap();
+        fs::write(staging_paths.state(), b"interrupted write").unwrap();
+
+        let before = discover_strategy_files(&root).unwrap();
+        assert!(before.strategies.is_empty());
+        assert!(before.anomalies.is_empty());
+        let prepared = prepare_leased_file_strategy(
+            MockGateway::new(rules(), 1_100),
+            &root,
+            run_id,
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+
+        assert!(prepared.paths().state().is_file());
+        assert!(!staging_paths.directory().exists());
+        assert!(FileStrategyStateStore::load(prepared.paths().state()).is_ok());
     }
 
     #[tokio::test]

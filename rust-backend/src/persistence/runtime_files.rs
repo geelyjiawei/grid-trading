@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::engine::StrategyRunId;
 
 pub(crate) const STRATEGY_CATALOG_LEASE_FILE_NAME: &str = ".catalog.lock";
+pub(crate) const STRATEGY_START_STAGING_DIRECTORY_NAME: &str = ".start-reservations";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrategyFilePaths {
@@ -128,6 +129,15 @@ pub fn discover_strategy_files(
         }
         if entry.file_name() == STRATEGY_CATALOG_LEASE_FILE_NAME {
             if !file_type.is_file() {
+                report.anomalies.push(StrategyDiscoveryAnomaly {
+                    path,
+                    kind: StrategyDiscoveryAnomalyKind::UnexpectedEntryType,
+                });
+            }
+            continue;
+        }
+        if entry.file_name() == STRATEGY_START_STAGING_DIRECTORY_NAME {
+            if !file_type.is_dir() {
                 report.anomalies.push(StrategyDiscoveryAnomaly {
                     path,
                     kind: StrategyDiscoveryAnomalyKind::UnexpectedEntryType,
@@ -320,6 +330,55 @@ mod tests {
         assert_eq!(
             malformed.anomalies[0].kind,
             StrategyDiscoveryAnomalyKind::UnexpectedEntryType
+        );
+    }
+
+    #[test]
+    fn start_staging_is_ignored_only_when_it_is_a_real_directory() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        fs::create_dir(&root).unwrap();
+        let staging = root.join(STRATEGY_START_STAGING_DIRECTORY_NAME);
+        let interrupted = staging.join("ABORTED1");
+        fs::create_dir_all(&interrupted).unwrap();
+        fs::write(interrupted.join("runtime.lock"), b"").unwrap();
+        fs::write(interrupted.join("strategy.json"), b"partial").unwrap();
+
+        let clean = discover_strategy_files(&root).unwrap();
+        assert!(clean.strategies.is_empty());
+        assert!(clean.anomalies.is_empty());
+
+        fs::remove_dir_all(&staging).unwrap();
+        fs::write(&staging, b"not a directory").unwrap();
+        let malformed = discover_strategy_files(&root).unwrap();
+        assert_eq!(malformed.anomalies.len(), 1);
+        assert_eq!(malformed.anomalies[0].path, staging);
+        assert_eq!(
+            malformed.anomalies[0].kind,
+            StrategyDiscoveryAnomalyKind::UnexpectedEntryType
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_link_start_staging_is_never_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let staging = root.join(STRATEGY_START_STAGING_DIRECTORY_NAME);
+        symlink(&outside, &staging).unwrap();
+
+        let report = discover_strategy_files(&root).unwrap();
+        assert!(report.strategies.is_empty());
+        assert_eq!(report.anomalies.len(), 1);
+        assert_eq!(report.anomalies[0].path, staging);
+        assert_eq!(
+            report.anomalies[0].kind,
+            StrategyDiscoveryAnomalyKind::SymbolicLink
         );
     }
 

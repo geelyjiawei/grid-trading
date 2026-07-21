@@ -54,6 +54,11 @@ impl StrategyRuntimeLease {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub(crate) fn relocate(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path = path.into();
+        self
+    }
 }
 
 fn ensure_parent_directory(parent: &Path) -> Result<(), RuntimeLeaseError> {

@@ -167,6 +167,10 @@ impl FileStrategyStateStore {
         &self.path
     }
 
+    pub(crate) fn relocate(&mut self, path: impl Into<PathBuf>) {
+        self.path = path.into();
+    }
+
     fn commit_snapshot(&self, snapshot: &StrategyState) -> Result<(), StrategyStoreError> {
         commit_persisted(
             &self.path,
@@ -211,6 +215,10 @@ impl FileArmedStrategyStateStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn relocate(&mut self, path: impl Into<PathBuf>) {
+        self.path = path.into();
     }
 
     pub fn activate(

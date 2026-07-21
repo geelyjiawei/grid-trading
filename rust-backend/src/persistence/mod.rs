@@ -16,7 +16,9 @@ pub use idempotency::{
 pub use order_ledger::{
     FileOrderIntentStore, IntentStore, LedgerError, LedgerSnapshot, MemoryOrderIntentStore,
 };
-pub(crate) use runtime_files::STRATEGY_CATALOG_LEASE_FILE_NAME;
+pub(crate) use runtime_files::{
+    STRATEGY_CATALOG_LEASE_FILE_NAME, STRATEGY_START_STAGING_DIRECTORY_NAME,
+};
 pub use runtime_files::{
     StrategyDiscoveryAnomaly, StrategyDiscoveryAnomalyKind, StrategyDiscoveryError,
     StrategyDiscoveryReport, StrategyFilePathError, StrategyFilePaths, discover_strategy_files,
