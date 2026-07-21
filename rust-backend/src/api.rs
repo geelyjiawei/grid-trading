@@ -29,9 +29,10 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{Exchange, GridConfig, OrderSide},
     engine::{
-        ArmedStrategyLifecycle, FeeValuationSource, MarketSnapshot, PreparedStrategyKind,
-        PreparedStrategyLifecycle, PreparedStrategyStopOutcome, RuntimeCoordinator,
-        RuntimeCoordinatorError, RuntimeRegistryEntry, ShadowCollectionError, StrategyLifecycle,
+        ArmedStrategyLifecycle, FeeValuationSource, FileStrategyStartError, LeveragePreflightError,
+        MarketSnapshot, PreparedStrategyKind, PreparedStrategyLifecycle,
+        PreparedStrategyStopOutcome, RuntimeCoordinator, RuntimeCoordinatorError,
+        RuntimeRegistryEntry, ShadowCollectionError, StrategyBootstrapError, StrategyLifecycle,
         StrategyOrderPurpose, StrategyState, StrategyTransition, build_grid_preview,
         collect_stable_exchange_view, collect_strategy_shadow_view, load_authoritative_fee_config,
     },
@@ -478,6 +479,14 @@ impl StartGridCommand for RuntimeStartGridCommand {
                 }),
             )
             .map_err(|_| CommandOutcomeUnknown),
+            Err(RuntimeCoordinatorError::Start(FileStrategyStartError::Bootstrap(
+                StrategyBootstrapError::Leverage(
+                    LeveragePreflightError::ExistingPositionLeverageMismatch {
+                        observed,
+                        requested,
+                    },
+                ),
+            ))) => existing_position_leverage_mismatch_response(&symbol, observed, requested),
             Err(
                 RuntimeCoordinatorError::InvalidConfig(_)
                 | RuntimeCoordinatorError::MissingExchange
@@ -523,14 +532,28 @@ impl StartGridCommand for RuntimeStartGridCommand {
     }
 }
 
+fn existing_position_leverage_mismatch_response(
+    symbol: &str,
+    observed: u16,
+    requested: u16,
+) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
+    command_response(
+        StatusCode::CONFLICT,
+        "existing_position_leverage_mismatch",
+        format!(
+            "{symbol} already has an open position at {observed}x leverage, but this strategy requested {requested}x. The bot will not change leverage on an existing position; start the grid at {observed}x or manage the existing position first."
+        ),
+    )
+}
+
 fn command_response(
     status: StatusCode,
     code: &'static str,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
     StoredCommandResponse::new(
         status.as_u16(),
-        json!({"ok": false, "error": {"code": code, "message": message}}),
+        json!({"ok": false, "error": {"code": code, "message": message.into()}}),
     )
     .map_err(|_| CommandOutcomeUnknown)
 }
@@ -3978,6 +4001,22 @@ mod tests {
     async fn response_json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn existing_position_leverage_conflict_is_actionable_and_fail_closed() {
+        let response = existing_position_leverage_mismatch_response("SKHYUSDT", 20, 3).unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT.as_u16());
+        assert_eq!(
+            response.body()["error"]["code"],
+            "existing_position_leverage_mismatch"
+        );
+        let message = response.body()["error"]["message"].as_str().unwrap();
+        assert!(message.contains("SKHYUSDT"));
+        assert!(message.contains("20x"));
+        assert!(message.contains("3x"));
+        assert!(message.contains("will not change leverage"));
     }
 
     #[tokio::test]
