@@ -28,6 +28,7 @@ use crate::{
             BinanceRequestGovernor, HyperliquidRequestGovernor, MonotonicMicrosecondNonce,
             MonotonicMillisecondNonce, ReqwestTransport, SystemClock, TransportBuildError,
         },
+        realtime::{spawn_binance_execution_stream, spawn_bybit_execution_stream},
         trade_xyz::{TradeXyzAdapter, TradeXyzAdapterError},
     },
 };
@@ -290,6 +291,7 @@ impl ExchangeGatewayFactory {
                 api_key,
                 api_secret,
             } => {
+                let stream_api_key = Zeroizing::new(api_key.as_str().to_owned());
                 let signer = HmacSha256Signer::new(api_secret.as_bytes())?;
                 let adapter = match self.environment {
                     ExchangeEnvironment::Production => BinanceAdapter::production(
@@ -305,6 +307,11 @@ impl ExchangeGatewayFactory {
                         api_key.as_str().to_owned(),
                     ),
                 };
+                spawn_binance_execution_stream(
+                    self.environment == ExchangeEnvironment::Testnet,
+                    stream_api_key,
+                    adapter.realtime_lifetime(),
+                );
                 ConfiguredExchangeGateway::Binance(adapter)
             }
             ExchangeCredentials::Aster { private_key } => {
@@ -326,6 +333,8 @@ impl ExchangeGatewayFactory {
                 api_key,
                 api_secret,
             } => {
+                let stream_api_key = Zeroizing::new(api_key.as_str().to_owned());
+                let stream_api_secret = Zeroizing::new(api_secret.as_str().to_owned());
                 let signer = BybitHmacSha256Signer::new(api_secret.as_bytes())?;
                 let adapter = match self.environment {
                     ExchangeEnvironment::Production => BybitAdapter::production(
@@ -341,6 +350,12 @@ impl ExchangeGatewayFactory {
                         api_key.as_str().to_owned(),
                     ),
                 };
+                spawn_bybit_execution_stream(
+                    self.environment == ExchangeEnvironment::Testnet,
+                    stream_api_key,
+                    stream_api_secret,
+                    adapter.realtime_lifetime(),
+                );
                 ConfiguredExchangeGateway::Bybit(adapter)
             }
             ExchangeCredentials::TradeXyz {

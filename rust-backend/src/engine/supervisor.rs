@@ -249,6 +249,45 @@ impl<G> RuntimeRegistry<G> {
         strategy.advance(now_ms).await.map_err(Into::into)
     }
 
+    pub async fn advance_execution_event(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        exchange_order_id: Option<&str>,
+        now_ms: u64,
+    ) -> Option<(
+        StrategyRunId,
+        Result<PreparedStrategyStep, RuntimeRegistryAdvanceError>,
+    )>
+    where
+        G: ExchangeIdentityGateway
+            + TradingFeeRateGateway
+            + LeverageGateway
+            + PositionSnapshotGateway
+            + MarketSnapshotGateway
+            + InstrumentRulesGateway
+            + OrderPlacementGateway
+            + OrderCancellationGateway
+            + OrderLookupGateway
+            + ExecutionSnapshotGateway
+            + HistoricalPriceGateway,
+    {
+        let (run_id, slot) = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .find(|(_, slot)| slot.exchange == exchange && slot.symbol == symbol)
+            .map(|(run_id, slot)| (run_id.clone(), Arc::clone(slot)))?;
+        let mut strategy = slot.strategy.lock().await;
+        let effective_now_ms = now_ms.max(strategy.updated_at_ms());
+        let result = strategy
+            .advance_execution_event(effective_now_ms, exchange_order_id)
+            .await
+            .map_err(Into::into);
+        Some((run_id, result))
+    }
+
     pub async fn request_stop(
         &self,
         run_id: &StrategyRunId,

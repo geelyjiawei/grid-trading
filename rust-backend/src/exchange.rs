@@ -34,6 +34,7 @@ mod codec;
 pub mod configured;
 mod execution;
 pub mod protocol;
+pub mod realtime;
 pub mod registry;
 pub mod trade_xyz;
 mod trade_xyz_codec;

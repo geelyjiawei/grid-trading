@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Weak},
+};
 
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -104,6 +107,7 @@ pub struct BybitAdapter<T, S, C> {
     api_key: Zeroizing<String>,
     base_url: String,
     recv_window_ms: u64,
+    realtime_lifetime: Arc<()>,
 }
 
 impl<T, S, C> BybitAdapter<T, S, C> {
@@ -129,7 +133,12 @@ impl<T, S, C> BybitAdapter<T, S, C> {
             api_key: Zeroizing::new(api_key.into()),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             recv_window_ms: 5_000,
+            realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
         }
+    }
+
+    pub(crate) fn realtime_lifetime(&self) -> Weak<()> {
+        Arc::downgrade(&self.realtime_lifetime)
     }
 
     pub fn set_recv_window_ms(&mut self, recv_window_ms: u64) {

@@ -45,6 +45,9 @@ use crate::{
     },
 };
 
+#[cfg(not(test))]
+use crate::exchange::realtime::publish_execution_wakeup;
+
 const PRODUCTION_BASE_URL: &str = "https://api.hyperliquid.xyz";
 const TESTNET_BASE_URL: &str = "https://api.hyperliquid-testnet.xyz";
 const PRODUCTION_WEBSOCKET_URL: &str = "wss://api.hyperliquid.xyz/ws";
@@ -370,7 +373,33 @@ async fn cache_user_fill_message(
         return false;
     };
     merge_fill_rows(&mut cache.lock().await.rows, fills.iter().cloned());
+    for ((symbol, order_id), event_time) in execution_wakeups_from_fills(fills) {
+        publish_execution_wakeup(Exchange::TradeXyz, &symbol, Some(order_id), event_time);
+    }
     true
+}
+
+fn execution_wakeups_from_fills(fills: &[Value]) -> BTreeMap<(String, String), Option<u64>> {
+    let mut wakeups = BTreeMap::new();
+    for fill in fills {
+        let Some(coin) = fill.get("coin").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(symbol) = local_symbol(coin) else {
+            continue;
+        };
+        let Ok(order_id) = id_string(fill.get("oid")) else {
+            continue;
+        };
+        let event_time = fill.get("time").and_then(value_u64);
+        wakeups
+            .entry((symbol, order_id))
+            .and_modify(|current: &mut Option<u64>| {
+                *current = (*current).max(event_time);
+            })
+            .or_insert(event_time);
+    }
+    wakeups
 }
 
 fn merge_fill_rows(rows: &mut Vec<Value>, incoming: impl IntoIterator<Item = Value>) {
@@ -1466,21 +1495,19 @@ where
         let collection_time =
             now_ms().map_err(|error| ExecutionSnapshotError::new(error.message))?;
         let fill_end_time = collection_time.max(status_time);
-        let expected_quantity = order.executed_quantity.ok_or_else(|| {
-            ExecutionSnapshotError::new("TRADE.XYZ authoritative execution quantity is missing")
-        })?;
+        let cache = Arc::clone(&self.execution_fill_cache);
+        let (mut cached, stream_connected) = {
+            let cache = cache.lock().await;
+            (
+                trades_for_order(&cache.rows, symbol, exchange_order_id)?,
+                cache.stream_connected,
+            )
+        };
+        let mut cached_quantity = trade_quantity(&cached)?;
+        let mut expected_quantity = promote_order_from_stream_fills(&mut order, cached_quantity)?;
         let trades = if expected_quantity.is_zero() {
             Vec::new()
         } else {
-            let cache = Arc::clone(&self.execution_fill_cache);
-            let (mut cached, stream_connected) = {
-                let cache = cache.lock().await;
-                (
-                    trades_for_order(&cache.rows, symbol, exchange_order_id)?,
-                    cache.stream_connected,
-                )
-            };
-            let mut cached_quantity = trade_quantity(&cached)?;
             if cached_quantity < expected_quantity && stream_connected {
                 // The order update and fill event are separate stream messages. Give
                 // an already-connected stream a short opportunity to deliver the fill
@@ -1489,6 +1516,7 @@ where
                 let cache = cache.lock().await;
                 cached = trades_for_order(&cache.rows, symbol, exchange_order_id)?;
                 cached_quantity = trade_quantity(&cached)?;
+                expected_quantity = promote_order_from_stream_fills(&mut order, cached_quantity)?;
             }
             if cached_quantity >= expected_quantity && cached_quantity <= order.shape.quantity {
                 cached
@@ -1546,6 +1574,30 @@ where
             update_time_ms: fill_end_time,
         })
     }
+}
+
+fn promote_order_from_stream_fills(
+    order: &mut AuthoritativeOrder,
+    cached_quantity: Decimal,
+) -> Result<Decimal, ExecutionSnapshotError> {
+    let expected_quantity = order.executed_quantity.ok_or_else(|| {
+        ExecutionSnapshotError::new("TRADE.XYZ authoritative execution quantity is missing")
+    })?;
+    if cached_quantity > order.shape.quantity {
+        return Err(ExecutionSnapshotError::new(
+            "TRADE.XYZ stream fills exceed the strategy order quantity",
+        ));
+    }
+    if cached_quantity <= expected_quantity {
+        return Ok(expected_quantity);
+    }
+    order.executed_quantity = Some(cached_quantity);
+    if cached_quantity == order.shape.quantity {
+        order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Filled);
+    } else if matches!(order.lifecycle, OrderLifecycle::Active(_)) {
+        order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+    }
+    Ok(cached_quantity)
 }
 
 #[async_trait]
@@ -2766,6 +2818,27 @@ mod tests {
         assert_eq!(rows[2]["oid"], 43);
     }
 
+    #[test]
+    fn user_fill_wakeups_keep_each_exchange_order_identity() {
+        let fills = vec![
+            json!({"coin":"xyz:MU","oid":42,"time":3}),
+            json!({"coin":"xyz:MU","oid":42,"time":4}),
+            json!({"coin":"xyz:MU","oid":43,"time":5}),
+        ];
+
+        let wakeups = execution_wakeups_from_fills(&fills);
+
+        assert_eq!(wakeups.len(), 2);
+        assert_eq!(
+            wakeups.get(&("MUUSDC".to_owned(), "42".to_owned())),
+            Some(&Some(4))
+        );
+        assert_eq!(
+            wakeups.get(&("MUUSDC".to_owned(), "43".to_owned())),
+            Some(&Some(5))
+        );
+    }
+
     #[tokio::test]
     async fn websocket_fill_cache_avoids_rest_fill_history_request() {
         let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
@@ -2819,6 +2892,56 @@ mod tests {
         let request: Value =
             serde_json::from_str(transport.requests()[0].raw_body.as_deref().unwrap()).unwrap();
         assert_eq!(request["type"], "orderStatus");
+    }
+
+    #[tokio::test]
+    async fn websocket_fill_advances_stale_open_order_without_another_rest_read() {
+        let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
+        let cloid = encode_cloid(&client_order_id).unwrap();
+        let transport = ScriptedTransport::new([response(json!([{
+            "coin": "xyz:MU",
+            "side": "A",
+            "limitPx": "850",
+            "sz": "0.2",
+            "origSz": "0.2",
+            "oid": 42,
+            "timestamp": 1,
+            "reduceOnly": false,
+            "orderType": "Limit",
+            "tif": "Gtc",
+            "cloid": cloid
+        }]))]);
+        let adapter = test_adapter(transport.clone());
+        adapter
+            .open_order_execution_progress_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap();
+        adapter.execution_fill_cache.lock().await.rows = vec![json!({
+            "closedPnl": "0",
+            "coin": "xyz:MU",
+            "crossed": false,
+            "oid": 42,
+            "px": "850",
+            "side": "A",
+            "sz": "0.1",
+            "time": 3,
+            "fee": "0.01",
+            "tid": 7,
+            "feeToken": "USDC"
+        })];
+
+        let snapshot = adapter
+            .execution_snapshot(Exchange::TradeXyz, "MUUSDC", &client_order_id, "42")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(1, 1));
+        assert_eq!(snapshot.order.executed_quantity, Some(Decimal::new(1, 1)));
+        assert_eq!(
+            snapshot.order.lifecycle,
+            OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+        );
+        assert_eq!(transport.requests().len(), 1);
     }
 
     #[tokio::test]

@@ -291,6 +291,21 @@ where
         results
     }
 
+    pub async fn advance_execution_event(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        exchange_order_id: Option<&str>,
+        now_ms: u64,
+    ) -> Option<RuntimeAdvanceResult> {
+        let (run_id, result) = self
+            .registry
+            .advance_execution_event(exchange, symbol, exchange_order_id, now_ms)
+            .await?;
+        self.registry.prune_terminal().await;
+        Some(RuntimeAdvanceResult { run_id, result })
+    }
+
     async fn load_catalog(&self) -> Result<StrategyCatalog, RuntimeCoordinatorError> {
         let root = self.strategy_root.clone();
         tokio::task::spawn_blocking(move || load_strategy_catalog(root))

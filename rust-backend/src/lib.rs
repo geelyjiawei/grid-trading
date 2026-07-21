@@ -31,6 +31,7 @@ use crate::{
             ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayBuildError,
             ExchangeGatewayFactory, SharedConfiguredExchangeGateway,
         },
+        realtime::{ExecutionWakeup, subscribe_execution_wakeups},
         registry::{ExchangeGatewayRegistry, RegistryError},
     },
     persistence::{
@@ -47,6 +48,7 @@ const DEFAULT_RUNTIME_TICK_MS: u64 = 1_000;
 const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
 const DEFAULT_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const DEFAULT_SUBMISSIONS_PER_TICK: usize = 100;
+const EXECUTION_EVENT_RETRY_DELAY: Duration = Duration::from_millis(125);
 
 pub fn app() -> Router {
     build_app(
@@ -225,52 +227,137 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_RUNTIME_TICK_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut execution_wakeups = subscribe_execution_wakeups();
         loop {
-            ticker.tick().await;
-            let Some(now_ms) = system_time_ms() else {
-                tracing::error!("system clock is unavailable; runtime tick skipped");
-                continue;
-            };
-            let runtime = Arc::clone(&runtime);
-            tokio::spawn(async move {
-                for advance in runtime.advance_all(now_ms).await {
-                    match advance.result {
-                        Ok(PreparedStrategyStep::WaitingForTrigger) => {}
-                        Ok(PreparedStrategyStep::Activated) => {
-                            tracing::info!(run_id = advance.run_id.as_str(), "strategy activated");
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let Some(now_ms) = system_time_ms() else {
+                        tracing::error!("system clock is unavailable; runtime tick skipped");
+                        continue;
+                    };
+                    let runtime = Arc::clone(&runtime);
+                    tokio::spawn(async move {
+                        for advance in runtime.advance_all(now_ms).await {
+                            log_runtime_advance(advance, false, None);
                         }
-                        Ok(PreparedStrategyStep::Active(report)) => {
-                            if report.is_blocked() {
-                                let representative = report
-                                    .blockers
-                                    .first()
-                                    .expect("a blocked report must contain a blocker");
-                                tracing::warn!(
-                                    run_id = advance.run_id.as_str(),
-                                    blocker_count = report.blockers.len(),
-                                    blocker_stage = ?representative.stage,
-                                    client_order_id = representative
-                                        .client_order_id
-                                        .as_ref()
-                                        .map(|client_order_id| client_order_id.as_str())
-                                        .unwrap_or("-"),
-                                    blocker_message = representative.message.as_str(),
-                                    "strategy tick is blocked pending authoritative reconciliation"
-                                );
-                            }
+                    });
+                }
+                event = execution_wakeups.recv() => {
+                    match event {
+                        Ok(event) => {
+                            let runtime = Arc::clone(&runtime);
+                            tokio::spawn(async move {
+                                advance_execution_event(runtime, event).await;
+                            });
                         }
-                        Err(error) => {
-                            tracing::error!(
-                                run_id = advance.run_id.as_str(),
-                                error = %error,
-                                "strategy tick failed closed"
-                            );
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "execution wakeup receiver lagged; REST fallback remains active");
                         }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
                 }
-            });
+            }
         }
     });
+}
+
+async fn advance_execution_event(
+    runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    event: ExecutionWakeup,
+) {
+    let Some(now_ms) = system_time_ms() else {
+        tracing::error!("system clock is unavailable; execution wakeup skipped");
+        return;
+    };
+    let Some(advance) = runtime
+        .advance_execution_event(
+            event.exchange,
+            &event.symbol,
+            event.exchange_order_id.as_deref(),
+            now_ms,
+        )
+        .await
+    else {
+        return;
+    };
+    let retry = matches!(
+        &advance.result,
+        Ok(PreparedStrategyStep::Active(report))
+            if report.submissions.is_empty() && report.execution_syncs == 0
+    );
+    log_runtime_advance(advance, true, Some(&event));
+    if !retry {
+        return;
+    }
+    tokio::time::sleep(EXECUTION_EVENT_RETRY_DELAY).await;
+    let Some(now_ms) = system_time_ms() else {
+        return;
+    };
+    if let Some(retry) = runtime
+        .advance_execution_event(
+            event.exchange,
+            &event.symbol,
+            event.exchange_order_id.as_deref(),
+            now_ms,
+        )
+        .await
+    {
+        log_runtime_advance(retry, true, Some(&event));
+    }
+}
+
+fn log_runtime_advance(
+    advance: engine::RuntimeAdvanceResult,
+    execution_event: bool,
+    event: Option<&ExecutionWakeup>,
+) {
+    match advance.result {
+        Ok(PreparedStrategyStep::WaitingForTrigger) => {}
+        Ok(PreparedStrategyStep::Activated) => {
+            tracing::info!(run_id = advance.run_id.as_str(), "strategy activated");
+        }
+        Ok(PreparedStrategyStep::Active(report)) => {
+            if execution_event {
+                let event_to_submit_ms =
+                    event.and_then(|event| system_time_ms()?.checked_sub(event.observed_at_ms));
+                tracing::info!(
+                    run_id = advance.run_id.as_str(),
+                    exchange = ?event.map(|event| event.exchange),
+                    symbol = event.map(|event| event.symbol.as_str()).unwrap_or("-"),
+                    execution_syncs = report.execution_syncs,
+                    submissions = report.submissions.len(),
+                    event_to_submit_ms,
+                    "execution WebSocket wakeup processed"
+                );
+            }
+            if report.is_blocked() {
+                let representative = report
+                    .blockers
+                    .first()
+                    .expect("a blocked report must contain a blocker");
+                tracing::warn!(
+                    run_id = advance.run_id.as_str(),
+                    blocker_count = report.blockers.len(),
+                    blocker_stage = ?representative.stage,
+                    client_order_id = representative
+                        .client_order_id
+                        .as_ref()
+                        .map(|client_order_id| client_order_id.as_str())
+                        .unwrap_or("-"),
+                    blocker_message = representative.message.as_str(),
+                    "strategy tick is blocked pending authoritative reconciliation"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                run_id = advance.run_id.as_str(),
+                error = %error,
+                execution_event,
+                "strategy tick failed closed"
+            );
+        }
+    }
 }
 
 fn system_time_ms() -> Option<u64> {

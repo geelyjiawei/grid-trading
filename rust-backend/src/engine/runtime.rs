@@ -464,6 +464,38 @@ impl<G> PreparedLeasedFileStrategy<G> {
             }
         }
     }
+
+    pub async fn advance_execution_event(
+        &mut self,
+        now_ms: u64,
+        exchange_order_id: Option<&str>,
+    ) -> Result<PreparedStrategyStep, PreparedStrategyStepError>
+    where
+        G: ExchangeIdentityGateway
+            + TradingFeeRateGateway
+            + LeverageGateway
+            + PositionSnapshotGateway
+            + MarketSnapshotGateway
+            + InstrumentRulesGateway
+            + OrderPlacementGateway
+            + OrderCancellationGateway
+            + OrderLookupGateway
+            + ExecutionSnapshotGateway
+            + HistoricalPriceGateway,
+    {
+        match self.inner.as_mut() {
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => runtime
+                .runtime_mut()
+                .tick_execution_event(now_ms, exchange_order_id)
+                .await
+                .map(PreparedStrategyStep::Active)
+                .map_err(PreparedStrategyStepError::from),
+            Some(PreparedLeasedFileStrategyInner::Armed { .. }) => {
+                Ok(PreparedStrategyStep::WaitingForTrigger)
+            }
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
 }
 
 pub async fn prepare_leased_file_strategy<G>(
@@ -1550,6 +1582,138 @@ where
     S: StrategyStateStore,
 {
     pub async fn tick(&mut self, now_ms: u64) -> Result<RuntimeTickReport, RuntimeTickError> {
+        self.tick_with_mode(now_ms, RuntimeTickMode::Full).await
+    }
+
+    pub async fn tick_execution_event(
+        &mut self,
+        now_ms: u64,
+        exchange_order_id: Option<&str>,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        if let Some(exchange_order_id) = exchange_order_id {
+            return self
+                .tick_targeted_execution_event(now_ms, exchange_order_id)
+                .await;
+        }
+        self.tick_with_mode(now_ms, RuntimeTickMode::ExecutionEvent)
+            .await
+    }
+
+    async fn tick_targeted_execution_event(
+        &mut self,
+        now_ms: u64,
+        exchange_order_id: &str,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        let tick_started = Instant::now();
+        self.validate_ledger_ownership()?;
+        self.converge_accounted_terminal_intents(now_ms)?;
+        self.validate_ledger_ownership()?;
+        let mut report = RuntimeTickReport::new();
+        let client_order_id = self
+            .machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| {
+                !order.terminal_processed
+                    && order.exchange_order_id.as_deref() == Some(exchange_order_id)
+            })
+            .map(|order| order.client_order_id.clone());
+        let Some(client_order_id) = client_order_id else {
+            return Ok(report);
+        };
+        let request = match self
+            .execution_sync
+            .request_for(&self.machine, &client_order_id)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::ExecutionAccounting,
+                    client_order_id: Some(client_order_id),
+                    message: error.to_string(),
+                });
+                return Ok(report);
+            }
+        };
+        let result = match self
+            .execution_sync
+            .load_snapshot(&self.gateway, request)
+            .await
+        {
+            Ok(loaded) => {
+                self.execution_sync
+                    .apply_loaded_snapshot(&self.gateway, &mut self.machine, loaded, now_ms)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(result) => {
+                report.execution_syncs = 1;
+                if matches!(result.transition, StrategyTransition::Failed { .. }) {
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::StrategyFailed,
+                        client_order_id: Some(client_order_id),
+                        message: "execution accounting failed the strategy".into(),
+                    });
+                }
+            }
+            Err(error) => {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::ExecutionAccounting,
+                    client_order_id: Some(client_order_id),
+                    message: error.to_string(),
+                });
+                return Ok(report);
+            }
+        }
+        self.converge_accounted_terminal_intents(now_ms)?;
+        self.validate_ledger_ownership()?;
+        let lifecycle = self.machine.store().snapshot().lifecycle;
+        if lifecycle == StrategyLifecycle::Failed {
+            return self
+                .drive_exit(
+                    report,
+                    lifecycle,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
+                .await;
+        }
+        if lifecycle != StrategyLifecycle::Running || report.is_blocked() {
+            return Ok(report);
+        }
+        let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
+        let replacement_transition = self
+            .machine
+            .materialize_replacements(&persisted_rules, now_ms)?;
+        if matches!(replacement_transition, StrategyTransition::Failed { .. }) {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::StrategyFailed,
+                client_order_id: None,
+                message: "replacement planning failed before targeted order submission".into(),
+            });
+            self.validate_ledger_ownership()?;
+            return self
+                .drive_exit(
+                    report,
+                    StrategyLifecycle::Failed,
+                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                )
+                .await;
+        }
+        self.submit_ready_replacement_orders(&mut report, now_ms)
+            .await?;
+        self.validate_ledger_ownership()?;
+        Ok(report)
+    }
+
+    async fn tick_with_mode(
+        &mut self,
+        now_ms: u64,
+        mode: RuntimeTickMode,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
         let tick_started = Instant::now();
         self.validate_ledger_ownership()?;
         self.converge_accounted_terminal_intents(now_ms)?;
@@ -1844,6 +2008,41 @@ where
                     advance_reference_time_ms(now_ms, tick_started.elapsed()),
                 )
                 .await;
+        }
+        if mode == RuntimeTickMode::ExecutionEvent && lifecycle == StrategyLifecycle::Running {
+            if report.is_blocked()
+                && !report.blockers.iter().all(|blocker| {
+                    matches!(
+                        blocker.stage,
+                        RuntimeStage::LedgerReconciliation | RuntimeStage::ExecutionAccounting
+                    )
+                })
+            {
+                return Ok(report);
+            }
+            let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
+            let replacement_transition = self
+                .machine
+                .materialize_replacements(&persisted_rules, now_ms)?;
+            if matches!(replacement_transition, StrategyTransition::Failed { .. }) {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::StrategyFailed,
+                    client_order_id: None,
+                    message: "replacement planning failed before fast order submission".into(),
+                });
+                self.validate_ledger_ownership()?;
+                return self
+                    .drive_exit(
+                        report,
+                        StrategyLifecycle::Failed,
+                        advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                    )
+                    .await;
+            }
+            self.submit_ready_replacement_orders(&mut report, now_ms)
+                .await?;
+            self.validate_ledger_ownership()?;
+            return Ok(report);
         }
         if lifecycle == StrategyLifecycle::Running
             && report.is_blocked()
@@ -2329,6 +2528,12 @@ where
         self.validate_ledger_ownership()?;
         Ok(report)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeTickMode {
+    Full,
+    ExecutionEvent,
 }
 
 #[cfg(test)]
@@ -5176,6 +5381,94 @@ mod tests {
         assert!(!stable.is_blocked(), "{stable:?}");
         assert!(stable.submissions.is_empty());
         assert_eq!(gateway.placement_call_count(), placements_before_fill + 2);
+    }
+
+    #[tokio::test]
+    async fn execution_event_submits_exact_counter_without_slow_account_reads() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+        let stable = runtime.tick(1_250).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+
+        let calls_before_manual_event = gateway.execution_snapshot_call_count();
+        let placements_before_manual_event = gateway.placement_call_count();
+        let manual_event = runtime
+            .tick_execution_event(1_275, Some("external-manual-order"))
+            .await
+            .unwrap();
+        assert!(!manual_event.is_blocked(), "{manual_event:?}");
+        assert!(manual_event.submissions.is_empty());
+        assert_eq!(
+            gateway.execution_snapshot_call_count(),
+            calls_before_manual_event
+        );
+        assert_eq!(
+            gateway.placement_call_count(),
+            placements_before_manual_event
+        );
+
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let source_exchange_order_id = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .get(&source_id)
+            .and_then(|order| order.exchange_order_id.clone())
+            .unwrap();
+        let partial_quantity = source_shape.quantity / Decimal::new(2, 0);
+        gateway.partially_fill_order(
+            &source_id,
+            partial_quantity,
+            source_shape.price.unwrap(),
+            Decimal::new(1, 3),
+        );
+        let slow_reads_before = gateway.all_bootstrap_call_count();
+        let open_progress_before = gateway.open_progress_call_count();
+        let placements_before = gateway.placement_call_count();
+
+        let report = runtime
+            .tick_execution_event(1_300, Some(&source_exchange_order_id))
+            .await
+            .unwrap();
+
+        assert!(!report.is_blocked(), "{report:?}");
+        assert_eq!(report.execution_syncs, 1);
+        assert_eq!(report.submissions.len(), 1);
+        assert_eq!(gateway.all_bootstrap_call_count(), slow_reads_before);
+        assert_eq!(gateway.open_progress_call_count(), open_progress_before);
+        assert_eq!(gateway.placement_call_count(), placements_before + 1);
+        let counter = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .get(&report.submissions[0].client_order_id)
+            .unwrap();
+        assert!(matches!(
+            counter.purpose,
+            StrategyOrderPurpose::Replacement { .. }
+        ));
+        assert_eq!(counter.shape.side, OrderSide::Buy);
+        assert_eq!(counter.shape.quantity, partial_quantity);
+        assert!(counter.shape.reduce_only);
+
+        let duplicate = runtime
+            .tick_execution_event(1_301, Some(&source_exchange_order_id))
+            .await
+            .unwrap();
+        assert!(!duplicate.is_blocked(), "{duplicate:?}");
+        assert!(duplicate.submissions.is_empty());
+        assert_eq!(gateway.all_bootstrap_call_count(), slow_reads_before);
+        assert_eq!(gateway.open_progress_call_count(), open_progress_before);
+        assert_eq!(gateway.placement_call_count(), placements_before + 1);
     }
 
     #[tokio::test]
