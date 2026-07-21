@@ -1940,6 +1940,10 @@ impl MemoryStrategyStateStore {
     pub fn fail_next_write(&mut self) {
         self.fail_write_attempt = Some(self.write_attempts + 1);
     }
+
+    pub fn write_attempts(&self) -> u64 {
+        self.write_attempts
+    }
 }
 
 impl StrategyStateStore for MemoryStrategyStateStore {
@@ -2077,94 +2081,42 @@ where
     ) -> Result<StrategyTransition, StrategyMachineError> {
         self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
-        let candidate = ExecutionAuditRecord {
-            snapshot: snapshot.clone(),
-            fee_valuations: valued.fee_valuations.clone(),
-            synced_at_ms: now_ms,
-        };
-        let audit_validation = next
-            .orders
-            .get(&valued.report.client_order_id)
-            .ok_or(StrategyStateError::InvalidExecutionAudit)
-            .and_then(|order| {
-                validate_execution_audit_payload(
-                    next.exchange,
-                    order,
-                    &candidate,
-                    valued.report.cumulative_quantity,
-                    valued.report.cumulative_quote,
-                    valued.report.cumulative_fee,
-                    valued.report.terminal_status,
-                )?;
-                if let Some(previous) = &order.execution_audit {
-                    validate_execution_audit_extension(previous, &candidate)?;
-                }
-                Ok(())
-            })
-            .and_then(|()| {
-                validate_strategy_trade_id_ownership(
-                    &next,
-                    Some((&valued.report.client_order_id, &candidate)),
-                )
-            });
-        if audit_validation.is_err() {
-            let transition = fail_transition(&mut next, "valued execution audit is invalid");
-            return self.finalize_and_store(next, now_ms, transition);
+        let transition = apply_valued_execution_to_state(&mut next, snapshot, valued, now_ms);
+        self.finalize_and_store(next, now_ms, transition)
+    }
+
+    pub fn apply_valued_executions(
+        &mut self,
+        executions: &[(
+            crate::exchange::OrderExecutionSnapshot,
+            ValuedExecutionReport,
+        )],
+        now_ms: u64,
+    ) -> Result<Vec<StrategyTransition>, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
+        if executions.is_empty() {
+            return Ok(Vec::new());
         }
-        let previous_trade_count = next
-            .orders
-            .get(&valued.report.client_order_id)
-            .and_then(|order| order.execution_audit.as_ref())
-            .map_or(0, |audit| audit.snapshot.trades.len());
-        let inventory_deltas = candidate
-            .snapshot
-            .trades
+        let mut next = self.store.snapshot().clone();
+        let transitions = executions
             .iter()
-            .skip(previous_trade_count)
-            .map(|trade| InventoryDeltaEvidence {
-                quantity: trade.quantity,
-                quote: trade.quote_quantity,
-                exchange_trade_id: Some(trade.trade_id.clone()),
-                execution_time_ms: Some(trade.trade_time_ms),
+            .map(|(snapshot, valued)| {
+                apply_valued_execution_to_state(&mut next, snapshot, valued, now_ms)
             })
             .collect::<Vec<_>>();
-        let audit_changed = next
-            .orders
-            .get(&valued.report.client_order_id)
-            .and_then(|order| order.execution_audit.as_ref())
-            .is_none_or(|previous| {
-                previous.snapshot != candidate.snapshot
-                    || previous.fee_valuations != candidate.fee_valuations
-            });
-        let report_was_already_applied = next
-            .orders
-            .get(&valued.report.client_order_id)
-            .is_some_and(|order| order_matches_execution_report(order, &valued.report));
-        let mut transition =
-            apply_execution_report(&mut next, &valued.report, Some(&inventory_deltas), now_ms);
-        let report_was_applied = next
-            .orders
-            .get(&valued.report.client_order_id)
-            .is_some_and(|order| order_matches_execution_report(order, &valued.report));
-        if audit_changed
-            && (!matches!(transition, StrategyTransition::Failed { .. })
-                || (report_was_applied && !report_was_already_applied))
+        if transitions
+            .iter()
+            .any(|transition| transition != &StrategyTransition::NoChange)
         {
-            let Some(order) = next.orders.get_mut(&valued.report.client_order_id) else {
-                transition = fail_transition(
-                    &mut next,
-                    "valued execution order disappeared during audit persistence",
-                );
-                return self.finalize_and_store(next, now_ms, transition);
-            };
-            order.execution_audit = Some(candidate);
-            if transition == StrategyTransition::NoChange {
-                transition = StrategyTransition::Updated {
+            self.finalize_and_store(
+                next,
+                now_ms,
+                StrategyTransition::Updated {
                     new_obligation_ids: Vec::new(),
-                };
-            }
+                },
+            )?;
         }
-        self.finalize_and_store(next, now_ms, transition)
+        Ok(transitions)
     }
 
     pub fn materialize_replacements(
@@ -2529,6 +2481,100 @@ where
             },
         )
     }
+}
+
+fn apply_valued_execution_to_state(
+    next: &mut StrategyState,
+    snapshot: &crate::exchange::OrderExecutionSnapshot,
+    valued: &ValuedExecutionReport,
+    now_ms: u64,
+) -> StrategyTransition {
+    let candidate = ExecutionAuditRecord {
+        snapshot: snapshot.clone(),
+        fee_valuations: valued.fee_valuations.clone(),
+        synced_at_ms: now_ms,
+    };
+    let audit_validation = next
+        .orders
+        .get(&valued.report.client_order_id)
+        .ok_or(StrategyStateError::InvalidExecutionAudit)
+        .and_then(|order| {
+            validate_execution_audit_payload(
+                next.exchange,
+                order,
+                &candidate,
+                valued.report.cumulative_quantity,
+                valued.report.cumulative_quote,
+                valued.report.cumulative_fee,
+                valued.report.terminal_status,
+            )?;
+            if let Some(previous) = &order.execution_audit {
+                validate_execution_audit_extension(previous, &candidate)?;
+            }
+            Ok(())
+        })
+        .and_then(|()| {
+            validate_strategy_trade_id_ownership(
+                next,
+                Some((&valued.report.client_order_id, &candidate)),
+            )
+        });
+    if audit_validation.is_err() {
+        return fail_transition(next, "valued execution audit is invalid");
+    }
+    let previous_trade_count = next
+        .orders
+        .get(&valued.report.client_order_id)
+        .and_then(|order| order.execution_audit.as_ref())
+        .map_or(0, |audit| audit.snapshot.trades.len());
+    let inventory_deltas = candidate
+        .snapshot
+        .trades
+        .iter()
+        .skip(previous_trade_count)
+        .map(|trade| InventoryDeltaEvidence {
+            quantity: trade.quantity,
+            quote: trade.quote_quantity,
+            exchange_trade_id: Some(trade.trade_id.clone()),
+            execution_time_ms: Some(trade.trade_time_ms),
+        })
+        .collect::<Vec<_>>();
+    let audit_changed = next
+        .orders
+        .get(&valued.report.client_order_id)
+        .and_then(|order| order.execution_audit.as_ref())
+        .is_none_or(|previous| {
+            previous.snapshot != candidate.snapshot
+                || previous.fee_valuations != candidate.fee_valuations
+        });
+    let report_was_already_applied = next
+        .orders
+        .get(&valued.report.client_order_id)
+        .is_some_and(|order| order_matches_execution_report(order, &valued.report));
+    let mut transition =
+        apply_execution_report(next, &valued.report, Some(&inventory_deltas), now_ms);
+    let report_was_applied = next
+        .orders
+        .get(&valued.report.client_order_id)
+        .is_some_and(|order| order_matches_execution_report(order, &valued.report));
+    if audit_changed
+        && (!matches!(transition, StrategyTransition::Failed { .. })
+            || (report_was_applied && !report_was_already_applied))
+    {
+        let Some(order) = next.orders.get_mut(&valued.report.client_order_id) else {
+            return fail_transition(
+                next,
+                "valued execution order disappeared during audit persistence",
+            );
+        };
+        order.execution_audit = Some(candidate);
+        if transition == StrategyTransition::NoChange {
+            transition = StrategyTransition::Updated {
+                new_obligation_ids: Vec::new(),
+            };
+        }
+    }
+    transition
 }
 
 fn order_may_still_be_live(order: &StrategyOrderRecord) -> bool {
@@ -5038,6 +5084,18 @@ mod tests {
         client_order_id: ClientOrderId,
         fixture: ValuedTradeFixture<'_>,
     ) {
+        let applied_at_ms = fixture.applied_at_ms;
+        let (snapshot, valued) = single_valued_trade(machine, client_order_id, fixture);
+        machine
+            .apply_valued_execution(&snapshot, &valued, applied_at_ms)
+            .unwrap();
+    }
+
+    fn single_valued_trade(
+        machine: &StrategyMachine<MemoryStrategyStateStore>,
+        client_order_id: ClientOrderId,
+        fixture: ValuedTradeFixture<'_>,
+    ) -> (OrderExecutionSnapshot, ValuedExecutionReport) {
         let shape = machine
             .store()
             .snapshot()
@@ -5098,9 +5156,7 @@ mod tests {
                 valuation_price: None,
             }],
         };
-        machine
-            .apply_valued_execution(&snapshot, &valued, fixture.applied_at_ms)
-            .unwrap();
+        (snapshot, valued)
     }
 
     fn small_neutral_risk_machine() -> StrategyMachine<MemoryStrategyStateStore> {
@@ -5162,6 +5218,72 @@ mod tests {
         )
         .unwrap();
         StrategyMachine::new(MemoryStrategyStateStore::new(state))
+    }
+
+    #[test]
+    fn valued_execution_batch_persists_all_reports_with_one_state_write() {
+        let mut machine = small_neutral_risk_machine();
+        let order_ids = machine
+            .store()
+            .snapshot()
+            .orders
+            .keys()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(order_ids.len(), 2);
+        accept_strategy_order(&mut machine, &order_ids[0], "batch-order-1", 101);
+        accept_strategy_order(&mut machine, &order_ids[1], "batch-order-2", 101);
+        let executions = order_ids
+            .iter()
+            .enumerate()
+            .map(|(index, client_order_id)| {
+                let order = machine
+                    .store()
+                    .snapshot()
+                    .orders
+                    .get(client_order_id)
+                    .unwrap();
+                let (exchange_order_id, trade_id) = if index == 0 {
+                    ("batch-order-1", "batch-trade-1")
+                } else {
+                    ("batch-order-2", "batch-trade-2")
+                };
+                single_valued_trade(
+                    &machine,
+                    client_order_id.clone(),
+                    ValuedTradeFixture {
+                        exchange_order_id,
+                        trade_id,
+                        price: order.shape.price.unwrap(),
+                        quantity: Decimal::ONE,
+                        trade_time_ms: 102 + u64::try_from(index).unwrap(),
+                        applied_at_ms: 105,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let writes_before = machine.store().write_attempts();
+
+        let transitions = machine.apply_valued_executions(&executions, 105).unwrap();
+
+        assert_eq!(transitions.len(), 2);
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| !matches!(transition, StrategyTransition::Failed { .. }))
+        );
+        assert_eq!(machine.store().write_attempts(), writes_before + 1);
+        assert!(order_ids.iter().all(|client_order_id| {
+            machine
+                .store()
+                .snapshot()
+                .orders
+                .get(client_order_id)
+                .unwrap()
+                .execution_audit
+                .is_some()
+        }));
     }
 
     fn replacement_orders(state: &StrategyState) -> Vec<&StrategyOrderRecord> {

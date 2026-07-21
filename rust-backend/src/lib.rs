@@ -9,7 +9,10 @@ pub mod web_auth;
 use std::{
     env, fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -228,15 +231,20 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
         let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_RUNTIME_TICK_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut execution_wakeups = subscribe_execution_wakeups();
+        let full_tick_in_flight = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    let Some(tick_lease) = RuntimeTickLease::try_acquire(&full_tick_in_flight) else {
+                        continue;
+                    };
                     let Some(now_ms) = system_time_ms() else {
                         tracing::error!("system clock is unavailable; runtime tick skipped");
                         continue;
                     };
                     let runtime = Arc::clone(&runtime);
                     tokio::spawn(async move {
+                        let _tick_lease = tick_lease;
                         for advance in runtime.advance_all(now_ms).await {
                             log_runtime_advance(advance, false, None);
                         }
@@ -259,6 +267,23 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
             }
         }
     });
+}
+
+struct RuntimeTickLease(Arc<AtomicBool>);
+
+impl RuntimeTickLease {
+    fn try_acquire(in_flight: &Arc<AtomicBool>) -> Option<Self> {
+        in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(in_flight)))
+    }
+}
+
+impl Drop for RuntimeTickLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 async fn advance_execution_event(
@@ -689,6 +714,16 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn runtime_tick_lease_coalesces_overlapping_full_ticks() {
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let lease = RuntimeTickLease::try_acquire(&in_flight).unwrap();
+
+        assert!(RuntimeTickLease::try_acquire(&in_flight).is_none());
+        drop(lease);
+        assert!(RuntimeTickLease::try_acquire(&in_flight).is_some());
+    }
 
     #[test]
     fn an_exactly_empty_optional_admin_token_is_unconfigured() {

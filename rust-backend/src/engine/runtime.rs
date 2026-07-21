@@ -1945,6 +1945,7 @@ where
         .buffered(MAX_CONCURRENT_EXECUTION_SNAPSHOTS)
         .collect::<BTreeMap<_, _>>()
         .await;
+        let mut prepared_execution_syncs = Vec::new();
         for client_order_id in &execution_sync_ids {
             let loaded = loaded_execution_snapshots
                 .remove(client_order_id)
@@ -1952,35 +1953,58 @@ where
             let result = match loaded {
                 Ok(loaded) => {
                     self.execution_sync
-                        .apply_loaded_snapshot(&self.gateway, &mut self.machine, loaded, now_ms)
+                        .prepare_loaded_snapshot(&self.gateway, &self.machine, loaded)
                         .await
                 }
                 Err(error) => Err(error),
             };
             match result {
-                Ok(result) => {
-                    report.execution_syncs += 1;
-                    // A validated execution snapshot proves ownership and current
-                    // exchange visibility more strongly than a transiently absent
-                    // per-order lookup. Do not let the weaker read stall unrelated
-                    // ready grid orders in this tick.
-                    report.blockers.retain(|blocker| {
-                        blocker.stage != RuntimeStage::LedgerReconciliation
-                            || blocker.client_order_id.as_ref() != Some(client_order_id)
-                    });
-                    if matches!(result.transition, StrategyTransition::Failed { .. }) {
-                        report.blockers.push(RuntimeBlocker {
-                            stage: RuntimeStage::StrategyFailed,
-                            client_order_id: Some(client_order_id.clone()),
-                            message: "execution accounting failed the strategy".into(),
-                        });
-                    }
-                }
+                Ok(prepared) => prepared_execution_syncs.push((client_order_id.clone(), prepared)),
                 Err(error) => report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::ExecutionAccounting,
                     client_order_id: Some(client_order_id.clone()),
                     message: error.to_string(),
                 }),
+            }
+        }
+        let prepared_reports = prepared_execution_syncs
+            .iter()
+            .map(|(_, prepared)| (prepared.snapshot.clone(), prepared.valued_report.clone()))
+            .collect::<Vec<_>>();
+        let transitions = match self
+            .machine
+            .apply_valued_executions(&prepared_reports, now_ms)
+        {
+            Ok(transitions) => transitions,
+            Err(error) => {
+                for (client_order_id, _) in &prepared_execution_syncs {
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::ExecutionAccounting,
+                        client_order_id: Some(client_order_id.clone()),
+                        message: error.to_string(),
+                    });
+                }
+                Vec::new()
+            }
+        };
+        report.execution_syncs += transitions.len();
+        for ((client_order_id, _), transition) in
+            prepared_execution_syncs.into_iter().zip(transitions)
+        {
+            // A validated execution snapshot proves ownership and current
+            // exchange visibility more strongly than a transiently absent
+            // per-order lookup. Do not let the weaker read stall unrelated
+            // ready grid orders in this tick.
+            report.blockers.retain(|blocker| {
+                blocker.stage != RuntimeStage::LedgerReconciliation
+                    || blocker.client_order_id.as_ref() != Some(&client_order_id)
+            });
+            if matches!(transition, StrategyTransition::Failed { .. }) {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::StrategyFailed,
+                    client_order_id: Some(client_order_id),
+                    message: "execution accounting failed the strategy".into(),
+                });
             }
         }
         let converged_terminal_ids = self.converge_accounted_terminal_intents(now_ms)?;

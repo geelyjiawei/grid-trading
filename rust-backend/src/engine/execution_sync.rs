@@ -17,6 +17,12 @@ pub struct ExecutionSyncResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PreparedExecutionSync {
+    pub(crate) snapshot: OrderExecutionSnapshot,
+    pub(crate) valued_report: ValuedExecutionReport,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExecutionSyncRequest {
     exchange: Exchange,
     symbol: String,
@@ -137,17 +143,37 @@ impl ExecutionSyncService {
         G: HistoricalPriceGateway,
         S: StrategyStateStore,
     {
+        let prepared = self
+            .prepare_loaded_snapshot(gateway, machine, loaded)
+            .await?;
+        let transition =
+            machine.apply_valued_execution(&prepared.snapshot, &prepared.valued_report, now_ms)?;
+        Ok(ExecutionSyncResult {
+            snapshot: prepared.snapshot,
+            valued_report: prepared.valued_report,
+            transition,
+        })
+    }
+
+    pub(crate) async fn prepare_loaded_snapshot<G, S>(
+        &self,
+        gateway: &G,
+        machine: &StrategyMachine<S>,
+        loaded: LoadedExecutionSnapshot,
+    ) -> Result<PreparedExecutionSync, ExecutionSyncError>
+    where
+        G: HistoricalPriceGateway,
+        S: StrategyStateStore,
+    {
         let current_request = self.request_for(machine, &loaded.request.client_order_id)?;
         if current_request != loaded.request || !current_request.matches(&loaded.snapshot) {
             return Err(ExecutionSyncError::OrderIdentityMismatch);
         }
         let snapshot = loaded.snapshot;
         let valued_report = self.accounting.value_snapshot(gateway, &snapshot).await?;
-        let transition = machine.apply_valued_execution(&snapshot, &valued_report, now_ms)?;
-        Ok(ExecutionSyncResult {
+        Ok(PreparedExecutionSync {
             snapshot,
             valued_report,
-            transition,
         })
     }
 }
