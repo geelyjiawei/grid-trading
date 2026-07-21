@@ -202,6 +202,148 @@ impl Default for BinanceRequestState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinanceRequestPriority {
+    TradingCritical,
+    Normal,
+}
+
+#[derive(Debug, Default)]
+struct BinancePriorityState {
+    active: bool,
+    critical_waiters: usize,
+    normal_waiters: usize,
+}
+
+#[derive(Debug, Default)]
+struct BinancePriorityGateInner {
+    state: Mutex<BinancePriorityState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BinancePriorityGate {
+    inner: Arc<BinancePriorityGateInner>,
+}
+
+impl BinancePriorityGate {
+    async fn acquire(&self, priority: BinanceRequestPriority) -> BinancePriorityPermit {
+        let mut waiter = BinancePriorityWaiter::register(self.clone(), priority);
+        loop {
+            let changed = self.inner.changed.notified();
+            let acquired = {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let can_run = !state.active
+                    && (priority == BinanceRequestPriority::TradingCritical
+                        || state.critical_waiters == 0);
+                if can_run {
+                    state.active = true;
+                    waiter.unregister_locked(&mut state);
+                }
+                can_run
+            };
+            if acquired {
+                return BinancePriorityPermit { gate: self.clone() };
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_counts(&self) -> (usize, usize) {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.critical_waiters, state.normal_waiters)
+    }
+}
+
+struct BinancePriorityWaiter {
+    gate: BinancePriorityGate,
+    priority: BinanceRequestPriority,
+    registered: bool,
+}
+
+impl BinancePriorityWaiter {
+    fn register(gate: BinancePriorityGate, priority: BinanceRequestPriority) -> Self {
+        {
+            let mut state = gate
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match priority {
+                BinanceRequestPriority::TradingCritical => {
+                    state.critical_waiters = state.critical_waiters.saturating_add(1);
+                }
+                BinanceRequestPriority::Normal => {
+                    state.normal_waiters = state.normal_waiters.saturating_add(1);
+                }
+            }
+        }
+        Self {
+            gate,
+            priority,
+            registered: true,
+        }
+    }
+
+    fn unregister_locked(&mut self, state: &mut BinancePriorityState) {
+        if !self.registered {
+            return;
+        }
+        match self.priority {
+            BinanceRequestPriority::TradingCritical => {
+                state.critical_waiters = state.critical_waiters.saturating_sub(1);
+            }
+            BinanceRequestPriority::Normal => {
+                state.normal_waiters = state.normal_waiters.saturating_sub(1);
+            }
+        }
+        self.registered = false;
+    }
+}
+
+impl Drop for BinancePriorityWaiter {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let inner = Arc::clone(&self.gate.inner);
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.unregister_locked(&mut state);
+        drop(state);
+        inner.changed.notify_waiters();
+    }
+}
+
+struct BinancePriorityPermit {
+    gate: BinancePriorityGate,
+}
+
+impl Drop for BinancePriorityPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = false;
+        drop(state);
+        self.gate.inner.changed.notify_waiters();
+    }
+}
+
 /// Serializes Binance REST traffic, enforces the published weight/order windows,
 /// and opens a fail-fast circuit after 403/418/429 responses. The shared state is
 /// deliberately below every adapter operation so reads and writes cannot bypass
@@ -211,6 +353,7 @@ pub struct BinanceRequestGovernor<T> {
     inner: T,
     minimum_interval: Duration,
     state: Arc<tokio::sync::Mutex<BinanceRequestState>>,
+    priority_gate: BinancePriorityGate,
 }
 
 impl<T> BinanceRequestGovernor<T> {
@@ -219,6 +362,7 @@ impl<T> BinanceRequestGovernor<T> {
             inner,
             minimum_interval,
             state: Arc::new(tokio::sync::Mutex::new(BinanceRequestState::default())),
+            priority_gate: BinancePriorityGate::default(),
         }
     }
 }
@@ -238,6 +382,8 @@ where
     T: HttpTransport,
 {
     async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError> {
+        let priority = binance_request_priority(&request);
+        let _priority_permit = self.priority_gate.acquire(priority).await;
         // Keep the guard through the network request. This prevents already queued
         // requests from escaping after the first response opens the circuit.
         let mut state = self.state.lock().await;
@@ -514,6 +660,16 @@ fn binance_request_cost(request: &PreparedHttpRequest) -> BinanceRequestCost {
         (HttpMethod::Post | HttpMethod::Delete, "/fapi/v1/order")
     ));
     BinanceRequestCost { weight, orders }
+}
+
+fn binance_request_priority(request: &PreparedHttpRequest) -> BinanceRequestPriority {
+    match (request.method, request.path.as_str()) {
+        (HttpMethod::Post | HttpMethod::Delete, "/fapi/v1/order")
+        | (HttpMethod::Post | HttpMethod::Delete, "/fapi/v1/batchOrders")
+        | (HttpMethod::Get, "/fapi/v1/order")
+        | (HttpMethod::Get, "/fapi/v1/userTrades") => BinanceRequestPriority::TradingCritical,
+        _ => BinanceRequestPriority::Normal,
+    }
 }
 
 fn prune_binance_usage(state: &mut BinanceRequestState, now: Instant) {
@@ -981,6 +1137,76 @@ mod tests {
             raw_body: None,
             headers: vec![],
         }
+    }
+
+    #[test]
+    fn binance_request_priority_is_limited_to_execution_critical_routes() {
+        for request in [
+            symbol_request(HttpMethod::Post, "/fapi/v1/order"),
+            symbol_request(HttpMethod::Delete, "/fapi/v1/order"),
+            symbol_request(HttpMethod::Get, "/fapi/v1/order"),
+            symbol_request(HttpMethod::Get, "/fapi/v1/userTrades"),
+        ] {
+            assert_eq!(
+                binance_request_priority(&request),
+                BinanceRequestPriority::TradingCritical
+            );
+        }
+        for request in [
+            symbol_request(HttpMethod::Get, "/fapi/v1/premiumIndex"),
+            symbol_request(HttpMethod::Get, "/fapi/v1/openOrders"),
+            symbol_request(HttpMethod::Get, "/fapi/v3/account"),
+        ] {
+            assert_eq!(
+                binance_request_priority(&request),
+                BinanceRequestPriority::Normal
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn binance_trading_request_overtakes_queued_normal_request() {
+        let gate = BinancePriorityGate::default();
+        let first = gate.acquire(BinanceRequestPriority::Normal).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let normal_gate = gate.clone();
+        let normal_sender = sender.clone();
+        let normal = tokio::spawn(async move {
+            let _permit = normal_gate.acquire(BinanceRequestPriority::Normal).await;
+            normal_sender.send("normal").unwrap();
+        });
+        let critical_gate = gate.clone();
+        let critical = tokio::spawn(async move {
+            let _permit = critical_gate
+                .acquire(BinanceRequestPriority::TradingCritical)
+                .await;
+            sender.send("critical").unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.waiting_counts() != (1, 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both requests should be waiting");
+        drop(first);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some("critical")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some("normal")
+        );
+        critical.await.unwrap();
+        normal.await.unwrap();
     }
 
     fn hyperliquid_request(path: &str, body: &str) -> PreparedHttpRequest {

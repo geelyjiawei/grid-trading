@@ -1,15 +1,17 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
-    sync::{Arc, OnceLock, Weak},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
 };
 
 #[cfg(not(test))]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(not(test))]
 use futures::{SinkExt, StreamExt};
 #[cfg(not(test))]
 use hmac::{Hmac, Mac};
+use rust_decimal::Decimal;
 use serde_json::Value;
 #[cfg(not(test))]
 use serde_json::json;
@@ -20,10 +22,19 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
 
-use crate::domain::Exchange;
+use crate::{
+    domain::{
+        ClientOrderId, Exchange, OrderKind, OrderShape, OrderSide, TerminalOrderStatus, TimeInForce,
+    },
+    exchange::{
+        ActiveOrderStatus, AuthoritativeOrder, OrderExecutionSnapshot, OrderLifecycle, TradeFill,
+        execution::{OrderExecutionHeader, assemble_execution_snapshot},
+    },
+};
 
 const EXECUTION_WAKEUP_CAPACITY: usize = 1_024;
 const RECENT_BINANCE_EXECUTION_CAPACITY: usize = 4_096;
+const BINANCE_EXECUTION_CACHE_CAPACITY: usize = 4_096;
 #[cfg(not(test))]
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -79,6 +90,183 @@ impl RecentBinanceExecutions {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BinanceOrderUpdate {
+    order: AuthoritativeOrder,
+    cumulative_quantity: Decimal,
+    update_time_ms: u64,
+    execution_type: String,
+    trade: Option<TradeFill>,
+}
+
+#[derive(Debug, Clone)]
+struct BinanceObservedOrder {
+    initial_shape: OrderShape,
+    client_order_id: ClientOrderId,
+    order_time_ms: u64,
+    trades: BTreeMap<String, TradeFill>,
+    snapshot: Option<OrderExecutionSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct BinanceExecutionCacheState {
+    entries: BTreeMap<(String, String), BinanceObservedOrder>,
+    order: VecDeque<(String, String)>,
+}
+
+/// Per-account cache populated only by one uninterrupted Binance user-stream
+/// session. Missing NEW events or incomplete trade totals always fall back to REST.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BinanceExecutionCache {
+    state: Arc<Mutex<BinanceExecutionCacheState>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl BinanceExecutionCache {
+    pub(crate) fn begin_session(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = BinanceExecutionCacheState::default();
+        self.changed.notify_waiters();
+    }
+
+    fn apply(&self, update: BinanceOrderUpdate) {
+        let key = (
+            update.order.shape.symbol.clone(),
+            update.order.exchange_order_id.clone(),
+        );
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if update.execution_type == "NEW"
+            && matches!(
+                update.order.lifecycle,
+                OrderLifecycle::Active(ActiveOrderStatus::New)
+            )
+        {
+            if !state.entries.contains_key(&key) {
+                state.order.push_back(key.clone());
+            }
+            state.entries.insert(
+                key.clone(),
+                BinanceObservedOrder {
+                    initial_shape: update.order.shape.clone(),
+                    client_order_id: update.order.client_order_id.clone(),
+                    order_time_ms: update.update_time_ms,
+                    trades: BTreeMap::new(),
+                    snapshot: None,
+                },
+            );
+            prune_binance_execution_cache(&mut state);
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
+
+        let Some(observed) = state.entries.get(&key) else {
+            return;
+        };
+        if observed.client_order_id != update.order.client_order_id
+            || observed.initial_shape != update.order.shape
+        {
+            state.entries.remove(&key);
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
+        let observed = state
+            .entries
+            .get_mut(&key)
+            .expect("the validated Binance execution cache entry must remain present");
+        if let Some(trade) = update.trade {
+            observed
+                .trades
+                .entry(trade.trade_id.clone())
+                .or_insert(trade);
+        }
+        let cumulative_quote = observed
+            .trades
+            .values()
+            .try_fold(Decimal::ZERO, |total, trade| {
+                total.checked_add(trade.quote_quantity)
+            });
+        let trades = observed.trades.values().cloned().collect::<Vec<_>>();
+        observed.snapshot = cumulative_quote.and_then(|cumulative_quote| {
+            assemble_execution_snapshot(
+                OrderExecutionHeader {
+                    order: update.order,
+                    cumulative_quantity: update.cumulative_quantity,
+                    cumulative_quote,
+                    order_time_ms: observed.order_time_ms,
+                    update_time_ms: update.update_time_ms,
+                },
+                trades,
+            )
+            .ok()
+        });
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn knows_order(&self, symbol: &str, exchange_order_id: &str) -> bool {
+        let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .contains_key(&key)
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+    ) -> Option<OrderExecutionSnapshot> {
+        let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let observed = state.entries.get(&key)?;
+        (observed.client_order_id == *client_order_id)
+            .then(|| observed.snapshot.clone())
+            .flatten()
+    }
+
+    pub(crate) async fn wait_snapshot(
+        &self,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+        maximum_wait: Duration,
+    ) -> Option<OrderExecutionSnapshot> {
+        if let Some(snapshot) = self.snapshot(symbol, client_order_id, exchange_order_id) {
+            return Some(snapshot);
+        }
+        if !self.knows_order(symbol, exchange_order_id) {
+            return None;
+        }
+        let changed = self.changed.notified();
+        if let Some(snapshot) = self.snapshot(symbol, client_order_id, exchange_order_id) {
+            return Some(snapshot);
+        }
+        tokio::time::timeout(maximum_wait, changed).await.ok()?;
+        self.snapshot(symbol, client_order_id, exchange_order_id)
+    }
+}
+
+fn prune_binance_execution_cache(state: &mut BinanceExecutionCacheState) {
+    while state.order.len() > BINANCE_EXECUTION_CACHE_CAPACITY {
+        if let Some(expired) = state.order.pop_front() {
+            state.entries.remove(&expired);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionWakeup {
     pub exchange: Exchange,
@@ -127,12 +315,18 @@ pub(crate) fn spawn_binance_execution_stream(
     testnet: bool,
     api_key: Zeroizing<String>,
     lifetime: Weak<()>,
+    execution_cache: BinanceExecutionCache,
 ) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("Binance user execution stream was not started outside a Tokio runtime");
         return;
     };
-    runtime.spawn(run_binance_execution_stream(testnet, api_key, lifetime));
+    runtime.spawn(run_binance_execution_stream(
+        testnet,
+        api_key,
+        lifetime,
+        execution_cache,
+    ));
 }
 
 #[cfg(test)]
@@ -140,6 +334,7 @@ pub(crate) fn spawn_binance_execution_stream(
     _testnet: bool,
     _api_key: Zeroizing<String>,
     _lifetime: Weak<()>,
+    _execution_cache: BinanceExecutionCache,
 ) {
 }
 
@@ -148,6 +343,7 @@ async fn run_binance_execution_stream(
     testnet: bool,
     api_key: Zeroizing<String>,
     lifetime: Weak<()>,
+    execution_cache: BinanceExecutionCache,
 ) {
     let rest_url = if testnet {
         "https://testnet.binancefuture.com"
@@ -190,6 +386,7 @@ async fn run_binance_execution_stream(
             stream = if testnet { "testnet" } else { "private" },
             "Binance user execution stream connected"
         );
+        execution_cache.begin_session();
         reconnect_delay = RECONNECT_MIN;
         let mut recent_executions = RecentBinanceExecutions::default();
         let mut keepalive = tokio::time::interval(BINANCE_KEEPALIVE_INTERVAL);
@@ -204,13 +401,21 @@ async fn run_binance_execution_stream(
                     let Some(message) = message else { break };
                     match message {
                         Ok(Message::Text(text)) => {
-                            if publish_binance_message(text.as_ref(), &mut recent_executions) {
+                            if publish_binance_message(
+                                text.as_ref(),
+                                &mut recent_executions,
+                                &execution_cache,
+                            ) {
                                 break;
                             }
                         }
                         Ok(Message::Binary(bytes)) => {
                             if let Ok(text) = std::str::from_utf8(bytes.as_ref()) {
-                                if publish_binance_message(text, &mut recent_executions) {
+                                if publish_binance_message(
+                                    text,
+                                    &mut recent_executions,
+                                    &execution_cache,
+                                ) {
                                     break;
                                 }
                             }
@@ -299,8 +504,18 @@ async fn binance_keepalive(
 }
 
 #[cfg(not(test))]
-fn publish_binance_message(text: &str, recent_executions: &mut RecentBinanceExecutions) -> bool {
-    match parse_binance_stream_event(text) {
+fn publish_binance_message(
+    text: &str,
+    recent_executions: &mut RecentBinanceExecutions,
+    execution_cache: &BinanceExecutionCache,
+) -> bool {
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if let Some(update) = parse_binance_order_update(&message) {
+        execution_cache.apply(update);
+    }
+    match parse_binance_stream_event_value(&message) {
         BinanceStreamEvent::Execution(event) if recent_executions.is_new(&event) => {
             publish_execution_wakeup(
                 Exchange::Binance,
@@ -318,10 +533,15 @@ fn publish_binance_message(text: &str, recent_executions: &mut RecentBinanceExec
     }
 }
 
+#[cfg(test)]
 fn parse_binance_stream_event(text: &str) -> BinanceStreamEvent {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return BinanceStreamEvent::Ignored;
     };
+    parse_binance_stream_event_value(&message)
+}
+
+fn parse_binance_stream_event_value(message: &Value) -> BinanceStreamEvent {
     match message.get("e").and_then(Value::as_str) {
         Some("TRADE_LITE") if positive_decimal_text(message.get("l")) => {
             let Some(symbol) = message.get("s").and_then(Value::as_str) else {
@@ -362,6 +582,145 @@ fn parse_binance_stream_event(text: &str) -> BinanceStreamEvent {
         Some("listenKeyExpired") => BinanceStreamEvent::ListenKeyExpired,
         _ => BinanceStreamEvent::Ignored,
     }
+}
+
+fn parse_binance_order_update(message: &Value) -> Option<BinanceOrderUpdate> {
+    (message.get("e").and_then(Value::as_str) == Some("ORDER_TRADE_UPDATE")).then_some(())?;
+    let row = message.get("o")?;
+    let symbol = row.get("s")?.as_str()?.to_ascii_uppercase();
+    if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let client_order_id = ClientOrderId::parse(row.get("c")?.as_str()?.to_owned()).ok()?;
+    let exchange_order_id = value_identifier(row.get("i"))?;
+    let side = match row.get("S")?.as_str()? {
+        "BUY" => OrderSide::Buy,
+        "SELL" => OrderSide::Sell,
+        _ => return None,
+    };
+    let kind = match row.get("o")?.as_str()? {
+        "LIMIT" => OrderKind::Limit,
+        "MARKET" => OrderKind::Market,
+        _ => return None,
+    };
+    let quantity = decimal_text(row.get("q"))?;
+    let (price, time_in_force) = match kind {
+        OrderKind::Limit => {
+            let price = decimal_text(row.get("p"))?;
+            let time_in_force = match row.get("f")?.as_str()? {
+                "GTC" => TimeInForce::Gtc,
+                "GTX" => TimeInForce::PostOnly,
+                _ => return None,
+            };
+            (Some(price), time_in_force)
+        }
+        OrderKind::Market => (None, TimeInForce::Gtc),
+    };
+    let shape = OrderShape {
+        symbol: symbol.clone(),
+        side,
+        price,
+        quantity,
+        reduce_only: row.get("R")?.as_bool()?,
+        kind,
+        time_in_force,
+    };
+    shape.validate().ok()?;
+    let cumulative_quantity = decimal_text(row.get("z"))?;
+    let lifecycle = match row.get("X")?.as_str()? {
+        "NEW" => OrderLifecycle::Active(ActiveOrderStatus::New),
+        "PARTIALLY_FILLED" => OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+        "FILLED" => OrderLifecycle::Terminal(TerminalOrderStatus::Filled),
+        "CANCELED" | "CANCELLED" => OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled),
+        "REJECTED" => OrderLifecycle::Terminal(TerminalOrderStatus::Rejected),
+        "EXPIRED" | "EXPIRED_IN_MATCH" => OrderLifecycle::Terminal(TerminalOrderStatus::Expired),
+        _ => return None,
+    };
+    if cumulative_quantity < Decimal::ZERO || cumulative_quantity > shape.quantity {
+        return None;
+    }
+    match lifecycle {
+        OrderLifecycle::Active(ActiveOrderStatus::New) if !cumulative_quantity.is_zero() => {
+            return None;
+        }
+        OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+            if cumulative_quantity <= Decimal::ZERO || cumulative_quantity >= shape.quantity =>
+        {
+            return None;
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+            if cumulative_quantity != shape.quantity =>
+        {
+            return None;
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Rejected)
+            if !cumulative_quantity.is_zero() =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    let update_time_ms = row
+        .get("T")
+        .and_then(Value::as_u64)
+        .or_else(|| message.get("T").and_then(Value::as_u64))?;
+    if update_time_ms == 0 {
+        return None;
+    }
+    let execution_type = row.get("x")?.as_str()?.to_owned();
+    let trade = if execution_type == "TRADE" && positive_decimal_text(row.get("l")) {
+        let trade_id = value_identifier(row.get("t"))?;
+        let price = decimal_text(row.get("L"))?;
+        let quantity = decimal_text(row.get("l"))?;
+        let quote_quantity = price.checked_mul(quantity)?;
+        let raw_commission = decimal_text(row.get("n"))?;
+        let commission_asset = row.get("N")?.as_str()?.to_ascii_uppercase();
+        let realized_profit = decimal_text(row.get("rp"))?;
+        let is_maker = row.get("m")?.as_bool()?;
+        if trade_id == "0"
+            || price <= Decimal::ZERO
+            || quantity <= Decimal::ZERO
+            || quote_quantity <= Decimal::ZERO
+            || raw_commission < Decimal::ZERO
+            || commission_asset.is_empty()
+            || !commission_asset
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(TradeFill {
+            trade_id,
+            exchange_order_id: exchange_order_id.clone(),
+            symbol: symbol.clone(),
+            side,
+            price,
+            quantity,
+            quote_quantity,
+            raw_commission,
+            commission_cost: raw_commission,
+            commission_asset,
+            realized_profit,
+            is_maker,
+            trade_time_ms: update_time_ms,
+        })
+    } else {
+        None
+    };
+    Some(BinanceOrderUpdate {
+        order: AuthoritativeOrder {
+            client_order_id,
+            exchange_order_id,
+            exchange: Exchange::Binance,
+            shape,
+            lifecycle,
+            executed_quantity: Some(cumulative_quantity),
+        },
+        cumulative_quantity,
+        update_time_ms,
+        execution_type,
+        trade,
+    })
 }
 
 #[cfg(not(test))]
@@ -563,10 +922,11 @@ fn value_identifier(value: Option<&Value>) -> Option<String> {
 }
 
 fn positive_decimal_text(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
-        .is_some_and(|value| value > rust_decimal::Decimal::ZERO)
+    decimal_text(value).is_some_and(|value| value > Decimal::ZERO)
+}
+
+fn decimal_text(value: Option<&Value>) -> Option<Decimal> {
+    value?.as_str()?.parse::<Decimal>().ok()
 }
 
 #[cfg(not(test))]
@@ -658,6 +1018,93 @@ mod tests {
             parse_binance_stream_event(r#"{"e":"listenKeyExpired","E":123}"#),
             BinanceStreamEvent::ListenKeyExpired
         );
+    }
+
+    #[test]
+    fn binance_builds_an_exact_snapshot_only_after_observing_new_and_fill() {
+        let cache = BinanceExecutionCache::default();
+        let new = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"3.14","p":"15.92","x":"NEW","X":"NEW","i":42,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
+        )
+        .unwrap();
+        cache.apply(parse_binance_order_update(&new).unwrap());
+        let client_order_id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        assert!(cache.knows_order("MUUSDT", "42"));
+        assert!(cache.snapshot("MUUSDT", &client_order_id, "42").is_none());
+
+        let filled = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"3.14","p":"15.92","x":"TRADE","X":"FILLED","i":42,"l":"3.14","z":"3.14","L":"15.92","N":"USDT","n":"0.00999776","R":true,"T":1010,"t":7,"m":true,"rp":"0"}}"#,
+        )
+        .unwrap();
+        cache.apply(parse_binance_order_update(&filled).unwrap());
+        let snapshot = cache.snapshot("MUUSDT", &client_order_id, "42").unwrap();
+        assert_eq!(snapshot.cumulative_quantity, "3.14".parse().unwrap());
+        assert_eq!(snapshot.cumulative_quote, "49.9888".parse().unwrap());
+        assert_eq!(
+            snapshot.fees_by_asset["USDT"],
+            "0.00999776".parse().unwrap()
+        );
+        assert_eq!(snapshot.trades.len(), 1);
+        assert_eq!(snapshot.order_time_ms, 1000);
+        assert_eq!(snapshot.update_time_ms, 1010);
+    }
+
+    #[test]
+    fn binance_accumulates_partial_fills_and_deduplicates_trade_ids() {
+        let cache = BinanceExecutionCache::default();
+        for text in [
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"NEW","X":"NEW","i":43,"l":"0","z":"0","L":"0","R":false,"T":1000}}"#,
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"TRADE","X":"PARTIALLY_FILLED","i":43,"l":"1","z":"1","L":"16","N":"USDT","n":"0.0032","R":false,"T":1010,"t":8,"m":true,"rp":"0"}}"#,
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"TRADE","X":"PARTIALLY_FILLED","i":43,"l":"1","z":"1","L":"16","N":"USDT","n":"0.0032","R":false,"T":1010,"t":8,"m":true,"rp":"0"}}"#,
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1020,"T":1020,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"TRADE","X":"FILLED","i":43,"l":"2","z":"3","L":"16","N":"USDT","n":"0.0064","R":false,"T":1020,"t":9,"m":true,"rp":"0"}}"#,
+        ] {
+            let message = serde_json::from_str::<Value>(text).unwrap();
+            cache.apply(parse_binance_order_update(&message).unwrap());
+        }
+        let snapshot = cache
+            .snapshot(
+                "MUUSDT",
+                &ClientOrderId::parse("r_run_0_S_1").unwrap(),
+                "43",
+            )
+            .unwrap();
+        assert_eq!(snapshot.cumulative_quantity, "3".parse().unwrap());
+        assert_eq!(snapshot.cumulative_quote, "48".parse().unwrap());
+        assert_eq!(snapshot.trades.len(), 2);
+        assert_eq!(snapshot.fees_by_asset["USDT"], "0.0096".parse().unwrap());
+    }
+
+    #[test]
+    fn binance_never_fast_paths_an_order_whose_new_event_was_not_observed() {
+        let cache = BinanceExecutionCache::default();
+        let filled = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"TRADE","X":"FILLED","i":44,"l":"1","z":"1","L":"15.92","N":"USDT","n":"0.003184","R":true,"T":1010,"t":10,"m":true,"rp":"0"}}"#,
+        )
+        .unwrap();
+        cache.apply(parse_binance_order_update(&filled).unwrap());
+        assert!(!cache.knows_order("MUUSDT", "44"));
+        assert!(
+            cache
+                .snapshot(
+                    "MUUSDT",
+                    &ClientOrderId::parse("r_run_0_B_1").unwrap(),
+                    "44",
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn binance_reconnect_invalidates_all_session_local_snapshots() {
+        let cache = BinanceExecutionCache::default();
+        let new = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"NEW","X":"NEW","i":45,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
+        )
+        .unwrap();
+        cache.apply(parse_binance_order_update(&new).unwrap());
+        assert!(cache.knows_order("MUUSDT", "45"));
+        cache.begin_session();
+        assert!(!cache.knows_order("MUUSDT", "45"));
     }
 
     #[test]

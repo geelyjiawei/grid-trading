@@ -1,4 +1,7 @@
-use std::sync::{Arc, Weak};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -34,6 +37,7 @@ use crate::{
             BINANCE_LOCAL_COOLDOWN_CODE, HttpMethod, HttpTransport, MillisecondClock, Parameters,
             PreparedHttpRequest, encode_parameters,
         },
+        realtime::BinanceExecutionCache,
     },
 };
 
@@ -41,6 +45,7 @@ const PRODUCTION_BASE_URL: &str = "https://fapi.binance.com";
 const TESTNET_BASE_URL: &str = "https://testnet.binancefuture.com";
 const TRADE_PAGE_LIMIT: usize = 1_000;
 const MAX_TRADE_PAGES: usize = 64;
+const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(50);
 
 pub trait BinanceRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, SignatureError>;
@@ -285,6 +290,7 @@ pub struct BinanceAdapter<T, S, C> {
     base_url: String,
     recv_window_ms: u64,
     realtime_lifetime: Arc<()>,
+    realtime_execution_cache: BinanceExecutionCache,
 }
 
 impl<T, S, C> BinanceAdapter<T, S, C> {
@@ -311,11 +317,16 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             recv_window_ms: 5_000,
             realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
+            realtime_execution_cache: BinanceExecutionCache::default(),
         }
     }
 
     pub(crate) fn realtime_lifetime(&self) -> Weak<()> {
         Arc::downgrade(&self.realtime_lifetime)
+    }
+
+    pub(crate) fn realtime_execution_cache(&self) -> BinanceExecutionCache {
+        self.realtime_execution_cache.clone()
     }
 
     pub fn set_recv_window_ms(&mut self, recv_window_ms: u64) {
@@ -751,6 +762,23 @@ where
             return Err(execution_error("exchange order ID is required"));
         }
         let symbol = symbol.to_ascii_uppercase();
+        if let Some(snapshot) = self
+            .realtime_execution_cache
+            .wait_snapshot(
+                &symbol,
+                client_order_id,
+                exchange_order_id,
+                REALTIME_EXECUTION_SNAPSHOT_WAIT,
+            )
+            .await
+        {
+            tracing::info!(
+                symbol = symbol.as_str(),
+                exchange_order_id,
+                "using Binance realtime execution snapshot"
+            );
+            return Ok(snapshot);
+        }
         let detail_request = self
             .signed_request(
                 HttpMethod::Get,

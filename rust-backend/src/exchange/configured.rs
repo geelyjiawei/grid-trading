@@ -311,6 +311,7 @@ impl ExchangeGatewayFactory {
                     self.environment == ExchangeEnvironment::Testnet,
                     stream_api_key,
                     adapter.realtime_lifetime(),
+                    adapter.realtime_execution_cache(),
                 );
                 ConfiguredExchangeGateway::Binance(adapter)
             }
