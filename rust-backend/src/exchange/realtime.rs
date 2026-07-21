@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     sync::{Arc, OnceLock, Weak},
 };
 
@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 use crate::domain::Exchange;
 
 const EXECUTION_WAKEUP_CAPACITY: usize = 1_024;
+const RECENT_BINANCE_EXECUTION_CAPACITY: usize = 4_096;
 #[cfg(not(test))]
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -33,6 +34,50 @@ const LIFETIME_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const BINANCE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 #[cfg(not(test))]
 const BYBIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinanceExecutionEvent {
+    symbol: String,
+    order_id: String,
+    trade_id: Option<String>,
+    event_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BinanceStreamEvent {
+    Execution(BinanceExecutionEvent),
+    ListenKeyExpired,
+    Ignored,
+}
+
+#[derive(Debug, Default)]
+struct RecentBinanceExecutions {
+    order: VecDeque<(String, String, String)>,
+    keys: BTreeSet<(String, String, String)>,
+}
+
+impl RecentBinanceExecutions {
+    fn is_new(&mut self, event: &BinanceExecutionEvent) -> bool {
+        let Some(trade_id) = event.trade_id.as_ref() else {
+            return true;
+        };
+        let key = (
+            event.symbol.clone(),
+            event.order_id.clone(),
+            trade_id.clone(),
+        );
+        if !self.keys.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > RECENT_BINANCE_EXECUTION_CAPACITY {
+            if let Some(expired) = self.order.pop_front() {
+                self.keys.remove(&expired);
+            }
+        }
+        true
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionWakeup {
@@ -109,11 +154,6 @@ async fn run_binance_execution_stream(
     } else {
         "https://fapi.binance.com"
     };
-    let websocket_url = if testnet {
-        "wss://stream.binancefuture.com/ws"
-    } else {
-        "wss://fstream.binance.com/ws"
-    };
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
@@ -136,7 +176,7 @@ async fn run_binance_execution_stream(
                 continue;
             }
         };
-        let stream_url = format!("{websocket_url}/{listen_key}");
+        let stream_url = binance_user_stream_url(testnet, &listen_key);
         let (mut socket, _) = match connect_async(&stream_url).await {
             Ok(connection) => connection,
             Err(error) => {
@@ -146,8 +186,12 @@ async fn run_binance_execution_stream(
                 continue;
             }
         };
-        tracing::info!("Binance user execution stream connected");
+        tracing::info!(
+            stream = if testnet { "testnet" } else { "private" },
+            "Binance user execution stream connected"
+        );
         reconnect_delay = RECONNECT_MIN;
+        let mut recent_executions = RecentBinanceExecutions::default();
         let mut keepalive = tokio::time::interval(BINANCE_KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         keepalive.tick().await;
@@ -159,10 +203,16 @@ async fn run_binance_execution_stream(
                 message = socket.next() => {
                     let Some(message) = message else { break };
                     match message {
-                        Ok(Message::Text(text)) => publish_binance_message(text.as_ref()),
+                        Ok(Message::Text(text)) => {
+                            if publish_binance_message(text.as_ref(), &mut recent_executions) {
+                                break;
+                            }
+                        }
                         Ok(Message::Binary(bytes)) => {
                             if let Ok(text) = std::str::from_utf8(bytes.as_ref()) {
-                                publish_binance_message(text);
+                                if publish_binance_message(text, &mut recent_executions) {
+                                    break;
+                                }
                             }
                         }
                         Ok(Message::Ping(payload)) => {
@@ -179,7 +229,8 @@ async fn run_binance_execution_stream(
                     }
                 }
                 _ = keepalive.tick() => {
-                    if binance_keepalive(&client, rest_url, api_key.as_str()).await.is_err() {
+                    if let Err(error) = binance_keepalive(&client, rest_url, api_key.as_str()).await {
+                        tracing::warn!(error, "Binance user execution listen key keepalive failed");
                         break;
                     }
                 }
@@ -193,6 +244,14 @@ async fn run_binance_execution_stream(
         tracing::warn!("Binance user execution stream disconnected; REST fallback remains active");
         tokio::time::sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX);
+    }
+}
+
+fn binance_user_stream_url(testnet: bool, listen_key: &str) -> String {
+    if testnet {
+        format!("wss://stream.binancefuture.com/ws/{listen_key}")
+    } else {
+        format!("wss://fstream.binance.com/private/ws/{listen_key}")
     }
 }
 
@@ -240,24 +299,69 @@ async fn binance_keepalive(
 }
 
 #[cfg(not(test))]
-fn publish_binance_message(text: &str) {
-    if let Some((symbol, order_id, event_time)) = parse_binance_execution_event(text) {
-        publish_execution_wakeup(Exchange::Binance, &symbol, Some(order_id), event_time);
+fn publish_binance_message(text: &str, recent_executions: &mut RecentBinanceExecutions) -> bool {
+    match parse_binance_stream_event(text) {
+        BinanceStreamEvent::Execution(event) if recent_executions.is_new(&event) => {
+            publish_execution_wakeup(
+                Exchange::Binance,
+                &event.symbol,
+                Some(event.order_id),
+                event.event_time_ms,
+            );
+            false
+        }
+        BinanceStreamEvent::Execution(_) | BinanceStreamEvent::Ignored => false,
+        BinanceStreamEvent::ListenKeyExpired => {
+            tracing::warn!("Binance user execution listen key expired; reconnecting immediately");
+            true
+        }
     }
 }
 
-fn parse_binance_execution_event(text: &str) -> Option<(String, String, Option<u64>)> {
-    let message = serde_json::from_str::<Value>(text).ok()?;
-    (message.get("e").and_then(Value::as_str) == Some("ORDER_TRADE_UPDATE")).then_some(())?;
-    let order = message.get("o")?;
-    (order.get("x").and_then(Value::as_str) == Some("TRADE")
-        && positive_decimal_text(order.get("l")))
-    .then_some(())?;
-    Some((
-        order.get("s")?.as_str()?.to_owned(),
-        value_identifier(order.get("i"))?,
-        message.get("E").and_then(Value::as_u64),
-    ))
+fn parse_binance_stream_event(text: &str) -> BinanceStreamEvent {
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return BinanceStreamEvent::Ignored;
+    };
+    match message.get("e").and_then(Value::as_str) {
+        Some("TRADE_LITE") if positive_decimal_text(message.get("l")) => {
+            let Some(symbol) = message.get("s").and_then(Value::as_str) else {
+                return BinanceStreamEvent::Ignored;
+            };
+            let Some(order_id) = value_identifier(message.get("i")) else {
+                return BinanceStreamEvent::Ignored;
+            };
+            BinanceStreamEvent::Execution(BinanceExecutionEvent {
+                symbol: symbol.to_owned(),
+                order_id,
+                trade_id: value_identifier(message.get("t")),
+                event_time_ms: message.get("E").and_then(Value::as_u64),
+            })
+        }
+        Some("ORDER_TRADE_UPDATE") => {
+            let Some(order) = message.get("o") else {
+                return BinanceStreamEvent::Ignored;
+            };
+            if order.get("x").and_then(Value::as_str) != Some("TRADE")
+                || !positive_decimal_text(order.get("l"))
+            {
+                return BinanceStreamEvent::Ignored;
+            }
+            let Some(symbol) = order.get("s").and_then(Value::as_str) else {
+                return BinanceStreamEvent::Ignored;
+            };
+            let Some(order_id) = value_identifier(order.get("i")) else {
+                return BinanceStreamEvent::Ignored;
+            };
+            BinanceStreamEvent::Execution(BinanceExecutionEvent {
+                symbol: symbol.to_owned(),
+                order_id,
+                trade_id: value_identifier(order.get("t")),
+                event_time_ms: message.get("E").and_then(Value::as_u64),
+            })
+        }
+        Some("listenKeyExpired") => BinanceStreamEvent::ListenKeyExpired,
+        _ => BinanceStreamEvent::Ignored,
+    }
 }
 
 #[cfg(not(test))]
@@ -490,17 +594,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn binance_only_parses_positive_trade_updates() {
-        let event = parse_binance_execution_event(
-            r#"{"e":"ORDER_TRADE_UPDATE","E":123,"o":{"x":"TRADE","l":"0.25","s":"MUUSDT","i":789}}"#,
-        )
-        .unwrap();
-        assert_eq!(event, ("MUUSDT".to_owned(), "789".to_owned(), Some(123)));
-        assert!(
-            parse_binance_execution_event(
+    fn binance_uses_the_official_private_user_stream_endpoint() {
+        assert_eq!(
+            binance_user_stream_url(false, "listen-key"),
+            "wss://fstream.binance.com/private/ws/listen-key"
+        );
+        assert_eq!(
+            binance_user_stream_url(true, "listen-key"),
+            "wss://stream.binancefuture.com/ws/listen-key"
+        );
+    }
+
+    #[test]
+    fn binance_parses_low_latency_trade_lite_events() {
+        let event = parse_binance_stream_event(
+            r#"{"e":"TRADE_LITE","E":123,"T":122,"s":"MUUSDT","l":"0.25","t":456,"i":789}"#,
+        );
+        assert!(matches!(
+            event,
+            BinanceStreamEvent::Execution(BinanceExecutionEvent {
+                symbol,
+                order_id,
+                trade_id: Some(trade_id),
+                event_time_ms: Some(123),
+            }) if symbol == "MUUSDT" && order_id == "789" && trade_id == "456"
+        ));
+    }
+
+    #[test]
+    fn binance_only_parses_positive_order_trade_updates() {
+        let event = parse_binance_stream_event(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":123,"o":{"x":"TRADE","l":"0.25","s":"MUUSDT","t":456,"i":789}}"#,
+        );
+        assert!(matches!(event, BinanceStreamEvent::Execution(_)));
+        assert_eq!(
+            parse_binance_stream_event(
                 r#"{"e":"ORDER_TRADE_UPDATE","E":124,"o":{"x":"NEW","l":"0","s":"MUUSDT","i":789}}"#,
-            )
-            .is_none()
+            ),
+            BinanceStreamEvent::Ignored
+        );
+    }
+
+    #[test]
+    fn binance_deduplicates_trade_lite_and_order_update_for_the_same_fill() {
+        let mut recent = RecentBinanceExecutions::default();
+        let lite = BinanceExecutionEvent {
+            symbol: "MUUSDT".into(),
+            order_id: "789".into(),
+            trade_id: Some("456".into()),
+            event_time_ms: Some(123),
+        };
+        let full = BinanceExecutionEvent {
+            event_time_ms: Some(124),
+            ..lite.clone()
+        };
+        assert!(recent.is_new(&lite));
+        assert!(!recent.is_new(&full));
+    }
+
+    #[test]
+    fn binance_reconnects_when_the_listen_key_expires() {
+        assert_eq!(
+            parse_binance_stream_event(r#"{"e":"listenKeyExpired","E":123}"#),
+            BinanceStreamEvent::ListenKeyExpired
         );
     }
 
