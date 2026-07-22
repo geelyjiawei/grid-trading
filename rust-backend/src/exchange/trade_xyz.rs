@@ -67,7 +67,7 @@ const USER_FILL_STREAM_HEARTBEAT: Duration = Duration::from_secs(30);
 const USER_FILL_STREAM_RECONNECT_MIN: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const USER_FILL_STREAM_RECONNECT_MAX: Duration = Duration::from_secs(30);
-const USER_FILL_STREAM_GRACE: Duration = Duration::from_millis(250);
+const USER_FILL_STREAM_GRACE: Duration = Duration::from_millis(50);
 
 fn minimum_notional() -> Decimal {
     Decimal::new(10, 0)
@@ -116,6 +116,23 @@ struct CachedOpenExecution {
     order_time_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedOrderUpdate {
+    symbol: String,
+    client_order_id: ClientOrderId,
+    exchange_order_id: String,
+    original_quantity: Decimal,
+    remaining_quantity: Decimal,
+    status: String,
+    order_time_ms: u64,
+    status_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CachedExecutionOrders {
+    rows: HashMap<(String, ClientOrderId), CachedOrderUpdate>,
+}
+
 pub struct TradeXyzAdapter<T, N> {
     transport: T,
     signer: HyperliquidSigner,
@@ -129,6 +146,7 @@ pub struct TradeXyzAdapter<T, N> {
     open_execution_cache:
         Arc<tokio::sync::Mutex<HashMap<String, BTreeMap<ClientOrderId, CachedOpenExecution>>>>,
     execution_fill_cache: Arc<tokio::sync::Mutex<CachedExecutionFills>>,
+    execution_order_cache: Arc<tokio::sync::Mutex<CachedExecutionOrders>>,
     credentials_verified: Arc<tokio::sync::OnceCell<()>>,
 }
 
@@ -188,6 +206,8 @@ impl<T, N> TradeXyzAdapter<T, N> {
         let account_address = normalize_address(account_address)?;
         let execution_fill_cache =
             Arc::new(tokio::sync::Mutex::new(CachedExecutionFills::default()));
+        let execution_order_cache =
+            Arc::new(tokio::sync::Mutex::new(CachedExecutionOrders::default()));
         spawn_user_fill_stream(
             if mainnet {
                 PRODUCTION_WEBSOCKET_URL
@@ -196,6 +216,7 @@ impl<T, N> TradeXyzAdapter<T, N> {
             },
             account_address.clone(),
             Arc::downgrade(&execution_fill_cache),
+            Arc::downgrade(&execution_order_cache),
         );
         Ok(Self {
             transport,
@@ -209,6 +230,7 @@ impl<T, N> TradeXyzAdapter<T, N> {
             leverage_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             open_execution_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             execution_fill_cache,
+            execution_order_cache,
             credentials_verified: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
@@ -227,12 +249,18 @@ fn spawn_user_fill_stream(
     websocket_url: &'static str,
     account_address: String,
     cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+    order_cache: Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
 ) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("TRADE.XYZ user-fill stream was not started outside a Tokio runtime");
         return;
     };
-    runtime.spawn(run_user_fill_stream(websocket_url, account_address, cache));
+    runtime.spawn(run_user_fill_stream(
+        websocket_url,
+        account_address,
+        cache,
+        order_cache,
+    ));
 }
 
 #[cfg(test)]
@@ -240,6 +268,7 @@ fn spawn_user_fill_stream(
     _websocket_url: &'static str,
     _account_address: String,
     _cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+    _order_cache: Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
 ) {
 }
 
@@ -248,10 +277,11 @@ async fn run_user_fill_stream(
     websocket_url: &'static str,
     account_address: String,
     cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+    order_cache: Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
 ) {
     let mut reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
     loop {
-        if cache.upgrade().is_none() {
+        if cache.upgrade().is_none() || order_cache.upgrade().is_none() {
             return;
         }
         let connection = connect_async(websocket_url).await;
@@ -281,10 +311,26 @@ async fn run_user_fill_stream(
             reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
             continue;
         }
-        if !set_fill_stream_connected(&cache, true).await {
+        let order_subscription = json!({
+            "method": "subscribe",
+            "subscription": {
+                "type": "orderUpdates",
+                "user": account_address,
+            }
+        });
+        if let Err(error) = socket
+            .send(Message::Text(order_subscription.to_string().into()))
+            .await
+        {
+            tracing::warn!(error = %error, "TRADE.XYZ order-update subscription failed");
+            tokio::time::sleep(reconnect_delay).await;
+            reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
+            continue;
+        }
+        if !set_execution_stream_connected(&cache, &order_cache, true).await {
             return;
         }
-        tracing::info!("TRADE.XYZ user-fill stream connected");
+        tracing::info!("TRADE.XYZ user-fill and order-update streams connected");
         reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
         let mut heartbeat = tokio::time::interval(USER_FILL_STREAM_HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -295,13 +341,13 @@ async fn run_user_fill_stream(
                     let Some(message) = message else { break };
                     match message {
                         Ok(Message::Text(text)) => {
-                            if !cache_user_fill_message(text.as_ref(), &cache).await {
+                            if !cache_execution_message(text.as_ref(), &cache, &order_cache).await {
                                 return;
                             }
                         }
                         Ok(Message::Binary(bytes)) => {
                             if let Ok(text) = std::str::from_utf8(bytes.as_ref())
-                                && !cache_user_fill_message(text, &cache).await
+                                && !cache_execution_message(text, &cache, &order_cache).await
                             {
                                 return;
                             }
@@ -330,7 +376,7 @@ async fn run_user_fill_stream(
                 }
             }
         }
-        if !set_fill_stream_connected(&cache, false).await {
+        if !set_execution_stream_connected(&cache, &order_cache, false).await {
             return;
         }
         tracing::warn!("TRADE.XYZ user-fill stream disconnected; REST fallback remains active");
@@ -340,25 +386,35 @@ async fn run_user_fill_stream(
 }
 
 #[cfg(not(test))]
-async fn set_fill_stream_connected(
+async fn set_execution_stream_connected(
     cache: &Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+    order_cache: &Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
     connected: bool,
 ) -> bool {
     let Some(cache) = cache.upgrade() else {
         return false;
     };
+    let Some(order_cache) = order_cache.upgrade() else {
+        return false;
+    };
     cache.lock().await.stream_connected = connected;
+    let mut order_cache = order_cache.lock().await;
+    order_cache.rows.clear();
     true
 }
 
 #[cfg(not(test))]
-async fn cache_user_fill_message(
+async fn cache_execution_message(
     text: &str,
     cache: &Weak<tokio::sync::Mutex<CachedExecutionFills>>,
+    order_cache: &Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
 ) -> bool {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return true;
     };
+    if message.get("channel").and_then(Value::as_str) == Some("orderUpdates") {
+        return cache_order_update_message(&message, order_cache).await;
+    }
     if message.get("channel").and_then(Value::as_str) != Some("userFills") {
         return true;
     }
@@ -373,10 +429,94 @@ async fn cache_user_fill_message(
         return false;
     };
     merge_fill_rows(&mut cache.lock().await.rows, fills.iter().cloned());
-    for ((symbol, order_id), event_time) in execution_wakeups_from_fills(fills) {
-        publish_execution_wakeup(Exchange::TradeXyz, &symbol, Some(order_id), event_time);
+    let is_snapshot = message
+        .get("data")
+        .and_then(|data| data.get("isSnapshot"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !is_snapshot {
+        for ((symbol, order_id), event_time) in execution_wakeups_from_fills(fills) {
+            publish_execution_wakeup(Exchange::TradeXyz, &symbol, Some(order_id), event_time);
+        }
     }
     true
+}
+
+#[cfg(not(test))]
+async fn cache_order_update_message(
+    message: &Value,
+    cache: &Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
+) -> bool {
+    let updates = parse_order_update_message(message);
+    let Some(cache) = cache.upgrade() else {
+        return false;
+    };
+    let mut cache = cache.lock().await;
+    for update in updates {
+        let key = (update.symbol.clone(), update.client_order_id.clone());
+        if cache
+            .rows
+            .get(&key)
+            .is_some_and(|existing| existing.status_time_ms > update.status_time_ms)
+        {
+            continue;
+        }
+        let executed = update.original_quantity - update.remaining_quantity;
+        if executed > Decimal::ZERO {
+            publish_execution_wakeup(
+                Exchange::TradeXyz,
+                &update.symbol,
+                Some(update.exchange_order_id.clone()),
+                Some(update.status_time_ms),
+            );
+        }
+        cache.rows.insert(key, update);
+    }
+    true
+}
+
+fn parse_order_update_message(message: &Value) -> Vec<CachedOrderUpdate> {
+    if message.get("channel").and_then(Value::as_str) != Some("orderUpdates") {
+        return Vec::new();
+    }
+    message
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let row = item.get("order")?;
+            let coin = row.get("coin")?.as_str()?;
+            let symbol = local_symbol(coin).ok()?;
+            let client_order_id = decode_cloid(row.get("cloid")?.as_str()?)?;
+            let exchange_order_id = id_string(row.get("oid")).ok()?;
+            let original_quantity = decimal_field(row, "origSz").ok()?;
+            let remaining_quantity = decimal_field(row, "sz").ok()?;
+            let status = item.get("status")?.as_str()?.to_owned();
+            let status_time_ms = item.get("statusTimestamp").and_then(value_u64)?;
+            let order_time_ms = row.get("timestamp").and_then(value_u64)?;
+            let executed = original_quantity.checked_sub(remaining_quantity)?;
+            if original_quantity <= Decimal::ZERO
+                || remaining_quantity < Decimal::ZERO
+                || remaining_quantity > original_quantity
+                || order_time_ms == 0
+                || status_time_ms < order_time_ms
+                || lifecycle(&status, executed).is_err()
+            {
+                return None;
+            }
+            Some(CachedOrderUpdate {
+                symbol,
+                client_order_id,
+                exchange_order_id,
+                original_quantity,
+                remaining_quantity,
+                status,
+                order_time_ms,
+                status_time_ms,
+            })
+        })
+        .collect()
 }
 
 fn execution_wakeups_from_fills(fills: &[Value]) -> BTreeMap<(String, String), Option<u64>> {
@@ -1460,15 +1600,24 @@ where
     ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
         validate_request(exchange, symbol)
             .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+        let symbol_key = symbol.to_ascii_uppercase();
+        let streamed_order = self
+            .execution_order_cache
+            .lock()
+            .await
+            .rows
+            .get(&(symbol_key.clone(), client_order_id.clone()))
+            .cloned()
+            .filter(|cached| cached.exchange_order_id == exchange_order_id);
         let cached_open = self
             .open_execution_cache
             .lock()
             .await
-            .get(&symbol.to_ascii_uppercase())
+            .get(&symbol_key)
             .and_then(|orders| orders.get(client_order_id))
             .cloned()
             .filter(|cached| cached.order.exchange_order_id == exchange_order_id);
-        let (mut order, order_time, status_time) = if let Some(cached) = cached_open {
+        let (mut order, mut order_time, mut status_time) = if let Some(cached) = cached_open {
             (cached.order, cached.order_time_ms, cached.order_time_ms)
         } else {
             let cloid = encode_cloid(client_order_id)
@@ -1487,6 +1636,11 @@ where
                 .map_err(|error| ExecutionSnapshotError::new(error.message))?;
             (order, order_time, status_time)
         };
+        if let Some(update) = streamed_order {
+            apply_streamed_order_update(&mut order, &update)?;
+            order_time = update.order_time_ms;
+            status_time = update.status_time_ms;
+        }
         if order.exchange_order_id != exchange_order_id {
             return Err(ExecutionSnapshotError::new(
                 "TRADE.XYZ order identity changed during execution collection",
@@ -1574,6 +1728,31 @@ where
             update_time_ms: fill_end_time,
         })
     }
+}
+
+fn apply_streamed_order_update(
+    order: &mut AuthoritativeOrder,
+    update: &CachedOrderUpdate,
+) -> Result<(), ExecutionSnapshotError> {
+    if order.shape.symbol != update.symbol
+        || order.client_order_id != update.client_order_id
+        || order.exchange_order_id != update.exchange_order_id
+        || order.shape.quantity != update.original_quantity
+        || update.remaining_quantity < Decimal::ZERO
+        || update.remaining_quantity > update.original_quantity
+    {
+        return Err(ExecutionSnapshotError::new(
+            "TRADE.XYZ streamed order identity or quantity does not match the strategy order",
+        ));
+    }
+    let executed = update
+        .original_quantity
+        .checked_sub(update.remaining_quantity)
+        .ok_or_else(|| ExecutionSnapshotError::new("TRADE.XYZ streamed quantity overflowed"))?;
+    order.lifecycle = lifecycle(&update.status, executed)
+        .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+    order.executed_quantity = Some(executed);
+    Ok(())
 }
 
 fn promote_order_from_stream_fills(
@@ -2261,6 +2440,30 @@ mod tests {
             lifecycle("filled", Decimal::ONE).unwrap(),
             OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
         );
+    }
+
+    #[test]
+    fn order_update_stream_parses_exact_strategy_identity_and_quantity() {
+        let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_2").unwrap();
+        let message = json!({
+            "channel": "orderUpdates",
+            "data": [{
+                "order": {
+                    "coin": "xyz:MU", "side": "A", "limitPx": "850",
+                    "sz": "0.1", "oid": 42, "timestamp": 1000,
+                    "origSz": "0.2", "cloid": encode_cloid(&client_order_id).unwrap()
+                },
+                "status": "open",
+                "statusTimestamp": 1010
+            }]
+        });
+        let updates = parse_order_update_message(&message);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].symbol, "MUUSDC");
+        assert_eq!(updates[0].client_order_id, client_order_id);
+        assert_eq!(updates[0].exchange_order_id, "42");
+        assert_eq!(updates[0].original_quantity, Decimal::new(2, 1));
+        assert_eq!(updates[0].remaining_quantity, Decimal::new(1, 1));
     }
 
     #[tokio::test]

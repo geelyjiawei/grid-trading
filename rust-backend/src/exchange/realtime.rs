@@ -12,9 +12,7 @@ use futures::{SinkExt, StreamExt};
 #[cfg(not(test))]
 use hmac::{Hmac, Mac};
 use rust_decimal::Decimal;
-use serde_json::Value;
-#[cfg(not(test))]
-use serde_json::json;
+use serde_json::{Value, json};
 #[cfg(not(test))]
 use sha2::Sha256;
 use tokio::sync::broadcast;
@@ -28,13 +26,14 @@ use crate::{
     },
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, OrderExecutionSnapshot, OrderLifecycle, TradeFill,
+        bybit_codec::{parse_execution_page, parse_order_row},
         execution::{OrderExecutionHeader, assemble_execution_snapshot},
     },
 };
 
 const EXECUTION_WAKEUP_CAPACITY: usize = 1_024;
 const RECENT_BINANCE_EXECUTION_CAPACITY: usize = 4_096;
-const BINANCE_EXECUTION_CACHE_CAPACITY: usize = 4_096;
+const FUTURES_EXECUTION_CACHE_CAPACITY: usize = 4_096;
 #[cfg(not(test))]
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -91,48 +90,50 @@ impl RecentBinanceExecutions {
 }
 
 #[derive(Debug, Clone)]
-struct BinanceOrderUpdate {
-    order: AuthoritativeOrder,
-    cumulative_quantity: Decimal,
-    update_time_ms: u64,
-    execution_type: String,
-    trade: Option<TradeFill>,
+pub(crate) struct FuturesOrderUpdate {
+    pub(crate) order: AuthoritativeOrder,
+    pub(crate) cumulative_quantity: Decimal,
+    pub(crate) update_time_ms: u64,
+    pub(crate) execution_type: String,
+    pub(crate) trade: Option<TradeFill>,
 }
 
 #[derive(Debug, Clone)]
-struct BinanceObservedOrder {
+struct FuturesObservedOrder {
     initial_shape: OrderShape,
     client_order_id: ClientOrderId,
     order_time_ms: u64,
     trades: BTreeMap<String, TradeFill>,
     snapshot: Option<OrderExecutionSnapshot>,
+    last_update_time_ms: u64,
 }
 
 #[derive(Debug, Default)]
-struct BinanceExecutionCacheState {
-    entries: BTreeMap<(String, String), BinanceObservedOrder>,
+struct FuturesExecutionCacheState {
+    entries: BTreeMap<(String, String), FuturesObservedOrder>,
     order: VecDeque<(String, String)>,
 }
 
-/// Per-account cache populated only by one uninterrupted Binance user-stream
-/// session. Missing NEW events or incomplete trade totals always fall back to REST.
+/// Per-account cache populated only by one uninterrupted Binance-compatible
+/// futures user-stream session. Missing NEW events, stale updates, or incomplete
+/// trade totals always fall back to REST.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BinanceExecutionCache {
-    state: Arc<Mutex<BinanceExecutionCacheState>>,
+pub(crate) struct FuturesExecutionCache {
+    state: Arc<Mutex<FuturesExecutionCacheState>>,
     changed: Arc<tokio::sync::Notify>,
 }
 
-impl BinanceExecutionCache {
+impl FuturesExecutionCache {
     pub(crate) fn begin_session(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *state = BinanceExecutionCacheState::default();
+        *state = FuturesExecutionCacheState::default();
         self.changed.notify_waiters();
     }
 
-    fn apply(&self, update: BinanceOrderUpdate) {
+    pub(crate) fn apply(&self, update: FuturesOrderUpdate) {
         let key = (
             update.order.shape.symbol.clone(),
             update.order.exchange_order_id.clone(),
@@ -152,15 +153,16 @@ impl BinanceExecutionCache {
             }
             state.entries.insert(
                 key.clone(),
-                BinanceObservedOrder {
+                FuturesObservedOrder {
                     initial_shape: update.order.shape.clone(),
                     client_order_id: update.order.client_order_id.clone(),
                     order_time_ms: update.update_time_ms,
                     trades: BTreeMap::new(),
                     snapshot: None,
+                    last_update_time_ms: update.update_time_ms,
                 },
             );
-            prune_binance_execution_cache(&mut state);
+            prune_futures_execution_cache(&mut state);
             drop(state);
             self.changed.notify_waiters();
             return;
@@ -180,7 +182,15 @@ impl BinanceExecutionCache {
         let observed = state
             .entries
             .get_mut(&key)
-            .expect("the validated Binance execution cache entry must remain present");
+            .expect("the validated futures execution cache entry must remain present");
+        if update.update_time_ms < observed.last_update_time_ms
+            || observed.snapshot.as_ref().is_some_and(|snapshot| {
+                update.update_time_ms == observed.last_update_time_ms
+                    && update.cumulative_quantity < snapshot.cumulative_quantity
+            })
+        {
+            return;
+        }
         if let Some(trade) = update.trade {
             observed
                 .trades
@@ -207,6 +217,7 @@ impl BinanceExecutionCache {
             )
             .ok()
         });
+        observed.last_update_time_ms = update.update_time_ms;
         drop(state);
         self.changed.notify_waiters();
     }
@@ -250,17 +261,192 @@ impl BinanceExecutionCache {
         if !self.knows_order(symbol, exchange_order_id) {
             return None;
         }
-        let changed = self.changed.notified();
-        if let Some(snapshot) = self.snapshot(symbol, client_order_id, exchange_order_id) {
-            return Some(snapshot);
+        let deadline = tokio::time::Instant::now() + maximum_wait;
+        loop {
+            let changed = self.changed.notified();
+            if let Some(snapshot) = self.snapshot(symbol, client_order_id, exchange_order_id) {
+                return Some(snapshot);
+            }
+            let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+            tokio::time::timeout(remaining, changed).await.ok()?;
         }
-        tokio::time::timeout(maximum_wait, changed).await.ok()?;
-        self.snapshot(symbol, client_order_id, exchange_order_id)
     }
 }
 
-fn prune_binance_execution_cache(state: &mut BinanceExecutionCacheState) {
-    while state.order.len() > BINANCE_EXECUTION_CACHE_CAPACITY {
+fn prune_futures_execution_cache(state: &mut FuturesExecutionCacheState) {
+    while state.order.len() > FUTURES_EXECUTION_CACHE_CAPACITY {
+        if let Some(expired) = state.order.pop_front() {
+            state.entries.remove(&expired);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BybitObservedOrder {
+    initial_shape: OrderShape,
+    client_order_id: ClientOrderId,
+    header: OrderExecutionHeader,
+    trades: BTreeMap<String, TradeFill>,
+    snapshot: Option<OrderExecutionSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct BybitExecutionCacheState {
+    entries: BTreeMap<(String, String), BybitObservedOrder>,
+    order: VecDeque<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BybitExecutionCache {
+    state: Arc<Mutex<BybitExecutionCacheState>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl BybitExecutionCache {
+    pub(crate) fn begin_session(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = BybitExecutionCacheState::default();
+        self.changed.notify_waiters();
+    }
+
+    fn apply_order(&self, header: OrderExecutionHeader) {
+        let key = (
+            header.order.shape.symbol.clone(),
+            header.order.exchange_order_id.clone(),
+        );
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(
+            header.order.lifecycle,
+            OrderLifecycle::Active(ActiveOrderStatus::New)
+        ) && header.cumulative_quantity.is_zero()
+        {
+            if !state.entries.contains_key(&key) {
+                state.order.push_back(key.clone());
+            }
+            state.entries.insert(
+                key,
+                BybitObservedOrder {
+                    initial_shape: header.order.shape.clone(),
+                    client_order_id: header.order.client_order_id.clone(),
+                    header,
+                    trades: BTreeMap::new(),
+                    snapshot: None,
+                },
+            );
+            prune_bybit_execution_cache(&mut state);
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
+        let Some(observed) = state.entries.get_mut(&key) else {
+            return;
+        };
+        if observed.client_order_id != header.order.client_order_id
+            || observed.initial_shape != header.order.shape
+        {
+            state.entries.remove(&key);
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
+        if header.update_time_ms < observed.header.update_time_ms
+            || (header.update_time_ms == observed.header.update_time_ms
+                && header.cumulative_quantity < observed.header.cumulative_quantity)
+        {
+            return;
+        }
+        observed.header = header;
+        refresh_bybit_snapshot(observed);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn apply_trade(&self, client_order_id: &ClientOrderId, trade: TradeFill) {
+        let key = (trade.symbol.clone(), trade.exchange_order_id.clone());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(observed) = state.entries.get_mut(&key) else {
+            return;
+        };
+        if observed.client_order_id != *client_order_id
+            || observed.initial_shape.symbol != trade.symbol
+            || observed.initial_shape.side != trade.side
+        {
+            state.entries.remove(&key);
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
+        observed
+            .trades
+            .entry(trade.trade_id.clone())
+            .or_insert(trade);
+        refresh_bybit_snapshot(observed);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) async fn wait_snapshot(
+        &self,
+        symbol: &str,
+        client_order_id: &ClientOrderId,
+        exchange_order_id: &str,
+        maximum_wait: Duration,
+    ) -> Option<OrderExecutionSnapshot> {
+        let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
+        let known = || {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .contains_key(&key)
+        };
+        let snapshot = || {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let observed = state.entries.get(&key)?;
+            (observed.client_order_id == *client_order_id)
+                .then(|| observed.snapshot.clone())
+                .flatten()
+        };
+        if let Some(snapshot) = snapshot() {
+            return Some(snapshot);
+        }
+        if !known() {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + maximum_wait;
+        loop {
+            let changed = self.changed.notified();
+            if let Some(snapshot) = snapshot() {
+                return Some(snapshot);
+            }
+            let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+            tokio::time::timeout(remaining, changed).await.ok()?;
+        }
+    }
+}
+
+fn refresh_bybit_snapshot(observed: &mut BybitObservedOrder) {
+    observed.snapshot = assemble_execution_snapshot(
+        observed.header.clone(),
+        observed.trades.values().cloned().collect(),
+    )
+    .ok();
+}
+
+fn prune_bybit_execution_cache(state: &mut BybitExecutionCacheState) {
+    while state.order.len() > FUTURES_EXECUTION_CACHE_CAPACITY {
         if let Some(expired) = state.order.pop_front() {
             state.entries.remove(&expired);
         }
@@ -315,7 +501,7 @@ pub(crate) fn spawn_binance_execution_stream(
     testnet: bool,
     api_key: Zeroizing<String>,
     lifetime: Weak<()>,
-    execution_cache: BinanceExecutionCache,
+    execution_cache: FuturesExecutionCache,
 ) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("Binance user execution stream was not started outside a Tokio runtime");
@@ -334,7 +520,7 @@ pub(crate) fn spawn_binance_execution_stream(
     _testnet: bool,
     _api_key: Zeroizing<String>,
     _lifetime: Weak<()>,
-    _execution_cache: BinanceExecutionCache,
+    _execution_cache: FuturesExecutionCache,
 ) {
 }
 
@@ -343,7 +529,7 @@ async fn run_binance_execution_stream(
     testnet: bool,
     api_key: Zeroizing<String>,
     lifetime: Weak<()>,
-    execution_cache: BinanceExecutionCache,
+    execution_cache: FuturesExecutionCache,
 ) {
     let rest_url = if testnet {
         "https://testnet.binancefuture.com"
@@ -507,12 +693,12 @@ async fn binance_keepalive(
 fn publish_binance_message(
     text: &str,
     recent_executions: &mut RecentBinanceExecutions,
-    execution_cache: &BinanceExecutionCache,
+    execution_cache: &FuturesExecutionCache,
 ) -> bool {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return false;
     };
-    if let Some(update) = parse_binance_order_update(&message) {
+    if let Some(update) = parse_futures_order_update(&message, Exchange::Binance) {
         execution_cache.apply(update);
     }
     match parse_binance_stream_event_value(&message) {
@@ -584,7 +770,10 @@ fn parse_binance_stream_event_value(message: &Value) -> BinanceStreamEvent {
     }
 }
 
-fn parse_binance_order_update(message: &Value) -> Option<BinanceOrderUpdate> {
+pub(crate) fn parse_futures_order_update(
+    message: &Value,
+    exchange: Exchange,
+) -> Option<FuturesOrderUpdate> {
     (message.get("e").and_then(Value::as_str) == Some("ORDER_TRADE_UPDATE")).then_some(())?;
     let row = message.get("o")?;
     let symbol = row.get("s")?.as_str()?.to_ascii_uppercase();
@@ -681,7 +870,7 @@ fn parse_binance_order_update(message: &Value) -> Option<BinanceOrderUpdate> {
             || price <= Decimal::ZERO
             || quantity <= Decimal::ZERO
             || quote_quantity <= Decimal::ZERO
-            || raw_commission < Decimal::ZERO
+            || (exchange == Exchange::Binance && raw_commission < Decimal::ZERO)
             || commission_asset.is_empty()
             || !commission_asset
                 .bytes()
@@ -698,7 +887,11 @@ fn parse_binance_order_update(message: &Value) -> Option<BinanceOrderUpdate> {
             quantity,
             quote_quantity,
             raw_commission,
-            commission_cost: raw_commission,
+            commission_cost: if exchange == Exchange::Aster {
+                raw_commission.abs()
+            } else {
+                raw_commission
+            },
             commission_asset,
             realized_profit,
             is_maker,
@@ -707,11 +900,11 @@ fn parse_binance_order_update(message: &Value) -> Option<BinanceOrderUpdate> {
     } else {
         None
     };
-    Some(BinanceOrderUpdate {
+    Some(FuturesOrderUpdate {
         order: AuthoritativeOrder {
             client_order_id,
             exchange_order_id,
-            exchange: Exchange::Binance,
+            exchange,
             shape,
             lifecycle,
             executed_quantity: Some(cumulative_quantity),
@@ -729,13 +922,18 @@ pub(crate) fn spawn_bybit_execution_stream(
     api_key: Zeroizing<String>,
     api_secret: Zeroizing<String>,
     lifetime: Weak<()>,
+    execution_cache: BybitExecutionCache,
 ) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("Bybit execution stream was not started outside a Tokio runtime");
         return;
     };
     runtime.spawn(run_bybit_execution_stream(
-        testnet, api_key, api_secret, lifetime,
+        testnet,
+        api_key,
+        api_secret,
+        lifetime,
+        execution_cache,
     ));
 }
 
@@ -745,6 +943,7 @@ pub(crate) fn spawn_bybit_execution_stream(
     _api_key: Zeroizing<String>,
     _api_secret: Zeroizing<String>,
     _lifetime: Weak<()>,
+    _execution_cache: BybitExecutionCache,
 ) {
 }
 
@@ -754,6 +953,7 @@ async fn run_bybit_execution_stream(
     api_key: Zeroizing<String>,
     api_secret: Zeroizing<String>,
     lifetime: Weak<()>,
+    execution_cache: BybitExecutionCache,
 ) {
     let websocket_url = if testnet {
         "wss://stream-testnet.bybit.com/v5/private"
@@ -789,19 +989,23 @@ async fn run_bybit_execution_stream(
             reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX);
             continue;
         }
-        let subscription = json!({"op":"subscribe","args":["execution.fast"]});
+        let subscription = json!({
+            "op":"subscribe",
+            "args":["execution.fast.linear", "execution.linear", "order.linear"]
+        });
         if socket
             .send(Message::Text(subscription.to_string().into()))
             .await
             .is_err()
             || !await_bybit_ack(&mut socket, "subscribe").await
         {
-            tracing::warn!("Bybit fast execution subscription failed");
+            tracing::warn!("Bybit private execution subscriptions failed");
             tokio::time::sleep(reconnect_delay).await;
             reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX);
             continue;
         }
-        tracing::info!("Bybit fast execution stream connected");
+        tracing::info!("Bybit fast execution, full execution, and order streams connected");
+        execution_cache.begin_session();
         reconnect_delay = RECONNECT_MIN;
         let mut heartbeat = tokio::time::interval(BYBIT_HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -814,10 +1018,12 @@ async fn run_bybit_execution_stream(
                 message = socket.next() => {
                     let Some(message) = message else { break };
                     match message {
-                        Ok(Message::Text(text)) => publish_bybit_message(text.as_ref()),
+                        Ok(Message::Text(text)) => {
+                            publish_bybit_message(text.as_ref(), &execution_cache)
+                        }
                         Ok(Message::Binary(bytes)) => {
                             if let Ok(text) = std::str::from_utf8(bytes.as_ref()) {
-                                publish_bybit_message(text);
+                                publish_bybit_message(text, &execution_cache);
                             }
                         }
                         Ok(Message::Ping(payload)) => {
@@ -849,7 +1055,8 @@ async fn run_bybit_execution_stream(
                 }
             }
         }
-        tracing::warn!("Bybit fast execution stream disconnected; REST fallback remains active");
+        execution_cache.begin_session();
+        tracing::warn!("Bybit execution stream disconnected; REST fallback remains active");
         tokio::time::sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX);
     }
@@ -879,10 +1086,69 @@ where
 }
 
 #[cfg(not(test))]
-fn publish_bybit_message(text: &str) {
+fn publish_bybit_message(text: &str, execution_cache: &BybitExecutionCache) {
+    if let Ok(message) = serde_json::from_str::<Value>(text) {
+        for header in parse_bybit_order_updates(&message) {
+            execution_cache.apply_order(header);
+        }
+        for (client_order_id, trade) in parse_bybit_trade_updates(&message) {
+            execution_cache.apply_trade(&client_order_id, trade);
+        }
+    }
     for (symbol, order_id, event_time) in parse_bybit_execution_events(text) {
         publish_execution_wakeup(Exchange::Bybit, &symbol, Some(order_id), event_time);
     }
+}
+
+fn parse_bybit_order_updates(message: &Value) -> Vec<OrderExecutionHeader> {
+    let topic = message.get("topic").and_then(Value::as_str);
+    if !topic.is_some_and(|topic| topic == "order.linear" || topic == "order") {
+        return Vec::new();
+    }
+    message
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("category").and_then(Value::as_str) == Some("linear"))
+        .filter_map(|row| {
+            let symbol = row.get("symbol")?.as_str()?.to_ascii_uppercase();
+            let client_order_id = ClientOrderId::parse(row.get("orderLinkId")?.as_str()?).ok()?;
+            let exchange_order_id = value_identifier(row.get("orderId"))?;
+            parse_order_row(row, &symbol, &client_order_id, Some(&exchange_order_id)).ok()
+        })
+        .collect()
+}
+
+fn parse_bybit_trade_updates(message: &Value) -> Vec<(ClientOrderId, TradeFill)> {
+    let topic = message.get("topic").and_then(Value::as_str);
+    if !topic.is_some_and(|topic| topic == "execution.linear" || topic == "execution") {
+        return Vec::new();
+    }
+    message
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("category").and_then(Value::as_str) == Some("linear"))
+        .filter_map(|row| {
+            let symbol = row.get("symbol")?.as_str()?.to_ascii_uppercase();
+            let client_order_id = ClientOrderId::parse(row.get("orderLinkId")?.as_str()?).ok()?;
+            let exchange_order_id = value_identifier(row.get("orderId"))?;
+            let body = json!({
+                "retCode": 0,
+                "result": {
+                    "category": "linear",
+                    "nextPageCursor": "",
+                    "list": [row]
+                }
+            })
+            .to_string();
+            let mut page =
+                parse_execution_page(&body, &symbol, &client_order_id, &exchange_order_id).ok()?;
+            (page.trades.len() == 1).then(|| (client_order_id, page.trades.remove(0)))
+        })
+        .collect()
 }
 
 fn parse_bybit_execution_events(text: &str) -> Vec<(String, String, Option<u64>)> {
@@ -1022,12 +1288,12 @@ mod tests {
 
     #[test]
     fn binance_builds_an_exact_snapshot_only_after_observing_new_and_fill() {
-        let cache = BinanceExecutionCache::default();
+        let cache = FuturesExecutionCache::default();
         let new = serde_json::from_str::<Value>(
             r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"3.14","p":"15.92","x":"NEW","X":"NEW","i":42,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
         )
         .unwrap();
-        cache.apply(parse_binance_order_update(&new).unwrap());
+        cache.apply(parse_futures_order_update(&new, Exchange::Binance).unwrap());
         let client_order_id = ClientOrderId::parse("r_run_0_B_1").unwrap();
         assert!(cache.knows_order("MUUSDT", "42"));
         assert!(cache.snapshot("MUUSDT", &client_order_id, "42").is_none());
@@ -1036,7 +1302,7 @@ mod tests {
             r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"3.14","p":"15.92","x":"TRADE","X":"FILLED","i":42,"l":"3.14","z":"3.14","L":"15.92","N":"USDT","n":"0.00999776","R":true,"T":1010,"t":7,"m":true,"rp":"0"}}"#,
         )
         .unwrap();
-        cache.apply(parse_binance_order_update(&filled).unwrap());
+        cache.apply(parse_futures_order_update(&filled, Exchange::Binance).unwrap());
         let snapshot = cache.snapshot("MUUSDT", &client_order_id, "42").unwrap();
         assert_eq!(snapshot.cumulative_quantity, "3.14".parse().unwrap());
         assert_eq!(snapshot.cumulative_quote, "49.9888".parse().unwrap());
@@ -1051,7 +1317,7 @@ mod tests {
 
     #[test]
     fn binance_accumulates_partial_fills_and_deduplicates_trade_ids() {
-        let cache = BinanceExecutionCache::default();
+        let cache = FuturesExecutionCache::default();
         for text in [
             r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"NEW","X":"NEW","i":43,"l":"0","z":"0","L":"0","R":false,"T":1000}}"#,
             r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"TRADE","X":"PARTIALLY_FILLED","i":43,"l":"1","z":"1","L":"16","N":"USDT","n":"0.0032","R":false,"T":1010,"t":8,"m":true,"rp":"0"}}"#,
@@ -1059,7 +1325,7 @@ mod tests {
             r#"{"e":"ORDER_TRADE_UPDATE","E":1020,"T":1020,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"TRADE","X":"FILLED","i":43,"l":"2","z":"3","L":"16","N":"USDT","n":"0.0064","R":false,"T":1020,"t":9,"m":true,"rp":"0"}}"#,
         ] {
             let message = serde_json::from_str::<Value>(text).unwrap();
-            cache.apply(parse_binance_order_update(&message).unwrap());
+            cache.apply(parse_futures_order_update(&message, Exchange::Binance).unwrap());
         }
         let snapshot = cache
             .snapshot(
@@ -1076,12 +1342,12 @@ mod tests {
 
     #[test]
     fn binance_never_fast_paths_an_order_whose_new_event_was_not_observed() {
-        let cache = BinanceExecutionCache::default();
+        let cache = FuturesExecutionCache::default();
         let filled = serde_json::from_str::<Value>(
             r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"TRADE","X":"FILLED","i":44,"l":"1","z":"1","L":"15.92","N":"USDT","n":"0.003184","R":true,"T":1010,"t":10,"m":true,"rp":"0"}}"#,
         )
         .unwrap();
-        cache.apply(parse_binance_order_update(&filled).unwrap());
+        cache.apply(parse_futures_order_update(&filled, Exchange::Binance).unwrap());
         assert!(!cache.knows_order("MUUSDT", "44"));
         assert!(
             cache
@@ -1096,12 +1362,12 @@ mod tests {
 
     #[test]
     fn binance_reconnect_invalidates_all_session_local_snapshots() {
-        let cache = BinanceExecutionCache::default();
+        let cache = FuturesExecutionCache::default();
         let new = serde_json::from_str::<Value>(
             r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"NEW","X":"NEW","i":45,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
         )
         .unwrap();
-        cache.apply(parse_binance_order_update(&new).unwrap());
+        cache.apply(parse_futures_order_update(&new, Exchange::Binance).unwrap());
         assert!(cache.knows_order("MUUSDT", "45"));
         cache.begin_session();
         assert!(!cache.knows_order("MUUSDT", "45"));
@@ -1116,5 +1382,79 @@ mod tests {
             events,
             vec![("MUUSDT".to_owned(), "42".to_owned(), Some(456))]
         );
+    }
+
+    #[test]
+    fn aster_uses_signed_commission_cost_and_preserves_exchange_identity() {
+        let message = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"ANSEMUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"100","p":"0.38","x":"TRADE","X":"FILLED","i":42,"l":"100","z":"100","L":"0.38","N":"USDT","n":"-0.0076","R":true,"T":1010,"t":7,"m":true,"rp":"0"}}"#,
+        )
+        .unwrap();
+        let update = parse_futures_order_update(&message, Exchange::Aster).unwrap();
+        assert_eq!(update.order.exchange, Exchange::Aster);
+        let trade = update.trade.unwrap();
+        assert_eq!(trade.raw_commission, "-0.0076".parse().unwrap());
+        assert_eq!(trade.commission_cost, "0.0076".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bybit_builds_exact_snapshot_from_order_and_execution_streams() {
+        let cache = BybitExecutionCache::default();
+        cache.begin_session();
+        let client_order_id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        let new_message = json!({
+            "topic": "order.linear",
+            "data": [{
+                "category": "linear", "symbol": "MUUSDT", "orderId": "42",
+                "orderLinkId": client_order_id.as_str(), "positionIdx": 0,
+                "side": "Buy", "orderType": "Limit", "qty": "3.14",
+                "price": "15.92", "timeInForce": "GTC", "reduceOnly": true,
+                "orderStatus": "New", "cumExecQty": "0", "cumExecValue": "0",
+                "createdTime": "1000", "updatedTime": "1000"
+            }]
+        });
+        for header in parse_bybit_order_updates(&new_message) {
+            cache.apply_order(header);
+        }
+        let execution_message = json!({
+            "topic": "execution.linear",
+            "data": [{
+                "category": "linear", "symbol": "MUUSDT", "orderId": "42",
+                "orderLinkId": client_order_id.as_str(), "execType": "Trade",
+                "execId": "trade-7", "execPrice": "15.92", "execQty": "3.14",
+                "execValue": "49.9888", "execFee": "0.00999776",
+                "execTime": "1010", "feeCurrency": "USDT", "execPnl": "0",
+                "side": "Buy", "isMaker": true
+            }]
+        });
+        for (observed_client_order_id, trade) in parse_bybit_trade_updates(&execution_message) {
+            cache.apply_trade(&observed_client_order_id, trade);
+        }
+        let filled_message = json!({
+            "topic": "order.linear",
+            "data": [{
+                "category": "linear", "symbol": "MUUSDT", "orderId": "42",
+                "orderLinkId": client_order_id.as_str(), "positionIdx": 0,
+                "side": "Buy", "orderType": "Limit", "qty": "3.14",
+                "price": "15.92", "timeInForce": "GTC", "reduceOnly": true,
+                "orderStatus": "Filled", "cumExecQty": "3.14",
+                "cumExecValue": "49.9888", "createdTime": "1000",
+                "updatedTime": "1010"
+            }]
+        });
+        for header in parse_bybit_order_updates(&filled_message) {
+            cache.apply_order(header);
+        }
+        let snapshot = cache
+            .wait_snapshot("MUUSDT", &client_order_id, "42", Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.cumulative_quantity, "3.14".parse().unwrap());
+        assert_eq!(snapshot.cumulative_quote, "49.9888".parse().unwrap());
+        assert_eq!(
+            snapshot.fees_by_asset["USDT"],
+            "0.00999776".parse().unwrap()
+        );
+        assert_eq!(snapshot.trades.len(), 1);
     }
 }

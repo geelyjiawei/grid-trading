@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     sync::{Arc, Weak},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ use crate::{
             HttpMethod, HttpResponse, HttpTransport, MillisecondClock, Parameters,
             PreparedHttpRequest, encode_parameters,
         },
+        realtime::BybitExecutionCache,
     },
 };
 
@@ -46,6 +48,7 @@ const OPEN_ORDER_PAGE_LIMIT: usize = 50;
 const MAX_OPEN_ORDER_PAGES: usize = 100;
 const ORDER_HISTORY_PAGE_LIMIT: usize = 50;
 const MAX_ORDER_HISTORY_PAGES: usize = 20;
+const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(50);
 
 pub trait BybitRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, BybitSignatureError>;
@@ -108,6 +111,7 @@ pub struct BybitAdapter<T, S, C> {
     base_url: String,
     recv_window_ms: u64,
     realtime_lifetime: Arc<()>,
+    realtime_execution_cache: BybitExecutionCache,
 }
 
 impl<T, S, C> BybitAdapter<T, S, C> {
@@ -134,11 +138,16 @@ impl<T, S, C> BybitAdapter<T, S, C> {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             recv_window_ms: 5_000,
             realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
+            realtime_execution_cache: BybitExecutionCache::default(),
         }
     }
 
     pub(crate) fn realtime_lifetime(&self) -> Weak<()> {
         Arc::downgrade(&self.realtime_lifetime)
+    }
+
+    pub(crate) fn realtime_execution_cache(&self) -> BybitExecutionCache {
+        self.realtime_execution_cache.clone()
     }
 
     pub fn set_recv_window_ms(&mut self, recv_window_ms: u64) {
@@ -848,6 +857,23 @@ where
             return Err(execution_error("exchange order ID is required"));
         }
         let symbol = symbol.to_ascii_uppercase();
+        if let Some(snapshot) = self
+            .realtime_execution_cache
+            .wait_snapshot(
+                &symbol,
+                client_order_id,
+                exchange_order_id,
+                REALTIME_EXECUTION_SNAPSHOT_WAIT,
+            )
+            .await
+        {
+            tracing::info!(
+                symbol = symbol.as_str(),
+                exchange_order_id,
+                "using Bybit realtime execution snapshot"
+            );
+            return Ok(snapshot);
+        }
         let header = self
             .load_order_record(&symbol, client_order_id, Some(exchange_order_id))
             .await

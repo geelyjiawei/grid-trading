@@ -21,7 +21,9 @@ use crate::{
         OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
         OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
         PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
-        aster::{AsterAdapter, AsterSignatureError, LocalEip712Signer},
+        aster::{
+            AsterAdapter, AsterSignatureError, LocalEip712Signer, spawn_aster_execution_stream,
+        },
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
         protocol::{
@@ -35,7 +37,8 @@ use crate::{
 
 type BinanceGateway =
     BinanceAdapter<BinanceRequestGovernor<ReqwestTransport>, HmacSha256Signer, SystemClock>;
-type AsterGateway = AsterAdapter<ReqwestTransport, LocalEip712Signer, MonotonicMicrosecondNonce>;
+type AsterGateway =
+    AsterAdapter<ReqwestTransport, LocalEip712Signer, Arc<MonotonicMicrosecondNonce>>;
 type BybitGateway = BybitAdapter<ReqwestTransport, BybitHmacSha256Signer, SystemClock>;
 type TradeXyzGateway =
     TradeXyzAdapter<HyperliquidRequestGovernor<ReqwestTransport>, MonotonicMillisecondNonce>;
@@ -316,18 +319,37 @@ impl ExchangeGatewayFactory {
                 ConfiguredExchangeGateway::Binance(adapter)
             }
             ExchangeCredentials::Aster { private_key } => {
+                let nonce = Arc::new(MonotonicMicrosecondNonce::default());
                 let adapter = match self.environment {
                     ExchangeEnvironment::Production => AsterAdapter::production_wallet(
                         self.transport.clone(),
-                        MonotonicMicrosecondNonce::default(),
+                        Arc::clone(&nonce),
                         private_key.as_str(),
                     )?,
                     ExchangeEnvironment::Testnet => AsterAdapter::testnet_wallet(
                         self.transport.clone(),
-                        MonotonicMicrosecondNonce::default(),
+                        Arc::clone(&nonce),
                         private_key.as_str(),
                     )?,
                 };
+                let stream_adapter = match self.environment {
+                    ExchangeEnvironment::Production => AsterAdapter::production_wallet(
+                        self.transport.clone(),
+                        Arc::clone(&nonce),
+                        private_key.as_str(),
+                    )?,
+                    ExchangeEnvironment::Testnet => AsterAdapter::testnet_wallet(
+                        self.transport.clone(),
+                        Arc::clone(&nonce),
+                        private_key.as_str(),
+                    )?,
+                };
+                spawn_aster_execution_stream(
+                    self.environment == ExchangeEnvironment::Testnet,
+                    stream_adapter,
+                    adapter.realtime_lifetime(),
+                    adapter.realtime_execution_cache(),
+                );
                 ConfiguredExchangeGateway::Aster(adapter)
             }
             ExchangeCredentials::Bybit {
@@ -356,6 +378,7 @@ impl ExchangeGatewayFactory {
                     stream_api_key,
                     stream_api_secret,
                     adapter.realtime_lifetime(),
+                    adapter.realtime_execution_cache(),
                 );
                 ConfiguredExchangeGateway::Bybit(adapter)
             }

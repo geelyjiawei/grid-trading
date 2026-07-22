@@ -318,7 +318,7 @@ pub(super) fn parse_order_history_page(
     })
 }
 
-fn parse_order_row(
+pub(super) fn parse_order_row(
     row: &Value,
     expected_symbol: &str,
     expected_client_order_id: &ClientOrderId,

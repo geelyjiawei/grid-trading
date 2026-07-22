@@ -37,7 +37,7 @@ use crate::{
             BINANCE_LOCAL_COOLDOWN_CODE, HttpMethod, HttpTransport, MillisecondClock, Parameters,
             PreparedHttpRequest, encode_parameters,
         },
-        realtime::BinanceExecutionCache,
+        realtime::FuturesExecutionCache,
     },
 };
 
@@ -290,7 +290,7 @@ pub struct BinanceAdapter<T, S, C> {
     base_url: String,
     recv_window_ms: u64,
     realtime_lifetime: Arc<()>,
-    realtime_execution_cache: BinanceExecutionCache,
+    realtime_execution_cache: FuturesExecutionCache,
 }
 
 impl<T, S, C> BinanceAdapter<T, S, C> {
@@ -317,7 +317,7 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             recv_window_ms: 5_000,
             realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
-            realtime_execution_cache: BinanceExecutionCache::default(),
+            realtime_execution_cache: FuturesExecutionCache::default(),
         }
     }
 
@@ -325,7 +325,7 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
         Arc::downgrade(&self.realtime_lifetime)
     }
 
-    pub(crate) fn realtime_execution_cache(&self) -> BinanceExecutionCache {
+    pub(crate) fn realtime_execution_cache(&self) -> FuturesExecutionCache {
         self.realtime_execution_cache.clone()
     }
 

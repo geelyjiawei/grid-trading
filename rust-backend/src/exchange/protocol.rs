@@ -16,6 +16,7 @@ pub type Parameters = Vec<(String, String)>;
 pub enum HttpMethod {
     Get,
     Post,
+    Put,
     Delete,
 }
 
@@ -892,6 +893,7 @@ impl ReqwestTransport {
         let method = match request.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Put => reqwest::Method::PUT,
             HttpMethod::Delete => reqwest::Method::DELETE,
         };
         let mut builder = self.client.request(method, request.url());
@@ -983,6 +985,15 @@ pub trait MillisecondClock: Send + Sync {
 
 pub trait NonceSource: Send + Sync {
     fn next_nonce(&self) -> u64;
+}
+
+impl<T> NonceSource for Arc<T>
+where
+    T: NonceSource + ?Sized,
+{
+    fn next_nonce(&self) -> u64 {
+        (**self).next_nonce()
+    }
 }
 
 #[derive(Debug, Default)]

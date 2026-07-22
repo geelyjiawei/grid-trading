@@ -1,7 +1,21 @@
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
+#[cfg(not(test))]
+use std::collections::{BTreeSet, VecDeque};
+
 use async_trait::async_trait;
+#[cfg(not(test))]
+use futures::{SinkExt, StreamExt};
 use k256::ecdsa::SigningKey;
+#[cfg(not(test))]
+use serde_json::Value;
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
+#[cfg(not(test))]
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -32,6 +46,7 @@ use crate::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
             encode_parameters,
         },
+        realtime::FuturesExecutionCache,
     },
 };
 
@@ -45,6 +60,15 @@ const TRADE_PAGE_LIMIT: usize = 1_000;
 const MAX_TRADE_HISTORY_QUERIES: usize = 64;
 const TRADE_PROBE_PADDING_MS: u64 = 5 * 60 * 1_000;
 const TRADE_WINDOW_LIMIT_MS: u64 = (7 * 24 * 60 * 60 * 1_000) - 1;
+const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const ASTER_EXECUTION_DEDUPE_CAPACITY: usize = 4_096;
+#[cfg(not(test))]
+const ASTER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+#[cfg(not(test))]
+const ASTER_RECONNECT_MIN: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const ASTER_RECONNECT_MAX: Duration = Duration::from_secs(15);
 
 pub trait AsterMessageSigner: Send + Sync {
     fn signer_address(&self) -> &str;
@@ -254,6 +278,8 @@ pub struct AsterAdapter<T, S, N> {
     nonce_source: N,
     user_address: String,
     base_url: String,
+    realtime_lifetime: Arc<()>,
+    realtime_execution_cache: FuturesExecutionCache,
 }
 
 impl<T, S, N> AsterAdapter<T, S, N> {
@@ -300,7 +326,17 @@ impl<T, S, N> AsterAdapter<T, S, N> {
             nonce_source,
             user_address: user_address.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
+            realtime_execution_cache: FuturesExecutionCache::default(),
         }
+    }
+
+    pub(crate) fn realtime_lifetime(&self) -> Weak<()> {
+        Arc::downgrade(&self.realtime_lifetime)
+    }
+
+    pub(crate) fn realtime_execution_cache(&self) -> FuturesExecutionCache {
+        self.realtime_execution_cache.clone()
     }
 
     fn public_request(&self, path: &str, parameters: Parameters) -> PreparedHttpRequest {
@@ -343,6 +379,250 @@ impl<T, N> AsterAdapter<T, LocalEip712Signer, N> {
     }
 }
 
+#[cfg(not(test))]
+pub(crate) fn spawn_aster_execution_stream<T, S, N>(
+    testnet: bool,
+    adapter: AsterAdapter<T, S, N>,
+    lifetime: Weak<()>,
+    execution_cache: FuturesExecutionCache,
+) where
+    T: HttpTransport + 'static,
+    S: AsterMessageSigner + 'static,
+    N: NonceSource + 'static,
+{
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("Aster user execution stream was not started outside a Tokio runtime");
+        return;
+    };
+    runtime.spawn(run_aster_execution_stream(
+        testnet,
+        adapter,
+        lifetime,
+        execution_cache,
+    ));
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_aster_execution_stream<T, S, N>(
+    _testnet: bool,
+    _adapter: AsterAdapter<T, S, N>,
+    _lifetime: Weak<()>,
+    _execution_cache: FuturesExecutionCache,
+) {
+}
+
+#[cfg(not(test))]
+async fn run_aster_execution_stream<T, S, N>(
+    testnet: bool,
+    adapter: AsterAdapter<T, S, N>,
+    lifetime: Weak<()>,
+    execution_cache: FuturesExecutionCache,
+) where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    let mut reconnect_delay = ASTER_RECONNECT_MIN;
+    while lifetime.upgrade().is_some() {
+        let listen_key = match aster_listen_key(&adapter).await {
+            Ok(listen_key) => listen_key,
+            Err(error) => {
+                tracing::warn!(error, "Aster user execution listen key failed");
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = (reconnect_delay * 2).min(ASTER_RECONNECT_MAX);
+                continue;
+            }
+        };
+        let stream_url = aster_user_stream_url(testnet, &listen_key);
+        let (mut socket, _) = match connect_async(&stream_url).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::warn!(error = %error, "Aster user execution stream connection failed");
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = (reconnect_delay * 2).min(ASTER_RECONNECT_MAX);
+                continue;
+            }
+        };
+        tracing::info!(
+            stream = if testnet { "testnet" } else { "private" },
+            "Aster user execution stream connected"
+        );
+        execution_cache.begin_session();
+        reconnect_delay = ASTER_RECONNECT_MIN;
+        let mut recent = RecentAsterExecutions::default();
+        let mut keepalive = tokio::time::interval(ASTER_KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        keepalive.tick().await;
+        loop {
+            tokio::select! {
+                message = socket.next() => {
+                    let Some(message) = message else { break };
+                    match message {
+                        Ok(Message::Text(text)) => {
+                            if publish_aster_message(text.as_ref(), &execution_cache, &mut recent) {
+                                break;
+                            }
+                        }
+                        Ok(Message::Binary(bytes)) => {
+                            if let Ok(text) = std::str::from_utf8(bytes.as_ref())
+                                && publish_aster_message(text, &execution_cache, &mut recent)
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Aster user execution stream read failed");
+                            break;
+                        }
+                        Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if let Err(error) = aster_keepalive(&adapter).await {
+                        tracing::warn!(error, "Aster user execution listen key keepalive failed");
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    if lifetime.upgrade().is_none() {
+                        return;
+                    }
+                }
+            }
+        }
+        execution_cache.begin_session();
+        tracing::warn!("Aster user execution stream disconnected; REST fallback remains active");
+        tokio::time::sleep(reconnect_delay).await;
+        reconnect_delay = (reconnect_delay * 2).min(ASTER_RECONNECT_MAX);
+    }
+}
+
+fn aster_user_stream_url(testnet: bool, listen_key: &str) -> String {
+    let base = if testnet {
+        "wss://fstream.asterdex-testnet.com"
+    } else {
+        "wss://fstream.asterdex.com"
+    };
+    format!("{base}/ws/{listen_key}")
+}
+
+#[cfg(not(test))]
+async fn aster_listen_key<T, S, N>(adapter: &AsterAdapter<T, S, N>) -> Result<String, String>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    let request = adapter
+        .signed_request(HttpMethod::Post, "/fapi/v3/listenKey", vec![])
+        .map_err(|error| error.to_string())?;
+    let response = adapter
+        .transport
+        .execute(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("HTTP {}", response.status));
+    }
+    serde_json::from_str::<Value>(&response.body)
+        .ok()
+        .and_then(|value| value.get("listenKey")?.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "listen key response is invalid".to_owned())
+}
+
+#[cfg(not(test))]
+async fn aster_keepalive<T, S, N>(adapter: &AsterAdapter<T, S, N>) -> Result<(), String>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    let request = adapter
+        .signed_request(HttpMethod::Put, "/fapi/v3/listenKey", vec![])
+        .map_err(|error| error.to_string())?;
+    let response = adapter
+        .transport
+        .execute(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    if (200..300).contains(&response.status) {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", response.status))
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Default)]
+struct RecentAsterExecutions {
+    order: VecDeque<(String, String, String)>,
+    keys: BTreeSet<(String, String, String)>,
+}
+
+#[cfg(not(test))]
+impl RecentAsterExecutions {
+    fn insert(&mut self, symbol: &str, order_id: &str, trade_id: &str) -> bool {
+        let key = (symbol.to_owned(), order_id.to_owned(), trade_id.to_owned());
+        if !self.keys.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > ASTER_EXECUTION_DEDUPE_CAPACITY {
+            if let Some(expired) = self.order.pop_front() {
+                self.keys.remove(&expired);
+            }
+        }
+        true
+    }
+}
+
+#[cfg(not(test))]
+fn publish_aster_message(
+    text: &str,
+    execution_cache: &FuturesExecutionCache,
+    recent: &mut RecentAsterExecutions,
+) -> bool {
+    use crate::exchange::realtime::parse_futures_order_update;
+
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if message.get("e").and_then(Value::as_str) == Some("listenKeyExpired") {
+        return true;
+    }
+    let Some(update) = parse_futures_order_update(&message, Exchange::Aster) else {
+        return false;
+    };
+    let wakeup = update.trade.as_ref().and_then(|trade| {
+        recent
+            .insert(&trade.symbol, &trade.exchange_order_id, &trade.trade_id)
+            .then(|| {
+                (
+                    trade.symbol.clone(),
+                    trade.exchange_order_id.clone(),
+                    update.update_time_ms,
+                )
+            })
+    });
+    execution_cache.apply(update);
+    if let Some((symbol, order_id, event_time_ms)) = wakeup {
+        crate::exchange::realtime::publish_execution_wakeup(
+            Exchange::Aster,
+            &symbol,
+            Some(order_id),
+            Some(event_time_ms),
+        );
+    }
+    false
+}
+
 impl<T, S, N> AsterAdapter<T, S, N>
 where
     S: AsterMessageSigner,
@@ -371,7 +651,7 @@ where
 
         let (query, body) = match method {
             HttpMethod::Get => (parameters, vec![]),
-            HttpMethod::Post | HttpMethod::Delete => (vec![], parameters),
+            HttpMethod::Post | HttpMethod::Put | HttpMethod::Delete => (vec![], parameters),
         };
         Ok(PreparedHttpRequest {
             method,
@@ -820,6 +1100,23 @@ where
             return Err(execution_error("exchange order ID is required"));
         }
         let symbol = symbol.to_ascii_uppercase();
+        if let Some(snapshot) = self
+            .realtime_execution_cache
+            .wait_snapshot(
+                &symbol,
+                client_order_id,
+                exchange_order_id,
+                REALTIME_EXECUTION_SNAPSHOT_WAIT,
+            )
+            .await
+        {
+            tracing::info!(
+                symbol = symbol.as_str(),
+                exchange_order_id,
+                "using Aster realtime execution snapshot"
+            );
+            return Ok(snapshot);
+        }
         let detail_request = self
             .signed_request(
                 HttpMethod::Get,
@@ -1089,6 +1386,18 @@ mod tests {
         fn next_nonce(&self) -> u64 {
             self.0
         }
+    }
+
+    #[test]
+    fn official_user_stream_urls_are_environment_scoped() {
+        assert_eq!(
+            aster_user_stream_url(false, "listen-key"),
+            "wss://fstream.asterdex.com/ws/listen-key"
+        );
+        assert_eq!(
+            aster_user_stream_url(true, "listen-key"),
+            "wss://fstream.asterdex-testnet.com/ws/listen-key"
+        );
     }
 
     #[derive(Clone)]
