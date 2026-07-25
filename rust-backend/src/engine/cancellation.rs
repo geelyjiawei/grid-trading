@@ -553,7 +553,7 @@ mod tests {
     async fn batch_cancellation_dispatches_once_and_persists_twice_for_many_orders() {
         let mut store = MemoryOrderIntentStore::default();
         let mut targets = Vec::new();
-        for index in 0..3 {
+        for index in 0..53 {
             let client_order_id = ClientOrderId::parse(format!("g_{index}_S_batch")).unwrap();
             let exchange_order_id = format!("exchange-{index}");
             let intent = OrderIntent::prepare(
@@ -608,7 +608,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(results.len(), 3);
+        assert_eq!(results.len(), 53);
         assert!(
             results
                 .iter()

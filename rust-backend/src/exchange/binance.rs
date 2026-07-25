@@ -1638,7 +1638,7 @@ mod tests {
     #[tokio::test]
     async fn batch_cancellation_uses_exact_ids_and_splits_at_the_official_limit() {
         let transport = MockTransport::default();
-        let targets = (0..12)
+        let targets = (0..53)
             .map(|index| OrderCancellationTarget {
                 client_order_id: ClientOrderId::parse(format!("g_{index}_S_batch")).unwrap(),
                 exchange_order_id: (100 + index).to_string(),
@@ -1672,7 +1672,7 @@ mod tests {
 
         assert_eq!(results.len(), targets.len());
         assert!(results.iter().all(Result::is_ok));
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 6);
         assert!(requests.iter().all(|request| {
             request.method == HttpMethod::Delete && request.path == "/fapi/v1/batchOrders"
         }));
@@ -1685,13 +1685,131 @@ mod tests {
             Some("[100,101,102,103,104,105,106,107,108,109]")
         );
         assert_eq!(
-            requests[1]
+            requests[5]
                 .query
                 .iter()
                 .find(|(key, _)| key == "orderIdList")
                 .map(|(_, value)| value.as_str()),
-            Some("[110,111]")
+            Some("[150,151,152]")
         );
+    }
+
+    #[tokio::test]
+    async fn batch_cancellation_keeps_exact_results_when_one_middle_chunk_times_out() {
+        let transport = MockTransport::default();
+        let targets = (0..21)
+            .map(|index| OrderCancellationTarget {
+                client_order_id: ClientOrderId::parse(format!("g_{index}_S_timeout")).unwrap(),
+                exchange_order_id: (200 + index).to_string(),
+            })
+            .collect::<Vec<_>>();
+        for (chunk_index, chunk) in targets.chunks(MAX_BATCH_CANCELLATIONS).enumerate() {
+            let response = if chunk_index == 1 {
+                Err(TransportError::Timeout("middle batch timed out".into()))
+            } else {
+                let body = chunk
+                    .iter()
+                    .map(|target| {
+                        serde_json::json!({
+                            "orderId": target.exchange_order_id.parse::<u64>().unwrap(),
+                            "clientOrderId": target.client_order_id.as_str(),
+                            "status": "CANCELED"
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_string(&body).unwrap(),
+                })
+            };
+            transport.responses.lock().unwrap().push_back(response);
+        }
+
+        let results = adapter(transport.clone())
+            .cancel_orders(Exchange::Binance, "MUUSDT", &targets)
+            .await;
+
+        assert_eq!(transport.all_requests().len(), 3);
+        assert!(results[..10].iter().all(Result::is_ok));
+        assert!(
+            results[10..20]
+                .iter()
+                .all(|result| matches!(result, Err(CancellationError::Unknown { .. })))
+        );
+        assert!(results[20].is_ok());
+    }
+
+    #[tokio::test]
+    async fn incomplete_batch_cancellation_response_never_claims_any_order_was_cancelled() {
+        let targets = (0..10)
+            .map(|index| OrderCancellationTarget {
+                client_order_id: ClientOrderId::parse(format!("g_{index}_S_incomplete")).unwrap(),
+                exchange_order_id: (300 + index).to_string(),
+            })
+            .collect::<Vec<_>>();
+        let incomplete = targets[..9]
+            .iter()
+            .map(|target| {
+                serde_json::json!({
+                    "orderId": target.exchange_order_id.parse::<u64>().unwrap(),
+                    "clientOrderId": target.client_order_id.as_str(),
+                    "status": "CANCELED"
+                })
+            })
+            .collect::<Vec<_>>();
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: serde_json::to_string(&incomplete).unwrap(),
+        }));
+
+        let results = adapter(transport)
+            .cancel_orders(Exchange::Binance, "MUUSDT", &targets)
+            .await;
+
+        assert_eq!(results.len(), targets.len());
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(CancellationError::Unknown { .. })))
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_cancellation_response_preserves_each_exact_outcome() {
+        let targets = (0..3)
+            .map(|index| OrderCancellationTarget {
+                client_order_id: ClientOrderId::parse(format!("g_{index}_S_mixed")).unwrap(),
+                exchange_order_id: (400 + index).to_string(),
+            })
+            .collect::<Vec<_>>();
+        let body = serde_json::json!([
+            {
+                "orderId": 400,
+                "clientOrderId": "g_0_S_mixed",
+                "status": "CANCELED"
+            },
+            {
+                "code": -2011,
+                "msg": "Unknown order sent."
+            },
+            {
+                "orderId": 402,
+                "clientOrderId": "g_2_S_mixed",
+                "status": "CANCELED"
+            }
+        ]);
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: serde_json::to_string(&body).unwrap(),
+        }));
+
+        let results = adapter(transport)
+            .cancel_orders(Exchange::Binance, "MUUSDT", &targets)
+            .await;
+
+        assert!(results[0].is_ok());
+        assert!(matches!(results[1], Err(CancellationError::Unknown { .. })));
+        assert!(results[2].is_ok());
     }
 
     #[tokio::test]
