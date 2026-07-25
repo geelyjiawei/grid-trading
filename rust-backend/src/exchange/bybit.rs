@@ -48,7 +48,7 @@ const OPEN_ORDER_PAGE_LIMIT: usize = 50;
 const MAX_OPEN_ORDER_PAGES: usize = 100;
 const ORDER_HISTORY_PAGE_LIMIT: usize = 50;
 const MAX_ORDER_HISTORY_PAGES: usize = 20;
-const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(50);
+const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 
 pub trait BybitRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, BybitSignatureError>;

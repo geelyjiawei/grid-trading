@@ -17,9 +17,10 @@ use crate::{
         ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        OrderCancellationTarget, OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup,
+        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
+        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
+        TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_account_balance_snapshot, parse_authoritative_order,
@@ -45,7 +46,8 @@ const PRODUCTION_BASE_URL: &str = "https://fapi.binance.com";
 const TESTNET_BASE_URL: &str = "https://testnet.binancefuture.com";
 const TRADE_PAGE_LIMIT: usize = 1_000;
 const MAX_TRADE_PAGES: usize = 64;
-const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(50);
+const MAX_BATCH_CANCELLATIONS: usize = 10;
+const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 
 pub trait BinanceRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, SignatureError>;
@@ -230,6 +232,122 @@ where
         Err(CancellationError::Unknown {
             message: error.message,
         })
+    }
+
+    async fn cancel_orders(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        if exchange != Exchange::Binance {
+            return vec![
+                Err(invalid_cancellation("orders belong to another exchange"));
+                targets.len()
+            ];
+        }
+        if symbol.trim().is_empty()
+            || targets.iter().any(|target| {
+                target.exchange_order_id.is_empty()
+                    || !target
+                        .exchange_order_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit())
+            })
+        {
+            return vec![
+                Err(invalid_cancellation(
+                    "symbol and numeric exchange order IDs are required",
+                ));
+                targets.len()
+            ];
+        }
+
+        let symbol = symbol.to_ascii_uppercase();
+        let mut results = Vec::with_capacity(targets.len());
+        for chunk in targets.chunks(MAX_BATCH_CANCELLATIONS) {
+            let order_ids = format!(
+                "[{}]",
+                chunk
+                    .iter()
+                    .map(|target| target.exchange_order_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let request = match self.signed_request(
+                HttpMethod::Delete,
+                "/fapi/v1/batchOrders",
+                vec![
+                    ("symbol".into(), symbol.clone()),
+                    ("orderIdList".into(), order_ids),
+                ],
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    results.extend(
+                        (0..chunk.len()).map(|_| Err(invalid_cancellation(&error.to_string()))),
+                    );
+                    continue;
+                }
+            };
+            let response = match self.transport.execute(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    results.extend((0..chunk.len()).map(|_| {
+                        Err(CancellationError::Unknown {
+                            message: error.to_string(),
+                        })
+                    }));
+                    continue;
+                }
+            };
+            if !(200..300).contains(&response.status) {
+                let error = parse_exchange_error(&response.body);
+                results.extend((0..chunk.len()).map(|_| {
+                    Err(CancellationError::Unknown {
+                        message: error.message.clone(),
+                    })
+                }));
+                continue;
+            }
+            let rows = match serde_json::from_str::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|value| value.as_array().cloned())
+            {
+                Some(rows) if rows.len() == chunk.len() => rows,
+                _ => {
+                    results.extend((0..chunk.len()).map(|_| {
+                        Err(CancellationError::Unknown {
+                            message: "Binance batch cancellation returned an invalid result set"
+                                .into(),
+                        })
+                    }));
+                    continue;
+                }
+            };
+            results.extend(rows.into_iter().zip(chunk).map(|(row, target)| {
+                if row.get("code").is_some() {
+                    let error = parse_exchange_error(&row.to_string());
+                    return Err(CancellationError::Unknown {
+                        message: error.message,
+                    });
+                }
+                parse_cancellation_acknowledgement(
+                    &row.to_string(),
+                    &target.client_order_id,
+                    &target.exchange_order_id,
+                )
+                .map_err(|error| CancellationError::Unknown {
+                    message: format!(
+                        "Binance batch cancellation acknowledgement is not authoritative: {error}"
+                    ),
+                })
+            }));
+        }
+        results
     }
 }
 
@@ -1515,6 +1633,65 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(CancellationError::Unknown { .. })));
+    }
+
+    #[tokio::test]
+    async fn batch_cancellation_uses_exact_ids_and_splits_at_the_official_limit() {
+        let transport = MockTransport::default();
+        let targets = (0..12)
+            .map(|index| OrderCancellationTarget {
+                client_order_id: ClientOrderId::parse(format!("g_{index}_S_batch")).unwrap(),
+                exchange_order_id: (100 + index).to_string(),
+            })
+            .collect::<Vec<_>>();
+        for chunk in targets.chunks(MAX_BATCH_CANCELLATIONS) {
+            let body = chunk
+                .iter()
+                .map(|target| {
+                    serde_json::json!({
+                        "orderId": target.exchange_order_id.parse::<u64>().unwrap(),
+                        "clientOrderId": target.client_order_id.as_str(),
+                        "status": "CANCELED"
+                    })
+                })
+                .collect::<Vec<_>>();
+            transport
+                .responses
+                .lock()
+                .unwrap()
+                .push_back(Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_string(&body).unwrap(),
+                }));
+        }
+
+        let results = adapter(transport.clone())
+            .cancel_orders(Exchange::Binance, "MUUSDT", &targets)
+            .await;
+        let requests = transport.all_requests();
+
+        assert_eq!(results.len(), targets.len());
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request.method == HttpMethod::Delete && request.path == "/fapi/v1/batchOrders"
+        }));
+        assert_eq!(
+            requests[0]
+                .query
+                .iter()
+                .find(|(key, _)| key == "orderIdList")
+                .map(|(_, value)| value.as_str()),
+            Some("[100,101,102,103,104,105,106,107,108,109]")
+        );
+        assert_eq!(
+            requests[1]
+                .query
+                .iter()
+                .find(|(key, _)| key == "orderIdList")
+                .map(|(_, value)| value.as_str()),
+            Some("[110,111]")
+        );
     }
 
     #[tokio::test]

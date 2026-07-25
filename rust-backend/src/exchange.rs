@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, collections::BTreeMap};
 
 use async_trait::async_trait;
+use futures::{StreamExt, stream};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -102,6 +103,12 @@ pub struct CancellationAcknowledgement {
     pub exchange_order_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderCancellationTarget {
+    pub client_order_id: ClientOrderId,
+    pub exchange_order_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CancellationError {
     #[error("order cancellation request is invalid: {message}")]
@@ -119,6 +126,26 @@ pub trait OrderCancellationGateway: Send + Sync {
         client_order_id: &ClientOrderId,
         exchange_order_id: &str,
     ) -> Result<CancellationAcknowledgement, CancellationError>;
+
+    async fn cancel_orders(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        stream::iter(targets.iter().cloned().map(|target| async move {
+            self.cancel_order(
+                exchange,
+                symbol,
+                &target.client_order_id,
+                &target.exchange_order_id,
+            )
+            .await
+        }))
+        .buffered(8)
+        .collect()
+        .await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,8 +622,40 @@ pub trait PositionSnapshotGateway: Send + Sync {
 
 #[cfg(test)]
 mod snapshot_tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        time::Duration,
+    };
+
     use super::*;
     use crate::domain::{OrderKind, OrderSide, TimeInForce};
+
+    #[derive(Default)]
+    struct ConcurrentCancellationGateway {
+        active: AtomicUsize,
+        maximum_active: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OrderCancellationGateway for ConcurrentCancellationGateway {
+        async fn cancel_order(
+            &self,
+            _exchange: Exchange,
+            _symbol: &str,
+            client_order_id: &ClientOrderId,
+            exchange_order_id: &str,
+        ) -> Result<CancellationAcknowledgement, CancellationError> {
+            let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.maximum_active
+                .fetch_max(active, AtomicOrdering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(CancellationAcknowledgement {
+                client_order_id: client_order_id.clone(),
+                exchange_order_id: exchange_order_id.into(),
+            })
+        }
+    }
 
     fn snapshot(observed_at_ms: u64) -> ExchangeMarketSnapshot {
         ExchangeMarketSnapshot {
@@ -615,6 +674,25 @@ mod snapshot_tests {
         assert!(snapshot(10_000).ensure_fresh(10_500, 1_000, 100).is_ok());
         assert!(snapshot(9_000).ensure_fresh(10_500, 1_000, 100).is_err());
         assert!(snapshot(10_601).ensure_fresh(10_500, 1_000, 100).is_err());
+    }
+
+    #[tokio::test]
+    async fn default_exact_cancellations_are_concurrent_but_bounded() {
+        let gateway = ConcurrentCancellationGateway::default();
+        let targets = (0..20)
+            .map(|index| OrderCancellationTarget {
+                client_order_id: ClientOrderId::parse(format!("g_{index}_B_cancel")).unwrap(),
+                exchange_order_id: index.to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let results = gateway
+            .cancel_orders(Exchange::Bybit, "MUUSDT", &targets)
+            .await;
+
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(gateway.maximum_active.load(AtomicOrdering::SeqCst), 8);
+        assert_eq!(gateway.active.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[test]

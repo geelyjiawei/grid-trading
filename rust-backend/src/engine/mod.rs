@@ -24,7 +24,8 @@ pub use bootstrap::{
     PreparedStrategy, StrategyBootstrapError, activate_armed_strategy, prepare_new_strategy,
 };
 pub use cancellation::{
-    CancellationResult, CancellationServiceError, cancel_with, resolve_cancellation_with,
+    CancellationResult, CancellationServiceError, cancel_many_with, cancel_with,
+    resolve_cancellation_with, resolve_cancellations_with,
 };
 pub use coordinator::{
     RuntimeAdvanceResult, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeExchangeGateway,

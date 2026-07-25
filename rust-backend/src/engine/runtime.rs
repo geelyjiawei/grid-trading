@@ -16,8 +16,8 @@ use crate::{
         StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking, StrategyRunId,
         StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
         StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
-        cancel_with, intent_requires_lookup, load_strategy_inputs, prepare_new_strategy,
-        reconcile_lookup_with, resolve_cancellation_with, submit_with,
+        cancel_many_with, intent_requires_lookup, load_strategy_inputs, prepare_new_strategy,
+        reconcile_lookup_with, resolve_cancellations_with, submit_with,
     },
     exchange::{
         ActiveOrderStatus, ExchangeIdentityGateway, ExecutionSnapshotGateway,
@@ -1368,7 +1368,7 @@ where
                 ))
             })
             .collect::<Vec<_>>();
-        let mut converged = Vec::new();
+        let mut transitions = Vec::new();
         for (client_order_id, status, exchange_order_id) in candidates {
             let intent = self
                 .intent_store
@@ -1398,10 +1398,13 @@ where
             if !can_converge {
                 return Err(RuntimeTickError::IntentLedgerMismatch);
             }
-            self.intent_store
-                .transition(&client_order_id, target, now_ms)?;
-            converged.push(client_order_id);
+            transitions.push((client_order_id, target));
         }
+        let converged = transitions
+            .iter()
+            .map(|(client_order_id, _)| client_order_id.clone())
+            .collect();
+        self.intent_store.transition_intents(transitions, now_ms)?;
         Ok(converged)
     }
 }
@@ -1883,9 +1886,7 @@ where
                     })
             })
             .collect::<Vec<_>>();
-        for (client_order_id, status) in terminal_cancellations {
-            resolve_cancellation_with(&mut self.intent_store, &client_order_id, status, now_ms)?;
-        }
+        resolve_cancellations_with(&mut self.intent_store, terminal_cancellations, now_ms)?;
         self.validate_ledger_ownership()?;
 
         let execution_ids = self
@@ -2307,6 +2308,121 @@ where
         Ok(())
     }
 
+    async fn synchronize_exit_orders(
+        &mut self,
+        client_order_ids: &[ClientOrderId],
+        report: &mut RuntimeTickReport,
+        now_ms: u64,
+    ) -> Result<Vec<ClientOrderId>, RuntimeTickError> {
+        if client_order_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let execution_requests = client_order_ids
+            .iter()
+            .map(|client_order_id| {
+                (
+                    client_order_id.clone(),
+                    self.execution_sync
+                        .request_for(&self.machine, client_order_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let execution_sync = &self.execution_sync;
+        let gateway = &self.gateway;
+        let mut loaded_snapshots = stream::iter(execution_requests.into_iter().map(
+            |(client_order_id, request)| async move {
+                let result = match request {
+                    Ok(request) => execution_sync.load_snapshot(gateway, request).await,
+                    Err(error) => Err(error),
+                };
+                (client_order_id, result)
+            },
+        ))
+        .buffered(MAX_CONCURRENT_EXECUTION_SNAPSHOTS)
+        .collect::<BTreeMap<_, _>>()
+        .await;
+        let mut prepared_syncs = Vec::new();
+        for client_order_id in client_order_ids {
+            let loaded = loaded_snapshots
+                .remove(client_order_id)
+                .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+            let prepared = match loaded {
+                Ok(loaded) => {
+                    self.execution_sync
+                        .prepare_loaded_snapshot(&self.gateway, &self.machine, loaded)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match prepared {
+                Ok(prepared) => prepared_syncs.push((client_order_id.clone(), prepared)),
+                Err(error) => report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::ExecutionAccounting,
+                    client_order_id: Some(client_order_id.clone()),
+                    message: error.to_string(),
+                }),
+            }
+        }
+        let prepared_reports = prepared_syncs
+            .iter()
+            .map(|(_, prepared)| (prepared.snapshot.clone(), prepared.valued_report.clone()))
+            .collect::<Vec<_>>();
+        let transitions = match self
+            .machine
+            .apply_valued_executions(&prepared_reports, now_ms)
+        {
+            Ok(transitions) => transitions,
+            Err(error) => {
+                for (client_order_id, _) in &prepared_syncs {
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::ExecutionAccounting,
+                        client_order_id: Some(client_order_id.clone()),
+                        message: error.to_string(),
+                    });
+                }
+                Vec::new()
+            }
+        };
+        report.execution_syncs += transitions.len();
+        for ((client_order_id, _), transition) in prepared_syncs.into_iter().zip(transitions) {
+            if matches!(transition, StrategyTransition::Failed { .. }) {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::StrategyFailed,
+                    client_order_id: Some(client_order_id),
+                    message: "execution accounting failed the strategy during exit".into(),
+                });
+            }
+        }
+        let converged = self.converge_accounted_terminal_intents(now_ms)?;
+        let resolutions = converged
+            .iter()
+            .filter_map(|client_order_id| {
+                self.intent_store
+                    .snapshot()
+                    .intents
+                    .get(client_order_id)
+                    .and_then(|intent| match intent.state {
+                        IntentState::Terminal { status, .. } => {
+                            Some((client_order_id.clone(), status))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        resolve_cancellations_with(&mut self.intent_store, resolutions, now_ms)?;
+        if !converged.is_empty() {
+            report.blockers.retain(|blocker| {
+                blocker.stage != RuntimeStage::CancellationPending
+                    || blocker
+                        .client_order_id
+                        .as_ref()
+                        .is_none_or(|client_order_id| !converged.contains(client_order_id))
+            });
+        }
+        self.validate_ledger_ownership()?;
+        Ok(converged)
+    }
+
     async fn drive_exit(
         &mut self,
         mut report: RuntimeTickReport,
@@ -2391,13 +2507,19 @@ where
             }
         }
 
-        for target in dispatch_targets
+        let dispatch_batch = dispatch_targets
             .iter()
             .take(self.maximum_submissions_per_tick)
             .cloned()
-        {
-            let client_order_id = target.client_order_id.clone();
-            let result = cancel_with(&self.gateway, &mut self.intent_store, target, now_ms).await?;
+            .collect::<Vec<_>>();
+        let cancellation_results = cancel_many_with(
+            &self.gateway,
+            &mut self.intent_store,
+            dispatch_batch,
+            now_ms,
+        )
+        .await?;
+        for (client_order_id, result) in cancellation_results {
             report.cancellations.push(RuntimeCancellation {
                 client_order_id: client_order_id.clone(),
                 result: result.clone(),
@@ -2433,8 +2555,46 @@ where
                 message: "additional active orders remain queued for cancellation".into(),
             });
         }
-        if !cancellation_targets.is_empty() {
+        let acknowledged_ids = report
+            .cancellations
+            .iter()
+            .filter_map(|cancellation| {
+                matches!(
+                    cancellation.result,
+                    CancellationResult::Acknowledged | CancellationResult::AlreadyAcknowledged
+                )
+                .then_some(cancellation.client_order_id.clone())
+            })
+            .collect::<Vec<_>>();
+        if lifecycle != StrategyLifecycle::RiskExitRequested {
+            self.synchronize_exit_orders(&acknowledged_ids, &mut report, now_ms)
+                .await?;
+        }
+        let has_active_owned_orders =
+            self.machine
+                .store()
+                .snapshot()
+                .orders
+                .values()
+                .any(|order| {
+                    (lifecycle == StrategyLifecycle::Failed
+                        || !matches!(order.purpose, StrategyOrderPurpose::RiskClose))
+                        && matches!(
+                            order.tracking,
+                            StrategyOrderTracking::Intent {
+                                state: IntentState::Accepted { .. }
+                            }
+                        )
+                });
+        if has_active_owned_orders {
             self.validate_ledger_ownership()?;
+            tracing::info!(
+                exchange = ?exchange,
+                symbol,
+                cancellation_targets = cancellation_targets.len(),
+                elapsed_ms = u64::try_from(exit_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "strategy exit is waiting for authoritative order terminals"
+            );
             return Ok(report);
         }
 
@@ -2471,6 +2631,13 @@ where
         if lifecycle == StrategyLifecycle::StopRequested {
             self.machine.mark_stopped(now_ms)?;
             self.validate_ledger_ownership()?;
+            tracing::info!(
+                exchange = ?exchange,
+                symbol,
+                cancellation_targets = cancellation_targets.len(),
+                elapsed_ms = u64::try_from(exit_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "strategy stop completed"
+            );
             return Ok(report);
         }
 
@@ -2591,9 +2758,10 @@ mod tests {
         exchange::{
             ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
             ExchangeMarketSnapshot, ExecutionSnapshotError, HistoricalMinutePrice,
-            LeverageAcknowledgement, LeverageError, LookupError, OrderExecutionSnapshot,
-            OrderLifecycle, OrderLookup, PlacementAcknowledgement, PlacementError, PositionLeg,
-            PositionSide, PositionSnapshot, SnapshotError, TradeFill, TradingFeeRates,
+            LeverageAcknowledgement, LeverageError, LookupError, OrderCancellationTarget,
+            OrderExecutionSnapshot, OrderLifecycle, OrderLookup, PlacementAcknowledgement,
+            PlacementError, PositionLeg, PositionSide, PositionSnapshot, SnapshotError, TradeFill,
+            TradingFeeRates,
         },
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
@@ -2688,6 +2856,7 @@ mod tests {
         placement_calls: Vec<OrderIntent>,
         next_placement_error: Option<PlacementError>,
         cancellation_calls: Vec<(ClientOrderId, String)>,
+        cancellation_batch_calls: usize,
         next_cancellation_error: Option<CancellationError>,
         cancellation_marks_terminal: bool,
         orders: BTreeMap<ClientOrderId, AuthoritativeOrder>,
@@ -2745,6 +2914,7 @@ mod tests {
                     placement_calls: Vec::new(),
                     next_placement_error: None,
                     cancellation_calls: Vec::new(),
+                    cancellation_batch_calls: 0,
                     next_cancellation_error: None,
                     cancellation_marks_terminal: false,
                     orders: BTreeMap::new(),
@@ -2817,6 +2987,10 @@ mod tests {
 
         fn cancellation_call_count(&self) -> usize {
             self.state.lock().unwrap().cancellation_calls.len()
+        }
+
+        fn cancellation_batch_call_count(&self) -> usize {
+            self.state.lock().unwrap().cancellation_batch_calls
         }
 
         fn market_snapshot_call_count(&self) -> usize {
@@ -3182,6 +3356,28 @@ mod tests {
                 client_order_id: client_order_id.clone(),
                 exchange_order_id: exchange_order_id.to_owned(),
             })
+        }
+
+        async fn cancel_orders(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            targets: &[OrderCancellationTarget],
+        ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+            self.state.lock().unwrap().cancellation_batch_calls += 1;
+            let mut results = Vec::with_capacity(targets.len());
+            for target in targets {
+                results.push(
+                    self.cancel_order(
+                        exchange,
+                        symbol,
+                        &target.client_order_id,
+                        &target.exchange_order_id,
+                    )
+                    .await,
+                );
+            }
+            results
         }
     }
 
@@ -6975,7 +7171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_waits_for_terminal_cancellation_and_complete_execution_accounting() {
+    async fn stop_completes_in_one_tick_when_cancellation_terminal_is_authoritative() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
         gateway.set_cancellation_marks_terminal(true);
@@ -6987,19 +7183,9 @@ mod tests {
 
         let cancellation = runtime.tick(1_200).await.unwrap();
         assert_eq!(cancellation.cancellations.len(), 1);
-        assert_eq!(
-            cancellation.blockers[0].stage,
-            RuntimeStage::CancellationPending
-        );
+        assert!(!cancellation.is_blocked(), "{cancellation:?}");
         assert_eq!(gateway.cancellation_call_count(), 1);
-        assert_eq!(
-            runtime.machine().store().snapshot().lifecycle,
-            StrategyLifecycle::StopRequested
-        );
-
-        let stopped = runtime.tick(1_300).await.unwrap();
-        assert!(!stopped.is_blocked(), "{stopped:?}");
-        assert_eq!(gateway.cancellation_call_count(), 1);
+        assert_eq!(gateway.cancellation_batch_call_count(), 1);
         assert_eq!(
             runtime.machine().store().snapshot().lifecycle,
             StrategyLifecycle::Stopped

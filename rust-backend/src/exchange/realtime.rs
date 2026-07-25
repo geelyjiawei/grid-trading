@@ -222,6 +222,7 @@ impl FuturesExecutionCache {
         self.changed.notify_waiters();
     }
 
+    #[cfg(test)]
     pub(crate) fn knows_order(&self, symbol: &str, exchange_order_id: &str) -> bool {
         let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
         self.state
@@ -257,9 +258,6 @@ impl FuturesExecutionCache {
     ) -> Option<OrderExecutionSnapshot> {
         if let Some(snapshot) = self.snapshot(symbol, client_order_id, exchange_order_id) {
             return Some(snapshot);
-        }
-        if !self.knows_order(symbol, exchange_order_id) {
-            return None;
         }
         let deadline = tokio::time::Instant::now() + maximum_wait;
         loop {
@@ -402,13 +400,6 @@ impl BybitExecutionCache {
         maximum_wait: Duration,
     ) -> Option<OrderExecutionSnapshot> {
         let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
-        let known = || {
-            self.state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entries
-                .contains_key(&key)
-        };
         let snapshot = || {
             let state = self
                 .state
@@ -421,9 +412,6 @@ impl BybitExecutionCache {
         };
         if let Some(snapshot) = snapshot() {
             return Some(snapshot);
-        }
-        if !known() {
-            return None;
         }
         let deadline = tokio::time::Instant::now() + maximum_wait;
         loop {
@@ -596,14 +584,14 @@ async fn run_binance_execution_stream(
                             }
                         }
                         Ok(Message::Binary(bytes)) => {
-                            if let Ok(text) = std::str::from_utf8(bytes.as_ref()) {
-                                if publish_binance_message(
+                            if let Ok(text) = std::str::from_utf8(bytes.as_ref())
+                                && publish_binance_message(
                                     text,
                                     &mut recent_executions,
                                     &execution_cache,
-                                ) {
-                                    break;
-                                }
+                                )
+                            {
+                                break;
                             }
                         }
                         Ok(Message::Ping(payload)) => {
@@ -1313,6 +1301,39 @@ mod tests {
         assert_eq!(snapshot.trades.len(), 1);
         assert_eq!(snapshot.order_time_ms, 1000);
         assert_eq!(snapshot.update_time_ms, 1010);
+    }
+
+    #[tokio::test]
+    async fn futures_snapshot_waits_for_a_newly_arriving_cancellation_event() {
+        let cache = FuturesExecutionCache::default();
+        let waiting_cache = cache.clone();
+        let client_order_id = ClientOrderId::parse("r_run_0_B_wait").unwrap();
+        let waiting_client_order_id = client_order_id.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_cache
+                .wait_snapshot(
+                    "MUUSDT",
+                    &waiting_client_order_id,
+                    "46",
+                    Duration::from_millis(100),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        for text in [
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_wait","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"NEW","X":"NEW","i":46,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_B_wait","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"CANCELED","X":"CANCELED","i":46,"l":"0","z":"0","L":"0","R":true,"T":1010}}"#,
+        ] {
+            let message = serde_json::from_str::<Value>(text).unwrap();
+            cache.apply(parse_futures_order_update(&message, Exchange::Binance).unwrap());
+        }
+
+        let snapshot = waiter.await.unwrap().unwrap();
+        assert_eq!(snapshot.order.client_order_id, client_order_id);
+        assert_eq!(
+            snapshot.order.lifecycle,
+            OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled)
+        );
     }
 
     #[test]

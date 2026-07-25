@@ -18,9 +18,10 @@ use crate::{
         ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        OrderCancellationTarget, OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup,
+        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
+        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
+        TradingFeeRates,
         aster::{
             AsterAdapter, AsterSignatureError, LocalEip712Signer, spawn_aster_execution_stream,
         },
@@ -573,6 +574,20 @@ impl OrderCancellationGateway for ConfiguredExchangeGateway {
             }
         }
     }
+
+    async fn cancel_orders(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        match self {
+            Self::Binance(gateway) => gateway.cancel_orders(exchange, symbol, targets).await,
+            Self::Aster(gateway) => gateway.cancel_orders(exchange, symbol, targets).await,
+            Self::Bybit(gateway) => gateway.cancel_orders(exchange, symbol, targets).await,
+            Self::TradeXyz(gateway) => gateway.cancel_orders(exchange, symbol, targets).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -872,6 +887,15 @@ impl OrderCancellationGateway for SharedConfiguredExchangeGateway {
         self.inner
             .cancel_order(exchange, symbol, client_order_id, exchange_order_id)
             .await
+    }
+
+    async fn cancel_orders(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        self.inner.cancel_orders(exchange, symbol, targets).await
     }
 }
 

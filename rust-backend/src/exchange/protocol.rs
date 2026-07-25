@@ -647,6 +647,7 @@ fn binance_request_cost(request: &PreparedHttpRequest) -> BinanceRequestCost {
         (_, "/fapi/v1/ticker/24hr") if !has_symbol => 40,
         (_, "/fapi/v1/premiumIndex") if !has_symbol => 10,
         (HttpMethod::Post, "/fapi/v1/order") => 0,
+        (HttpMethod::Delete, "/fapi/v1/batchOrders") => 1,
         (_, "/fapi/v1/order")
         | (_, "/fapi/v1/openOrders")
         | (_, "/fapi/v1/ticker/24hr")
@@ -658,7 +659,7 @@ fn binance_request_cost(request: &PreparedHttpRequest) -> BinanceRequestCost {
     };
     let orders = u32::from(matches!(
         (request.method, request.path.as_str()),
-        (HttpMethod::Post | HttpMethod::Delete, "/fapi/v1/order")
+        (HttpMethod::Post, "/fapi/v1/order")
     ));
     BinanceRequestCost { weight, orders }
 }
@@ -1610,7 +1611,14 @@ mod tests {
             binance_request_cost(&symbol_request(HttpMethod::Delete, "/fapi/v1/order")),
             BinanceRequestCost {
                 weight: 1,
-                orders: 1
+                orders: 0
+            }
+        );
+        assert_eq!(
+            binance_request_cost(&symbol_request(HttpMethod::Delete, "/fapi/v1/batchOrders")),
+            BinanceRequestCost {
+                weight: 1,
+                orders: 0
             }
         );
         assert_eq!(

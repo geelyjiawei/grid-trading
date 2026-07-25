@@ -60,7 +60,7 @@ const TRADE_PAGE_LIMIT: usize = 1_000;
 const MAX_TRADE_HISTORY_QUERIES: usize = 64;
 const TRADE_PROBE_PADDING_MS: u64 = 5 * 60 * 1_000;
 const TRADE_WINDOW_LIMIT_MS: u64 = (7 * 24 * 60 * 60 * 1_000) - 1;
-const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(50);
+const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
 const ASTER_EXECUTION_DEDUPE_CAPACITY: usize = 4_096;
 #[cfg(not(test))]

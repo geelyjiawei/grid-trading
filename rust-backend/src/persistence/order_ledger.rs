@@ -42,14 +42,28 @@ pub trait IntentStore {
         next_state: IntentState,
         now_ms: u64,
     ) -> Result<(), LedgerError>;
+    fn transition_intents(
+        &mut self,
+        transitions: Vec<(ClientOrderId, IntentState)>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError>;
     fn insert_cancellation_prepared(
         &mut self,
         intent: CancellationIntent,
+    ) -> Result<(), LedgerError>;
+    fn insert_cancellations_prepared(
+        &mut self,
+        intents: Vec<CancellationIntent>,
     ) -> Result<(), LedgerError>;
     fn transition_cancellation(
         &mut self,
         client_order_id: &ClientOrderId,
         next_state: CancellationState,
+        now_ms: u64,
+    ) -> Result<(), LedgerError>;
+    fn transition_cancellations(
+        &mut self,
+        transitions: Vec<(ClientOrderId, CancellationState)>,
         now_ms: u64,
     ) -> Result<(), LedgerError>;
 }
@@ -129,17 +143,36 @@ impl IntentStore for FileOrderIntentStore {
         next_state: IntentState,
         now_ms: u64,
     ) -> Result<(), LedgerError> {
-        let mut next = self.snapshot.clone();
-        let intent = next
-            .intents
-            .get_mut(client_order_id)
-            .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
-        validate_transition(&intent.state, &next_state)?;
-        if now_ms < intent.updated_at_ms {
-            return Err(LedgerError::TimestampRegression);
+        self.transition_intents(vec![(client_order_id.clone(), next_state)], now_ms)
+    }
+
+    fn transition_intents(
+        &mut self,
+        transitions: Vec<(ClientOrderId, IntentState)>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        if transitions.is_empty() {
+            return Ok(());
         }
-        intent.state = next_state;
-        intent.updated_at_ms = now_ms;
+        let mut next = self.snapshot.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        for (client_order_id, next_state) in transitions {
+            if !seen.insert(client_order_id.clone()) {
+                return Err(LedgerError::DuplicateClientOrderId(
+                    client_order_id.as_str().to_owned(),
+                ));
+            }
+            let intent = next
+                .intents
+                .get_mut(&client_order_id)
+                .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
+            validate_transition(&intent.state, &next_state)?;
+            if now_ms < intent.updated_at_ms {
+                return Err(LedgerError::TimestampRegression);
+            }
+            intent.state = next_state;
+            intent.updated_at_ms = now_ms;
+        }
         self.replace(next)
     }
 
@@ -147,17 +180,31 @@ impl IntentStore for FileOrderIntentStore {
         &mut self,
         intent: CancellationIntent,
     ) -> Result<(), LedgerError> {
-        if intent.state != CancellationState::Prepared {
-            return Err(LedgerError::NewCancellationNotPrepared);
+        self.insert_cancellations_prepared(vec![intent])
+    }
+
+    fn insert_cancellations_prepared(
+        &mut self,
+        intents: Vec<CancellationIntent>,
+    ) -> Result<(), LedgerError> {
+        if intents.is_empty() {
+            return Ok(());
         }
         let mut next = self.snapshot.clone();
-        if next.cancellations.contains_key(&intent.client_order_id) {
-            return Err(LedgerError::DuplicateCancellation(
-                intent.client_order_id.as_str().to_owned(),
-            ));
+        for intent in intents {
+            if intent.state != CancellationState::Prepared {
+                return Err(LedgerError::NewCancellationNotPrepared);
+            }
+            if next
+                .cancellations
+                .insert(intent.client_order_id.clone(), intent.clone())
+                .is_some()
+            {
+                return Err(LedgerError::DuplicateCancellation(
+                    intent.client_order_id.as_str().to_owned(),
+                ));
+            }
         }
-        next.cancellations
-            .insert(intent.client_order_id.clone(), intent);
         self.replace(next)
     }
 
@@ -167,17 +214,38 @@ impl IntentStore for FileOrderIntentStore {
         next_state: CancellationState,
         now_ms: u64,
     ) -> Result<(), LedgerError> {
-        let mut next = self.snapshot.clone();
-        let intent = next
-            .cancellations
-            .get_mut(client_order_id)
-            .ok_or_else(|| LedgerError::MissingCancellation(client_order_id.as_str().to_owned()))?;
-        validate_cancellation_transition(&intent.state, &next_state)?;
-        if now_ms < intent.updated_at_ms {
-            return Err(LedgerError::TimestampRegression);
+        self.transition_cancellations(vec![(client_order_id.clone(), next_state)], now_ms)
+    }
+
+    fn transition_cancellations(
+        &mut self,
+        transitions: Vec<(ClientOrderId, CancellationState)>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        if transitions.is_empty() {
+            return Ok(());
         }
-        intent.state = next_state;
-        intent.updated_at_ms = now_ms;
+        let mut next = self.snapshot.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        for (client_order_id, next_state) in transitions {
+            if !seen.insert(client_order_id.clone()) {
+                return Err(LedgerError::DuplicateCancellation(
+                    client_order_id.as_str().to_owned(),
+                ));
+            }
+            let intent = next
+                .cancellations
+                .get_mut(&client_order_id)
+                .ok_or_else(|| {
+                    LedgerError::MissingCancellation(client_order_id.as_str().to_owned())
+                })?;
+            validate_cancellation_transition(&intent.state, &next_state)?;
+            if now_ms < intent.updated_at_ms {
+                return Err(LedgerError::TimestampRegression);
+            }
+            intent.state = next_state;
+            intent.updated_at_ms = now_ms;
+        }
         self.replace(next)
     }
 }
@@ -243,24 +311,44 @@ impl IntentStore for MemoryOrderIntentStore {
         next_state: IntentState,
         now_ms: u64,
     ) -> Result<(), LedgerError> {
+        self.transition_intents(vec![(client_order_id.clone(), next_state)], now_ms)
+    }
+
+    fn transition_intents(
+        &mut self,
+        transitions: Vec<(ClientOrderId, IntentState)>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
         self.before_write()?;
-        let next_revision = self
+        let mut next = self.snapshot.clone();
+        next.revision = self
             .snapshot
             .revision
             .checked_add(1)
             .ok_or(LedgerError::RevisionOverflow)?;
-        let intent = self
-            .snapshot
-            .intents
-            .get_mut(client_order_id)
-            .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
-        validate_transition(&intent.state, &next_state)?;
-        if now_ms < intent.updated_at_ms {
-            return Err(LedgerError::TimestampRegression);
+        let mut seen = std::collections::BTreeSet::new();
+        for (client_order_id, next_state) in transitions {
+            if !seen.insert(client_order_id.clone()) {
+                return Err(LedgerError::DuplicateClientOrderId(
+                    client_order_id.as_str().to_owned(),
+                ));
+            }
+            let intent = next
+                .intents
+                .get_mut(&client_order_id)
+                .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
+            validate_transition(&intent.state, &next_state)?;
+            if now_ms < intent.updated_at_ms {
+                return Err(LedgerError::TimestampRegression);
+            }
+            intent.state = next_state;
+            intent.updated_at_ms = now_ms;
         }
-        intent.state = next_state;
-        intent.updated_at_ms = now_ms;
-        self.snapshot.revision = next_revision;
+        validate_snapshot(&next)?;
+        self.snapshot = next;
         Ok(())
     }
 
@@ -268,27 +356,39 @@ impl IntentStore for MemoryOrderIntentStore {
         &mut self,
         intent: CancellationIntent,
     ) -> Result<(), LedgerError> {
+        self.insert_cancellations_prepared(vec![intent])
+    }
+
+    fn insert_cancellations_prepared(
+        &mut self,
+        intents: Vec<CancellationIntent>,
+    ) -> Result<(), LedgerError> {
+        if intents.is_empty() {
+            return Ok(());
+        }
         self.before_write()?;
-        if intent.state != CancellationState::Prepared {
-            return Err(LedgerError::NewCancellationNotPrepared);
+        let mut next = self.snapshot.clone();
+        for intent in intents {
+            if intent.state != CancellationState::Prepared {
+                return Err(LedgerError::NewCancellationNotPrepared);
+            }
+            if next
+                .cancellations
+                .insert(intent.client_order_id.clone(), intent.clone())
+                .is_some()
+            {
+                return Err(LedgerError::DuplicateCancellation(
+                    intent.client_order_id.as_str().to_owned(),
+                ));
+            }
         }
-        if self
-            .snapshot
-            .cancellations
-            .contains_key(&intent.client_order_id)
-        {
-            return Err(LedgerError::DuplicateCancellation(
-                intent.client_order_id.as_str().to_owned(),
-            ));
-        }
-        self.snapshot.revision = self
+        next.revision = self
             .snapshot
             .revision
             .checked_add(1)
             .ok_or(LedgerError::RevisionOverflow)?;
-        self.snapshot
-            .cancellations
-            .insert(intent.client_order_id.clone(), intent);
+        validate_snapshot(&next)?;
+        self.snapshot = next;
         Ok(())
     }
 
@@ -298,24 +398,46 @@ impl IntentStore for MemoryOrderIntentStore {
         next_state: CancellationState,
         now_ms: u64,
     ) -> Result<(), LedgerError> {
+        self.transition_cancellations(vec![(client_order_id.clone(), next_state)], now_ms)
+    }
+
+    fn transition_cancellations(
+        &mut self,
+        transitions: Vec<(ClientOrderId, CancellationState)>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
         self.before_write()?;
-        let next_revision = self
+        let mut next = self.snapshot.clone();
+        next.revision = self
             .snapshot
             .revision
             .checked_add(1)
             .ok_or(LedgerError::RevisionOverflow)?;
-        let intent = self
-            .snapshot
-            .cancellations
-            .get_mut(client_order_id)
-            .ok_or_else(|| LedgerError::MissingCancellation(client_order_id.as_str().to_owned()))?;
-        validate_cancellation_transition(&intent.state, &next_state)?;
-        if now_ms < intent.updated_at_ms {
-            return Err(LedgerError::TimestampRegression);
+        let mut seen = std::collections::BTreeSet::new();
+        for (client_order_id, next_state) in transitions {
+            if !seen.insert(client_order_id.clone()) {
+                return Err(LedgerError::DuplicateCancellation(
+                    client_order_id.as_str().to_owned(),
+                ));
+            }
+            let intent = next
+                .cancellations
+                .get_mut(&client_order_id)
+                .ok_or_else(|| {
+                    LedgerError::MissingCancellation(client_order_id.as_str().to_owned())
+                })?;
+            validate_cancellation_transition(&intent.state, &next_state)?;
+            if now_ms < intent.updated_at_ms {
+                return Err(LedgerError::TimestampRegression);
+            }
+            intent.state = next_state;
+            intent.updated_at_ms = now_ms;
         }
-        intent.state = next_state;
-        intent.updated_at_ms = now_ms;
-        self.snapshot.revision = next_revision;
+        validate_snapshot(&next)?;
+        self.snapshot = next;
         Ok(())
     }
 }
@@ -719,6 +841,103 @@ mod tests {
                     status: crate::domain::TerminalOrderStatus::Filled,
                     exchange_order_id: Some("exchange-2".into()),
                 },
+                102,
+            ),
+            Err(LedgerError::InvalidTransition)
+        ));
+        assert_eq!(store.snapshot(), &before);
+    }
+
+    #[test]
+    fn batch_terminal_transition_is_atomic_and_uses_one_revision() {
+        let mut store = MemoryOrderIntentStore::default();
+        let first = intent("g_1_S_batch_terminal");
+        let second = intent("g_2_S_batch_terminal");
+        for (order, exchange_order_id) in [(&first, "exchange-1"), (&second, "exchange-2")] {
+            store.insert_prepared(order.clone()).unwrap();
+            store
+                .transition(
+                    &order.client_order_id,
+                    IntentState::Accepted {
+                        exchange_order_id: exchange_order_id.into(),
+                    },
+                    101,
+                )
+                .unwrap();
+        }
+        let revision_before = store.snapshot().revision;
+
+        store
+            .transition_intents(
+                vec![
+                    (
+                        first.client_order_id.clone(),
+                        IntentState::Terminal {
+                            status: crate::domain::TerminalOrderStatus::Cancelled,
+                            exchange_order_id: Some("exchange-1".into()),
+                        },
+                    ),
+                    (
+                        second.client_order_id.clone(),
+                        IntentState::Terminal {
+                            status: crate::domain::TerminalOrderStatus::Cancelled,
+                            exchange_order_id: Some("exchange-2".into()),
+                        },
+                    ),
+                ],
+                102,
+            )
+            .unwrap();
+
+        assert_eq!(store.snapshot().revision, revision_before + 1);
+        assert!(store.snapshot().intents.values().all(|intent| {
+            matches!(
+                intent.state,
+                IntentState::Terminal {
+                    status: crate::domain::TerminalOrderStatus::Cancelled,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn invalid_batch_terminal_transition_changes_nothing() {
+        let mut store = MemoryOrderIntentStore::default();
+        let first = intent("g_1_S_batch_rollback");
+        let second = intent("g_2_S_batch_rollback");
+        for (order, exchange_order_id) in [(&first, "exchange-1"), (&second, "exchange-2")] {
+            store.insert_prepared(order.clone()).unwrap();
+            store
+                .transition(
+                    &order.client_order_id,
+                    IntentState::Accepted {
+                        exchange_order_id: exchange_order_id.into(),
+                    },
+                    101,
+                )
+                .unwrap();
+        }
+        let before = store.snapshot().clone();
+
+        assert!(matches!(
+            store.transition_intents(
+                vec![
+                    (
+                        first.client_order_id.clone(),
+                        IntentState::Terminal {
+                            status: crate::domain::TerminalOrderStatus::Cancelled,
+                            exchange_order_id: Some("exchange-1".into()),
+                        },
+                    ),
+                    (
+                        second.client_order_id.clone(),
+                        IntentState::Terminal {
+                            status: crate::domain::TerminalOrderStatus::Cancelled,
+                            exchange_order_id: Some("wrong-exchange-id".into()),
+                        },
+                    ),
+                ],
                 102,
             ),
             Err(LedgerError::InvalidTransition)
