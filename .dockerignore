@@ -9,4 +9,5 @@ vue-frontend/dist/
 data/
 backend/api_config.json
 .env
+.env.*
 .git/

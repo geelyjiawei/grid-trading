@@ -5,6 +5,7 @@ backend/__pycache__/
 tests/__pycache__/
 .env
 .env.*
+!.env.testnet.example
 .venv/
 data/
 /data-rust-preview/

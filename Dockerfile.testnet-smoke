@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.7.0
+
+FROM rust:1.90-bookworm AS build
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY rust-backend/ ./rust-backend/
+RUN --mount=type=cache,id=grid-trading-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=grid-trading-testnet-target,target=/src/target,sharing=locked \
+    cargo build --locked --release --package grid-trading-server --bin exchange-testnet-smoke \
+    && install -D --mode=0755 \
+        /src/target/release/exchange-testnet-smoke \
+        /out/exchange-testnet-smoke
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 grid \
+    && useradd --uid 10001 --gid grid --no-create-home --shell /usr/sbin/nologin grid
+
+COPY --from=build /out/exchange-testnet-smoke /usr/local/bin/exchange-testnet-smoke
+
+USER grid:grid
+ENTRYPOINT ["exchange-testnet-smoke"]

@@ -1,0 +1,17 @@
+services:
+  exchange-testnet-smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile.testnet-smoke
+    image: grid-trading-testnet-smoke:local
+    env_file:
+      - .env.testnet
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: bridge
+    restart: "no"
