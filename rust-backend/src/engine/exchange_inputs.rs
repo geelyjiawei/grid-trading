@@ -126,7 +126,7 @@ where
     })
 }
 
-pub(super) fn advance_reference_time_ms(reference_ms: u64, elapsed: Duration) -> u64 {
+pub(crate) fn advance_reference_time_ms(reference_ms: u64, elapsed: Duration) -> u64 {
     // Preserve the caller's wall-clock reference while accounting for async work
     // with a monotonic duration, so an exchange timestamp collected later is valid.
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);

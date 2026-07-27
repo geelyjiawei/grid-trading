@@ -31,6 +31,7 @@ pub use coordinator::{
     RuntimeAdvanceResult, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeExchangeGateway,
     RuntimeRecoveryError, RuntimeStartReceipt, RuntimeStopReceipt,
 };
+pub(crate) use exchange_inputs::advance_reference_time_ms;
 pub use exchange_inputs::{
     AuthoritativeStrategyInputs, StrategyInputError, StrategyInputService, load_strategy_inputs,
 };

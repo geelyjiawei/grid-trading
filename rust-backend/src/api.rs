@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -33,8 +33,9 @@ use crate::{
         MarketSnapshot, PreparedStrategyKind, PreparedStrategyLifecycle,
         PreparedStrategyStopOutcome, RuntimeCoordinator, RuntimeCoordinatorError,
         RuntimeRegistryEntry, ShadowCollectionError, StrategyBootstrapError, StrategyLifecycle,
-        StrategyOrderPurpose, StrategyState, StrategyTransition, build_grid_preview,
-        collect_stable_exchange_view, collect_strategy_shadow_view, load_authoritative_fee_config,
+        StrategyOrderPurpose, StrategyState, StrategyTransition, advance_reference_time_ms,
+        build_grid_preview, collect_stable_exchange_view, collect_strategy_shadow_view,
+        load_authoritative_fee_config,
     },
     exchange::{
         AccountBalanceSnapshotGateway, ActiveOrderStatus, AuthoritativeOrder, CancellationError,
@@ -1309,6 +1310,7 @@ async fn grid_preview(
             );
         }
     };
+    let collection_started = Instant::now();
     let now_ms = match unix_time_ms() {
         Ok(now_ms) => now_ms,
         Err(ClockUnavailable) => return clock_unavailable(),
@@ -1341,7 +1343,7 @@ async fn grid_preview(
         );
     }
     if let Err(error) = market.ensure_fresh(
-        now_ms,
+        advance_reference_time_ms(now_ms, collection_started.elapsed()),
         PREVIEW_MARKET_MAX_AGE_MS,
         PREVIEW_MARKET_FUTURE_SKEW_MS,
     ) {
@@ -3900,6 +3902,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use axum::{
@@ -6896,6 +6899,38 @@ mod tests {
         assert_eq!(
             response_json(unavailable).await["error"]["code"],
             "exchange_preview_unavailable"
+        );
+    }
+
+    #[test]
+    fn preview_market_freshness_accounts_for_slow_exchange_collection() {
+        let market = ExchangeMarketSnapshot {
+            exchange: Exchange::TradeXyz,
+            symbol: "CXMTUSDC".into(),
+            last_price: Decimal::new(608, 3),
+            mark_price: Decimal::new(607, 3),
+            price_24h_change_ratio: None,
+            volume_24h: None,
+            observed_at_ms: 12_500,
+        };
+
+        assert!(
+            market
+                .ensure_fresh(
+                    advance_reference_time_ms(10_000, Duration::from_millis(2_500)),
+                    PREVIEW_MARKET_MAX_AGE_MS,
+                    PREVIEW_MARKET_FUTURE_SKEW_MS,
+                )
+                .is_ok()
+        );
+        assert!(
+            market
+                .ensure_fresh(
+                    10_000,
+                    PREVIEW_MARKET_MAX_AGE_MS,
+                    PREVIEW_MARKET_FUTURE_SKEW_MS,
+                )
+                .is_err()
         );
     }
 
