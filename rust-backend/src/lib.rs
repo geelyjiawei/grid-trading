@@ -7,6 +7,7 @@ pub mod security;
 pub mod web_auth;
 
 use std::{
+    collections::HashMap,
     env, fs,
     path::PathBuf,
     sync::{
@@ -231,6 +232,9 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
         let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_RUNTIME_TICK_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut execution_wakeups = subscribe_execution_wakeups();
+        let (execution_completion_sender, mut execution_completions) =
+            tokio::sync::mpsc::unbounded_channel();
+        let mut execution_dispatches = HashMap::<String, ExecutionDispatchState>::new();
         let full_tick_in_flight = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
@@ -246,17 +250,19 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                     tokio::spawn(async move {
                         let _tick_lease = tick_lease;
                         for advance in runtime.advance_all(now_ms).await {
-                            log_runtime_advance(advance, false, None);
+                            log_runtime_advance(advance, false, None, None, 0);
                         }
                     });
                 }
                 event = execution_wakeups.recv() => {
                     match event {
                         Ok(event) => {
-                            let runtime = Arc::clone(&runtime);
-                            tokio::spawn(async move {
-                                advance_execution_event(runtime, event).await;
-                            });
+                            queue_execution_wakeup(
+                                &runtime,
+                                &mut execution_dispatches,
+                                &execution_completion_sender,
+                                event,
+                            );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::warn!(skipped, "execution wakeup receiver lagged; REST fallback remains active");
@@ -264,8 +270,133 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
                 }
+                Some(key) = execution_completions.recv() => {
+                    complete_execution_dispatch(
+                        &runtime,
+                        &mut execution_dispatches,
+                        &execution_completion_sender,
+                        key,
+                    );
+                }
             }
         }
+    });
+}
+
+#[derive(Debug, Default)]
+struct ExecutionDispatchState {
+    pending: Option<PendingExecutionWakeups>,
+}
+
+#[derive(Debug)]
+struct PendingExecutionWakeups {
+    event: ExecutionWakeup,
+    event_count: usize,
+}
+
+impl PendingExecutionWakeups {
+    fn new(event: ExecutionWakeup) -> Self {
+        Self {
+            event,
+            event_count: 1,
+        }
+    }
+
+    fn merge(&mut self, event: ExecutionWakeup) {
+        debug_assert_eq!(self.event.exchange, event.exchange);
+        debug_assert_eq!(self.event.symbol, event.symbol);
+        self.event_count = self.event_count.saturating_add(1);
+        self.event.observed_at_ms = self.event.observed_at_ms.min(event.observed_at_ms);
+        self.event.exchange_event_time_ms = match (
+            self.event.exchange_event_time_ms,
+            event.exchange_event_time_ms,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        if self.event.exchange_order_id != event.exchange_order_id {
+            // Multiple changed orders are cheaper and safer to reconcile in one
+            // bounded exchange snapshot than through serialized per-order reads.
+            self.event.exchange_order_id = None;
+        }
+    }
+}
+
+struct ExecutionDispatchCompletion {
+    sender: tokio::sync::mpsc::UnboundedSender<String>,
+    key: Option<String>,
+}
+
+impl ExecutionDispatchCompletion {
+    fn new(sender: tokio::sync::mpsc::UnboundedSender<String>, key: String) -> Self {
+        Self {
+            sender,
+            key: Some(key),
+        }
+    }
+}
+
+impl Drop for ExecutionDispatchCompletion {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            let _ = self.sender.send(key);
+        }
+    }
+}
+
+fn execution_dispatch_key(event: &ExecutionWakeup) -> String {
+    format!("{:?}:{}", event.exchange, event.symbol)
+}
+
+fn queue_execution_wakeup(
+    runtime: &Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    dispatches: &mut HashMap<String, ExecutionDispatchState>,
+    completion_sender: &tokio::sync::mpsc::UnboundedSender<String>,
+    event: ExecutionWakeup,
+) {
+    let key = execution_dispatch_key(&event);
+    if let Some(dispatch) = dispatches.get_mut(&key) {
+        match &mut dispatch.pending {
+            Some(pending) => pending.merge(event),
+            None => dispatch.pending = Some(PendingExecutionWakeups::new(event)),
+        }
+        return;
+    }
+
+    dispatches.insert(key.clone(), ExecutionDispatchState::default());
+    spawn_execution_dispatch(
+        Arc::clone(runtime),
+        completion_sender.clone(),
+        key,
+        PendingExecutionWakeups::new(event),
+    );
+}
+
+fn complete_execution_dispatch(
+    runtime: &Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    dispatches: &mut HashMap<String, ExecutionDispatchState>,
+    completion_sender: &tokio::sync::mpsc::UnboundedSender<String>,
+    key: String,
+) {
+    let Some(mut dispatch) = dispatches.remove(&key) else {
+        return;
+    };
+    let Some(pending) = dispatch.pending.take() else {
+        return;
+    };
+    dispatches.insert(key.clone(), ExecutionDispatchState::default());
+    spawn_execution_dispatch(Arc::clone(runtime), completion_sender.clone(), key, pending);
+}
+
+fn spawn_execution_dispatch(
+    runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    completion_sender: tokio::sync::mpsc::UnboundedSender<String>,
+    key: String,
+    pending: PendingExecutionWakeups,
+) {
+    tokio::spawn(async move {
+        let _completion = ExecutionDispatchCompletion::new(completion_sender, key);
+        advance_execution_event(runtime, pending.event, pending.event_count).await;
     });
 }
 
@@ -289,11 +420,13 @@ impl Drop for RuntimeTickLease {
 async fn advance_execution_event(
     runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
     event: ExecutionWakeup,
+    coalesced_events: usize,
 ) {
     let Some(now_ms) = system_time_ms() else {
         tracing::error!("system clock is unavailable; execution wakeup skipped");
         return;
     };
+    let event_queue_ms = now_ms.checked_sub(event.observed_at_ms);
     let Some(advance) = runtime
         .advance_execution_event(
             event.exchange,
@@ -310,7 +443,13 @@ async fn advance_execution_event(
         Ok(PreparedStrategyStep::Active(report))
             if report.submissions.is_empty() && report.execution_syncs == 0
     );
-    log_runtime_advance(advance, true, Some(&event));
+    log_runtime_advance(
+        advance,
+        true,
+        Some(&event),
+        event_queue_ms,
+        coalesced_events,
+    );
     if !retry {
         return;
     }
@@ -327,7 +466,7 @@ async fn advance_execution_event(
         )
         .await
     {
-        log_runtime_advance(retry, true, Some(&event));
+        log_runtime_advance(retry, true, Some(&event), event_queue_ms, coalesced_events);
     }
 }
 
@@ -335,6 +474,8 @@ fn log_runtime_advance(
     advance: engine::RuntimeAdvanceResult,
     execution_event: bool,
     event: Option<&ExecutionWakeup>,
+    event_queue_ms: Option<u64>,
+    coalesced_events: usize,
 ) {
     match advance.result {
         Ok(PreparedStrategyStep::WaitingForTrigger) => {}
@@ -352,6 +493,8 @@ fn log_runtime_advance(
                     execution_syncs = report.execution_syncs,
                     submissions = report.submissions.len(),
                     event_to_submit_ms,
+                    event_queue_ms,
+                    coalesced_events,
                     "execution WebSocket wakeup processed"
                 );
             }
@@ -723,6 +866,45 @@ mod tests {
         assert!(RuntimeTickLease::try_acquire(&in_flight).is_none());
         drop(lease);
         assert!(RuntimeTickLease::try_acquire(&in_flight).is_some());
+    }
+
+    #[test]
+    fn repeated_execution_wakeups_for_one_order_keep_the_targeted_fast_path() {
+        let mut pending =
+            PendingExecutionWakeups::new(execution_wakeup(Some("42"), Some(1_000), 1_010));
+        pending.merge(execution_wakeup(Some("42"), Some(1_005), 1_015));
+
+        assert_eq!(pending.event_count, 2);
+        assert_eq!(pending.event.exchange_order_id.as_deref(), Some("42"));
+        assert_eq!(pending.event.exchange_event_time_ms, Some(1_000));
+        assert_eq!(pending.event.observed_at_ms, 1_010);
+    }
+
+    #[test]
+    fn different_order_wakeups_collapse_to_one_bounded_strategy_snapshot() {
+        let mut pending =
+            PendingExecutionWakeups::new(execution_wakeup(Some("42"), Some(1_000), 1_010));
+        pending.merge(execution_wakeup(Some("43"), Some(1_005), 1_015));
+        pending.merge(execution_wakeup(Some("44"), Some(1_006), 1_016));
+
+        assert_eq!(pending.event_count, 3);
+        assert_eq!(pending.event.exchange_order_id, None);
+        assert_eq!(pending.event.exchange_event_time_ms, Some(1_000));
+        assert_eq!(pending.event.observed_at_ms, 1_010);
+    }
+
+    fn execution_wakeup(
+        exchange_order_id: Option<&str>,
+        exchange_event_time_ms: Option<u64>,
+        observed_at_ms: u64,
+    ) -> ExecutionWakeup {
+        ExecutionWakeup {
+            exchange: Exchange::TradeXyz,
+            symbol: "CXMTUSDC".into(),
+            exchange_order_id: exchange_order_id.map(str::to_owned),
+            exchange_event_time_ms,
+            observed_at_ms,
+        }
     }
 
     #[test]

@@ -1376,6 +1376,27 @@ where
         let value = parse_write_response(response, "TRADE.XYZ order placement")
             .map_err(write_to_placement_error)?;
         let exchange_order_id = placement_order_id(&value).map_err(write_to_placement_error)?;
+        if intent.shape.kind == OrderKind::Limit
+            && let Ok(order_time_ms) = now_ms()
+        {
+            let cached = CachedOpenExecution {
+                order: AuthoritativeOrder {
+                    client_order_id: intent.client_order_id.clone(),
+                    exchange_order_id: exchange_order_id.clone(),
+                    exchange: Exchange::TradeXyz,
+                    shape: intent.shape.clone(),
+                    lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                    executed_quantity: Some(Decimal::ZERO),
+                },
+                order_time_ms,
+            };
+            self.open_execution_cache
+                .lock()
+                .await
+                .entry(intent.shape.symbol.to_ascii_uppercase())
+                .or_default()
+                .insert(intent.client_order_id.clone(), cached);
+        }
         Ok(PlacementAcknowledgement {
             client_order_id: intent.client_order_id.clone(),
             exchange_order_id,
@@ -2522,9 +2543,15 @@ mod tests {
             .position_snapshot(Exchange::TradeXyz, "MUUSDC")
             .await
             .unwrap();
-        adapter
-            .place_order(&limit_intent("g_012345abcdef_15_S_2"))
+        let intent = limit_intent("g_012345abcdef_15_S_2");
+        let acknowledgement = adapter.place_order(&intent).await.unwrap();
+        let cached_order = adapter
+            .open_execution_cache
+            .lock()
             .await
+            .get("MUUSDC")
+            .and_then(|orders| orders.get(&intent.client_order_id))
+            .cloned()
             .unwrap();
 
         let request_types = transport
@@ -2548,6 +2575,17 @@ mod tests {
             ]
         );
         assert_eq!(transport.requests().last().unwrap().path, "/exchange");
+        assert_eq!(
+            cached_order.order.exchange_order_id,
+            acknowledgement.exchange_order_id
+        );
+        assert_eq!(cached_order.order.shape, intent.shape);
+        assert_eq!(
+            cached_order.order.lifecycle,
+            OrderLifecycle::Active(ActiveOrderStatus::New)
+        );
+        assert_eq!(cached_order.order.executed_quantity, Some(Decimal::ZERO));
+        assert!(cached_order.order_time_ms > 0);
     }
 
     #[test]
