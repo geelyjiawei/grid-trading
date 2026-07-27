@@ -499,6 +499,7 @@ struct HyperliquidRequestState {
 pub struct HyperliquidRequestGovernor<T> {
     inner: T,
     state: Arc<tokio::sync::Mutex<HyperliquidRequestState>>,
+    priority_gate: BinancePriorityGate,
 }
 
 impl<T> HyperliquidRequestGovernor<T> {
@@ -506,6 +507,7 @@ impl<T> HyperliquidRequestGovernor<T> {
         Self {
             inner,
             state: Arc::new(tokio::sync::Mutex::new(HyperliquidRequestState::default())),
+            priority_gate: BinancePriorityGate::default(),
         }
     }
 }
@@ -525,6 +527,8 @@ where
     T: HttpTransport,
 {
     async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError> {
+        let priority = hyperliquid_request_priority(&request);
+        let _priority_permit = self.priority_gate.acquire(priority).await;
         // Keep the guard through the response so concurrent snapshots cannot
         // independently consume the same IP-level budget.
         let mut state = self.state.lock().await;
@@ -587,6 +591,19 @@ fn hyperliquid_request_weight(request: &PreparedHttpRequest) -> u32 {
         ) => 2,
         Some("userRole") => 60,
         _ => 20,
+    }
+}
+
+fn hyperliquid_request_priority(request: &PreparedHttpRequest) -> BinanceRequestPriority {
+    if request.path == "/exchange"
+        || matches!(
+            hyperliquid_info_type(request).as_deref(),
+            Some("orderStatus" | "userFillsByTime")
+        )
+    {
+        BinanceRequestPriority::TradingCritical
+    } else {
+        BinanceRequestPriority::Normal
     }
 }
 
@@ -1313,6 +1330,30 @@ mod tests {
             hyperliquid_request_weight(&hyperliquid_request("/exchange", &body)),
             2
         );
+    }
+
+    #[test]
+    fn hyperliquid_execution_requests_are_trading_critical() {
+        for request in [
+            hyperliquid_request("/exchange", r#"{"action":{"orders":[{}]}}"#),
+            hyperliquid_request("/info", r#"{"type":"orderStatus"}"#),
+            hyperliquid_request("/info", r#"{"type":"userFillsByTime"}"#),
+        ] {
+            assert_eq!(
+                hyperliquid_request_priority(&request),
+                BinanceRequestPriority::TradingCritical
+            );
+        }
+        for request in [
+            hyperliquid_request("/info", r#"{"type":"frontendOpenOrders"}"#),
+            hyperliquid_request("/info", r#"{"type":"clearinghouseState"}"#),
+            hyperliquid_request("/info", r#"{"type":"metaAndAssetCtxs"}"#),
+        ] {
+            assert_eq!(
+                hyperliquid_request_priority(&request),
+                BinanceRequestPriority::Normal
+            );
+        }
     }
 
     #[test]

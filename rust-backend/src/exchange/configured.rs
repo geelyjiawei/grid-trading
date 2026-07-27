@@ -6,22 +6,24 @@ use std::{
 };
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::{
-    domain::{ClientOrderId, Exchange, InstrumentRules, OrderIntent},
+    domain::{ClientOrderId, Exchange, InstrumentRules, OrderIntent, OrderKind},
     exchange::{
-        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
-        CancellationError, ExchangeIdentityGateway, ExchangeMarketSnapshot, ExecutionSnapshotError,
+        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, ActiveOrderStatus,
+        AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
+        ExchangeIdentityGateway, ExchangeMarketSnapshot, ExecutionSnapshotError,
         ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
-        LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderCancellationTarget, OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup,
-        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
-        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
-        TradingFeeRates,
+        LookupError, MarketSnapshotGateway, OpenOrderExecutionProgress, OpenOrderSnapshotGateway,
+        OrderCancellationGateway, OrderCancellationTarget, OrderExecutionSnapshot,
+        OrderHistorySnapshotGateway, OrderLifecycle, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         aster::{
             AsterAdapter, AsterSignatureError, LocalEip712Signer, spawn_aster_execution_stream,
         },
@@ -51,6 +53,7 @@ const TRADE_XYZ_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(75);
 const BINANCE_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
 const INSTRUMENT_RULES_CACHE_TTL: Duration = Duration::from_secs(60);
 const TRADING_FEE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const TRADE_XYZ_EXECUTION_PROGRESS_CACHE_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 struct TimedSnapshotCache<T> {
@@ -88,12 +91,32 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key, (now, value));
     }
+
+    fn mutate_if_fresh(&self, key: &str, now: Instant, mutate: impl FnOnce(&mut T)) -> bool {
+        let mut values = self
+            .values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((cached_at, _)) = values.get(key) else {
+            return false;
+        };
+        if now.saturating_duration_since(*cached_at) >= self.ttl {
+            values.remove(key);
+            return false;
+        }
+        let (_, value) = values
+            .get_mut(key)
+            .expect("a fresh cache entry must remain available");
+        mutate(value);
+        true
+    }
 }
 
 #[derive(Debug)]
 struct GatewaySnapshotCaches {
     instrument_rules: TimedSnapshotCache<InstrumentRules>,
     trading_fees: TimedSnapshotCache<TradingFeeRates>,
+    trade_xyz_execution_progress: TimedSnapshotCache<Option<Vec<OpenOrderExecutionProgress>>>,
 }
 
 impl GatewaySnapshotCaches {
@@ -101,6 +124,9 @@ impl GatewaySnapshotCaches {
         Self {
             instrument_rules: TimedSnapshotCache::new(INSTRUMENT_RULES_CACHE_TTL),
             trading_fees: TimedSnapshotCache::new(TRADING_FEE_CACHE_TTL),
+            trade_xyz_execution_progress: TimedSnapshotCache::new(
+                TRADE_XYZ_EXECUTION_PROGRESS_CACHE_TTL,
+            ),
         }
     }
 }
@@ -460,6 +486,25 @@ pub struct SharedConfiguredExchangeGateway {
 impl SharedConfiguredExchangeGateway {
     pub fn exchange(&self) -> Exchange {
         self.inner.exchange()
+    }
+
+    fn mutate_trade_xyz_execution_progress(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        mutate: impl FnOnce(&mut Vec<OpenOrderExecutionProgress>),
+    ) {
+        if exchange != Exchange::TradeXyz {
+            return;
+        }
+        let key = snapshot_cache_key(exchange, symbol);
+        self.snapshot_caches
+            .trade_xyz_execution_progress
+            .mutate_if_fresh(&key, Instant::now(), |cached| {
+                if let Some(progress) = cached {
+                    mutate(progress);
+                }
+            });
     }
 }
 
@@ -830,7 +875,28 @@ impl OrderPlacementGateway for SharedConfiguredExchangeGateway {
         intent: &OrderIntent,
     ) -> Result<PlacementAcknowledgement, PlacementError> {
         self.order_placement_pacer.wait_for_slot().await;
-        self.inner.place_order(intent).await
+        let acknowledgement = self.inner.place_order(intent).await?;
+        if intent.shape.kind == OrderKind::Limit {
+            self.mutate_trade_xyz_execution_progress(
+                intent.exchange,
+                &intent.shape.symbol,
+                |progress| {
+                    progress.retain(|item| item.order.client_order_id != intent.client_order_id);
+                    progress.push(OpenOrderExecutionProgress {
+                        order: AuthoritativeOrder {
+                            client_order_id: intent.client_order_id.clone(),
+                            exchange_order_id: acknowledgement.exchange_order_id.clone(),
+                            exchange: intent.exchange,
+                            shape: intent.shape.clone(),
+                            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                            executed_quantity: Some(Decimal::ZERO),
+                        },
+                        cumulative_quantity: Decimal::ZERO,
+                    });
+                },
+            );
+        }
+        Ok(acknowledgement)
     }
 }
 
@@ -884,9 +950,14 @@ impl OrderCancellationGateway for SharedConfiguredExchangeGateway {
         client_order_id: &ClientOrderId,
         exchange_order_id: &str,
     ) -> Result<CancellationAcknowledgement, CancellationError> {
-        self.inner
+        let acknowledgement = self
+            .inner
             .cancel_order(exchange, symbol, client_order_id, exchange_order_id)
-            .await
+            .await?;
+        self.mutate_trade_xyz_execution_progress(exchange, symbol, |progress| {
+            progress.retain(|item| item.order.client_order_id != *client_order_id);
+        });
+        Ok(acknowledgement)
     }
 
     async fn cancel_orders(
@@ -895,7 +966,14 @@ impl OrderCancellationGateway for SharedConfiguredExchangeGateway {
         symbol: &str,
         targets: &[OrderCancellationTarget],
     ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
-        self.inner.cancel_orders(exchange, symbol, targets).await
+        let results = self.inner.cancel_orders(exchange, symbol, targets).await;
+        self.mutate_trade_xyz_execution_progress(exchange, symbol, |progress| {
+            for acknowledgement in results.iter().filter_map(|result| result.as_ref().ok()) {
+                progress
+                    .retain(|item| item.order.client_order_id != acknowledgement.client_order_id);
+            }
+        });
+        results
     }
 }
 
@@ -946,9 +1024,27 @@ impl ExecutionSnapshotGateway for SharedConfiguredExchangeGateway {
         symbol: &str,
     ) -> Result<Option<Vec<crate::exchange::OpenOrderExecutionProgress>>, ExecutionSnapshotError>
     {
-        self.inner
+        let key = snapshot_cache_key(exchange, symbol);
+        if exchange == Exchange::TradeXyz
+            && let Some(cached) = self
+                .snapshot_caches
+                .trade_xyz_execution_progress
+                .get(&key, Instant::now())
+        {
+            return Ok(cached);
+        }
+        let progress = self
+            .inner
             .open_order_execution_progress_snapshot(exchange, symbol)
-            .await
+            .await?;
+        if exchange == Exchange::TradeXyz {
+            self.snapshot_caches.trade_xyz_execution_progress.insert(
+                key,
+                progress.clone(),
+                Instant::now(),
+            );
+        }
+        Ok(progress)
     }
 
     async fn execution_snapshot(
@@ -958,9 +1054,20 @@ impl ExecutionSnapshotGateway for SharedConfiguredExchangeGateway {
         client_order_id: &ClientOrderId,
         exchange_order_id: &str,
     ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
-        self.inner
+        let snapshot = self
+            .inner
             .execution_snapshot(exchange, symbol, client_order_id, exchange_order_id)
-            .await
+            .await?;
+        self.mutate_trade_xyz_execution_progress(exchange, symbol, |progress| {
+            progress.retain(|item| item.order.client_order_id != *client_order_id);
+            if matches!(snapshot.order.lifecycle, OrderLifecycle::Active(_)) {
+                progress.push(OpenOrderExecutionProgress {
+                    order: snapshot.order.clone(),
+                    cumulative_quantity: snapshot.cumulative_quantity,
+                });
+            }
+        });
+        Ok(snapshot)
     }
 }
 
@@ -1114,6 +1221,27 @@ mod tests {
         );
         assert_eq!(
             cache.get("MUUSDT", inserted_at + Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn mutating_a_fresh_snapshot_does_not_extend_its_authoritative_deadline() {
+        let cache = TimedSnapshotCache::new(Duration::from_secs(10));
+        let inserted_at = Instant::now();
+        cache.insert("CXMTUSDC".into(), vec![1], inserted_at);
+
+        assert!(
+            cache.mutate_if_fresh("CXMTUSDC", inserted_at + Duration::from_secs(9), |rows| {
+                rows.push(2)
+            },)
+        );
+        assert_eq!(
+            cache.get("CXMTUSDC", inserted_at + Duration::from_secs(9)),
+            Some(vec![1, 2])
+        );
+        assert_eq!(
+            cache.get("CXMTUSDC", inserted_at + Duration::from_secs(10)),
             None
         );
     }
