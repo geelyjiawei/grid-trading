@@ -521,14 +521,21 @@ onUnmounted(() => {
   <main class="app-shell">
     <header class="topbar">
       <div class="brand-block">
-        <span class="brand-mark">G</span>
-        <div>
-          <p class="eyebrow">Vue + Rust migration</p>
+        <span class="brand-mark" aria-hidden="true">
+          <strong>G</strong>
+          <small>01</small>
+        </span>
+        <div class="brand-copy">
+          <p class="eyebrow">GRID EXECUTION / RUST CORE</p>
           <h1>合约网格控制台</h1>
+          <p class="brand-subtitle">多交易所执行、策略隔离与权威账本核对</p>
         </div>
       </div>
       <div class="topbar-actions">
-        <span class="migration-lock">{{ tradingEnabled ? "Rust 实盘写入已启用" : "Rust 只读预览" }}</span>
+        <span class="migration-lock" :class="{ enabled: tradingEnabled }">
+          <i></i>
+          {{ tradingEnabled ? "实盘执行已启用" : "只读预览模式" }}
+        </span>
         <button class="ghost-button" type="button" @click="settingsOpen = true">API 配置状态</button>
         <button class="primary-button compact" type="button" :disabled="loading" @click="refreshWorkspace">
           {{ loading ? "同步中…" : "立即刷新" }}
@@ -537,17 +544,20 @@ onUnmounted(() => {
     </header>
 
     <section class="workspace-bar">
-      <div class="exchange-tabs" aria-label="交易所工作区">
-        <button
-          v-for="exchange in exchanges"
-          :key="exchange"
-          type="button"
-          :class="{ active: activeExchange === exchange }"
-          @click="selectExchange(exchange)"
-        >
-          {{ exchangeName(exchange) }}
-          <span :class="config?.configs[exchange]?.configured ? 'configured-dot' : 'empty-dot'"></span>
-        </button>
+      <div class="workspace-cluster">
+        <span class="workspace-label">交易场所</span>
+        <div class="exchange-tabs" aria-label="交易所工作区">
+          <button
+            v-for="exchange in exchanges"
+            :key="exchange"
+            type="button"
+            :class="{ active: activeExchange === exchange }"
+            @click="selectExchange(exchange)"
+          >
+            {{ exchangeName(exchange) }}
+            <span :class="config?.configs[exchange]?.configured ? 'configured-dot' : 'empty-dot'"></span>
+          </button>
+        </div>
       </div>
       <label class="symbol-control">
         <span>交易对</span>
@@ -555,14 +565,25 @@ onUnmounted(() => {
       </label>
     </section>
 
-    <p class="migration-note">
-      启动前必须通过交易所权威预览；启动请求持久化后由 Rust 状态机执行。停止只撤销本策略订单，不主动平仓，也不改动启动前已有仓位。
-    </p>
+    <section class="migration-note" aria-label="执行安全说明">
+      <div class="safety-copy">
+        <span class="safety-icon" aria-hidden="true"></span>
+        <p>
+          <strong>执行安全链路</strong>
+          启动前必须通过交易所权威预览；启动请求持久化后由 Rust 状态机执行。
+        </p>
+      </div>
+      <div class="safety-rules">
+        <span>停止仅撤策略订单</span>
+        <span>不主动平仓</span>
+        <span>不改动既有仓位</span>
+      </div>
+    </section>
     <p v-if="workspaceError || (!authenticated && authError)" class="callout danger global-error">
       {{ workspaceError || authError }}
     </p>
 
-    <section class="dashboard-grid">
+    <section class="dashboard-grid" aria-label="交易工作台">
       <MarketOverview
         :exchange="activeExchange"
         :symbol="symbol"
@@ -578,6 +599,14 @@ onUnmounted(() => {
         :active-symbol="symbol"
         :loading="loading"
         @select="selectStrategy"
+      />
+      <StrategyOverview
+        class="dashboard-span"
+        :status="selectedStatus"
+        :risk="risk"
+        :stop-busy="stopBusy"
+        :stop-error="stopError"
+        @stop="stopStrategy"
       />
       <GridConfigurationPanel
         :exchange="activeExchange"
@@ -595,14 +624,6 @@ onUnmounted(() => {
         :trading-enabled="tradingEnabled"
         @preview="requestPreview"
         @start="startStrategy"
-      />
-      <StrategyOverview
-        class="dashboard-span"
-        :status="selectedStatus"
-        :risk="risk"
-        :stop-busy="stopBusy"
-        :stop-error="stopError"
-        @stop="stopStrategy"
       />
       <StrategyDetailsPanel
         :exchange="activeExchange"

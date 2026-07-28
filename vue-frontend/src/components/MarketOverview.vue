@@ -31,9 +31,12 @@ function balanceUnit(): string {
 <template>
   <section class="market-card panel-card">
     <header class="section-header">
-      <div>
+      <div class="market-identity">
         <p class="eyebrow">{{ exchangeName(exchange) }} · {{ symbol }}</p>
-        <h2>{{ formatExactDecimal(price?.last_price) }}</h2>
+        <div class="market-price-row">
+          <h2>{{ formatExactDecimal(price?.last_price) }}</h2>
+          <span class="snapshot-label">交易所快照</span>
+        </div>
       </div>
       <span
         class="market-change"
@@ -43,7 +46,7 @@ function balanceUnit(): string {
       </span>
     </header>
 
-    <div class="metric-grid compact-grid">
+    <div class="metric-grid compact-grid market-metrics">
       <div><span>标记价格</span><strong>{{ formatExactDecimal(price?.mark_price) }}</strong></div>
       <div><span>24H 成交量</span><strong>{{ formatNumber(price?.volume_24h, 2) }}</strong></div>
       <div><span>可用余额{{ balanceUnit() }}</span><strong>{{ configured ? formatNumber(balance?.available ?? balance?.available_balance, 4) : "未配置" }}</strong></div>

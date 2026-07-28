@@ -34,8 +34,11 @@ const emit = defineEmits<{
       type="button"
       @click="emit('select', grid)"
     >
-      <span>
-        <strong>{{ grid.symbol }}</strong>
+      <span class="strategy-identity">
+        <span class="strategy-symbol-line">
+          <strong>{{ grid.symbol }}</strong>
+          <i>{{ strategyStatusLabel(grid) }}</i>
+        </span>
         <small>{{ exchangeName(grid.exchange) }} · {{ directionName(grid.direction) }} · {{ grid.grid_mode === "geometric" ? "等比" : "等差" }} · {{ strategyStatusLabel(grid) }}</small>
       </span>
       <span class="strategy-profit">

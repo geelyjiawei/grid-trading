@@ -100,6 +100,7 @@ function feeDisplayAsset(trade: GridTrade): string {
       <div>
         <p class="eyebrow">交易所权威数据</p>
         <h2>{{ exchangeName(exchange) }} · {{ symbol }}</h2>
+        <p class="section-subtitle">持仓、挂单、成交与策略账本使用同一交易所上下文</p>
       </div>
       <button class="ghost-button" type="button" :disabled="loading || !configured" @click="emit('refresh')">
         {{ loading ? "读取中…" : "刷新明细" }}
