@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use url::form_urlencoded;
 
 pub type Parameters = Vec<(String, String)>;
@@ -162,6 +163,8 @@ const BINANCE_DEFAULT_IP_BAN_COOLDOWN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_WAF_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const BINANCE_MAX_WAF_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const BINANCE_MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const BINANCE_NORMAL_INFLIGHT_LIMIT: usize = 2;
+const BINANCE_CRITICAL_INFLIGHT_LIMIT: usize = 4;
 pub(crate) const BINANCE_LOCAL_COOLDOWN_CODE: &str = "LOCAL_REQUEST_COOLDOWN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,16 +348,19 @@ impl Drop for BinancePriorityPermit {
     }
 }
 
-/// Serializes Binance REST traffic, enforces the published weight/order windows,
+/// Schedules Binance REST traffic, enforces the published weight/order windows,
 /// and opens a fail-fast circuit after 403/418/429 responses. The shared state is
 /// deliberately below every adapter operation so reads and writes cannot bypass
-/// the same IP-level protection.
+/// the same IP-level protection. Network responses use separate bounded lanes so
+/// a slow account snapshot cannot head-of-line block a trading-critical request.
 #[derive(Clone)]
 pub struct BinanceRequestGovernor<T> {
     inner: T,
     minimum_interval: Duration,
     state: Arc<tokio::sync::Mutex<BinanceRequestState>>,
     priority_gate: BinancePriorityGate,
+    normal_inflight: Arc<Semaphore>,
+    critical_inflight: Arc<Semaphore>,
 }
 
 impl<T> BinanceRequestGovernor<T> {
@@ -364,6 +370,8 @@ impl<T> BinanceRequestGovernor<T> {
             minimum_interval,
             state: Arc::new(tokio::sync::Mutex::new(BinanceRequestState::default())),
             priority_gate: BinancePriorityGate::default(),
+            normal_inflight: Arc::new(Semaphore::new(BINANCE_NORMAL_INFLIGHT_LIMIT)),
+            critical_inflight: Arc::new(Semaphore::new(BINANCE_CRITICAL_INFLIGHT_LIMIT)),
         }
     }
 }
@@ -384,62 +392,74 @@ where
 {
     async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError> {
         let priority = binance_request_priority(&request);
-        let _priority_permit = self.priority_gate.acquire(priority).await;
-        // Keep the guard through the network request. This prevents already queued
-        // requests from escaping after the first response opens the circuit.
-        let mut state = self.state.lock().await;
-        let now = Instant::now();
-        if let Some(cooldown_until) = state.cooldown_until {
-            if cooldown_until > now {
-                return Ok(binance_cooldown_response(
-                    cooldown_until.saturating_duration_since(now),
-                ));
-            }
-            state.cooldown_until = None;
-        }
-
+        let inflight = match priority {
+            BinanceRequestPriority::TradingCritical => Arc::clone(&self.critical_inflight),
+            BinanceRequestPriority::Normal => Arc::clone(&self.normal_inflight),
+        };
+        let _inflight_permit = inflight.acquire_owned().await.map_err(|error| {
+            TransportError::Other(format!("Binance request lane is unavailable: {error}"))
+        })?;
+        let priority_permit = self.priority_gate.acquire(priority).await;
         let request_cost = binance_request_cost(&request);
-        if let Some(cooldown_until) = state.order_cooldown_until {
-            if cooldown_until > now && request_cost.orders > 0 {
-                let cooldown = cooldown_until.saturating_duration_since(now);
+        let is_exchange_info = request.path == "/fapi/v1/exchangeInfo";
+        {
+            let mut state = self.state.lock().await;
+            let now = Instant::now();
+            if let Some(cooldown_until) = state.cooldown_until {
+                if cooldown_until > now {
+                    return Ok(binance_cooldown_response(
+                        cooldown_until.saturating_duration_since(now),
+                    ));
+                }
+                state.cooldown_until = None;
+            }
+
+            if let Some(cooldown_until) = state.order_cooldown_until {
+                if cooldown_until > now && request_cost.orders > 0 {
+                    let cooldown = cooldown_until.saturating_duration_since(now);
+                    return Ok(binance_cooldown_response(cooldown));
+                }
+                if cooldown_until <= now {
+                    state.order_cooldown_until = None;
+                }
+            }
+            prune_binance_usage(&mut state, now);
+            if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
+                let cooldown = match limit {
+                    BinanceBudgetCooldown::AllRequests(cooldown) => {
+                        state.cooldown_until = Some(now + cooldown);
+                        cooldown
+                    }
+                    BinanceBudgetCooldown::Orders(cooldown) => {
+                        state.order_cooldown_until = Some(now + cooldown);
+                        cooldown
+                    }
+                };
                 return Ok(binance_cooldown_response(cooldown));
             }
-            if cooldown_until <= now {
-                state.order_cooldown_until = None;
+
+            if let Some(next_request_at) = state.next_request_at
+                && next_request_at > now
+            {
+                tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
             }
-        }
-        prune_binance_usage(&mut state, now);
-        if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
-            let cooldown = match limit {
-                BinanceBudgetCooldown::AllRequests(cooldown) => {
-                    state.cooldown_until = Some(now + cooldown);
-                    cooldown
-                }
-                BinanceBudgetCooldown::Orders(cooldown) => {
-                    state.order_cooldown_until = Some(now + cooldown);
-                    cooldown
-                }
-            };
-            return Ok(binance_cooldown_response(cooldown));
-        }
 
-        if let Some(next_request_at) = state.next_request_at
-            && next_request_at > now
-        {
-            tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
+            let requested_at = Instant::now();
+            state.next_request_at = Some(requested_at + self.minimum_interval);
+            state.usage.push_back(BinanceUsageEvent {
+                at: requested_at,
+                cost: request_cost,
+            });
         }
-
-        let is_exchange_info = request.path == "/fapi/v1/exchangeInfo";
-        let requested_at = Instant::now();
-        state.next_request_at = Some(requested_at + self.minimum_interval);
-        state.usage.push_back(BinanceUsageEvent {
-            at: requested_at,
-            cost: request_cost,
-        });
+        // The budget reservation above is serialized and priority-aware. Release
+        // that gate before awaiting the exchange so a slow read cannot block an
+        // independently bounded trading-critical request for the HTTP timeout.
+        drop(priority_permit);
         let transport_response = self.inner.execute_with_metadata(request).await?;
         let response = transport_response.response;
         let metadata = transport_response.metadata;
         let responded_at = Instant::now();
+        let mut state = self.state.lock().await;
         if is_exchange_info
             && let Some((request_weight_limit, order_limit_10s, order_limit)) =
                 binance_exchange_limits(&response.body)
@@ -486,20 +506,25 @@ fn binance_cooldown_response(cooldown: Duration) -> HttpResponse {
 
 const HYPERLIQUID_WEIGHT_INTERVAL: Duration = Duration::from_millis(60);
 const HYPERLIQUID_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+const HYPERLIQUID_NORMAL_INFLIGHT_LIMIT: usize = 2;
+const HYPERLIQUID_CRITICAL_INFLIGHT_LIMIT: usize = 4;
 
 #[derive(Debug, Default)]
 struct HyperliquidRequestState {
     next_request_at: Option<Instant>,
 }
 
-/// Serializes Hyperliquid REST traffic using the published request weights.
+/// Schedules Hyperliquid REST traffic using the published request weights.
 /// A 60 ms interval per weight unit caps this process at 1,000 weight/minute,
-/// leaving headroom below Hyperliquid's 1,200 weight/minute IP limit.
+/// leaving headroom below Hyperliquid's 1,200 weight/minute IP limit. Slow
+/// snapshot responses use a separate bounded lane from trading writes.
 #[derive(Clone)]
 pub struct HyperliquidRequestGovernor<T> {
     inner: T,
     state: Arc<tokio::sync::Mutex<HyperliquidRequestState>>,
     priority_gate: BinancePriorityGate,
+    normal_inflight: Arc<Semaphore>,
+    critical_inflight: Arc<Semaphore>,
 }
 
 impl<T> HyperliquidRequestGovernor<T> {
@@ -508,6 +533,8 @@ impl<T> HyperliquidRequestGovernor<T> {
             inner,
             state: Arc::new(tokio::sync::Mutex::new(HyperliquidRequestState::default())),
             priority_gate: BinancePriorityGate::default(),
+            normal_inflight: Arc::new(Semaphore::new(HYPERLIQUID_NORMAL_INFLIGHT_LIMIT)),
+            critical_inflight: Arc::new(Semaphore::new(HYPERLIQUID_CRITICAL_INFLIGHT_LIMIT)),
         }
     }
 }
@@ -528,24 +555,34 @@ where
 {
     async fn execute(&self, request: PreparedHttpRequest) -> Result<HttpResponse, TransportError> {
         let priority = hyperliquid_request_priority(&request);
-        let _priority_permit = self.priority_gate.acquire(priority).await;
-        // Keep the guard through the response so concurrent snapshots cannot
-        // independently consume the same IP-level budget.
-        let mut state = self.state.lock().await;
-        let now = Instant::now();
-        if let Some(next_request_at) = state.next_request_at
-            && next_request_at > now
+        let inflight = match priority {
+            BinanceRequestPriority::TradingCritical => Arc::clone(&self.critical_inflight),
+            BinanceRequestPriority::Normal => Arc::clone(&self.normal_inflight),
+        };
+        let _inflight_permit = inflight.acquire_owned().await.map_err(|error| {
+            TransportError::Other(format!("Hyperliquid request lane is unavailable: {error}"))
+        })?;
+        let priority_permit = self.priority_gate.acquire(priority).await;
+        let base_weight = hyperliquid_request_weight(&request);
         {
-            tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
+            let mut state = self.state.lock().await;
+            let now = Instant::now();
+            if let Some(next_request_at) = state.next_request_at
+                && next_request_at > now
+            {
+                tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
+            }
+
+            let requested_at = Instant::now();
+            state.next_request_at =
+                Some(requested_at + HYPERLIQUID_WEIGHT_INTERVAL.saturating_mul(base_weight));
         }
 
-        let base_weight = hyperliquid_request_weight(&request);
-        let requested_at = Instant::now();
-        state.next_request_at =
-            Some(requested_at + HYPERLIQUID_WEIGHT_INTERVAL.saturating_mul(base_weight));
+        drop(priority_permit);
         let response = self.inner.execute(request.clone()).await?;
         let responded_at = Instant::now();
         let extra_weight = hyperliquid_response_extra_weight(&request, &response);
+        let mut state = self.state.lock().await;
         if extra_weight > 0 {
             let next = state
                 .next_request_at
@@ -1144,6 +1181,61 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct BlockingFirstTransport {
+        calls: Arc<AtomicUsize>,
+        first_started: Arc<Semaphore>,
+        release_first: Arc<Semaphore>,
+    }
+
+    impl BlockingFirstTransport {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                first_started: Arc::new(Semaphore::new(0)),
+                release_first: Arc::new(Semaphore::new(0)),
+            }
+        }
+
+        async fn wait_until_first_started(&self) {
+            self.first_started
+                .acquire()
+                .await
+                .expect("test semaphore should remain open")
+                .forget();
+        }
+
+        fn release_first(&self) {
+            self.release_first.add_permits(1);
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for BlockingFirstTransport {
+        async fn execute(
+            &self,
+            _request: PreparedHttpRequest,
+        ) -> Result<HttpResponse, TransportError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.first_started.add_permits(1);
+                self.release_first
+                    .acquire()
+                    .await
+                    .map_err(|error| TransportError::Other(error.to_string()))?
+                    .forget();
+            }
+            Ok(HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            })
+        }
+    }
+
     fn test_request() -> PreparedHttpRequest {
         PreparedHttpRequest {
             method: HttpMethod::Get,
@@ -1236,6 +1328,31 @@ mod tests {
         );
         critical.await.unwrap();
         normal.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binance_trading_request_is_not_blocked_by_an_inflight_normal_request() {
+        let transport = BlockingFirstTransport::new();
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+
+        let normal_governor = governor.clone();
+        let normal = tokio::spawn(async move { normal_governor.execute(test_request()).await });
+        transport.wait_until_first_started().await;
+
+        let critical = tokio::time::timeout(
+            Duration::from_millis(250),
+            governor.execute(symbol_request(HttpMethod::Post, "/fapi/v1/order")),
+        )
+        .await
+        .expect("trading request must bypass a slow normal response")
+        .unwrap();
+
+        assert_eq!(critical.status, 200);
+        assert_eq!(transport.call_count(), 2);
+        assert!(!normal.is_finished());
+
+        transport.release_first();
+        assert_eq!(normal.await.unwrap().unwrap().status, 200);
     }
 
     fn hyperliquid_request(path: &str, body: &str) -> PreparedHttpRequest {
@@ -1354,6 +1471,41 @@ mod tests {
                 BinanceRequestPriority::Normal
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_trading_request_is_not_blocked_by_an_inflight_normal_request() {
+        let transport = BlockingFirstTransport::new();
+        let governor = HyperliquidRequestGovernor::new(transport.clone());
+
+        let normal_governor = governor.clone();
+        let normal = tokio::spawn(async move {
+            normal_governor
+                .execute(hyperliquid_request(
+                    "/info",
+                    r#"{"type":"clearinghouseState"}"#,
+                ))
+                .await
+        });
+        transport.wait_until_first_started().await;
+
+        let critical = tokio::time::timeout(
+            Duration::from_millis(500),
+            governor.execute(hyperliquid_request(
+                "/exchange",
+                r#"{"action":{"orders":[{}]}}"#,
+            )),
+        )
+        .await
+        .expect("trading request must bypass a slow normal response")
+        .unwrap();
+
+        assert_eq!(critical.status, 200);
+        assert_eq!(transport.call_count(), 2);
+        assert!(!normal.is_finished());
+
+        transport.release_first();
+        assert_eq!(normal.await.unwrap().unwrap().status, 200);
     }
 
     #[test]
