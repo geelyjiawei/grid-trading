@@ -876,6 +876,97 @@ strong,
   font-size: 1.2rem;
 }
 
+.strategy-specification {
+  margin-bottom: 0.9rem;
+  overflow: hidden;
+  border: 1px solid rgba(70, 217, 160, 0.22);
+  border-radius: 12px 3px 12px 3px;
+  background:
+    linear-gradient(135deg, rgba(70, 217, 160, 0.07), transparent 38%),
+    rgba(7, 24, 20, 0.82);
+}
+
+.strategy-specification-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 0.9rem 0.72rem;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.strategy-specification-header h3 {
+  margin-top: 0.12rem;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.strategy-specification-badge {
+  flex: 0 0 auto;
+  border: 1px solid rgba(240, 188, 88, 0.45);
+  border-radius: 3px 9px;
+  padding: 0.32rem 0.52rem;
+  color: var(--amber);
+  background: rgba(240, 188, 88, 0.07);
+  font-size: 0.64rem;
+  font-weight: 700;
+}
+
+.strategy-specification-grid,
+.strategy-position-ledger {
+  display: grid;
+  margin: 0;
+}
+
+.strategy-specification-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  background: var(--line-soft);
+  gap: 1px;
+}
+
+.strategy-specification-grid > div,
+.strategy-position-ledger > div {
+  min-width: 0;
+  padding: 0.72rem 0.9rem;
+  background: rgba(9, 29, 24, 0.96);
+}
+
+.strategy-specification dt,
+.strategy-position-ledger dt {
+  margin-bottom: 0.28rem;
+  color: var(--muted);
+  font-size: 0.64rem;
+}
+
+.strategy-specification dd,
+.strategy-position-ledger dd {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-soft);
+  font-size: 0.86rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.strategy-position-ledger {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid rgba(240, 188, 88, 0.22);
+  background: rgba(240, 188, 88, 0.12);
+  gap: 1px;
+}
+
+.strategy-position-ledger > div {
+  background: rgba(30, 34, 25, 0.9);
+}
+
+.strategy-position-ledger small {
+  display: block;
+  margin-top: 0.24rem;
+  color: var(--muted);
+  font-size: 0.59rem;
+}
+
 .preview-lock {
   border: 1px solid rgba(142, 184, 232, 0.34);
   border-radius: 3px 10px;
@@ -1495,6 +1586,10 @@ strong,
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .strategy-specification-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .strategy-metrics .metric-primary {
     grid-column: span 1;
   }
@@ -1577,6 +1672,10 @@ strong,
   }
 
   .strategy-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .strategy-specification-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1682,6 +1781,14 @@ strong,
   .strategy-actions {
     align-items: flex-end;
     flex-direction: column;
+  }
+
+  .strategy-specification-header {
+    align-items: flex-start;
+  }
+
+  .strategy-position-ledger {
+    grid-template-columns: 1fr;
   }
 
   .form-grid {

@@ -46,6 +46,19 @@ export interface GridStatus {
   lifecycle?: string;
   direction?: Direction;
   grid_mode?: GridMode;
+  grid_count?: number;
+  active_grid_count?: number;
+  participating_level_count?: number;
+  lower_price?: DecimalValue;
+  upper_price?: DecimalValue;
+  reference_price?: DecimalValue;
+  leverage?: number;
+  position_sizing_mode?: PositionSizingMode;
+  grid_order_qty?: DecimalValue | null;
+  total_investment?: DecimalValue;
+  initial_order_type?: InitialOrderType;
+  initial_order_price?: DecimalValue | null;
+  grid_order_post_only?: boolean;
   total_profit?: DecimalValue;
   completed_pairs?: number;
   trigger_message?: string;
@@ -66,7 +79,7 @@ export interface GridStatus {
   grid_position_net_qty?: DecimalValue;
   expected_position_net_qty?: DecimalValue;
   opening_filled_qty?: DecimalValue;
-  opening_planned_qty?: DecimalValue;
+  planned_total_qty?: DecimalValue;
   grid_profit_pct?: DecimalValue;
   initial_side?: "Buy" | "Sell";
   initial_qty?: number;
@@ -184,6 +197,8 @@ export interface GridTrade {
 export interface PositionBaseline {
   side?: "Buy" | "Sell";
   qty?: string | number;
+  signed_qty?: string | number;
+  entry_price?: string | number | null;
 }
 
 export interface PositionSnapshot {

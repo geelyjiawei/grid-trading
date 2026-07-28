@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import type { GridStatus, RiskSnapshot } from "../api/types";
 import {
   directionName,
+  formatExactDecimal,
   formatNumber,
   quoteAsset,
   strategyCanStop,
@@ -52,6 +53,42 @@ const manualStopPending = computed(
   () => props.status?.manual_stop_pending === true || props.status?.lifecycle === "stop_requested",
 );
 const settlementAsset = computed(() => props.status ? quoteAsset(props.status.exchange) : "USDT");
+const quantityAsset = computed(() => {
+  const symbol = props.status?.symbol ?? "";
+  const quote = settlementAsset.value;
+  return symbol.endsWith(quote) ? symbol.slice(0, -quote.length) : "标的";
+});
+const hasGridSpecification = computed(
+  () => props.status?.lower_price != null
+    && props.status?.upper_price != null
+    && props.status?.grid_count != null,
+);
+const sizingLabel = computed(() => (
+  props.status?.position_sizing_mode === "fixed_grid_qty" ? "固定每格数量" : "按投入金额"
+));
+const openingOrderLabel = computed(() => {
+  const type = props.status?.initial_order_type;
+  if (type === "market") return "市价";
+  if (type === "post_only") return "Post Only 限价";
+  if (type === "limit") return "限价";
+  return "--";
+});
+const openingOrderDisplay = computed(() => {
+  const price = props.status?.initial_order_price;
+  return price == null
+    ? openingOrderLabel.value
+    : `${openingOrderLabel.value} · ${formatExactDecimal(price)}`;
+});
+const activeGridDisplay = computed(() => {
+  const active = props.status?.active_grid_count;
+  const participating = props.status?.participating_level_count;
+  if (active == null) return "-- 格";
+  return participating == null ? `${active} 格` : `${active} / ${participating} 格`;
+});
+const baselineSignedQuantity = computed(
+  () => props.status?.baseline_position?.signed_qty
+    ?? signedQuantity(props.status?.baseline_position?.side, props.status?.baseline_position?.qty),
+);
 
 watch(
   () => [props.status?.run_id, props.status?.lifecycle, canStop.value, props.stopBusy],
@@ -68,6 +105,26 @@ function requestStop(): void {
   }
   stopConfirmation.value = false;
   emit("stop");
+}
+
+function signedQuantity(
+  side: "Buy" | "Sell" | undefined,
+  quantity: string | number | undefined,
+): string | null {
+  const text = typeof quantity === "string" ? quantity.trim() : String(quantity ?? "");
+  const match = /^[+-]?(\d+(?:\.\d+)?)$/.exec(text);
+  if (!match) return null;
+  if (side === "Sell") return `-${match[1]}`;
+  return match[1];
+}
+
+function positionLabel(value: unknown): string {
+  const text = typeof value === "string" ? value.trim() : String(value ?? "");
+  const match = /^([+-]?)(\d+(?:\.\d+)?)$/.exec(text);
+  if (!match) return "--";
+  if (/^0+(?:\.0+)?$/.test(match[2])) return `0 ${quantityAsset.value}`;
+  const side = match[1] === "-" ? "空" : "多";
+  return `${side} ${formatExactDecimal(match[2])} ${quantityAsset.value}`;
 }
 </script>
 
@@ -105,6 +162,71 @@ function requestStop(): void {
       <div v-if="currentRisk?.has_risk" class="callout danger">
         风险核对未通过。当前页面仅展示状态，不执行自动补救操作。
       </div>
+      <section v-if="hasGridSpecification" class="strategy-specification" aria-label="网格策略参数">
+        <header class="strategy-specification-header">
+          <div>
+            <p class="eyebrow">本轮策略参数</p>
+            <h3>网格设置与仓位归属</h3>
+          </div>
+          <span class="strategy-specification-badge">{{ sizingLabel }}</span>
+        </header>
+        <dl class="strategy-specification-grid">
+          <div>
+            <dt>价格区间</dt>
+            <dd>{{ formatExactDecimal(status.lower_price) }} → {{ formatExactDecimal(status.upper_price) }}</dd>
+          </div>
+          <div>
+            <dt>网格数量</dt>
+            <dd>{{ status.grid_count }} 格</dd>
+          </div>
+          <div>
+            <dt>每格数量</dt>
+            <dd>
+              <template v-if="status.position_sizing_mode === 'fixed_grid_qty'">
+                {{ formatExactDecimal(status.grid_order_qty) }} {{ quantityAsset }}
+              </template>
+              <template v-else>动态分配</template>
+            </dd>
+          </div>
+          <div>
+            <dt>杠杆</dt>
+            <dd>{{ status.leverage != null ? `${status.leverage}x` : "--" }}</dd>
+          </div>
+          <div>
+            <dt>开仓方式</dt>
+            <dd>{{ openingOrderDisplay }}</dd>
+          </div>
+          <div>
+            <dt>启动参与网格</dt>
+            <dd>{{ activeGridDisplay }}</dd>
+          </div>
+          <div>
+            <dt>计划初始网格仓</dt>
+            <dd>{{ formatExactDecimal(status.planned_total_qty) }} {{ quantityAsset }}</dd>
+          </div>
+          <div>
+            <dt>已成交初始网格仓</dt>
+            <dd>{{ formatExactDecimal(status.opening_filled_qty) }} {{ quantityAsset }}</dd>
+          </div>
+        </dl>
+        <dl class="strategy-position-ledger">
+          <div>
+            <dt>启动前旧仓</dt>
+            <dd>{{ positionLabel(baselineSignedQuantity) }}</dd>
+            <small>独立保留，不归本轮网格</small>
+          </div>
+          <div>
+            <dt>当前网格净仓</dt>
+            <dd>{{ positionLabel(status.grid_position_net_qty) }}</dd>
+            <small>仅统计本轮策略成交</small>
+          </div>
+          <div>
+            <dt>台账应有总仓</dt>
+            <dd>{{ positionLabel(status.expected_position_net_qty) }}</dd>
+            <small>旧仓与网格仓合计</small>
+          </div>
+        </dl>
+      </section>
       <div class="metric-grid strategy-metrics">
         <div class="metric-primary"><span>总权益利润</span><strong :class="Number(totalEquityProfit ?? 0) >= 0 ? 'positive' : 'negative'">{{ formatNumber(totalEquityProfit, 4) }} {{ settlementAsset }}</strong></div>
         <div><span>已实现净利润</span><strong>{{ formatNumber(realizedNetProfit, 4) }} {{ settlementAsset }}</strong></div>

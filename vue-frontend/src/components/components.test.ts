@@ -345,6 +345,53 @@ describe("Vue migration components", () => {
     expect(wrapper.text()).not.toContain("等待当前策略");
   });
 
+  it("shows the persisted grid setup and separates baseline from grid inventory", () => {
+    const wrapper = mount(StrategyOverview, {
+      props: {
+        status: {
+          run_id: "run-skyh-grid",
+          exchange: "binance",
+          symbol: "SKHYUSDT",
+          running: true,
+          direction: "short",
+          grid_mode: "arithmetic",
+          lower_price: "137",
+          upper_price: "140",
+          grid_count: 20,
+          active_grid_count: 9,
+          participating_level_count: 20,
+          leverage: 20,
+          position_sizing_mode: "fixed_grid_qty",
+          grid_order_qty: "2",
+          initial_order_type: "limit",
+          initial_order_price: "138.3",
+          planned_total_qty: "18",
+          opening_filled_qty: "18",
+          baseline_position: {
+            side: "Sell",
+            qty: "3.00",
+            signed_qty: "-3.00",
+            entry_price: "141.24035085268247",
+          },
+          grid_position_net_qty: "-26.00",
+          expected_position_net_qty: "-29.00",
+        },
+        risk: null,
+      },
+    });
+
+    const specification = wrapper.find(".strategy-specification");
+    expect(specification.text()).toContain("137 → 140");
+    expect(specification.text()).toContain("20 格");
+    expect(specification.text()).toContain("2 SKHY");
+    expect(specification.text()).toContain("20x");
+    expect(specification.text()).toContain("限价 · 138.3");
+    expect(specification.text()).toContain("9 / 20 格");
+    expect(specification.text()).toContain("空 3.00 SKHY");
+    expect(specification.text()).toContain("空 26.00 SKHY");
+    expect(specification.text()).toContain("空 29.00 SKHY");
+  });
+
   it("rejects a stale profit snapshot from another strategy context", () => {
     const wrapper = mount(StrategyOverview, {
       props: {

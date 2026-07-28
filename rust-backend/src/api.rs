@@ -1883,6 +1883,13 @@ fn strategy_status_response(
             "grid_count": state.config.grid_count,
             "lower_price": state.config.lower_price.to_string(),
             "upper_price": state.config.upper_price.to_string(),
+            "leverage": state.config.leverage,
+            "position_sizing_mode": state.config.position_sizing_mode,
+            "grid_order_qty": state.config.grid_order_qty.map(|value| value.to_string()),
+            "total_investment": state.config.total_investment.to_string(),
+            "initial_order_type": state.config.initial_order_type,
+            "initial_order_price": state.config.initial_order_price.map(|value| value.to_string()),
+            "grid_order_post_only": state.config.grid_order_post_only,
             "waiting_trigger": true,
             "waiting_initial_order": false,
             "manual_stop_pending": false,
@@ -1947,6 +1954,13 @@ fn strategy_status_response(
                 "lower_price": state.config.lower_price.to_string(),
                 "upper_price": state.config.upper_price.to_string(),
                 "reference_price": state.plan.reference_price.to_string(),
+                "leverage": state.config.leverage,
+                "position_sizing_mode": state.config.position_sizing_mode,
+                "grid_order_qty": state.config.grid_order_qty.map(|value| value.to_string()),
+                "total_investment": state.config.total_investment.to_string(),
+                "initial_order_type": state.config.initial_order_type,
+                "initial_order_price": state.config.initial_order_price.map(|value| value.to_string()),
+                "grid_order_post_only": state.config.grid_order_post_only,
                 "waiting_trigger": false,
                 "waiting_initial_order": state.lifecycle == StrategyLifecycle::AwaitingOpening,
                 "manual_stop_pending": state.lifecycle == StrategyLifecycle::StopRequested,
@@ -5396,6 +5410,13 @@ mod tests {
         assert_eq!(status["grids"][0]["run_id"], strategy.run_id.as_str());
         assert_eq!(status["grids"][0]["waiting_trigger"], false);
         assert_eq!(status["grids"][0]["engine_running"], false);
+        assert_eq!(status["grids"][0]["lower_price"], "0.38000");
+        assert_eq!(status["grids"][0]["upper_price"], "0.42000");
+        assert_eq!(status["grids"][0]["grid_count"], 20);
+        assert_eq!(status["grids"][0]["grid_order_qty"], "100.000");
+        assert_eq!(status["grids"][0]["leverage"], 3);
+        assert_eq!(status["grids"][0]["position_sizing_mode"], "fixed_grid_qty");
+        assert_eq!(status["grids"][0]["initial_order_type"], "market");
         assert_eq!(status["grids"][0]["grid_position_net_qty"], "0");
         assert_eq!(status["grids"][0]["expected_position_net_qty"], "0");
 
