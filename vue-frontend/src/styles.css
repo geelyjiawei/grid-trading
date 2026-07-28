@@ -950,7 +950,7 @@ strong,
 }
 
 .strategy-position-ledger {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   border-top: 1px solid rgba(240, 188, 88, 0.22);
   background: rgba(240, 188, 88, 0.12);
   gap: 1px;
@@ -965,6 +965,16 @@ strong,
   margin-top: 0.24rem;
   color: var(--muted);
   font-size: 0.59rem;
+}
+
+.strategy-position-ledger .position-ledger-risk {
+  background:
+    linear-gradient(90deg, rgba(255, 111, 121, 0.1), transparent),
+    rgba(42, 26, 25, 0.95);
+}
+
+.strategy-position-ledger .position-ledger-risk dd {
+  color: var(--danger-soft);
 }
 
 .preview-lock {
@@ -1364,6 +1374,15 @@ strong,
   background: var(--danger-bg);
 }
 
+.callout strong,
+.callout span {
+  display: block;
+}
+
+.callout span {
+  margin-top: 0.22rem;
+}
+
 .callout code {
   color: var(--text);
   font-family: "Cascadia Mono", "Consolas", monospace;
@@ -1590,6 +1609,10 @@ strong,
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .strategy-position-ledger {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .strategy-metrics .metric-primary {
     grid-column: span 1;
   }
@@ -1676,6 +1699,10 @@ strong,
   }
 
   .strategy-specification-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .strategy-position-ledger {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

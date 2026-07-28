@@ -89,6 +89,14 @@ const baselineSignedQuantity = computed(
   () => props.status?.baseline_position?.signed_qty
     ?? signedQuantity(props.status?.baseline_position?.side, props.status?.baseline_position?.qty),
 );
+const actualPosition = computed(() => currentRisk.value?.actual_position_net_qty ?? null);
+const unmanagedPositionDelta = computed(() => currentRisk.value?.unmanaged_delta_qty ?? null);
+const riskPositionSummary = computed(() => {
+  if (!currentRisk.value?.unmanaged_position) return "";
+  return `台账应有 ${positionLabel(props.status?.expected_position_net_qty)}，交易所实际 ${
+    positionLabel(actualPosition.value)
+  }，未归属差额 ${positionLabel(unmanagedPositionDelta.value)}。`;
+});
 
 watch(
   () => [props.status?.run_id, props.status?.lifecycle, canStop.value, props.stopBusy],
@@ -160,7 +168,8 @@ function positionLabel(value: unknown): string {
         停止请求已保存。程序正在核对成交、手续费并确认策略订单全部终态；期间不会继续补单，也不会主动平仓。
       </div>
       <div v-if="currentRisk?.has_risk" class="callout danger">
-        风险核对未通过。当前页面仅展示状态，不执行自动补救操作。
+        <strong>风险核对未通过，当前页面仅展示状态，不执行自动补救操作。</strong>
+        <span v-if="riskPositionSummary">{{ riskPositionSummary }}</span>
       </div>
       <section v-if="hasGridSpecification" class="strategy-specification" aria-label="网格策略参数">
         <header class="strategy-specification-header">
@@ -224,6 +233,16 @@ function positionLabel(value: unknown): string {
             <dt>台账应有总仓</dt>
             <dd>{{ positionLabel(status.expected_position_net_qty) }}</dd>
             <small>旧仓与网格仓合计</small>
+          </div>
+          <div>
+            <dt>交易所实际总仓</dt>
+            <dd>{{ positionLabel(actualPosition) }}</dd>
+            <small>来自当前权威风险快照</small>
+          </div>
+          <div :class="{ 'position-ledger-risk': currentRisk?.unmanaged_position }">
+            <dt>未归属差额</dt>
+            <dd>{{ positionLabel(unmanagedPositionDelta) }}</dd>
+            <small>不属于本轮策略台账</small>
           </div>
         </dl>
       </section>

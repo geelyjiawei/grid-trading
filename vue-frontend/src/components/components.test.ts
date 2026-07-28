@@ -376,7 +376,16 @@ describe("Vue migration components", () => {
           grid_position_net_qty: "-26.00",
           expected_position_net_qty: "-29.00",
         },
-        risk: null,
+        risk: {
+          run_id: "run-skyh-grid",
+          exchange: "binance",
+          symbol: "SKHYUSDT",
+          actual_position_net_qty: "-55.00",
+          expected_position_net_qty: "-29.00",
+          unmanaged_delta_qty: "-26.00",
+          unmanaged_position: true,
+          has_risk: true,
+        },
       },
     });
 
@@ -390,6 +399,11 @@ describe("Vue migration components", () => {
     expect(specification.text()).toContain("空 3.00 SKHY");
     expect(specification.text()).toContain("空 26.00 SKHY");
     expect(specification.text()).toContain("空 29.00 SKHY");
+    expect(specification.text()).toContain("空 55.00 SKHY");
+    expect(specification.text()).toContain("未归属差额空 26.00 SKHY");
+    expect(wrapper.find(".callout.danger").text()).toContain(
+      "台账应有 空 29.00 SKHY，交易所实际 空 55.00 SKHY，未归属差额 空 26.00 SKHY",
+    );
   });
 
   it("rejects a stale profit snapshot from another strategy context", () => {
