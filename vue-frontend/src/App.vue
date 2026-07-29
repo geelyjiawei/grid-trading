@@ -161,9 +161,18 @@ async function loadConfig(): Promise<void> {
   const response = await api.config();
   config.value = response;
   const preferred = response.active_exchange ?? response.exchange;
-  if (preferred && exchanges.includes(preferred)) {
-    activeExchange.value = preferred;
-    alignSymbolWithExchange(preferred);
+  const configuredFallback = exchanges.find(
+    (exchange) => response.configs[exchange]?.configured,
+  );
+  const selected =
+    preferred
+    && exchanges.includes(preferred)
+    && response.configs[preferred]?.configured
+      ? preferred
+      : configuredFallback ?? preferred;
+  if (selected && exchanges.includes(selected)) {
+    activeExchange.value = selected;
+    alignSymbolWithExchange(selected);
   }
 }
 
@@ -191,6 +200,16 @@ async function refreshStrategies(): Promise<void> {
 async function refreshMarket(): Promise<void> {
   if (!authenticated.value || !symbol.value) return;
   prepareWorkspaceContext();
+  if (!configured.value) {
+    marketRequestSequence += 1;
+    price.value = null;
+    balance.value = null;
+    fees.value = null;
+    risk.value = null;
+    marketError.value = "";
+    loading.value = false;
+    return;
+  }
   const exchange = activeExchange.value;
   const requestedSymbol = symbol.value;
   const requestContext = `${exchange}:${requestedSymbol}`;

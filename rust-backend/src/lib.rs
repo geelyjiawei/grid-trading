@@ -129,6 +129,7 @@ pub async fn app_from_environment() -> Result<Router, AppConfigurationError> {
     if let Some(store) = &exchange_config_store {
         register_stored_exchange_gateways(&exchange_gateways, store)?;
     }
+    exchange_gateways.select_configured_preferred();
     let runtime = if trading_enabled {
         let settings = RuntimeSettings::new(
             "USDT",

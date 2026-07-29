@@ -57,6 +57,71 @@ afterEach(() => {
 });
 
 describe("workspace request isolation", () => {
+  it("does not poll an unconfigured preferred exchange", async () => {
+    vi.spyOn(api, "authStatus").mockResolvedValue({
+      required: false,
+      configured: true,
+      authenticated: true,
+    });
+    vi.spyOn(api, "config").mockResolvedValue({
+      configured: false,
+      active_exchange: "bybit",
+      configs: {
+        binance: { exchange: "binance", configured: true },
+        aster: { exchange: "aster", configured: false },
+        bybit: { exchange: "bybit", configured: false },
+        trade_xyz: { exchange: "trade_xyz", configured: false },
+      },
+    });
+    vi.spyOn(api, "gridStatus").mockResolvedValue({
+      running: false,
+      count: 0,
+      trading_enabled: true,
+      grids: [],
+    });
+    const priceSpy = vi.spyOn(api, "price").mockResolvedValue({
+      last_price: "100",
+      mark_price: "100",
+    });
+    vi.spyOn(api, "balance").mockResolvedValue({
+      exchange: "binance",
+      available: "100",
+      equity: "100",
+    });
+    vi.spyOn(api, "feeRates").mockResolvedValue({
+      exchange: "binance",
+      symbol: "BTCUSDT",
+      maker_fee_rate: "0.0002",
+      taker_fee_rate: "0.0005",
+    });
+    vi.spyOn(api, "risk").mockResolvedValue({
+      exchange: "binance",
+      symbol: "BTCUSDT",
+      has_risk: false,
+    });
+    vi.spyOn(api, "positions").mockResolvedValue({ positions: [] });
+    vi.spyOn(api, "openOrders").mockResolvedValue({ orders: [] });
+    vi.spyOn(api, "trades").mockResolvedValue({ trades: [] });
+    vi.spyOn(api, "history").mockResolvedValue({ runs: [] });
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => {
+      expect(priceSpy).toHaveBeenCalledWith("binance", "BTCUSDT");
+    });
+    expect(priceSpy).not.toHaveBeenCalledWith("bybit", expect.any(String));
+
+    const bybitTab = wrapper
+      .findAll(".exchange-tabs button")
+      .find((button) => button.text().includes("Bybit"));
+    expect(bybitTab).toBeDefined();
+    await bybitTab!.trigger("click");
+    await flushPromises();
+
+    expect(priceSpy).not.toHaveBeenCalledWith("bybit", expect.any(String));
+    expect(wrapper.find(".global-error").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("renders TRADE.XYZ market data without waiting for a slower risk snapshot", async () => {
     const grid: GridStatus = {
       run_id: "run-trade-xyz",

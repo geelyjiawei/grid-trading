@@ -117,6 +117,27 @@ impl ExchangeGatewayRegistry {
             .preferred = preferred;
     }
 
+    pub fn select_configured_preferred(&self) -> Option<Exchange> {
+        let mut state = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let preferred = state.preferred;
+        if state.slot(preferred).is_some() {
+            return Some(preferred);
+        }
+        let fallback = [
+            Exchange::Binance,
+            Exchange::Aster,
+            Exchange::Bybit,
+            Exchange::TradeXyz,
+        ]
+        .into_iter()
+        .find(|exchange| state.slot(*exchange).is_some())?;
+        state.preferred = fallback;
+        Some(fallback)
+    }
+
     pub fn register_configured(
         &mut self,
         gateway: ConfiguredExchangeGateway,
@@ -444,5 +465,23 @@ mod tests {
         assert!(summary.testnet);
         assert_eq!(summary.source.as_deref(), Some("file"));
         assert_eq!(summary.api_key.as_deref(), Some("seco****alue"));
+    }
+
+    #[test]
+    fn unavailable_default_falls_back_to_a_configured_exchange() {
+        let factory = ExchangeGatewayFactory::standard(ExchangeEnvironment::Production).unwrap();
+        let gateway = factory
+            .build(ExchangeCredentials::binance("visible-key", "secret-value").unwrap())
+            .unwrap();
+        let mut registry = ExchangeGatewayRegistry::empty(Exchange::Bybit);
+        registry
+            .register_configured(gateway, ExchangeEnvironment::Production, "env", None)
+            .unwrap();
+
+        assert_eq!(
+            registry.select_configured_preferred(),
+            Some(Exchange::Binance)
+        );
+        assert_eq!(registry.preferred(), Exchange::Binance);
     }
 }
