@@ -10,7 +10,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::{
-    domain::{ClientOrderId, Exchange, OrderIntent},
+    domain::{ClientOrderId, Exchange, OrderIntent, TimeInForce},
     exchange::{
         AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
         CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
@@ -48,6 +48,7 @@ const TRADE_PAGE_LIMIT: usize = 1_000;
 const MAX_TRADE_PAGES: usize = 64;
 const MAX_BATCH_CANCELLATIONS: usize = 10;
 const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
+const POST_ONLY_WOULD_TAKE_CODE: &str = "-5022";
 
 pub trait BinanceRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, SignatureError>;
@@ -696,6 +697,16 @@ where
 
         let error = parse_exchange_error(&response.body);
         if response.status == 429 && error.code.as_deref() == Some(BINANCE_LOCAL_COOLDOWN_CODE) {
+            return Err(PlacementError::NotSubmitted {
+                message: error.message,
+            });
+        }
+        if intent.shape.time_in_force == TimeInForce::PostOnly
+            && error.code.as_deref() == Some(POST_ONLY_WOULD_TAKE_CODE)
+        {
+            // Binance guarantees that -5022 creates no order. Keeping the
+            // intent retryable preserves the grid obligation without risking
+            // a duplicate exchange order when the price becomes maker-safe.
             return Err(PlacementError::NotSubmitted {
                 message: error.message,
             });
@@ -1543,6 +1554,30 @@ mod tests {
         assert!(matches!(
             adapter(rejected).place_order(&intent()).await,
             Err(PlacementError::Definitive { code: Some(code), .. }) if code == "-1013"
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_only_would_take_is_retryable_only_for_post_only_orders() {
+        let response = || {
+            Ok(HttpResponse {
+                status: 400,
+                body: r#"{"code":-5022,"msg":"Due to the order could not be executed as maker, the Post Only order will be rejected. The order will not be recorded in the order history"}"#.into(),
+            })
+        };
+        let post_only = MockTransport::with_response(response());
+        assert!(matches!(
+            adapter(post_only).place_order(&intent()).await,
+            Err(PlacementError::NotSubmitted { .. })
+        ));
+
+        let mut ordinary_limit = intent();
+        ordinary_limit.shape.time_in_force = TimeInForce::Gtc;
+        let gtc = MockTransport::with_response(response());
+        assert!(matches!(
+            adapter(gtc).place_order(&ordinary_limit).await,
+            Err(PlacementError::Definitive { code: Some(code), .. })
+                if code == POST_ONLY_WOULD_TAKE_CODE
         ));
     }
 
