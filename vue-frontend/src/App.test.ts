@@ -54,6 +54,30 @@ function installWorkspaceMocks(grids: GridStatus[]): void {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  document.documentElement.dataset.theme = "dark";
+  window.localStorage.removeItem("grid-console-theme");
+});
+
+describe("theme control", () => {
+  it("switches between dark and light themes", async () => {
+    document.documentElement.dataset.theme = "dark";
+    installWorkspaceMocks([]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValue({
+      exchange: "aster",
+      symbol: "BTCUSDT",
+      has_risk: false,
+    });
+
+    const wrapper = mount(App);
+    const themeButton = wrapper.get('button[aria-label="切换到浅色模式"]');
+    await themeButton.trigger("click");
+
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(themeButton.attributes("aria-label")).toBe("切换到深色模式");
+    expect(themeButton.attributes("aria-pressed")).toBe("true");
+    wrapper.unmount();
+  });
 });
 
 describe("workspace request isolation", () => {

@@ -3,9 +3,29 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#071210" />
     <meta name="description" content="多交易所合约网格执行与风险核对控制台" />
+    <script>
+      (() => {
+        let theme = "dark";
+        try {
+          const saved = window.localStorage.getItem("grid-console-theme");
+          theme = saved === "light" || saved === "dark"
+            ? saved
+            : window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+        } catch {
+          theme = "dark";
+        }
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document
+          .querySelector('meta[name="theme-color"]')
+          ?.setAttribute("content", theme === "dark" ? "#07110e" : "#f2f0e9");
+      })();
+    </script>
     <title>GRID/01 · 合约网格控制台</title>
   </head>
   <body>

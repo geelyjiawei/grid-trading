@@ -29,6 +29,11 @@ import StrategyOverview from "./components/StrategyOverview.vue";
 import { exchangeName, quoteAsset, strategyCanStop } from "./format";
 
 const exchanges: Exchange[] = ["binance", "aster", "bybit", "trade_xyz"];
+type ColorTheme = "dark" | "light";
+const themeStorageKey = "grid-console-theme";
+const theme = ref<ColorTheme>(
+  document.documentElement.dataset.theme === "light" ? "light" : "dark",
+);
 const authStatus = ref<AuthStatus | null>(null);
 const authenticated = ref(false);
 const authBusy = ref(false);
@@ -83,6 +88,24 @@ let marketContext = "";
 let balanceContext = "";
 let detailsContext = "";
 const riskRequestsInFlight = new Map<string, Promise<RiskSnapshot>>();
+
+function applyTheme(nextTheme: ColorTheme): void {
+  theme.value = nextTheme;
+  document.documentElement.dataset.theme = nextTheme;
+  document.documentElement.style.colorScheme = nextTheme;
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute("content", nextTheme === "dark" ? "#07110e" : "#f2f0e9");
+  try {
+    window.localStorage.setItem(themeStorageKey, nextTheme);
+  } catch {
+    // The visual preference still applies when storage is unavailable.
+  }
+}
+
+function toggleTheme(): void {
+  applyTheme(theme.value === "dark" ? "light" : "dark");
+}
 
 const configured = computed(
   () => Boolean(config.value?.configs[activeExchange.value]?.configured),
@@ -537,7 +560,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="app-shell">
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <main id="main-content" class="app-shell">
     <header class="topbar">
       <div class="brand-block">
         <span class="brand-mark" aria-hidden="true">
@@ -555,7 +579,26 @@ onUnmounted(() => {
           <i></i>
           {{ tradingEnabled ? "实盘执行已启用" : "只读预览模式" }}
         </span>
-        <button class="ghost-button" type="button" @click="settingsOpen = true">API 配置状态</button>
+        <button
+          class="ghost-button theme-toggle"
+          type="button"
+          :aria-label="theme === 'dark' ? '切换到浅色模式' : '切换到深色模式'"
+          :aria-pressed="theme === 'light'"
+          :title="theme === 'dark' ? '切换到浅色模式' : '切换到深色模式'"
+          @click="toggleTheme"
+        >
+          <span class="theme-icon-stack" aria-hidden="true">
+            <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="3.5" />
+              <path d="M12 2v2.2M12 19.8V22M4.93 4.93l1.56 1.56M17.51 17.51l1.56 1.56M2 12h2.2M19.8 12H22M4.93 19.07l1.56-1.56M17.51 6.49l1.56-1.56" />
+            </svg>
+            <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24">
+              <path d="M20.1 15.4A8.2 8.2 0 0 1 8.6 3.9 8.35 8.35 0 1 0 20.1 15.4Z" />
+            </svg>
+          </span>
+          <span>{{ theme === "dark" ? "浅色" : "深色" }}</span>
+        </button>
+        <button class="ghost-button" type="button" @click="settingsOpen = true">API 设置</button>
         <button class="primary-button compact" type="button" :disabled="loading" @click="refreshWorkspace">
           {{ loading ? "同步中…" : "立即刷新" }}
         </button>
