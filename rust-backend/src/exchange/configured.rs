@@ -164,11 +164,12 @@ impl OrderPlacementPacer {
         reserved_at.saturating_duration_since(now)
     }
 
-    async fn wait_for_slot(&self) {
+    async fn wait_for_slot(&self) -> Duration {
         let delay = self.reserve(Instant::now());
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
+        delay
     }
 }
 
@@ -874,8 +875,20 @@ impl OrderPlacementGateway for SharedConfiguredExchangeGateway {
         &self,
         intent: &OrderIntent,
     ) -> Result<PlacementAcknowledgement, PlacementError> {
-        self.order_placement_pacer.wait_for_slot().await;
-        let acknowledgement = self.inner.place_order(intent).await?;
+        let pacer_wait = self.order_placement_pacer.wait_for_slot().await;
+        let exchange_started = Instant::now();
+        let placement = self.inner.place_order(intent).await;
+        tracing::info!(
+            exchange = ?intent.exchange,
+            symbol = intent.shape.symbol.as_str(),
+            client_order_id = intent.client_order_id.as_str(),
+            pacer_wait_ms = u64::try_from(pacer_wait.as_millis()).unwrap_or(u64::MAX),
+            exchange_roundtrip_ms = u64::try_from(exchange_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+            accepted = placement.is_ok(),
+            "exchange order placement completed"
+        );
+        let acknowledgement = placement?;
         if intent.shape.kind == OrderKind::Limit {
             self.mutate_trade_xyz_execution_progress(
                 intent.exchange,

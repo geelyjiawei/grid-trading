@@ -1641,11 +1641,15 @@ where
                 return Ok(report);
             }
         };
-        let result = match self
+        let preflight_ms = u64::try_from(tick_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let snapshot_started = Instant::now();
+        let loaded = self
             .execution_sync
             .load_snapshot(&self.gateway, request)
-            .await
-        {
+            .await;
+        let snapshot_ms = u64::try_from(snapshot_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let accounting_started = Instant::now();
+        let result = match loaded {
             Ok(loaded) => {
                 self.execution_sync
                     .apply_loaded_snapshot(&self.gateway, &mut self.machine, loaded, now_ms)
@@ -1653,13 +1657,15 @@ where
             }
             Err(error) => Err(error),
         };
+        let accounting_ms =
+            u64::try_from(accounting_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match result {
             Ok(result) => {
                 report.execution_syncs = 1;
                 if matches!(result.transition, StrategyTransition::Failed { .. }) {
                     report.blockers.push(RuntimeBlocker {
                         stage: RuntimeStage::StrategyFailed,
-                        client_order_id: Some(client_order_id),
+                        client_order_id: Some(client_order_id.clone()),
                         message: "execution accounting failed the strategy".into(),
                     });
                 }
@@ -1673,8 +1679,11 @@ where
                 return Ok(report);
             }
         }
+        let convergence_started = Instant::now();
         self.converge_accounted_terminal_intents(now_ms)?;
         self.validate_ledger_ownership()?;
+        let convergence_ms =
+            u64::try_from(convergence_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lifecycle = self.machine.store().snapshot().lifecycle;
         if lifecycle == StrategyLifecycle::Failed {
             return self
@@ -1689,9 +1698,12 @@ where
             return Ok(report);
         }
         let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
+        let materialization_started = Instant::now();
         let replacement_transition = self
             .machine
             .materialize_replacements(&persisted_rules, now_ms)?;
+        let materialization_ms =
+            u64::try_from(materialization_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if matches!(replacement_transition, StrategyTransition::Failed { .. }) {
             report.blockers.push(RuntimeBlocker {
                 stage: RuntimeStage::StrategyFailed,
@@ -1707,9 +1719,25 @@ where
                 )
                 .await;
         }
+        let submission_started = Instant::now();
         self.submit_ready_replacement_orders(&mut report, now_ms)
             .await?;
+        let submission_ms =
+            u64::try_from(submission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.validate_ledger_ownership()?;
+        tracing::info!(
+            run_id = self.machine.store().snapshot().run_id.as_str(),
+            symbol = self.machine.store().snapshot().symbol.as_str(),
+            client_order_id = client_order_id.as_str(),
+            preflight_ms,
+            snapshot_ms,
+            accounting_ms,
+            convergence_ms,
+            materialization_ms,
+            submission_ms,
+            total_ms = u64::try_from(tick_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "targeted execution processing stages completed"
+        );
         Ok(report)
     }
 
