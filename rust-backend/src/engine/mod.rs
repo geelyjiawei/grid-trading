@@ -78,7 +78,9 @@ pub use strategy_machine::{
     StrategyOrderRecord, StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError,
     StrategyStateStore, StrategyStoreError, StrategyTransition, ValidatedStrategyState,
 };
-pub use submission::{SubmissionError, SubmissionResult, SubmissionService, submit_with};
+pub use submission::{
+    SubmissionError, SubmissionResult, SubmissionService, submit_many_with, submit_with,
+};
 pub use supervisor::{
     RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError,
     RuntimeRegistryEntry, RuntimeRegistryStopError, RuntimeStartupFailure, RuntimeStartupReport,

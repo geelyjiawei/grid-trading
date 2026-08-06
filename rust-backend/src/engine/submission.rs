@@ -1,8 +1,9 @@
+use futures::{StreamExt, stream};
 use thiserror::Error;
 
 use crate::{
     domain::{IntentState, OrderIntent},
-    exchange::{OrderPlacementGateway, PlacementError},
+    exchange::{OrderPlacementGateway, PlacementAcknowledgement, PlacementError},
     persistence::{IntentStore, LedgerError},
 };
 
@@ -51,6 +52,59 @@ where
     G: OrderPlacementGateway,
     S: IntentStore,
 {
+    prepare_intent(store, &intent, result_time_ms)?;
+    let client_order_id = intent.client_order_id.clone();
+    let (next_state, result) =
+        classify_placement(&client_order_id, gateway.place_order(&intent).await);
+    store.transition(&client_order_id, next_state, result_time_ms)?;
+    Ok(result)
+}
+
+pub async fn submit_many_with<G, S>(
+    gateway: &G,
+    store: &mut S,
+    intents: Vec<OrderIntent>,
+    result_time_ms: u64,
+    maximum_concurrency: usize,
+) -> Result<Vec<(crate::domain::ClientOrderId, SubmissionResult)>, SubmissionError>
+where
+    G: OrderPlacementGateway,
+    S: IntentStore,
+{
+    store.prepare_intents(intents.clone(), result_time_ms)?;
+
+    let placements = stream::iter(intents.into_iter().map(|intent| async move {
+        let client_order_id = intent.client_order_id.clone();
+        let placement = gateway.place_order(&intent).await;
+        let (next_state, result) = classify_placement(&client_order_id, placement);
+        (client_order_id, next_state, result)
+    }))
+    .buffered(maximum_concurrency.max(1))
+    .collect::<Vec<_>>()
+    .await;
+
+    store.transition_intents(
+        placements
+            .iter()
+            .map(|(client_order_id, next_state, _)| (client_order_id.clone(), next_state.clone()))
+            .collect(),
+        result_time_ms,
+    )?;
+
+    Ok(placements
+        .into_iter()
+        .map(|(client_order_id, _, result)| (client_order_id, result))
+        .collect())
+}
+
+fn prepare_intent<S>(
+    store: &mut S,
+    intent: &OrderIntent,
+    result_time_ms: u64,
+) -> Result<(), SubmissionError>
+where
+    S: IntentStore,
+{
     let client_order_id = intent.client_order_id.clone();
     match store.snapshot().intents.get(&client_order_id).cloned() {
         None => store.insert_prepared(intent.clone())?,
@@ -67,56 +121,46 @@ where
             );
         }
     }
+    Ok(())
+}
 
-    match gateway.place_order(&intent).await {
+fn classify_placement(
+    client_order_id: &crate::domain::ClientOrderId,
+    placement: Result<PlacementAcknowledgement, PlacementError>,
+) -> (IntentState, SubmissionResult) {
+    match placement {
         Ok(acknowledgement) => {
-            if acknowledgement.client_order_id != client_order_id
+            if acknowledgement.client_order_id != *client_order_id
                 || acknowledgement.exchange_order_id.is_empty()
             {
-                store.transition(
-                    &client_order_id,
+                return (
                     IntentState::SubmitUnknown {
                         message: "placement acknowledgement identity is missing or mismatched"
                             .into(),
                     },
-                    result_time_ms,
-                )?;
-                return Ok(SubmissionResult::SubmitUnknown);
+                    SubmissionResult::SubmitUnknown,
+                );
             }
             let exchange_order_id = acknowledgement.exchange_order_id;
-            store.transition(
-                &client_order_id,
+            (
                 IntentState::Accepted {
                     exchange_order_id: exchange_order_id.clone(),
                 },
-                result_time_ms,
-            )?;
-            Ok(SubmissionResult::Accepted { exchange_order_id })
+                SubmissionResult::Accepted { exchange_order_id },
+            )
         }
-        Err(PlacementError::NotSubmitted { message }) => {
-            store.transition(
-                &client_order_id,
-                IntentState::RetryableNotSubmitted { message },
-                result_time_ms,
-            )?;
-            Ok(SubmissionResult::NotSubmitted)
-        }
-        Err(PlacementError::Unknown { message }) => {
-            store.transition(
-                &client_order_id,
-                IntentState::SubmitUnknown { message },
-                result_time_ms,
-            )?;
-            Ok(SubmissionResult::SubmitUnknown)
-        }
-        Err(PlacementError::Definitive { code, message }) => {
-            store.transition(
-                &client_order_id,
-                IntentState::Rejected { code, message },
-                result_time_ms,
-            )?;
-            Ok(SubmissionResult::Rejected)
-        }
+        Err(PlacementError::NotSubmitted { message }) => (
+            IntentState::RetryableNotSubmitted { message },
+            SubmissionResult::NotSubmitted,
+        ),
+        Err(PlacementError::Unknown { message }) => (
+            IntentState::SubmitUnknown { message },
+            SubmissionResult::SubmitUnknown,
+        ),
+        Err(PlacementError::Definitive { code, message }) => (
+            IntentState::Rejected { code, message },
+            SubmissionResult::Rejected,
+        ),
     }
 }
 
@@ -398,6 +442,128 @@ mod tests {
         assert_eq!(
             service.submit(intent("g_0_B_mismatch"), 101).await.unwrap(),
             SubmissionResult::SubmitUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_batch_persists_every_result_when_one_outcome_is_unknown() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let first = intent("g_0_B_batch");
+        let second = intent("g_1_B_batch");
+        let third = intent("g_2_B_batch");
+        let gateway = ScriptedGateway {
+            calls: calls.clone(),
+            results: Mutex::new(VecDeque::from([
+                Err(PlacementError::Unknown {
+                    message: "connection reset after request body".into(),
+                }),
+                Ok(PlacementAcknowledgement {
+                    client_order_id: second.client_order_id.clone(),
+                    exchange_order_id: "exchange-2".into(),
+                }),
+                Ok(PlacementAcknowledgement {
+                    client_order_id: third.client_order_id.clone(),
+                    exchange_order_id: "exchange-3".into(),
+                }),
+            ])),
+        };
+        let mut store = MemoryOrderIntentStore::default();
+
+        let results = submit_many_with(
+            &gateway,
+            &mut store,
+            vec![first.clone(), second.clone(), third.clone()],
+            101,
+            3,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert!(matches!(
+            store.snapshot().intents[&first.client_order_id].state,
+            IntentState::SubmitUnknown { .. }
+        ));
+        assert_eq!(
+            store.snapshot().intents[&second.client_order_id].state,
+            IntentState::Accepted {
+                exchange_order_id: "exchange-2".into()
+            }
+        );
+        assert_eq!(
+            store.snapshot().intents[&third.client_order_id].state,
+            IntentState::Accepted {
+                exchange_order_id: "exchange-3".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_batch_never_calls_exchange_after_write_ahead_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let first = intent("g_0_B_batch_writefail");
+        let second = intent("g_1_B_batch_writefail");
+        let gateway = FakeGateway {
+            calls: calls.clone(),
+            result: Ok(PlacementAcknowledgement {
+                client_order_id: first.client_order_id.clone(),
+                exchange_order_id: "exchange-1".into(),
+            }),
+        };
+        let mut store = MemoryOrderIntentStore::default();
+        store.fail_on_write(1);
+
+        let result = submit_many_with(&gateway, &mut store, vec![first, second], 101, 2).await;
+
+        assert!(matches!(
+            result,
+            Err(SubmissionError::Persistence(
+                LedgerError::InjectedWriteFailure
+            ))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(store.snapshot().intents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_batch_acknowledgement_commit_leaves_every_sent_intent_reconcilable() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let first = intent("g_0_B_batch_ackfail");
+        let second = intent("g_1_B_batch_ackfail");
+        let gateway = FakeGateway {
+            calls: calls.clone(),
+            result: Ok(PlacementAcknowledgement {
+                client_order_id: first.client_order_id.clone(),
+                exchange_order_id: "exchange-1".into(),
+            }),
+        };
+        let mut store = MemoryOrderIntentStore::default();
+        store.fail_on_write(2);
+
+        let result = submit_many_with(
+            &gateway,
+            &mut store,
+            vec![first.clone(), second.clone()],
+            101,
+            2,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SubmissionError::Persistence(
+                LedgerError::InjectedWriteFailure
+            ))
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            store.snapshot().intents[&first.client_order_id].state,
+            IntentState::Prepared
+        );
+        assert_eq!(
+            store.snapshot().intents[&second.client_order_id].state,
+            IntentState::Prepared
         );
     }
 

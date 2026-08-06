@@ -17,7 +17,7 @@ use crate::{
         StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
         StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
         cancel_many_with, intent_requires_lookup, load_strategy_inputs, prepare_new_strategy,
-        reconcile_lookup_with, resolve_cancellations_with, submit_with,
+        reconcile_lookup_with, resolve_cancellations_with, submit_many_with, submit_with,
     },
     exchange::{
         ActiveOrderStatus, ExchangeIdentityGateway, ExecutionSnapshotGateway,
@@ -37,6 +37,7 @@ use super::exchange_inputs::advance_reference_time_ms;
 
 const MAX_CONCURRENT_ORDER_LOOKUPS: usize = 8;
 const MAX_CONCURRENT_EXECUTION_SNAPSHOTS: usize = 8;
+const MAX_CONCURRENT_REPLACEMENT_SUBMISSIONS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2261,7 +2262,70 @@ where
         let remaining_submissions = self
             .maximum_submissions_per_tick
             .saturating_sub(report.submissions.len());
-        for intent in ready.into_iter().take(remaining_submissions) {
+        let ready = ready
+            .into_iter()
+            .take(remaining_submissions)
+            .collect::<Vec<_>>();
+        let all_ready_are_replacements = {
+            let state = self.machine.store().snapshot();
+            !ready.is_empty()
+                && ready.iter().all(|intent| {
+                    state
+                        .orders
+                        .get(&intent.client_order_id)
+                        .is_some_and(|order| {
+                            matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
+                        })
+                })
+        };
+        if replacements_only || all_ready_are_replacements {
+            let submissions = submit_many_with(
+                &self.gateway,
+                &mut self.intent_store,
+                ready,
+                now_ms,
+                MAX_CONCURRENT_REPLACEMENT_SUBMISSIONS,
+            )
+            .await?;
+            for (client_order_id, result) in submissions {
+                let persisted = self
+                    .intent_store
+                    .snapshot()
+                    .intents
+                    .get(&client_order_id)
+                    .cloned()
+                    .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+                let transition = self.machine.synchronize_intent(&persisted, now_ms)?;
+                report.submissions.push(RuntimeSubmission {
+                    client_order_id: client_order_id.clone(),
+                    result: result.clone(),
+                });
+                match result {
+                    SubmissionResult::Accepted { .. } => {}
+                    SubmissionResult::NotSubmitted => {}
+                    SubmissionResult::SubmitUnknown => report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::SubmissionUnknown,
+                        client_order_id: Some(client_order_id.clone()),
+                        message: "placement outcome is unknown; no later batch will be sent".into(),
+                    }),
+                    SubmissionResult::Rejected => report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::SubmissionRejected,
+                        client_order_id: Some(client_order_id.clone()),
+                        message: "exchange definitively rejected the order".into(),
+                    }),
+                }
+                if matches!(transition, StrategyTransition::Failed { .. }) {
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::StrategyFailed,
+                        client_order_id: Some(client_order_id),
+                        message: "submitted intent failed strategy synchronization".into(),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
+        for intent in ready {
             let client_order_id = intent.client_order_id.clone();
             let result = submit_with(&self.gateway, &mut self.intent_store, intent, now_ms).await?;
             let persisted = self
@@ -2855,6 +2919,9 @@ mod tests {
     struct MockGatewayState {
         placement_calls: Vec<OrderIntent>,
         next_placement_error: Option<PlacementError>,
+        active_placements: usize,
+        maximum_concurrent_placements: usize,
+        placement_delay: Option<Duration>,
         cancellation_calls: Vec<(ClientOrderId, String)>,
         cancellation_batch_calls: usize,
         next_cancellation_error: Option<CancellationError>,
@@ -2913,6 +2980,9 @@ mod tests {
                 state: Arc::new(Mutex::new(MockGatewayState {
                     placement_calls: Vec::new(),
                     next_placement_error: None,
+                    active_placements: 0,
+                    maximum_concurrent_placements: 0,
+                    placement_delay: None,
                     cancellation_calls: Vec::new(),
                     cancellation_batch_calls: 0,
                     next_cancellation_error: None,
@@ -2983,6 +3053,17 @@ mod tests {
 
         fn fail_next_placement(&self, error: PlacementError) {
             self.state.lock().unwrap().next_placement_error = Some(error);
+        }
+
+        fn measure_delayed_placements(&self, delay: Duration) {
+            let mut state = self.state.lock().unwrap();
+            state.active_placements = 0;
+            state.maximum_concurrent_placements = 0;
+            state.placement_delay = Some(delay);
+        }
+
+        fn maximum_concurrent_placement_count(&self) -> usize {
+            self.state.lock().unwrap().maximum_concurrent_placements
         }
 
         fn cancellation_call_count(&self) -> usize {
@@ -3279,12 +3360,27 @@ mod tests {
             &self,
             intent: &OrderIntent,
         ) -> Result<PlacementAcknowledgement, PlacementError> {
+            let (delay, error, exchange_order_id) = {
+                let mut state = self.state.lock().unwrap();
+                state.placement_calls.push(intent.clone());
+                state.active_placements += 1;
+                state.maximum_concurrent_placements = state
+                    .maximum_concurrent_placements
+                    .max(state.active_placements);
+                (
+                    state.placement_delay,
+                    state.next_placement_error.take(),
+                    format!("exchange-{}", state.placement_calls.len()),
+                )
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             let mut state = self.state.lock().unwrap();
-            state.placement_calls.push(intent.clone());
-            if let Some(error) = state.next_placement_error.take() {
+            state.active_placements -= 1;
+            if let Some(error) = error {
                 return Err(error);
             }
-            let exchange_order_id = format!("exchange-{}", state.placement_calls.len());
             let order = AuthoritativeOrder {
                 client_order_id: intent.client_order_id.clone(),
                 exchange_order_id: exchange_order_id.clone(),
@@ -5407,6 +5503,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_deployment_remains_sequential() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.measure_delayed_placements(Duration::from_millis(5));
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+
+        assert!(gateway.placement_call_count() > 1);
+        assert_eq!(gateway.maximum_concurrent_placement_count(), 1);
+    }
+
+    #[tokio::test]
     async fn exact_lookup_fallback_is_concurrent_but_bounded() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
@@ -5483,6 +5596,7 @@ mod tests {
         );
         gateway.enable_open_progress();
         gateway.measure_delayed_execution_snapshots(Duration::from_millis(20));
+        gateway.measure_delayed_placements(Duration::from_millis(30));
 
         let report = runtime.tick(1_300).await.unwrap();
 
@@ -5494,6 +5608,11 @@ mod tests {
                 <= MAX_CONCURRENT_EXECUTION_SNAPSHOTS
         );
         assert_eq!(report.execution_syncs, 4);
+        assert_eq!(report.submissions.len(), 4);
+        assert!(gateway.maximum_concurrent_placement_count() > 1);
+        assert!(
+            gateway.maximum_concurrent_placement_count() <= MAX_CONCURRENT_REPLACEMENT_SUBMISSIONS
+        );
         assert_eq!(
             runtime
                 .machine()

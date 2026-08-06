@@ -36,6 +36,11 @@ impl Default for LedgerSnapshot {
 pub trait IntentStore {
     fn snapshot(&self) -> &LedgerSnapshot;
     fn insert_prepared(&mut self, intent: OrderIntent) -> Result<(), LedgerError>;
+    fn prepare_intents(
+        &mut self,
+        intents: Vec<OrderIntent>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError>;
     fn transition(
         &mut self,
         client_order_id: &ClientOrderId,
@@ -134,6 +139,19 @@ impl IntentStore for FileOrderIntentStore {
             ));
         }
         next.intents.insert(intent.client_order_id.clone(), intent);
+        self.replace(next)
+    }
+
+    fn prepare_intents(
+        &mut self,
+        intents: Vec<OrderIntent>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.snapshot.clone();
+        apply_intent_preparations(&mut next, intents, now_ms)?;
         self.replace(next)
     }
 
@@ -302,6 +320,27 @@ impl IntentStore for MemoryOrderIntentStore {
         self.snapshot
             .intents
             .insert(intent.client_order_id.clone(), intent);
+        Ok(())
+    }
+
+    fn prepare_intents(
+        &mut self,
+        intents: Vec<OrderIntent>,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        self.before_write()?;
+        let mut next = self.snapshot.clone();
+        next.revision = self
+            .snapshot
+            .revision
+            .checked_add(1)
+            .ok_or(LedgerError::RevisionOverflow)?;
+        apply_intent_preparations(&mut next, intents, now_ms)?;
+        validate_snapshot(&next)?;
+        self.snapshot = next;
         Ok(())
     }
 
@@ -522,6 +561,48 @@ fn validate_transition(current: &IntentState, next: &IntentState) -> Result<(), 
     }
 }
 
+fn apply_intent_preparations(
+    snapshot: &mut LedgerSnapshot,
+    intents: Vec<OrderIntent>,
+    now_ms: u64,
+) -> Result<(), LedgerError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for intent in intents {
+        if intent.state != IntentState::Prepared {
+            return Err(LedgerError::NewIntentNotPrepared);
+        }
+        let client_order_id = intent.client_order_id.clone();
+        if !seen.insert(client_order_id.clone()) {
+            return Err(LedgerError::DuplicateClientOrderId(
+                client_order_id.as_str().to_owned(),
+            ));
+        }
+        match snapshot.intents.get_mut(&client_order_id) {
+            None => {
+                snapshot.intents.insert(client_order_id, intent);
+            }
+            Some(existing)
+                if matches!(existing.state, IntentState::RetryableNotSubmitted { .. })
+                    && existing.exchange == intent.exchange
+                    && existing.shape == intent.shape =>
+            {
+                if now_ms < existing.updated_at_ms {
+                    return Err(LedgerError::TimestampRegression);
+                }
+                validate_transition(&existing.state, &IntentState::Prepared)?;
+                existing.state = IntentState::Prepared;
+                existing.updated_at_ms = now_ms;
+            }
+            Some(_) => {
+                return Err(LedgerError::DuplicateClientOrderId(
+                    client_order_id.as_str().to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_cancellation_transition(
     current: &CancellationState,
     next: &CancellationState,
@@ -677,6 +758,47 @@ mod tests {
             Err(LedgerError::DuplicateClientOrderId(_))
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn prepared_batch_commits_once_and_round_trips_every_intent() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("order-ledger.json");
+        let mut store = FileOrderIntentStore::load(&path).unwrap();
+        let first = intent("g_1_S_batch_roundtrip");
+        let second = intent("g_2_S_batch_roundtrip");
+
+        store
+            .prepare_intents(vec![first.clone(), second.clone()], 101)
+            .unwrap();
+
+        let restored = FileOrderIntentStore::load(&path).unwrap();
+        assert_eq!(restored.snapshot().revision, 1);
+        assert_eq!(
+            restored.snapshot().intents.get(&first.client_order_id),
+            Some(&first)
+        );
+        assert_eq!(
+            restored.snapshot().intents.get(&second.client_order_id),
+            Some(&second)
+        );
+    }
+
+    #[test]
+    fn invalid_prepared_batch_does_not_change_durable_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("order-ledger.json");
+        let mut store = FileOrderIntentStore::load(&path).unwrap();
+        let existing = intent("g_1_S_batch_existing");
+        store.insert_prepared(existing.clone()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert!(matches!(
+            store.prepare_intents(vec![intent("g_2_S_batch_new"), existing], 101,),
+            Err(LedgerError::DuplicateClientOrderId(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(store.snapshot().revision, 1);
     }
 
     #[test]
