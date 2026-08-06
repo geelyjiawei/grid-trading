@@ -441,8 +441,7 @@ async fn advance_execution_event(
     };
     let retry = matches!(
         &advance.result,
-        Ok(PreparedStrategyStep::Active(report))
-            if report.submissions.is_empty() && report.execution_syncs == 0
+        Ok(PreparedStrategyStep::Active(report)) if execution_event_needs_retry(report)
     );
     log_runtime_advance(
         advance,
@@ -469,6 +468,10 @@ async fn advance_execution_event(
     {
         log_runtime_advance(retry, true, Some(&event), event_queue_ms, coalesced_events);
     }
+}
+
+fn execution_event_needs_retry(report: &crate::engine::RuntimeTickReport) -> bool {
+    report.submissions.is_empty() && (report.execution_syncs == 0 || !report.is_blocked())
 }
 
 fn log_runtime_advance(
@@ -892,6 +895,36 @@ mod tests {
         assert_eq!(pending.event.exchange_order_id, None);
         assert_eq!(pending.event.exchange_event_time_ms, Some(1_000));
         assert_eq!(pending.event.observed_at_ms, 1_010);
+    }
+
+    #[test]
+    fn execution_event_retries_a_clean_snapshot_that_has_not_materialized_a_counter() {
+        let report = crate::engine::RuntimeTickReport {
+            ledger_reconciliations: 0,
+            execution_syncs: 1,
+            submissions: Vec::new(),
+            cancellations: Vec::new(),
+            blockers: Vec::new(),
+        };
+
+        assert!(execution_event_needs_retry(&report));
+    }
+
+    #[test]
+    fn execution_event_does_not_retry_a_synchronized_safety_blocker() {
+        let report = crate::engine::RuntimeTickReport {
+            ledger_reconciliations: 0,
+            execution_syncs: 1,
+            submissions: Vec::new(),
+            cancellations: Vec::new(),
+            blockers: vec![crate::engine::RuntimeBlocker {
+                stage: crate::engine::RuntimeStage::PositionReconciliation,
+                client_order_id: None,
+                message: "authoritative position is inconsistent".into(),
+            }],
+        };
+
+        assert!(!execution_event_needs_retry(&report));
     }
 
     fn execution_wakeup(
