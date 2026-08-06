@@ -2246,6 +2246,16 @@ where
     ) -> Result<(), RuntimeTickError> {
         let ready = {
             let state = self.machine.store().snapshot();
+            let retryable_ids = self
+                .intent_store
+                .snapshot()
+                .intents
+                .iter()
+                .filter_map(|(client_order_id, intent)| {
+                    matches!(intent.state, IntentState::RetryableNotSubmitted { .. })
+                        .then_some(client_order_id)
+                })
+                .collect::<std::collections::BTreeSet<_>>();
             let mut ready = state.ready_intents(now_ms)?;
             if replacements_only {
                 ready.retain(|intent| {
@@ -2255,6 +2265,7 @@ where
                         .is_some_and(|order| {
                             matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
                         })
+                        && !retryable_ids.contains(&intent.client_order_id)
                 });
             }
             ready
@@ -5940,6 +5951,74 @@ mod tests {
         assert_eq!(second.blockers[0].stage, RuntimeStage::LedgerReconciliation);
         assert!(second.submissions.is_empty());
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_reduce_only_replacement_retries_only_after_full_position_reconciliation() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        gateway.fill_order(&source_id, source_shape.price.unwrap(), Decimal::new(1, 3));
+        let expected_position = -(opening_quantity + source_shape.quantity);
+        gateway.set_position(expected_position, Some(Decimal::new(1014, 0)));
+        gateway.fail_next_placement(PlacementError::Unknown {
+            message: "connection failed: HTTP connection failed".into(),
+        });
+        let placements_before = gateway.placement_call_count();
+
+        let unknown = runtime.tick(1_300).await.unwrap();
+        assert_eq!(unknown.blockers[0].stage, RuntimeStage::SubmissionUnknown);
+        assert_eq!(unknown.submissions.len(), 1);
+        let replacement_id = unknown.submissions[0].client_order_id.clone();
+        assert_eq!(gateway.placement_call_count(), placements_before + 1);
+
+        let recent = runtime.tick(10_299).await.unwrap();
+        assert!(recent.is_blocked(), "{recent:?}");
+        assert!(recent.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), placements_before + 1);
+
+        gateway.set_market_price(Decimal::new(1014, 0), 11_300);
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        let mismatched = runtime.tick(11_300).await.unwrap();
+        assert!(mismatched.is_blocked(), "{mismatched:?}");
+        assert!(
+            mismatched
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.stage == RuntimeStage::PositionReconciliation })
+        );
+        assert!(mismatched.submissions.is_empty());
+        assert!(matches!(
+            runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .get(&replacement_id)
+                .unwrap()
+                .state,
+            IntentState::RetryableNotSubmitted { .. }
+        ));
+
+        let fast_event = runtime.tick_execution_event(11_301, None).await.unwrap();
+        assert!(fast_event.submissions.is_empty(), "{fast_event:?}");
+        assert_eq!(gateway.placement_call_count(), placements_before + 1);
+
+        gateway.set_market_price(Decimal::new(1014, 0), 11_302);
+        gateway.set_position(expected_position, Some(Decimal::new(1014, 0)));
+        let recovered = runtime.tick(11_302).await.unwrap();
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(recovered.submissions.len(), 1);
+        assert_eq!(recovered.submissions[0].client_order_id, replacement_id);
+        assert_eq!(gateway.placement_call_count(), placements_before + 2);
+        let placements = gateway.placement_ids();
+        assert_eq!(placements[placements.len() - 2], replacement_id);
+        assert_eq!(placements[placements.len() - 1], replacement_id);
     }
 
     #[tokio::test]

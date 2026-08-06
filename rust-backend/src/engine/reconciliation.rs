@@ -6,6 +6,8 @@ use crate::{
     persistence::{IntentStore, LedgerError},
 };
 
+const BINANCE_REDUCE_ONLY_UNKNOWN_CONFIRMATION_MS: u64 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconciliationResult {
     Accepted {
@@ -136,6 +138,22 @@ where
             )?;
             Ok(ReconciliationResult::NotSubmitted { message })
         }
+        Ok(OrderLookup::NotFound)
+            if binance_reduce_only_unknown_is_confirmed_absent(&intent, now_ms) =>
+        {
+            let message = format!(
+                "authoritative Binance lookup found no order after {} ms; the exact reduce-only intent may retry after position reconciliation",
+                BINANCE_REDUCE_ONLY_UNKNOWN_CONFIRMATION_MS
+            );
+            store.transition(
+                &intent.client_order_id,
+                IntentState::RetryableNotSubmitted {
+                    message: message.clone(),
+                },
+                now_ms,
+            )?;
+            Ok(ReconciliationResult::NotSubmitted { message })
+        }
         Ok(OrderLookup::NotFound) => preserve_unknown(
             store,
             intent,
@@ -144,6 +162,17 @@ where
         ),
         Err(error) => preserve_unknown(store, intent, &error.message, now_ms),
     }
+}
+
+fn binance_reduce_only_unknown_is_confirmed_absent(intent: &OrderIntent, now_ms: u64) -> bool {
+    intent.exchange == Exchange::Binance
+        && intent.shape.reduce_only
+        && matches!(
+            intent.state,
+            IntentState::Prepared | IntentState::SubmitUnknown { .. }
+        )
+        && now_ms.saturating_sub(intent.created_at_ms)
+            >= BINANCE_REDUCE_ONLY_UNKNOWN_CONFIRMATION_MS
 }
 
 fn legacy_local_cooldown_was_not_submitted(intent: &OrderIntent) -> bool {
@@ -484,6 +513,123 @@ mod tests {
                 .unwrap()
                 .state,
             IntentState::SubmitUnknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn recent_binance_reduce_only_unknown_remains_blocked_during_confirmation_grace() {
+        let order = intent_on("g_0_B_recent_reduce", Exchange::Binance);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MemoryOrderIntentStore::default();
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::SubmitUnknown {
+                    message: "connection failed: HTTP connection failed".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let mut service = ReconciliationService::new(
+            FakeLookupGateway {
+                calls,
+                result: Ok(OrderLookup::NotFound),
+            },
+            store,
+        );
+
+        assert!(matches!(
+            service
+                .reconcile(&order.client_order_id, 10_099)
+                .await
+                .unwrap(),
+            ReconciliationResult::StillUnknown { .. }
+        ));
+        assert!(matches!(
+            service
+                .store()
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::SubmitUnknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn aged_binance_reduce_only_unknown_becomes_retryable_after_authoritative_absence() {
+        let order = intent_on("g_0_B_aged_reduce", Exchange::Binance);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MemoryOrderIntentStore::default();
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::SubmitUnknown {
+                    message: "connection failed: HTTP connection failed".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let mut service = ReconciliationService::new(
+            FakeLookupGateway {
+                calls,
+                result: Ok(OrderLookup::NotFound),
+            },
+            store,
+        );
+
+        assert!(matches!(
+            service
+                .reconcile(&order.client_order_id, 10_100)
+                .await
+                .unwrap(),
+            ReconciliationResult::NotSubmitted { .. }
+        ));
+        assert!(matches!(
+            service
+                .store()
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::RetryableNotSubmitted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn aged_binance_opening_unknown_never_becomes_retryable() {
+        let mut order = intent_on("g_0_S_aged_open", Exchange::Binance);
+        order.shape.reduce_only = false;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MemoryOrderIntentStore::default();
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::SubmitUnknown {
+                    message: "connection failed: HTTP connection failed".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let mut service = ReconciliationService::new(
+            FakeLookupGateway {
+                calls,
+                result: Ok(OrderLookup::NotFound),
+            },
+            store,
+        );
+
+        assert!(matches!(
+            service
+                .reconcile(&order.client_order_id, 100_000)
+                .await
+                .unwrap(),
+            ReconciliationResult::StillUnknown { .. }
         ));
     }
 
