@@ -97,14 +97,15 @@ impl FileOrderIntentStore {
     }
 
     fn commit_snapshot(&self, snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
+        let mut bytes = serde_json::to_vec(snapshot).map_err(LedgerError::Serialize)?;
+        bytes.push(b'\n');
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(LedgerError::CreateDirectory)?;
         }
         let mut file = AtomicWriteFile::options()
             .open(&self.path)
             .map_err(LedgerError::OpenAtomic)?;
-        serde_json::to_writer_pretty(&mut file, snapshot).map_err(LedgerError::Serialize)?;
-        file.write_all(b"\n").map_err(LedgerError::Write)?;
+        file.write_all(&bytes).map_err(LedgerError::Write)?;
         file.commit().map_err(LedgerError::Commit)?;
         sync_parent(&self.path)?;
         Ok(())
@@ -742,6 +743,9 @@ mod tests {
             Some(&original)
         );
         assert_eq!(restored.snapshot().revision, 1);
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.ends_with('\n'));
+        assert_eq!(persisted.lines().count(), 1);
     }
 
     #[test]

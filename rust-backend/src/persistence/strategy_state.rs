@@ -31,14 +31,15 @@ fn commit_persisted(
     path: &Path,
     snapshot: &PersistedStrategyState,
 ) -> Result<(), StrategyStoreError> {
+    let mut bytes = serde_json::to_vec(snapshot).map_err(StrategyStoreError::Serialize)?;
+    bytes.push(b'\n');
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(StrategyStoreError::CreateDirectory)?;
     }
     let mut file = AtomicWriteFile::options()
         .open(path)
         .map_err(StrategyStoreError::OpenAtomic)?;
-    serde_json::to_writer_pretty(&mut file, snapshot).map_err(StrategyStoreError::Serialize)?;
-    file.write_all(b"\n").map_err(StrategyStoreError::Write)?;
+    file.write_all(&bytes).map_err(StrategyStoreError::Write)?;
     file.commit().map_err(StrategyStoreError::Commit)?;
     sync_parent(path)?;
     Ok(())
@@ -48,7 +49,7 @@ fn create_persisted(
     path: &Path,
     snapshot: &PersistedStrategyState,
 ) -> Result<(), StrategyStoreError> {
-    let mut bytes = serde_json::to_vec_pretty(snapshot).map_err(StrategyStoreError::Serialize)?;
+    let mut bytes = serde_json::to_vec(snapshot).map_err(StrategyStoreError::Serialize)?;
     bytes.push(b'\n');
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(StrategyStoreError::CreateDirectory)?;
@@ -432,7 +433,9 @@ mod tests {
         assert!(store.snapshot_is_known_valid());
         assert!(restored.snapshot_is_known_valid());
         assert_eq!(restored.snapshot(), &original);
-        assert!(fs::read_to_string(&path).unwrap().ends_with('\n'));
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.ends_with('\n'));
+        assert_eq!(persisted.lines().count(), 1);
     }
 
     #[test]
