@@ -708,9 +708,10 @@ mod tests {
         FileArmedStrategyStateStore::create(&path, original.clone()).unwrap();
         let restored = FileArmedStrategyStateStore::load(&path).unwrap();
         let json = fs::read_to_string(&path).unwrap();
+        let document = serde_json::from_str::<serde_json::Value>(&json).unwrap();
 
         assert_eq!(restored.snapshot(), &original);
-        assert!(json.contains("\"runtime_state\": \"armed\""));
+        assert_eq!(document["runtime_state"], "armed");
         assert!(!json.contains("\"orders\""));
         assert!(matches!(
             FileStrategyStateStore::load(&path),
@@ -763,11 +764,12 @@ mod tests {
             .unwrap();
         let restored = FileStrategyStateStore::load(&path).unwrap();
         let json = fs::read_to_string(&path).unwrap();
+        let document = serde_json::from_str::<serde_json::Value>(&json).unwrap();
 
         assert_eq!(active.snapshot(), restored.snapshot());
         assert_eq!(active.snapshot().revision, 1);
         assert_eq!(active.snapshot().triggered_at_ms, Some(102));
-        assert!(json.contains("\"runtime_state\": \"active\""));
+        assert_eq!(document["runtime_state"], "active");
         assert!(json.contains("\"orders\""));
         assert!(matches!(
             FileArmedStrategyStateStore::load(&path),
