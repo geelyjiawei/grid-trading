@@ -857,22 +857,27 @@ where
             return Err(execution_error("exchange order ID is required"));
         }
         let symbol = symbol.to_ascii_uppercase();
-        if let Some(snapshot) = self
+        if self
             .realtime_execution_cache
-            .wait_snapshot(
-                &symbol,
-                client_order_id,
-                exchange_order_id,
-                REALTIME_EXECUTION_SNAPSHOT_WAIT,
-            )
-            .await
+            .knows_order(&symbol, exchange_order_id)
         {
-            tracing::info!(
-                symbol = symbol.as_str(),
-                exchange_order_id,
-                "using Bybit realtime execution snapshot"
-            );
-            return Ok(snapshot);
+            if let Some(snapshot) = self
+                .realtime_execution_cache
+                .wait_snapshot(
+                    &symbol,
+                    client_order_id,
+                    exchange_order_id,
+                    REALTIME_EXECUTION_SNAPSHOT_WAIT,
+                )
+                .await
+            {
+                tracing::info!(
+                    symbol = symbol.as_str(),
+                    exchange_order_id,
+                    "using Bybit realtime execution snapshot"
+                );
+                return Ok(snapshot);
+            }
         }
         let header = self
             .load_order_record(&symbol, client_order_id, Some(exchange_order_id))

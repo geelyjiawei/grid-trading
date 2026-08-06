@@ -222,7 +222,6 @@ impl FuturesExecutionCache {
         self.changed.notify_waiters();
     }
 
-    #[cfg(test)]
     pub(crate) fn knows_order(&self, symbol: &str, exchange_order_id: &str) -> bool {
         let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
         self.state
@@ -308,6 +307,15 @@ impl BybitExecutionCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *state = BybitExecutionCacheState::default();
         self.changed.notify_waiters();
+    }
+
+    pub(crate) fn knows_order(&self, symbol: &str, exchange_order_id: &str) -> bool {
+        let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .contains_key(&key)
     }
 
     fn apply_order(&self, header: OrderExecutionHeader) {
@@ -1423,6 +1431,7 @@ mod tests {
         let cache = BybitExecutionCache::default();
         cache.begin_session();
         let client_order_id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        assert!(!cache.knows_order("MUUSDT", "42"));
         let new_message = json!({
             "topic": "order.linear",
             "data": [{
@@ -1437,6 +1446,7 @@ mod tests {
         for header in parse_bybit_order_updates(&new_message) {
             cache.apply_order(header);
         }
+        assert!(cache.knows_order("MUUSDT", "42"));
         let execution_message = json!({
             "topic": "execution.linear",
             "data": [{
