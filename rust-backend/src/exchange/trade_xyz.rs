@@ -38,9 +38,10 @@ use crate::{
         },
         trade_xyz_codec::{
             CancelAction, HyperliquidSignature, HyperliquidSigner, OrderAction, TradeXyzCodecError,
-            UpdateLeverageAction, WireOrder, WireOrderType, decode_cloid, effective_price_tick,
-            encode_cloid, exchange_coin, local_symbol, maximum_decimal_price_tick,
-            normalize_address, quantity_step, valid_price, wire_decimal,
+            UpdateLeverageAction, WireOrder, WireOrderType, decode_cloid, default_exchange_coin,
+            effective_price_tick, encode_cloid, exchange_coin, local_symbol,
+            maximum_decimal_price_tick, normalize_address, quantity_step, symbol_base, valid_price,
+            wire_decimal,
         },
     },
 };
@@ -92,7 +93,9 @@ struct DexMetadata {
 #[derive(Debug, Clone)]
 struct MarketInfo {
     coin: String,
+    dex_name: String,
     asset_id: u32,
+    hip3_fee_scale: Option<Decimal>,
     size_decimals: u32,
     max_leverage: u16,
     delisted: bool,
@@ -711,11 +714,27 @@ where
     }
 
     async fn fetch_market_info(&self, symbol: &str) -> Result<MarketInfo, SnapshotError> {
-        let coin = exchange_coin(&symbol.to_ascii_uppercase())
+        let symbol = symbol.to_ascii_uppercase();
+        let xyz_coin =
+            exchange_coin(&symbol).map_err(|error| SnapshotError::new(error.to_string()))?;
+        if let Some(market) = self.fetch_market_info_for_dex(&xyz_coin, DEX_NAME).await? {
+            return Ok(market);
+        }
+        let default_coin = default_exchange_coin(&symbol)
             .map_err(|error| SnapshotError::new(error.to_string()))?;
+        self.fetch_market_info_for_dex(&default_coin, "")
+            .await?
+            .ok_or_else(|| SnapshotError::new("TRADE.XYZ symbol is not listed"))
+    }
+
+    async fn fetch_market_info_for_dex(
+        &self,
+        coin: &str,
+        dex_name: &str,
+    ) -> Result<Option<MarketInfo>, SnapshotError> {
         let value = self
             .post_info(
-                json!({"type": "metaAndAssetCtxs", "dex": DEX_NAME}),
+                json!({"type": "metaAndAssetCtxs", "dex": dex_name}),
                 "TRADE.XYZ market metadata lookup failed",
             )
             .await?;
@@ -735,10 +754,12 @@ where
                 "TRADE.XYZ market metadata changed during collection",
             ));
         }
-        let index = universe
+        let Some(index) = universe
             .iter()
-            .position(|item| item.get("name").and_then(Value::as_str) == Some(coin.as_str()))
-            .ok_or_else(|| SnapshotError::new("TRADE.XYZ symbol is not listed"))?;
+            .position(|item| item.get("name").and_then(Value::as_str) == Some(coin))
+        else {
+            return Ok(None);
+        };
         let metadata = &universe[index];
         let context = &contexts[index];
         let size_decimals = u32_field(metadata, "szDecimals")?;
@@ -772,20 +793,27 @@ where
         if volume_24h.is_some_and(|volume| volume < Decimal::ZERO) {
             return Err(SnapshotError::new("TRADE.XYZ 24H volume is invalid"));
         }
-        let dex = self.dex_metadata().await?;
         let index = u32::try_from(index)
             .map_err(|_| SnapshotError::new("TRADE.XYZ market index is out of range"))?;
-        let asset_id = 100_000_u32
-            .checked_add(
-                dex.index
-                    .checked_mul(10_000)
-                    .ok_or_else(|| SnapshotError::new("TRADE.XYZ asset identity overflowed"))?,
-            )
-            .and_then(|base| base.checked_add(index))
-            .ok_or_else(|| SnapshotError::new("TRADE.XYZ asset identity overflowed"))?;
-        Ok(MarketInfo {
-            coin,
+        let (asset_id, hip3_fee_scale) = if dex_name.is_empty() {
+            (index, None)
+        } else {
+            let dex = self.dex_metadata().await?;
+            let asset_id = 100_000_u32
+                .checked_add(
+                    dex.index
+                        .checked_mul(10_000)
+                        .ok_or_else(|| SnapshotError::new("TRADE.XYZ asset identity overflowed"))?,
+                )
+                .and_then(|base| base.checked_add(index))
+                .ok_or_else(|| SnapshotError::new("TRADE.XYZ asset identity overflowed"))?;
+            (asset_id, Some(dex.fee_scale))
+        };
+        Ok(Some(MarketInfo {
+            coin: coin.to_owned(),
+            dex_name: dex_name.to_owned(),
             asset_id,
+            hip3_fee_scale,
             size_decimals,
             max_leverage,
             delisted: metadata
@@ -798,7 +826,7 @@ where
             price_24h_change_ratio,
             volume_24h,
             observed_at_ms: now_ms()?,
-        })
+        }))
     }
 
     async fn order_status_value(&self, cloid: &str) -> Result<Value, SnapshotError> {
@@ -813,13 +841,13 @@ where
         .await
     }
 
-    async fn frontend_open_orders(&self) -> Result<Vec<Value>, SnapshotError> {
+    async fn frontend_open_orders(&self, dex_name: &str) -> Result<Vec<Value>, SnapshotError> {
         let value = self
             .post_info(
                 json!({
                     "type": "frontendOpenOrders",
                     "user": self.account_address,
-                    "dex": DEX_NAME,
+                    "dex": dex_name,
                 }),
                 "TRADE.XYZ open-order lookup failed",
             )
@@ -951,18 +979,18 @@ where
         validate_request(exchange, symbol)?;
         self.verify_credentials().await?;
         let symbol = symbol.to_ascii_uppercase();
-        let coin = exchange_coin(&symbol).map_err(|error| SnapshotError::new(error.to_string()))?;
+        let market = self.market_info(&symbol).await?;
+        let coin = market.coin.clone();
         let state = self
             .post_info(
                 json!({
                     "type": "clearinghouseState",
                     "user": self.account_address,
-                    "dex": DEX_NAME,
+                    "dex": &market.dex_name,
                 }),
                 "TRADE.XYZ position lookup failed",
             )
             .await?;
-        let market = self.market_info(&symbol).await?;
         let active_leverage = self.active_asset_leverage(&coin).await?;
         let position = state
             .get("assetPositions")
@@ -1171,11 +1199,14 @@ where
         if !(Decimal::ZERO..Decimal::ONE).contains(&referral_discount) {
             return Err(SnapshotError::new("TRADE.XYZ referral discount is invalid"));
         }
-        let dex = self.dex_metadata().await?;
-        let hip3_scale = if dex.fee_scale < Decimal::ONE {
-            Decimal::ONE + dex.fee_scale
+        let venue_scale = if let Some(fee_scale) = market.hip3_fee_scale {
+            if fee_scale < Decimal::ONE {
+                Decimal::ONE + fee_scale
+            } else {
+                fee_scale * Decimal::from(2)
+            }
         } else {
-            dex.fee_scale * Decimal::from(2)
+            Decimal::ONE
         };
         let growth_scale = if market.growth_mode {
             Decimal::new(1, 1)
@@ -1184,7 +1215,7 @@ where
         };
         let discount_scale = Decimal::ONE - referral_discount;
         let maker_rate = if base_maker > Decimal::ZERO {
-            base_maker * hip3_scale * growth_scale * discount_scale
+            base_maker * venue_scale * growth_scale * discount_scale
         } else {
             base_maker * growth_scale
         };
@@ -1192,7 +1223,7 @@ where
             exchange: Exchange::TradeXyz,
             symbol: symbol.to_ascii_uppercase(),
             maker_rate,
-            taker_rate: base_taker * hip3_scale * growth_scale * discount_scale,
+            taker_rate: base_taker * venue_scale * growth_scale * discount_scale,
         };
         rates.validate()?;
         Ok(rates)
@@ -1484,17 +1515,22 @@ where
         let (row, status, _) = order_status_parts(&value).map_err(|error| LookupError {
             message: error.message,
         })?;
-        let order = parse_authoritative_order(
-            row,
-            status,
-            &exchange_coin(symbol).map_err(|error| LookupError {
-                message: error.to_string(),
-            })?,
-            Some(client_order_id),
-        )
-        .map_err(|error| LookupError {
+        let coin = text_field(row, "coin").map_err(|error| LookupError {
             message: error.message,
         })?;
+        let actual_symbol = local_symbol(coin).map_err(|error| LookupError {
+            message: error.to_string(),
+        })?;
+        if actual_symbol != symbol.to_ascii_uppercase() {
+            return Err(LookupError {
+                message: "TRADE.XYZ order symbol mismatch".into(),
+            });
+        }
+        let order = parse_authoritative_order(row, status, coin, Some(client_order_id)).map_err(
+            |error| LookupError {
+                message: error.message,
+            },
+        )?;
         Ok(OrderLookup::Found(order))
     }
 }
@@ -1511,8 +1547,9 @@ where
         symbol: &str,
     ) -> Result<Vec<AuthoritativeOrder>, SnapshotError> {
         validate_request(exchange, symbol)?;
-        let coin = exchange_coin(symbol).map_err(|error| SnapshotError::new(error.to_string()))?;
-        let rows = self.frontend_open_orders().await?;
+        let market = self.market_info(symbol).await?;
+        let coin = market.coin;
+        let rows = self.frontend_open_orders(&market.dex_name).await?;
         let mut cached = BTreeMap::new();
         for row in &rows {
             if row.get("coin").and_then(Value::as_str) != Some(coin.as_str()) {
@@ -1572,7 +1609,7 @@ where
         if limit == 0 || limit > 2_000 {
             return Err(SnapshotError::new("TRADE.XYZ history limit is invalid"));
         }
-        let coin = exchange_coin(symbol).map_err(|error| SnapshotError::new(error.to_string()))?;
+        let coin = self.market_info(symbol).await?.coin;
         let value = self
             .post_info(
                 json!({"type": "historicalOrders", "user": self.account_address}),
@@ -1649,9 +1686,16 @@ where
                 .map_err(|error| ExecutionSnapshotError::new(error.message))?;
             let (row, status, status_time) = order_status_parts(&value)
                 .map_err(|error| ExecutionSnapshotError::new(error.message))?;
-            let coin = exchange_coin(symbol)
+            let coin = text_field(row, "coin")
+                .map_err(|error| ExecutionSnapshotError::new(error.message))?;
+            let actual_symbol = local_symbol(coin)
                 .map_err(|error| ExecutionSnapshotError::new(error.to_string()))?;
-            let order = parse_authoritative_order(row, status, &coin, Some(client_order_id))
+            if actual_symbol != symbol_key {
+                return Err(ExecutionSnapshotError::new(
+                    "TRADE.XYZ order symbol mismatch",
+                ));
+            }
+            let order = parse_authoritative_order(row, status, coin, Some(client_order_id))
                 .map_err(|error| ExecutionSnapshotError::new(error.message))?;
             let order_time = u64_field(row, "timestamp")
                 .map_err(|error| ExecutionSnapshotError::new(error.message))?;
@@ -1816,7 +1860,7 @@ where
         if minute_start_ms == 0 || !minute_start_ms.is_multiple_of(60_000) {
             return Err(SnapshotError::new("TRADE.XYZ candle time is invalid"));
         }
-        let coin = exchange_coin(symbol).map_err(|error| SnapshotError::new(error.to_string()))?;
+        let coin = self.market_info(symbol).await?.coin;
         let value = self
             .post_info(
                 json!({
@@ -2237,7 +2281,7 @@ fn validate_request(exchange: Exchange, symbol: &str) -> Result<(), SnapshotErro
     if exchange != Exchange::TradeXyz {
         return Err(SnapshotError::new("TRADE.XYZ exchange identity mismatch"));
     }
-    exchange_coin(&symbol.to_ascii_uppercase())
+    symbol_base(&symbol.to_ascii_uppercase())
         .map_err(|error| SnapshotError::new(error.to_string()))?;
     Ok(())
 }
@@ -2411,6 +2455,33 @@ mod tests {
         response(json!([{"universe": universe}, contexts]))
     }
 
+    fn default_cashcat_market_response() -> HttpResponse {
+        let mut universe = (0..231)
+            .map(|index| {
+                json!({
+                    "name": format!("D{index}"),
+                    "szDecimals": 2,
+                    "maxLeverage": 5
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut contexts = (0..231)
+            .map(|_| json!({"markPx": "1", "midPx": "1"}))
+            .collect::<Vec<_>>();
+        universe.push(json!({
+            "name": "CASHCAT",
+            "szDecimals": 0,
+            "maxLeverage": 3
+        }));
+        contexts.push(json!({
+            "markPx": "0.158715",
+            "midPx": "0.1587",
+            "prevDayPx": "0.15",
+            "dayBaseVlm": "100000"
+        }));
+        response(json!([{"universe": universe}, contexts]))
+    }
+
     fn dex_response() -> HttpResponse {
         response(json!([
             null,
@@ -2438,6 +2509,24 @@ mod tests {
                 side: OrderSide::Sell,
                 price: Some(Decimal::new(850, 0)),
                 quantity: Decimal::new(2, 1),
+                reduce_only: false,
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::Gtc,
+            },
+            100,
+        )
+        .unwrap()
+    }
+
+    fn cashcat_limit_intent(client_order_id: &str) -> OrderIntent {
+        OrderIntent::prepare(
+            ClientOrderId::parse(client_order_id).unwrap(),
+            Exchange::TradeXyz,
+            OrderShape {
+                symbol: "CASHCATUSDC".into(),
+                side: OrderSide::Buy,
+                price: Some(Decimal::new(158, 3)),
+                quantity: Decimal::new(100, 0),
                 reduce_only: false,
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::Gtc,
@@ -2790,6 +2879,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_perp_fallback_places_cashcat_on_the_authoritative_asset() {
+        let transport = ScriptedTransport::new([
+            market_response(),
+            default_cashcat_market_response(),
+            response(json!({
+                "status": "ok",
+                "response": {"data": {"statuses": [{"resting": {"oid": 43}}]}}
+            })),
+        ]);
+        let adapter = test_adapter(transport.clone());
+
+        adapter
+            .place_order(&cashcat_limit_intent("g_012345abcdef_15_B_3"))
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        let xyz_query: Value =
+            serde_json::from_str(requests[0].raw_body.as_deref().unwrap()).unwrap();
+        let default_query: Value =
+            serde_json::from_str(requests[1].raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(xyz_query["dex"], "xyz");
+        assert_eq!(default_query["dex"], "");
+        let placement: Value =
+            serde_json::from_str(requests[2].raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(placement["action"]["orders"][0]["a"], 231);
+    }
+
+    #[tokio::test]
+    async fn default_perp_position_and_open_orders_use_the_resolved_dex() {
+        let client_order_id = ClientOrderId::parse("g_012345abcdef_15_B_4").unwrap();
+        let transport = ScriptedTransport::new([
+            market_response(),
+            default_cashcat_market_response(),
+            response(json!({
+                "assetPositions": [{
+                    "position": {
+                        "coin": "CASHCAT",
+                        "szi": "100",
+                        "entryPx": "0.158",
+                        "unrealizedPnl": "0.0715"
+                    }
+                }]
+            })),
+            response(json!({"leverage": {"type": "isolated", "value": 3}})),
+            response(json!([{
+                "coin": "CASHCAT",
+                "side": "B",
+                "limitPx": "0.158",
+                "sz": "100",
+                "origSz": "100",
+                "oid": 44,
+                "timestamp": 1000,
+                "reduceOnly": false,
+                "orderType": "Limit",
+                "tif": "Gtc",
+                "cloid": encode_cloid(&client_order_id).unwrap()
+            }])),
+        ]);
+        let adapter = test_adapter(transport.clone());
+
+        let position = adapter
+            .position_snapshot(Exchange::TradeXyz, "CASHCATUSDC")
+            .await
+            .unwrap();
+        let orders = adapter
+            .open_orders_snapshot(Exchange::TradeXyz, "CASHCATUSDC")
+            .await
+            .unwrap();
+
+        assert_eq!(position.legs[0].signed_quantity, Decimal::new(100, 0));
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].shape.symbol, "CASHCATUSDC");
+        let requests = transport.requests();
+        let position_query: Value =
+            serde_json::from_str(requests[2].raw_body.as_deref().unwrap()).unwrap();
+        let orders_query: Value =
+            serde_json::from_str(requests[4].raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(position_query["type"], "clearinghouseState");
+        assert_eq!(position_query["dex"], "");
+        assert_eq!(orders_query["type"], "frontendOpenOrders");
+        assert_eq!(orders_query["dex"], "");
+    }
+
+    #[tokio::test]
+    async fn default_perp_fees_do_not_apply_the_hip3_deployer_multiplier() {
+        let transport = ScriptedTransport::new([
+            market_response(),
+            default_cashcat_market_response(),
+            response(json!({
+                "userAddRate": "0.0002",
+                "userCrossRate": "0.0005",
+                "activeReferralDiscount": "0"
+            })),
+        ]);
+        let adapter = test_adapter(transport.clone());
+
+        let rates = adapter
+            .trading_fee_rates(Exchange::TradeXyz, "CASHCATUSDC")
+            .await
+            .unwrap();
+
+        assert_eq!(rates.maker_rate, Decimal::new(2, 4));
+        assert_eq!(rates.taker_rate, Decimal::new(5, 4));
+        assert_eq!(transport.requests().len(), 3);
+    }
+
+    #[tokio::test]
     async fn limit_minimum_notional_uses_the_order_price_not_the_mark_price() {
         let transport = ScriptedTransport::new([market_response(), dex_response()]);
         let adapter = test_adapter(transport.clone());
@@ -2888,6 +3086,8 @@ mod tests {
         let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
         let cloid = encode_cloid(&client_order_id).unwrap();
         let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
             response(json!([{
                 "coin": "xyz:MU",
                 "side": "A",
@@ -2945,7 +3145,15 @@ mod tests {
                     .to_owned()
             })
             .collect::<Vec<_>>();
-        assert_eq!(request_types, vec!["frontendOpenOrders", "userFillsByTime"]);
+        assert_eq!(
+            request_types,
+            vec![
+                "metaAndAssetCtxs",
+                "perpDexs",
+                "frontendOpenOrders",
+                "userFillsByTime"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2967,7 +3175,12 @@ mod tests {
                 "cloid": cloid
             }])
         };
-        let transport = ScriptedTransport::new([response(row("13.1")), response(row("15.0"))]);
+        let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
+            response(row("13.1")),
+            response(row("15.0")),
+        ]);
         let adapter = test_adapter(transport);
 
         let first = adapter
@@ -3005,6 +3218,8 @@ mod tests {
             })
         };
         let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
             response(json!([{
                 "coin": "xyz:MU",
                 "side": "A",
@@ -3139,19 +3354,23 @@ mod tests {
     async fn websocket_fill_advances_stale_open_order_without_another_rest_read() {
         let client_order_id = ClientOrderId::parse("g_012345abcdef_15_S_9").unwrap();
         let cloid = encode_cloid(&client_order_id).unwrap();
-        let transport = ScriptedTransport::new([response(json!([{
-            "coin": "xyz:MU",
-            "side": "A",
-            "limitPx": "850",
-            "sz": "0.2",
-            "origSz": "0.2",
-            "oid": 42,
-            "timestamp": 1,
-            "reduceOnly": false,
-            "orderType": "Limit",
-            "tif": "Gtc",
-            "cloid": cloid
-        }]))]);
+        let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
+            response(json!([{
+                "coin": "xyz:MU",
+                "side": "A",
+                "limitPx": "850",
+                "sz": "0.2",
+                "origSz": "0.2",
+                "oid": 42,
+                "timestamp": 1,
+                "reduceOnly": false,
+                "orderType": "Limit",
+                "tif": "Gtc",
+                "cloid": cloid
+            }])),
+        ]);
         let adapter = test_adapter(transport.clone());
         adapter
             .open_order_execution_progress_snapshot(Exchange::TradeXyz, "MUUSDC")
@@ -3182,7 +3401,7 @@ mod tests {
             snapshot.order.lifecycle,
             OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
         );
-        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(transport.requests().len(), 3);
     }
 
     #[tokio::test]

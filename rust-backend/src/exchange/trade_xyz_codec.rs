@@ -146,7 +146,15 @@ pub(crate) fn normalize_address(value: &str) -> Result<String, TradeXyzCodecErro
 }
 
 pub(crate) fn exchange_coin(symbol: &str) -> Result<String, TradeXyzCodecError> {
-    let base = symbol
+    Ok(format!("{DEX_PREFIX}{}", symbol_base(symbol)?))
+}
+
+pub(crate) fn default_exchange_coin(symbol: &str) -> Result<String, TradeXyzCodecError> {
+    symbol_base(symbol)
+}
+
+pub(crate) fn symbol_base(symbol: &str) -> Result<String, TradeXyzCodecError> {
+    symbol
         .strip_suffix(QUOTE_ASSET)
         .filter(|base| {
             !base.is_empty()
@@ -154,13 +162,14 @@ pub(crate) fn exchange_coin(symbol: &str) -> Result<String, TradeXyzCodecError> 
                     .bytes()
                     .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
         })
-        .ok_or(TradeXyzCodecError::InvalidSymbol)?;
-    Ok(format!("{DEX_PREFIX}{base}"))
+        .map(str::to_owned)
+        .ok_or(TradeXyzCodecError::InvalidSymbol)
 }
 
 pub(crate) fn local_symbol(coin: &str) -> Result<String, TradeXyzCodecError> {
-    let base = coin
-        .strip_prefix(DEX_PREFIX)
+    let base = coin.strip_prefix(DEX_PREFIX).unwrap_or(coin);
+    let base = (!coin.contains(':') || coin.starts_with(DEX_PREFIX))
+        .then_some(base)
         .filter(|base| {
             !base.is_empty()
                 && base
@@ -519,8 +528,11 @@ mod tests {
     #[test]
     fn symbol_and_precision_contracts_are_strict() {
         assert_eq!(exchange_coin("MUUSDC").unwrap(), "xyz:MU");
+        assert_eq!(default_exchange_coin("CASHCATUSDC").unwrap(), "CASHCAT");
         assert_eq!(local_symbol("xyz:MU").unwrap(), "MUUSDC");
+        assert_eq!(local_symbol("CASHCAT").unwrap(), "CASHCATUSDC");
         assert!(exchange_coin("MUUSDT").is_err());
+        assert!(local_symbol("cash:CASHCAT").is_err());
         assert!(valid_price(Decimal::new(12345, 4), 2));
         assert!(!valid_price(Decimal::new(123456, 5), 2));
         assert_eq!(quantity_step(3), Some(Decimal::new(1, 3)));
