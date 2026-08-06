@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -2616,13 +2619,27 @@ where
             return Err(StrategyStateError::TimestampRegression.into());
         }
         next.updated_at_ms = now_ms;
+        let validation_started = Instant::now();
         let validated = if self.snapshot_validated {
             ValidatedStrategyState::from_validated_transition(self.store.snapshot(), next)?
         } else {
             ValidatedStrategyState::new(next)?
         };
+        let validation_ms =
+            u64::try_from(validation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let persistence_started = Instant::now();
         self.store.replace_validated(validated)?;
+        let persistence_ms =
+            u64::try_from(persistence_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.snapshot_validated = true;
+        tracing::info!(
+            run_id = self.store.snapshot().run_id.as_str(),
+            symbol = self.store.snapshot().symbol.as_str(),
+            revision = self.store.snapshot().revision,
+            validation_ms,
+            persistence_ms,
+            "strategy state transition committed"
+        );
         Ok(transition)
     }
 }
