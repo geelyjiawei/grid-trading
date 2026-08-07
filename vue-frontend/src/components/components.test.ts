@@ -317,6 +317,29 @@ describe("Vue migration components", () => {
     expect(wrapper.find("button.stop-button").exists()).toBe(false);
   });
 
+  it("allows an explicit cleanup stop for a failed non-terminal strategy", async () => {
+    const wrapper = mount(StrategyOverview, {
+      props: {
+        status: {
+          run_id: "run-failed-cleanup",
+          exchange: "binance",
+          symbol: "SKHYNIXUSDT",
+          running: false,
+          lifecycle: "failed",
+        },
+        risk: null,
+      },
+    });
+
+    const stopButton = wrapper.find("button.stop-button");
+    expect(stopButton.exists()).toBe(true);
+    expect(stopButton.text()).toContain("清理并停止");
+    await stopButton.trigger("click");
+    expect(wrapper.emitted("stop")).toBeUndefined();
+    await stopButton.trigger("click");
+    expect(wrapper.emitted("stop")).toHaveLength(1);
+  });
+
   it("shows total equity only from the matching authoritative risk snapshot", () => {
     const status: GridStatus = {
       run_id: "run-profit-1",

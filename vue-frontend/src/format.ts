@@ -38,9 +38,15 @@ export function strategyStatusTone(status?: GridStatus | null): "running" | "pen
 }
 
 export function strategyCanStop(status?: GridStatus | null): boolean {
-  return status?.running === true
-    && !["stop_requested", "risk_exit_requested", "failed", "stopped", "closed", "cancelled"]
-      .includes(status.lifecycle ?? "");
+  if (!status) return false;
+  const lifecycle = status.lifecycle ?? "";
+  if (["stop_requested", "risk_exit_requested", "stopped", "closed", "cancelled"]
+    .includes(lifecycle)) {
+    return false;
+  }
+  // Failed strategies remain non-terminal and may still own exchange orders.
+  // Keep cleanup reachable even though normal execution has already stopped.
+  return status.running === true || lifecycle === "failed";
 }
 
 export function finiteNumber(value: unknown): number | null {

@@ -272,6 +272,49 @@ describe("workspace request isolation", () => {
     wrapper.unmount();
   });
 
+  it("submits cleanup for a selected failed strategy", async () => {
+    const failed: GridStatus = {
+      run_id: "run-skhynix-failed",
+      exchange: "binance",
+      symbol: "SKHYNIXUSDT",
+      running: false,
+      lifecycle: "failed",
+      realized_net_profit: "15.7876",
+    };
+    installWorkspaceMocks([failed]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "1004", mark_price: "1004" });
+    vi.spyOn(api, "risk").mockResolvedValue({
+      run_id: failed.run_id,
+      exchange: failed.exchange,
+      symbol: failed.symbol,
+      has_risk: false,
+    });
+    const stop = vi.spyOn(api, "stop").mockResolvedValue({
+      ok: true,
+      message: "cleanup already in progress",
+      run_id: "run-skhynix-failed",
+      exchange: failed.exchange,
+      symbol: failed.symbol,
+      lifecycle: "unchanged",
+    });
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => {
+      expect(wrapper.findAll("button.strategy-row")).toHaveLength(1);
+    });
+    await wrapper.find("button.strategy-row").trigger("click");
+    await flushPromises();
+
+    const stopButton = wrapper.get("button.stop-button");
+    expect(stopButton.text()).toContain("清理并停止");
+    await stopButton.trigger("click");
+    await stopButton.trigger("click");
+    await vi.waitFor(() => {
+      expect(stop).toHaveBeenCalledWith("binance", "SKHYNIXUSDT");
+    });
+    wrapper.unmount();
+  });
+
   it("ignores a previous exchange response that arrives after strategy switching", async () => {
     const grids: GridStatus[] = [
       {

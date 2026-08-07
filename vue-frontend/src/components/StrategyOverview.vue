@@ -47,6 +47,7 @@ const completedPairs = computed(
   () => currentRisk.value?.completed_pairs ?? props.status?.completed_pairs ?? 0,
 );
 const canStop = computed(() => strategyCanStop(props.status));
+const failedCleanup = computed(() => props.status?.lifecycle === "failed");
 const statusLabel = computed(() => strategyStatusLabel(props.status));
 const statusTone = computed(() => strategyStatusTone(props.status));
 const manualStopPending = computed(
@@ -157,7 +158,11 @@ function positionLabel(value: unknown): string {
           :disabled="stopBusy"
           @click="requestStop"
         >
-          {{ stopBusy ? "正在停止…" : stopConfirmation ? "确认停止（只撤单）" : "停止策略" }}
+          {{ stopBusy
+            ? failedCleanup ? "正在清理…" : "正在停止…"
+            : stopConfirmation
+              ? failedCleanup ? "确认清理（只撤单）" : "确认停止（只撤单）"
+              : failedCleanup ? "清理并停止" : "停止策略" }}
         </button>
       </div>
     </header>
@@ -166,6 +171,9 @@ function positionLabel(value: unknown): string {
     <template v-else>
       <div v-if="manualStopPending" class="callout">
         停止请求已保存。程序正在核对成交、手续费并确认策略订单全部终态；期间不会继续补单，也不会主动平仓。
+      </div>
+      <div v-else-if="failedCleanup" class="callout danger">
+        策略执行已冻结，不会继续补单。可使用“清理并停止”撤销本策略仍归属的挂单；该操作不会主动平仓。
       </div>
       <div v-if="currentRisk?.has_risk" class="callout danger">
         <strong>风险核对未通过，当前页面仅展示状态，不执行自动补救操作。</strong>
