@@ -1162,6 +1162,9 @@ fn stop_lifecycle(
         PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
             lifecycle: StrategyLifecycle::StopRequested,
         }) => Ok("stop_requested"),
+        PreparedStrategyStopOutcome::Active(StrategyTransition::FailedCleanupRequested) => {
+            Ok("failed_cleanup_requested")
+        }
         PreparedStrategyStopOutcome::Active(StrategyTransition::NoChange) => Ok("unchanged"),
         PreparedStrategyStopOutcome::Active(_) => Err(CommandOutcomeUnknown),
     }
@@ -5756,6 +5759,17 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn failed_cleanup_stop_outcome_is_not_reported_as_unchanged() {
+        let outcome =
+            PreparedStrategyStopOutcome::Active(StrategyTransition::FailedCleanupRequested);
+
+        assert_eq!(
+            stop_lifecycle(&outcome).unwrap(),
+            "failed_cleanup_requested"
+        );
     }
 
     #[tokio::test]

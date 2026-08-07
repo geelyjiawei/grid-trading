@@ -1884,6 +1884,7 @@ pub struct ExecutionReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StrategyTransition {
     NoChange,
+    FailedCleanupRequested,
     Updated {
         new_obligation_ids: Vec<u64>,
     },
@@ -2385,12 +2386,18 @@ where
     ) -> Result<StrategyTransition, StrategyMachineError> {
         self.ensure_snapshot_validated()?;
         let mut next = self.store.snapshot().clone();
+        if next.lifecycle == StrategyLifecycle::Failed {
+            return self.finalize_and_store(
+                next,
+                now_ms,
+                StrategyTransition::FailedCleanupRequested,
+            );
+        }
         if matches!(
             next.lifecycle,
             StrategyLifecycle::RiskExitRequested
                 | StrategyLifecycle::StopRequested
                 | StrategyLifecycle::Stopped
-                | StrategyLifecycle::Failed
                 | StrategyLifecycle::Closed
         ) {
             return Ok(StrategyTransition::NoChange);
@@ -9690,6 +9697,25 @@ mod tests {
             }
         );
         assert_eq!(machine.store().snapshot().failure, failure);
+    }
+
+    #[test]
+    fn manual_stop_on_failed_strategy_is_a_durable_cleanup_request() {
+        let mut failed = state(Direction::Short, PositionBaseline::flat());
+        failed.fail("valued execution audit is invalid");
+        failed.validate().unwrap();
+        let original_revision = failed.revision;
+        let original_failure = failed.failure.clone();
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(failed));
+
+        let transition = machine.request_stop(101).unwrap();
+
+        assert_eq!(transition, StrategyTransition::FailedCleanupRequested);
+        let persisted = machine.store().snapshot();
+        assert_eq!(persisted.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(persisted.failure, original_failure);
+        assert_eq!(persisted.revision, original_revision + 1);
+        assert_eq!(persisted.updated_at_ms, 101);
     }
 
     #[test]

@@ -7934,6 +7934,21 @@ mod tests {
             runtime.machine().store().snapshot().lifecycle,
             StrategyLifecycle::Failed
         );
+        let failed_revision = runtime.machine().store().snapshot().revision;
+        let failed_reason = runtime.machine().store().snapshot().failure.clone();
+        assert_eq!(
+            runtime.machine_mut().request_stop(1_550).unwrap(),
+            StrategyTransition::FailedCleanupRequested
+        );
+        assert_eq!(
+            runtime.machine().store().snapshot().revision,
+            failed_revision + 1
+        );
+        assert_eq!(runtime.machine().store().snapshot().failure, failed_reason);
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Failed
+        );
         assert_eq!(
             gateway.cancellation_call_count(),
             cancellations_before_failure
