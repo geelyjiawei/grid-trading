@@ -102,7 +102,11 @@ pub(crate) struct FuturesOrderUpdate {
 struct FuturesObservedOrder {
     initial_shape: OrderShape,
     client_order_id: ClientOrderId,
-    order_time_ms: u64,
+    order_time_ms: Option<u64>,
+    new_event_observed: bool,
+    post_new_update_observed: bool,
+    latest_order: AuthoritativeOrder,
+    cumulative_quantity: Decimal,
     trades: BTreeMap<String, TradeFill>,
     snapshot: Option<OrderExecutionSnapshot>,
     last_update_time_ms: u64,
@@ -148,7 +152,29 @@ impl FuturesExecutionCache {
                 OrderLifecycle::Active(ActiveOrderStatus::New)
             )
         {
-            if !state.entries.contains_key(&key) {
+            let key_was_tracked = state.entries.contains_key(&key);
+            let identity_matches = state.entries.get(&key).is_some_and(|observed| {
+                observed.client_order_id == update.order.client_order_id
+                    && observed.initial_shape == update.order.shape
+            });
+            if identity_matches {
+                let observed = state
+                    .entries
+                    .get_mut(&key)
+                    .expect("the validated futures execution cache entry must remain present");
+                observed.new_event_observed = true;
+                if observed.cumulative_quantity.is_zero()
+                    && update.update_time_ms >= observed.last_update_time_ms
+                {
+                    observed.latest_order = update.order;
+                    observed.last_update_time_ms = update.update_time_ms;
+                }
+                refresh_futures_snapshot(observed);
+                drop(state);
+                self.changed.notify_waiters();
+                return;
+            }
+            if !key_was_tracked {
                 state.order.push_back(key.clone());
             }
             state.entries.insert(
@@ -156,7 +182,11 @@ impl FuturesExecutionCache {
                 FuturesObservedOrder {
                     initial_shape: update.order.shape.clone(),
                     client_order_id: update.order.client_order_id.clone(),
-                    order_time_ms: update.update_time_ms,
+                    order_time_ms: None,
+                    new_event_observed: true,
+                    post_new_update_observed: false,
+                    latest_order: update.order,
+                    cumulative_quantity: update.cumulative_quantity,
                     trades: BTreeMap::new(),
                     snapshot: None,
                     last_update_time_ms: update.update_time_ms,
@@ -171,7 +201,8 @@ impl FuturesExecutionCache {
         let Some(observed) = state.entries.get(&key) else {
             return;
         };
-        if observed.client_order_id != update.order.client_order_id
+        if !observed.new_event_observed
+            || observed.client_order_id != update.order.client_order_id
             || observed.initial_shape != update.order.shape
         {
             state.entries.remove(&key);
@@ -184,10 +215,8 @@ impl FuturesExecutionCache {
             .get_mut(&key)
             .expect("the validated futures execution cache entry must remain present");
         if update.update_time_ms < observed.last_update_time_ms
-            || observed.snapshot.as_ref().is_some_and(|snapshot| {
-                update.update_time_ms == observed.last_update_time_ms
-                    && update.cumulative_quantity < snapshot.cumulative_quantity
-            })
+            || (update.update_time_ms == observed.last_update_time_ms
+                && update.cumulative_quantity < observed.cumulative_quantity)
         {
             return;
         }
@@ -197,27 +226,90 @@ impl FuturesExecutionCache {
                 .entry(trade.trade_id.clone())
                 .or_insert(trade);
         }
-        let cumulative_quote = observed
-            .trades
-            .values()
-            .try_fold(Decimal::ZERO, |total, trade| {
-                total.checked_add(trade.quote_quantity)
-            });
-        let trades = observed.trades.values().cloned().collect::<Vec<_>>();
-        observed.snapshot = cumulative_quote.and_then(|cumulative_quote| {
-            assemble_execution_snapshot(
-                OrderExecutionHeader {
-                    order: update.order,
-                    cumulative_quantity: update.cumulative_quantity,
-                    cumulative_quote,
-                    order_time_ms: observed.order_time_ms,
-                    update_time_ms: update.update_time_ms,
-                },
-                trades,
-            )
-            .ok()
-        });
+        observed.latest_order = update.order;
+        observed.cumulative_quantity = update.cumulative_quantity;
+        observed.post_new_update_observed = true;
         observed.last_update_time_ms = update.update_time_ms;
+        refresh_futures_snapshot(observed);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Binds immutable REST order identity to session-local stream updates.
+    /// Binance-compatible streams expose transaction time rather than a stable
+    /// creation time, so an unbound stream event is never auditable by itself.
+    pub(crate) fn bind_authoritative_snapshot(&self, snapshot: &OrderExecutionSnapshot) {
+        let key = (
+            snapshot.order.shape.symbol.clone(),
+            snapshot.order.exchange_order_id.clone(),
+        );
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key_was_tracked = state.entries.contains_key(&key);
+        let identity_matches = state.entries.get(&key).is_some_and(|observed| {
+            observed.client_order_id == snapshot.order.client_order_id
+                && observed.initial_shape == snapshot.order.shape
+        });
+        if identity_matches {
+            let observed = state
+                .entries
+                .get_mut(&key)
+                .expect("the validated futures execution cache entry must remain present");
+            observed.order_time_ms = Some(snapshot.order_time_ms);
+            observed.post_new_update_observed |= !matches!(
+                snapshot.order.lifecycle,
+                OrderLifecycle::Active(ActiveOrderStatus::New)
+            );
+            if snapshot.update_time_ms >= observed.last_update_time_ms {
+                observed.latest_order = snapshot.order.clone();
+                observed.cumulative_quantity = snapshot.cumulative_quantity;
+                observed.trades = snapshot
+                    .trades
+                    .iter()
+                    .cloned()
+                    .map(|trade| (trade.trade_id.clone(), trade))
+                    .collect();
+                observed.last_update_time_ms = snapshot.update_time_ms;
+            } else {
+                for trade in &snapshot.trades {
+                    observed
+                        .trades
+                        .entry(trade.trade_id.clone())
+                        .or_insert_with(|| trade.clone());
+                }
+            }
+            refresh_futures_snapshot(observed);
+        } else {
+            if !key_was_tracked {
+                state.order.push_back(key.clone());
+            }
+            state.entries.insert(
+                key,
+                FuturesObservedOrder {
+                    initial_shape: snapshot.order.shape.clone(),
+                    client_order_id: snapshot.order.client_order_id.clone(),
+                    order_time_ms: Some(snapshot.order_time_ms),
+                    new_event_observed: false,
+                    post_new_update_observed: !matches!(
+                        snapshot.order.lifecycle,
+                        OrderLifecycle::Active(ActiveOrderStatus::New)
+                    ),
+                    latest_order: snapshot.order.clone(),
+                    cumulative_quantity: snapshot.cumulative_quantity,
+                    trades: snapshot
+                        .trades
+                        .iter()
+                        .cloned()
+                        .map(|trade| (trade.trade_id.clone(), trade))
+                        .collect(),
+                    snapshot: None,
+                    last_update_time_ms: snapshot.update_time_ms,
+                },
+            );
+        }
+        prune_futures_execution_cache(&mut state);
         drop(state);
         self.changed.notify_waiters();
     }
@@ -228,7 +320,8 @@ impl FuturesExecutionCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entries
-            .contains_key(&key)
+            .get(&key)
+            .is_some_and(|observed| observed.new_event_observed && observed.order_time_ms.is_some())
     }
 
     pub(crate) fn snapshot(
@@ -243,7 +336,9 @@ impl FuturesExecutionCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let observed = state.entries.get(&key)?;
-        (observed.client_order_id == *client_order_id)
+        (observed.new_event_observed
+            && observed.order_time_ms.is_some()
+            && observed.client_order_id == *client_order_id)
             .then(|| observed.snapshot.clone())
             .flatten()
     }
@@ -268,6 +363,37 @@ impl FuturesExecutionCache {
             tokio::time::timeout(remaining, changed).await.ok()?;
         }
     }
+}
+
+fn refresh_futures_snapshot(observed: &mut FuturesObservedOrder) {
+    let Some(order_time_ms) = observed.order_time_ms else {
+        observed.snapshot = None;
+        return;
+    };
+    if !observed.new_event_observed || !observed.post_new_update_observed {
+        observed.snapshot = None;
+        return;
+    }
+    let cumulative_quote = observed
+        .trades
+        .values()
+        .try_fold(Decimal::ZERO, |total, trade| {
+            total.checked_add(trade.quote_quantity)
+        });
+    let trades = observed.trades.values().cloned().collect::<Vec<_>>();
+    observed.snapshot = cumulative_quote.and_then(|cumulative_quote| {
+        assemble_execution_snapshot(
+            OrderExecutionHeader {
+                order: observed.latest_order.clone(),
+                cumulative_quantity: observed.cumulative_quantity,
+                cumulative_quote,
+                order_time_ms,
+                update_time_ms: observed.last_update_time_ms,
+            },
+            trades,
+        )
+        .ok()
+    });
 }
 
 fn prune_futures_execution_cache(state: &mut FuturesExecutionCacheState) {
@@ -1215,6 +1341,23 @@ pub(crate) fn new_realtime_lifetime() -> Arc<()> {
 mod tests {
     use super::*;
 
+    fn authoritative_new_snapshot(
+        update: &FuturesOrderUpdate,
+        order_time_ms: u64,
+    ) -> OrderExecutionSnapshot {
+        assemble_execution_snapshot(
+            OrderExecutionHeader {
+                order: update.order.clone(),
+                cumulative_quantity: Decimal::ZERO,
+                cumulative_quote: Decimal::ZERO,
+                order_time_ms,
+                update_time_ms: update.update_time_ms,
+            },
+            vec![],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn binance_uses_the_official_private_user_stream_endpoint() {
         assert_eq!(
@@ -1289,8 +1432,11 @@ mod tests {
             r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"3.14","p":"15.92","x":"NEW","X":"NEW","i":42,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
         )
         .unwrap();
-        cache.apply(parse_futures_order_update(&new, Exchange::Binance).unwrap());
+        let new_update = parse_futures_order_update(&new, Exchange::Binance).unwrap();
+        cache.apply(new_update.clone());
         let client_order_id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        assert!(!cache.knows_order("MUUSDT", "42"));
+        cache.bind_authoritative_snapshot(&authoritative_new_snapshot(&new_update, 1000));
         assert!(cache.knows_order("MUUSDT", "42"));
         assert!(cache.snapshot("MUUSDT", &client_order_id, "42").is_none());
 
@@ -1311,6 +1457,86 @@ mod tests {
         assert_eq!(snapshot.update_time_ms, 1010);
     }
 
+    #[test]
+    fn binance_preserves_the_rest_order_time_when_stream_transaction_time_differs() {
+        let cache = FuturesExecutionCache::default();
+        let new = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1786105786428,"T":1786105786428,"o":{"s":"SKHYNIXUSDT","c":"r_66ad5ac4ed3a_33_S_376","S":"SELL","o":"LIMIT","f":"GTC","q":"0.10","p":"1044","x":"NEW","X":"NEW","i":3112233650,"l":"0","z":"0","L":"0","R":false,"T":1786105786428}}"#,
+        )
+        .unwrap();
+        let new_update = parse_futures_order_update(&new, Exchange::Binance).unwrap();
+        cache.apply(new_update.clone());
+        cache.bind_authoritative_snapshot(&authoritative_new_snapshot(&new_update, 1786105786410));
+
+        let filled = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1786105801893,"T":1786105801893,"o":{"s":"SKHYNIXUSDT","c":"r_66ad5ac4ed3a_33_S_376","S":"SELL","o":"LIMIT","f":"GTC","q":"0.10","p":"1044","x":"TRADE","X":"FILLED","i":3112233650,"l":"0.10","z":"0.10","L":"1044","N":"USDT","n":"0","R":false,"T":1786105801893,"t":194852257,"m":true,"rp":"0"}}"#,
+        )
+        .unwrap();
+        cache.apply(parse_futures_order_update(&filled, Exchange::Binance).unwrap());
+
+        let snapshot = cache
+            .snapshot(
+                "SKHYNIXUSDT",
+                &ClientOrderId::parse("r_66ad5ac4ed3a_33_S_376").unwrap(),
+                "3112233650",
+            )
+            .unwrap();
+        assert_eq!(snapshot.order_time_ms, 1786105786410);
+    }
+
+    #[test]
+    fn futures_cache_handles_rest_binding_before_the_new_event() {
+        let cache = FuturesExecutionCache::default();
+        let new = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1001,"T":1001,"o":{"s":"MUUSDT","c":"r_run_0_B_early","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"NEW","X":"NEW","i":47,"l":"0","z":"0","L":"0","R":true,"T":1001}}"#,
+        )
+        .unwrap();
+        let new_update = parse_futures_order_update(&new, Exchange::Binance).unwrap();
+        cache.bind_authoritative_snapshot(&authoritative_new_snapshot(&new_update, 990));
+        assert!(!cache.knows_order("MUUSDT", "47"));
+
+        cache.apply(new_update);
+        assert!(cache.knows_order("MUUSDT", "47"));
+        assert!(
+            cache
+                .snapshot(
+                    "MUUSDT",
+                    &ClientOrderId::parse("r_run_0_B_early").unwrap(),
+                    "47",
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn futures_cache_reconstructs_a_fill_observed_before_rest_binding() {
+        let cache = FuturesExecutionCache::default();
+        let new = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1001,"T":1001,"o":{"s":"MUUSDT","c":"r_run_0_S_late","S":"SELL","o":"LIMIT","f":"GTC","q":"1","p":"16","x":"NEW","X":"NEW","i":48,"l":"0","z":"0","L":"0","R":false,"T":1001}}"#,
+        )
+        .unwrap();
+        let new_update = parse_futures_order_update(&new, Exchange::Binance).unwrap();
+        cache.apply(new_update.clone());
+        let filled = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_S_late","S":"SELL","o":"LIMIT","f":"GTC","q":"1","p":"16","x":"TRADE","X":"FILLED","i":48,"l":"1","z":"1","L":"16","N":"USDT","n":"0.0032","R":false,"T":1010,"t":11,"m":true,"rp":"0"}}"#,
+        )
+        .unwrap();
+        cache.apply(parse_futures_order_update(&filled, Exchange::Binance).unwrap());
+        assert!(!cache.knows_order("MUUSDT", "48"));
+
+        cache.bind_authoritative_snapshot(&authoritative_new_snapshot(&new_update, 990));
+        let snapshot = cache
+            .snapshot(
+                "MUUSDT",
+                &ClientOrderId::parse("r_run_0_S_late").unwrap(),
+                "48",
+            )
+            .unwrap();
+        assert_eq!(snapshot.order_time_ms, 990);
+        assert_eq!(snapshot.cumulative_quantity, Decimal::ONE);
+        assert_eq!(snapshot.trades.len(), 1);
+    }
+
     #[tokio::test]
     async fn futures_snapshot_waits_for_a_newly_arriving_cancellation_event() {
         let cache = FuturesExecutionCache::default();
@@ -1328,13 +1554,18 @@ mod tests {
                 .await
         });
         tokio::task::yield_now().await;
-        for text in [
+        let new = serde_json::from_str::<Value>(
             r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_wait","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"NEW","X":"NEW","i":46,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
+        )
+        .unwrap();
+        let new_update = parse_futures_order_update(&new, Exchange::Binance).unwrap();
+        cache.apply(new_update.clone());
+        cache.bind_authoritative_snapshot(&authoritative_new_snapshot(&new_update, 999));
+        let cancelled = serde_json::from_str::<Value>(
             r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"MUUSDT","c":"r_run_0_B_wait","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"CANCELED","X":"CANCELED","i":46,"l":"0","z":"0","L":"0","R":true,"T":1010}}"#,
-        ] {
-            let message = serde_json::from_str::<Value>(text).unwrap();
-            cache.apply(parse_futures_order_update(&message, Exchange::Binance).unwrap());
-        }
+        )
+        .unwrap();
+        cache.apply(parse_futures_order_update(&cancelled, Exchange::Binance).unwrap());
 
         let snapshot = waiter.await.unwrap().unwrap();
         assert_eq!(snapshot.order.client_order_id, client_order_id);
@@ -1354,7 +1585,11 @@ mod tests {
             r#"{"e":"ORDER_TRADE_UPDATE","E":1020,"T":1020,"o":{"s":"MUUSDT","c":"r_run_0_S_1","S":"SELL","o":"LIMIT","f":"GTC","q":"3","p":"16","x":"TRADE","X":"FILLED","i":43,"l":"2","z":"3","L":"16","N":"USDT","n":"0.0064","R":false,"T":1020,"t":9,"m":true,"rp":"0"}}"#,
         ] {
             let message = serde_json::from_str::<Value>(text).unwrap();
-            cache.apply(parse_futures_order_update(&message, Exchange::Binance).unwrap());
+            let update = parse_futures_order_update(&message, Exchange::Binance).unwrap();
+            cache.apply(update.clone());
+            if update.execution_type == "NEW" {
+                cache.bind_authoritative_snapshot(&authoritative_new_snapshot(&update, 999));
+            }
         }
         let snapshot = cache
             .snapshot(
@@ -1396,7 +1631,9 @@ mod tests {
             r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":1000,"o":{"s":"MUUSDT","c":"r_run_0_B_1","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"15.92","x":"NEW","X":"NEW","i":45,"l":"0","z":"0","L":"0","R":true,"T":1000}}"#,
         )
         .unwrap();
-        cache.apply(parse_futures_order_update(&new, Exchange::Binance).unwrap());
+        let new_update = parse_futures_order_update(&new, Exchange::Binance).unwrap();
+        cache.apply(new_update.clone());
+        cache.bind_authoritative_snapshot(&authoritative_new_snapshot(&new_update, 999));
         assert!(cache.knows_order("MUUSDT", "45"));
         cache.begin_session();
         assert!(!cache.knows_order("MUUSDT", "45"));

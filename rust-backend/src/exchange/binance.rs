@@ -936,8 +936,11 @@ where
         )
         .map_err(|error| execution_error(format!("invalid Binance order totals: {error}")))?;
         if header.cumulative_quantity.is_zero() {
-            return assemble_execution_snapshot(header, vec![])
-                .map_err(|error| execution_error(error.to_string()));
+            let snapshot = assemble_execution_snapshot(header, vec![])
+                .map_err(|error| execution_error(error.to_string()))?;
+            self.realtime_execution_cache
+                .bind_authoritative_snapshot(&snapshot);
+            return Ok(snapshot);
         }
 
         let mut trades = Vec::new();
@@ -1007,8 +1010,11 @@ where
                 "Binance trade history exceeded the bounded pagination limit",
             ));
         }
-        assemble_execution_snapshot(header, trades)
-            .map_err(|error| execution_error(format!("incomplete Binance execution: {error}")))
+        let snapshot = assemble_execution_snapshot(header, trades)
+            .map_err(|error| execution_error(format!("incomplete Binance execution: {error}")))?;
+        self.realtime_execution_cache
+            .bind_authoritative_snapshot(&snapshot);
+        Ok(snapshot)
     }
 }
 
