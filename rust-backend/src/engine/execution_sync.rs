@@ -1,12 +1,15 @@
 use thiserror::Error;
 
 use crate::{
-    domain::{ClientOrderId, Exchange, OrderShape},
+    domain::{ClientOrderId, Exchange, IntentState, OrderShape},
     engine::{
         ExecutionAccountingError, ExecutionAccountingService, StrategyMachine,
-        StrategyMachineError, StrategyStateStore, StrategyTransition, ValuedExecutionReport,
+        StrategyMachineError, StrategyOrderTracking, StrategyStateStore, StrategyTransition,
+        ValuedExecutionReport,
     },
-    exchange::{ExecutionSnapshotGateway, HistoricalPriceGateway, OrderExecutionSnapshot},
+    exchange::{
+        ExecutionSnapshotGateway, HistoricalPriceGateway, OrderExecutionSnapshot, OrderLifecycle,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +171,25 @@ impl ExecutionSyncService {
         let current_request = self.request_for(machine, &loaded.request.client_order_id)?;
         if current_request != loaded.request || !current_request.matches(&loaded.snapshot) {
             return Err(ExecutionSyncError::OrderIdentityMismatch);
+        }
+        let state = machine.store().snapshot();
+        let order = state
+            .orders
+            .get(&loaded.request.client_order_id)
+            .ok_or(ExecutionSyncError::UnknownStrategyOrder)?;
+        if matches!(
+            (&order.tracking, &loaded.snapshot.order.lifecycle),
+            (
+                StrategyOrderTracking::Intent {
+                    state: IntentState::Terminal { .. }
+                },
+                OrderLifecycle::Active(_)
+            )
+        ) {
+            return Err(ExecutionSyncError::SnapshotInconclusive(
+                "execution snapshot has not caught up to the authoritative terminal order state"
+                    .into(),
+            ));
         }
         let snapshot = loaded.snapshot;
         let valued_report = self.accounting.value_snapshot(gateway, &snapshot).await?;

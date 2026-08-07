@@ -5762,6 +5762,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_order_with_lagging_active_execution_snapshot_waits_without_cancelling_grid() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+        let stable = runtime.tick(1_250).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let lagging_execution = gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .get(&source_id)
+            .cloned()
+            .unwrap();
+        gateway.fill_order(&source_id, source_shape.price.unwrap(), Decimal::new(1, 2));
+        let terminal_execution = gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .get(&source_id)
+            .cloned()
+            .unwrap();
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .insert(source_id.clone(), lagging_execution);
+        gateway.set_position(
+            -(opening_quantity + source_shape.quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        let placements_before_fill = gateway.placement_call_count();
+        let cancellations_before_fill = gateway.cancellation_call_count();
+
+        let waiting = runtime.tick(1_300).await.unwrap();
+
+        assert!(waiting.is_blocked(), "{waiting:?}");
+        assert!(
+            waiting.blockers.iter().any(|blocker| {
+                blocker.stage == RuntimeStage::ExecutionAccounting
+                    && blocker.client_order_id.as_ref() == Some(&source_id)
+            }),
+            "{waiting:?}"
+        );
+        assert!(waiting.cancellations.is_empty(), "{waiting:?}");
+        assert!(waiting.submissions.is_empty(), "{waiting:?}");
+        assert_eq!(gateway.placement_call_count(), placements_before_fill);
+        assert_eq!(gateway.cancellation_call_count(), cancellations_before_fill);
+        let waiting_state = runtime.machine().store().snapshot();
+        assert_eq!(waiting_state.lifecycle, StrategyLifecycle::Running);
+        assert!(waiting_state.failure.is_none());
+
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .insert(source_id, terminal_execution);
+        let recovered = runtime.tick(1_400).await.unwrap();
+
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(recovered.submissions.len(), 1, "{recovered:?}");
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+        assert_eq!(gateway.cancellation_call_count(), cancellations_before_fill);
+        let recovered_state = runtime.machine().store().snapshot();
+        assert_eq!(recovered_state.lifecycle, StrategyLifecycle::Running);
+        assert!(recovered_state.failure.is_none());
+
+        let stable = runtime.tick(1_500).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+        assert!(stable.submissions.is_empty(), "{stable:?}");
+        assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
+        assert_eq!(gateway.cancellation_call_count(), cancellations_before_fill);
+    }
+
+    #[tokio::test]
     async fn execution_event_submits_exact_counter_without_slow_account_reads() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
