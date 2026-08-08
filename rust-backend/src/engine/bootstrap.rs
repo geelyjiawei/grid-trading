@@ -1,20 +1,21 @@
 use std::time::Instant;
 
+use rust_decimal::Decimal;
 use thiserror::Error;
 
 use crate::{
-    domain::{Exchange, GridConfig},
+    domain::{Exchange, GridConfig, OrderKind, OrderSide, TimeInForce},
     exchange::{
-        InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway,
+        AccountBalanceSnapshotGateway, AccountBalanceUnit, InstrumentRulesGateway, LeverageGateway,
+        MarketSnapshotGateway, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
     },
 };
 
 use super::exchange_inputs::advance_reference_time_ms;
 use super::{
-    ArmedStrategyError, ArmedStrategyState, FeeRateConfigError, GridPlanError, MarketSnapshot,
-    StrategyInputError, StrategyRunId, StrategyState, StrategyStateError, build_grid_plan,
-    ensure_symbol_leverage, load_authoritative_fee_config, load_strategy_inputs,
+    ArmedStrategyError, ArmedStrategyState, FeeRateConfigError, GridPlan, GridPlanError,
+    MarketSnapshot, StrategyInputError, StrategyRunId, StrategyState, StrategyStateError,
+    build_grid_plan, ensure_symbol_leverage, load_authoritative_fee_config, load_strategy_inputs,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +34,7 @@ pub async fn prepare_new_strategy<G>(
 ) -> Result<PreparedStrategy, StrategyBootstrapError>
 where
     G: TradingFeeRateGateway
+        + AccountBalanceSnapshotGateway
         + LeverageGateway
         + PositionSnapshotGateway
         + MarketSnapshotGateway
@@ -81,6 +83,7 @@ pub async fn activate_armed_strategy<G>(
 ) -> Result<StrategyState, StrategyBootstrapError>
 where
     G: TradingFeeRateGateway
+        + AccountBalanceSnapshotGateway
         + LeverageGateway
         + PositionSnapshotGateway
         + MarketSnapshotGateway
@@ -122,6 +125,7 @@ async fn prepare_active<G>(
 ) -> Result<StrategyState, StrategyBootstrapError>
 where
     G: TradingFeeRateGateway
+        + AccountBalanceSnapshotGateway
         + LeverageGateway
         + PositionSnapshotGateway
         + MarketSnapshotGateway
@@ -153,7 +157,7 @@ where
         if !armed.is_triggered(&inputs.market)? {
             return Err(StrategyBootstrapError::TriggerNoLongerReached);
         }
-        return armed
+        let active = armed
             .activate_with_config(
                 authoritative.config,
                 &inputs.market,
@@ -161,7 +165,16 @@ where
                 inputs.position,
                 now_ms,
             )
-            .map_err(StrategyBootstrapError::from);
+            .map_err(StrategyBootstrapError::from)?;
+        ensure_available_margin(
+            gateway,
+            exchange,
+            &active.config,
+            &inputs.market,
+            &active.plan,
+        )
+        .await?;
+        return Ok(active);
     }
 
     let plan = build_grid_plan(
@@ -169,6 +182,14 @@ where
         &inputs.market,
         &inputs.instrument_rules,
     )?;
+    ensure_available_margin(
+        gateway,
+        exchange,
+        &authoritative.config,
+        &inputs.market,
+        &plan,
+    )
+    .await?;
     StrategyState::from_plan(
         run_id,
         authoritative.config,
@@ -178,6 +199,174 @@ where
         now_ms,
     )
     .map_err(StrategyBootstrapError::from)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SideMarginRequirement {
+    order_margin: Decimal,
+    fee_reserve: Decimal,
+}
+
+impl SideMarginRequirement {
+    fn total(self) -> Result<Decimal, StrategyBootstrapError> {
+        self.order_margin.checked_add(self.fee_reserve).ok_or(
+            StrategyBootstrapError::MarginNumericOverflow("required available balance"),
+        )
+    }
+
+    fn add_order(
+        &mut self,
+        price: Decimal,
+        quantity: Decimal,
+        leverage: Decimal,
+        fee_rate: Decimal,
+    ) -> Result<(), StrategyBootstrapError> {
+        let notional =
+            price
+                .checked_mul(quantity)
+                .ok_or(StrategyBootstrapError::MarginNumericOverflow(
+                    "order notional",
+                ))?;
+        let margin =
+            notional
+                .checked_div(leverage)
+                .ok_or(StrategyBootstrapError::MarginNumericOverflow(
+                    "order margin",
+                ))?;
+        let fee =
+            notional
+                .checked_mul(fee_rate)
+                .ok_or(StrategyBootstrapError::MarginNumericOverflow(
+                    "order fee reserve",
+                ))?;
+        self.order_margin = self.order_margin.checked_add(margin).ok_or(
+            StrategyBootstrapError::MarginNumericOverflow("side order margin"),
+        )?;
+        self.fee_reserve = self.fee_reserve.checked_add(fee).ok_or(
+            StrategyBootstrapError::MarginNumericOverflow("side fee reserve"),
+        )?;
+        Ok(())
+    }
+}
+
+async fn ensure_available_margin<G>(
+    gateway: &G,
+    exchange: Exchange,
+    config: &GridConfig,
+    market: &MarketSnapshot,
+    plan: &GridPlan,
+) -> Result<(), StrategyBootstrapError>
+where
+    G: AccountBalanceSnapshotGateway,
+{
+    let requirement = strategy_margin_requirement(config, market, plan)?;
+    let snapshot = gateway.account_balance_snapshot(exchange).await?;
+    snapshot.validate()?;
+    if snapshot.exchange != exchange {
+        return Err(StrategyBootstrapError::BalanceIdentityMismatch);
+    }
+    if snapshot.available_balance < Decimal::ZERO {
+        return Err(StrategyBootstrapError::InvalidAvailableBalance);
+    }
+    let required = requirement.total()?;
+    if snapshot.available_balance >= required {
+        return Ok(());
+    }
+    let shortfall = required.checked_sub(snapshot.available_balance).ok_or(
+        StrategyBootstrapError::MarginNumericOverflow("available balance shortfall"),
+    )?;
+    Err(StrategyBootstrapError::InsufficientAvailableBalance {
+        unit: snapshot.unit,
+        order_margin: requirement.order_margin,
+        fee_reserve: requirement.fee_reserve,
+        required,
+        available: snapshot.available_balance,
+        shortfall,
+    })
+}
+
+fn strategy_margin_requirement(
+    config: &GridConfig,
+    market: &MarketSnapshot,
+    plan: &GridPlan,
+) -> Result<SideMarginRequirement, StrategyBootstrapError> {
+    let leverage = Decimal::from(config.leverage);
+    let maker_rate = non_negative_fee_rate(
+        config
+            .maker_fee_rate
+            .ok_or(StrategyBootstrapError::MissingAuthoritativeFeeRate)?,
+    );
+    let taker_rate = non_negative_fee_rate(
+        config
+            .taker_fee_rate
+            .ok_or(StrategyBootstrapError::MissingAuthoritativeFeeRate)?,
+    );
+    let mut buy = SideMarginRequirement::default();
+    let mut sell = SideMarginRequirement::default();
+
+    if let Some(opening) = &plan.opening_order {
+        let price = opening.price.unwrap_or(market.mark_price);
+        let fee_rate = order_fee_rate(opening.kind, opening.time_in_force, maker_rate, taker_rate);
+        side_requirement_mut(opening.side, &mut buy, &mut sell).add_order(
+            price,
+            opening.quantity,
+            leverage,
+            fee_rate,
+        )?;
+    }
+
+    for order in plan.grid_orders.iter().filter(|order| !order.reduce_only) {
+        let fee_rate = order_fee_rate(
+            OrderKind::Limit,
+            order.time_in_force,
+            maker_rate,
+            taker_rate,
+        );
+        side_requirement_mut(order.side, &mut buy, &mut sell).add_order(
+            order.price,
+            order.quantity,
+            leverage,
+            fee_rate,
+        )?;
+    }
+
+    if buy.total()? >= sell.total()? {
+        Ok(buy)
+    } else {
+        Ok(sell)
+    }
+}
+
+fn side_requirement_mut<'a>(
+    side: OrderSide,
+    buy: &'a mut SideMarginRequirement,
+    sell: &'a mut SideMarginRequirement,
+) -> &'a mut SideMarginRequirement {
+    match side {
+        OrderSide::Buy => buy,
+        OrderSide::Sell => sell,
+    }
+}
+
+fn order_fee_rate(
+    kind: OrderKind,
+    time_in_force: TimeInForce,
+    maker_rate: Decimal,
+    taker_rate: Decimal,
+) -> Decimal {
+    if kind == OrderKind::Limit && time_in_force == TimeInForce::PostOnly {
+        maker_rate
+    } else {
+        taker_rate
+    }
+}
+
+fn non_negative_fee_rate(rate: Decimal) -> Decimal {
+    if rate < Decimal::ZERO {
+        Decimal::ZERO
+    } else {
+        rate
+    }
 }
 
 async fn load_fresh_market<G>(
@@ -220,6 +409,25 @@ pub enum StrategyBootstrapError {
     TriggerNotReached,
     #[error("trigger condition was no longer true after account preflight")]
     TriggerNoLongerReached,
+    #[error("account balance response identity does not match the requested exchange")]
+    BalanceIdentityMismatch,
+    #[error("account available balance is invalid")]
+    InvalidAvailableBalance,
+    #[error("authoritative fee rates are required for margin preflight")]
+    MissingAuthoritativeFeeRate,
+    #[error("strategy margin calculation overflowed at {0}")]
+    MarginNumericOverflow(&'static str),
+    #[error(
+        "insufficient available balance: required {required} {unit:?}, available {available} {unit:?}, shortfall {shortfall} {unit:?}"
+    )]
+    InsufficientAvailableBalance {
+        unit: AccountBalanceUnit,
+        order_margin: Decimal,
+        fee_reserve: Decimal,
+        required: Decimal,
+        available: Decimal,
+        shortfall: Decimal,
+    },
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
     #[error(transparent)]
@@ -254,6 +462,7 @@ mod tests {
         },
         engine::StrategyLifecycle,
         exchange::{
+            AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
             ExchangeMarketSnapshot, LeverageAcknowledgement, LeverageError, PositionLeg,
             PositionSide, PositionSnapshot, TradingFeeRates,
         },
@@ -265,6 +474,7 @@ mod tests {
         rules: usize,
         position: usize,
         fees: usize,
+        balances: usize,
         leverage_writes: usize,
     }
 
@@ -278,6 +488,7 @@ mod tests {
         market_sequence: VecDeque<Decimal>,
         leverage: u16,
         baseline_quantity: Decimal,
+        available_balance: Decimal,
         fee_error: Option<SnapshotError>,
         calls: Calls,
     }
@@ -290,6 +501,7 @@ mod tests {
                     market_sequence: VecDeque::new(),
                     leverage,
                     baseline_quantity,
+                    available_balance: Decimal::new(1_000_000, 0),
                     fee_error: None,
                     calls: Calls::default(),
                 })),
@@ -302,6 +514,10 @@ mod tests {
 
         fn fail_fee_rates(&self, message: &str) {
             self.state.lock().unwrap().fee_error = Some(SnapshotError::new(message));
+        }
+
+        fn set_available_balance(&self, available_balance: Decimal) {
+            self.state.lock().unwrap().available_balance = available_balance;
         }
     }
 
@@ -388,6 +604,25 @@ mod tests {
     }
 
     #[async_trait]
+    impl AccountBalanceSnapshotGateway for FakeGateway {
+        async fn account_balance_snapshot(
+            &self,
+            exchange: Exchange,
+        ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.balances += 1;
+            Ok(AccountBalanceSnapshot {
+                exchange,
+                unit: AccountBalanceUnit::Usdt,
+                available_balance: state.available_balance,
+                wallet_balance: state.available_balance,
+                equity: state.available_balance,
+                unrealized_profit: Decimal::ZERO,
+            })
+        }
+    }
+
+    #[async_trait]
     impl LeverageGateway for FakeGateway {
         async fn set_leverage(
             &self,
@@ -468,6 +703,7 @@ mod tests {
         assert_eq!(state.calls.rules, 0);
         assert_eq!(state.calls.position, 0);
         assert_eq!(state.calls.fees, 0);
+        assert_eq!(state.calls.balances, 0);
         assert_eq!(state.calls.leverage_writes, 0);
         assert_eq!(state.leverage, 3);
     }
@@ -498,6 +734,65 @@ mod tests {
         assert!(state.calls.position >= 2);
         assert_eq!(state.calls.fees, 1);
         assert_eq!(state.calls.rules, 1);
+        assert_eq!(state.calls.balances, 1);
+    }
+
+    #[tokio::test]
+    async fn insufficient_available_balance_for_full_deployment_prevents_strategy_creation() {
+        let gateway = FakeGateway::new(Decimal::new(1014, 0), 5, Decimal::ZERO);
+        // The opening order alone needs less than 700 USDT. The full plan does not,
+        // so this catches regressions that forget to reserve add-order margin.
+        gateway.set_available_balance(Decimal::new(700, 0));
+
+        let result = prepare_new_strategy(
+            &gateway,
+            StrategyRunId::parse("BOOT0007").unwrap(),
+            config(None),
+            10_500,
+            1_000,
+            100,
+        )
+        .await;
+
+        match result {
+            Err(StrategyBootstrapError::InsufficientAvailableBalance {
+                unit,
+                order_margin,
+                fee_reserve,
+                required,
+                available,
+                shortfall,
+            }) => {
+                assert_eq!(unit, AccountBalanceUnit::Usdt);
+                assert_eq!(order_margin, Decimal::new(81_204, 2));
+                assert_eq!(fee_reserve, Decimal::new(162_408, 5));
+                assert_eq!(required, Decimal::new(81_366_408, 5));
+                assert_eq!(available, Decimal::new(700, 0));
+                assert_eq!(shortfall, Decimal::new(11_366_408, 5));
+            }
+            other => panic!("expected insufficient balance, got {other:?}"),
+        }
+        assert_eq!(gateway.state.lock().unwrap().calls.balances, 1);
+    }
+
+    #[tokio::test]
+    async fn exact_full_deployment_requirement_allows_strategy_creation() {
+        let gateway = FakeGateway::new(Decimal::new(1014, 0), 5, Decimal::ZERO);
+        gateway.set_available_balance(Decimal::new(81_366_408, 5));
+
+        let prepared = prepare_new_strategy(
+            &gateway,
+            StrategyRunId::parse("BOOT0008").unwrap(),
+            config(None),
+            10_500,
+            1_000,
+            100,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(prepared, PreparedStrategy::Active(_)));
+        assert_eq!(gateway.state.lock().unwrap().calls.balances, 1);
     }
 
     #[tokio::test]
@@ -522,6 +817,7 @@ mod tests {
         let state = gateway.state.lock().unwrap();
         assert_eq!(state.calls.fees, 0);
         assert_eq!(state.calls.position, 0);
+        assert_eq!(state.calls.balances, 0);
         assert_eq!(state.calls.leverage_writes, 0);
     }
 
@@ -553,6 +849,7 @@ mod tests {
         assert_eq!(state.calls.leverage_writes, 1);
         assert_eq!(state.calls.fees, 1);
         assert_eq!(state.calls.rules, 1);
+        assert_eq!(state.calls.balances, 1);
     }
 
     #[tokio::test]
@@ -582,6 +879,7 @@ mod tests {
         assert_eq!(state.calls.position, 0);
         assert_eq!(state.calls.rules, 0);
         assert_eq!(state.calls.market, 0);
+        assert_eq!(state.calls.balances, 0);
         assert_eq!(state.leverage, 3);
     }
 
@@ -614,6 +912,7 @@ mod tests {
         assert_eq!(state.calls.leverage_writes, 1);
         assert_eq!(state.calls.rules, 1);
         assert!(state.calls.position >= 3);
+        assert_eq!(state.calls.balances, 0);
         assert_eq!(state.market_price, Decimal::new(1013, 0));
     }
 }

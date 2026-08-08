@@ -38,8 +38,8 @@ use crate::{
         load_authoritative_fee_config,
     },
     exchange::{
-        AccountBalanceSnapshotGateway, ActiveOrderStatus, AuthoritativeOrder, CancellationError,
-        ExchangeIdentityGateway, InstrumentRulesGateway, MarketSnapshotGateway,
+        AccountBalanceSnapshotGateway, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
+        CancellationError, ExchangeIdentityGateway, InstrumentRulesGateway, MarketSnapshotGateway,
         OrderCancellationGateway, OrderLifecycle, OrderLookup, OrderLookupGateway, PositionLeg,
         PositionSnapshot, SnapshotError,
         aster::LocalEip712Signer,
@@ -488,6 +488,23 @@ impl StartGridCommand for RuntimeStartGridCommand {
                     },
                 ),
             ))) => existing_position_leverage_mismatch_response(&symbol, observed, requested),
+            Err(RuntimeCoordinatorError::Start(FileStrategyStartError::Bootstrap(
+                StrategyBootstrapError::InsufficientAvailableBalance {
+                    unit,
+                    order_margin,
+                    fee_reserve,
+                    required,
+                    available,
+                    shortfall,
+                },
+            ))) => insufficient_available_margin_response(
+                unit,
+                order_margin,
+                fee_reserve,
+                required,
+                available,
+                shortfall,
+            ),
             Err(
                 RuntimeCoordinatorError::InvalidConfig(_)
                 | RuntimeCoordinatorError::MissingExchange
@@ -531,6 +548,42 @@ impl StartGridCommand for RuntimeStartGridCommand {
             ),
         }
     }
+}
+
+fn insufficient_available_margin_response(
+    unit: AccountBalanceUnit,
+    order_margin: Decimal,
+    fee_reserve: Decimal,
+    required: Decimal,
+    available: Decimal,
+    shortfall: Decimal,
+) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
+    let unit = match unit {
+        AccountBalanceUnit::Usdt => "USDT",
+        AccountBalanceUnit::Usd => "USD",
+        AccountBalanceUnit::Usdc => "USDC",
+    };
+    StoredCommandResponse::new(
+        StatusCode::CONFLICT.as_u16(),
+        json!({
+            "ok": false,
+            "error": {
+                "code": "insufficient_available_margin",
+                "message": format!(
+                    "Available margin is {available} {unit}, but safe grid deployment requires {required} {unit} (shortfall {shortfall} {unit})"
+                ),
+                "details": {
+                    "unit": unit,
+                    "order_margin": order_margin.to_string(),
+                    "fee_reserve": fee_reserve.to_string(),
+                    "required": required.to_string(),
+                    "available": available.to_string(),
+                    "shortfall": shortfall.to_string(),
+                }
+            }
+        }),
+    )
+    .map_err(|_| CommandOutcomeUnknown)
 }
 
 fn existing_position_leverage_mismatch_response(
@@ -4037,6 +4090,39 @@ mod tests {
         assert!(message.contains("20x"));
         assert!(message.contains("3x"));
         assert!(message.contains("will not change leverage"));
+    }
+
+    #[test]
+    fn insufficient_available_margin_response_is_actionable_and_exact() {
+        let response = insufficient_available_margin_response(
+            AccountBalanceUnit::Usdc,
+            Decimal::from_str_exact("987.654321").unwrap(),
+            Decimal::from_str_exact("1.234567").unwrap(),
+            Decimal::from_str_exact("988.888888").unwrap(),
+            Decimal::from_str_exact("421.0812").unwrap(),
+            Decimal::from_str_exact("567.807688").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT.as_u16());
+        assert_eq!(
+            response.body()["error"]["code"],
+            "insufficient_available_margin"
+        );
+        assert_eq!(response.body()["error"]["details"]["unit"], "USDC");
+        assert_eq!(
+            response.body()["error"]["details"]["required"],
+            "988.888888"
+        );
+        assert_eq!(response.body()["error"]["details"]["available"], "421.0812");
+        assert_eq!(
+            response.body()["error"]["details"]["shortfall"],
+            "567.807688"
+        );
+        let message = response.body()["error"]["message"].as_str().unwrap();
+        assert!(message.contains("421.0812 USDC"));
+        assert!(message.contains("988.888888 USDC"));
+        assert!(message.contains("567.807688 USDC"));
     }
 
     #[tokio::test]

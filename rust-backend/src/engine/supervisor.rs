@@ -5,9 +5,10 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::domain::Exchange;
 use crate::exchange::{
-    ExchangeIdentityGateway, ExecutionSnapshotGateway, HistoricalPriceGateway,
-    InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway, OrderCancellationGateway,
-    OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
+    AccountBalanceSnapshotGateway, ExchangeIdentityGateway, ExecutionSnapshotGateway,
+    HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway,
+    OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway,
+    TradingFeeRateGateway,
 };
 use crate::persistence::{StrategyDiscoveryAnomaly, StrategyDiscoveryReport, StrategyFilePaths};
 
@@ -225,6 +226,7 @@ impl<G> RuntimeRegistry<G> {
     where
         G: ExchangeIdentityGateway
             + TradingFeeRateGateway
+            + AccountBalanceSnapshotGateway
             + LeverageGateway
             + PositionSnapshotGateway
             + MarketSnapshotGateway

@@ -20,10 +20,11 @@ use crate::{
         reconcile_lookup_with, resolve_cancellations_with, submit_many_with, submit_with,
     },
     exchange::{
-        ActiveOrderStatus, ExchangeIdentityGateway, ExecutionSnapshotGateway,
-        HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway,
-        OpenOrderExecutionProgress, OrderCancellationGateway, OrderLifecycle, OrderLookup,
-        OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
+        AccountBalanceSnapshotGateway, ActiveOrderStatus, ExchangeIdentityGateway,
+        ExecutionSnapshotGateway, HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway,
+        MarketSnapshotGateway, OpenOrderExecutionProgress, OrderCancellationGateway,
+        OrderLifecycle, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PositionSnapshotGateway, TradingFeeRateGateway,
     },
     persistence::{
         FileArmedStrategyStateStore, FileOrderIntentStore, FilePreparedStrategyStore,
@@ -413,6 +414,7 @@ impl<G> PreparedLeasedFileStrategy<G> {
     where
         G: ExchangeIdentityGateway
             + TradingFeeRateGateway
+            + AccountBalanceSnapshotGateway
             + LeverageGateway
             + PositionSnapshotGateway
             + MarketSnapshotGateway
@@ -510,6 +512,7 @@ pub async fn prepare_leased_file_strategy<G>(
 where
     G: ExchangeIdentityGateway
         + TradingFeeRateGateway
+        + AccountBalanceSnapshotGateway
         + LeverageGateway
         + PositionSnapshotGateway
         + MarketSnapshotGateway
@@ -1073,6 +1076,7 @@ impl LeasedFileArmedStrategy {
     where
         G: ExchangeIdentityGateway
             + TradingFeeRateGateway
+            + AccountBalanceSnapshotGateway
             + LeverageGateway
             + PositionSnapshotGateway
             + MarketSnapshotGateway
@@ -1099,6 +1103,7 @@ impl LeasedFileArmedStrategy {
     where
         G: ExchangeIdentityGateway
             + TradingFeeRateGateway
+            + AccountBalanceSnapshotGateway
             + LeverageGateway
             + PositionSnapshotGateway
             + MarketSnapshotGateway
@@ -2859,12 +2864,12 @@ mod tests {
             build_grid_plan, recover_discovered_strategies,
         },
         exchange::{
-            ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
-            ExchangeMarketSnapshot, ExecutionSnapshotError, HistoricalMinutePrice,
-            LeverageAcknowledgement, LeverageError, LookupError, OrderCancellationTarget,
-            OrderExecutionSnapshot, OrderLifecycle, OrderLookup, PlacementAcknowledgement,
-            PlacementError, PositionLeg, PositionSide, PositionSnapshot, SnapshotError, TradeFill,
-            TradingFeeRates,
+            AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
+            CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
+            ExecutionSnapshotError, HistoricalMinutePrice, LeverageAcknowledgement, LeverageError,
+            LookupError, OrderCancellationTarget, OrderExecutionSnapshot, OrderLifecycle,
+            OrderLookup, PlacementAcknowledgement, PlacementError, PositionLeg, PositionSide,
+            PositionSnapshot, SnapshotError, TradeFill, TradingFeeRates,
         },
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
@@ -2986,6 +2991,7 @@ mod tests {
         next_open_progress_error: Option<ExecutionSnapshotError>,
         open_progress_calls: usize,
         fee_rate_calls: usize,
+        balance_snapshot_calls: usize,
         leverage_write_calls: usize,
         market_gate: Option<Arc<MarketGate>>,
     }
@@ -3055,6 +3061,7 @@ mod tests {
                     next_open_progress_error: None,
                     open_progress_calls: 0,
                     fee_rate_calls: 0,
+                    balance_snapshot_calls: 0,
                     leverage_write_calls: 0,
                     market_gate: None,
                 })),
@@ -3167,7 +3174,10 @@ mod tests {
 
         fn account_preflight_call_count(&self) -> usize {
             let state = self.state.lock().unwrap();
-            state.position_snapshot_calls + state.fee_rate_calls + state.leverage_write_calls
+            state.position_snapshot_calls
+                + state.fee_rate_calls
+                + state.balance_snapshot_calls
+                + state.leverage_write_calls
         }
 
         fn all_bootstrap_call_count(&self) -> usize {
@@ -3176,6 +3186,7 @@ mod tests {
                 + state.rules_snapshot_calls
                 + state.position_snapshot_calls
                 + state.fee_rate_calls
+                + state.balance_snapshot_calls
                 + state.leverage_write_calls
         }
 
@@ -3698,6 +3709,29 @@ mod tests {
                 symbol: symbol.into(),
                 maker_rate: Decimal::new(2, 4),
                 taker_rate: Decimal::new(5, 4),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AccountBalanceSnapshotGateway for MockGateway {
+        async fn account_balance_snapshot(
+            &self,
+            exchange: Exchange,
+        ) -> Result<AccountBalanceSnapshot, SnapshotError> {
+            self.state.lock().unwrap().balance_snapshot_calls += 1;
+            let unit = match exchange {
+                Exchange::Binance | Exchange::Aster => AccountBalanceUnit::Usdt,
+                Exchange::Bybit => AccountBalanceUnit::Usd,
+                Exchange::TradeXyz => AccountBalanceUnit::Usdc,
+            };
+            Ok(AccountBalanceSnapshot {
+                exchange,
+                unit,
+                available_balance: Decimal::new(1_000_000, 0),
+                wallet_balance: Decimal::new(1_000_000, 0),
+                equity: Decimal::new(1_000_000, 0),
+                unrealized_profit: Decimal::ZERO,
             })
         }
     }

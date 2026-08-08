@@ -7,9 +7,10 @@ use tokio::sync::Mutex;
 use crate::{
     domain::{Exchange, GridConfig, GridConfigError},
     exchange::{
-        ExchangeIdentityGateway, ExecutionSnapshotGateway, HistoricalPriceGateway,
-        InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway, OrderCancellationGateway,
-        OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway, TradingFeeRateGateway,
+        AccountBalanceSnapshotGateway, ExchangeIdentityGateway, ExecutionSnapshotGateway,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway,
+        OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway,
+        PositionSnapshotGateway, TradingFeeRateGateway,
     },
     persistence::{
         RuntimeLeaseError, STRATEGY_CATALOG_LEASE_FILE_NAME, StrategyCatalog, StrategyCatalogError,
@@ -30,6 +31,7 @@ pub trait RuntimeExchangeGateway:
     Clone
     + ExchangeIdentityGateway
     + TradingFeeRateGateway
+    + AccountBalanceSnapshotGateway
     + LeverageGateway
     + PositionSnapshotGateway
     + MarketSnapshotGateway
@@ -49,6 +51,7 @@ impl<T> RuntimeExchangeGateway for T where
     T: Clone
         + ExchangeIdentityGateway
         + TradingFeeRateGateway
+        + AccountBalanceSnapshotGateway
         + LeverageGateway
         + PositionSnapshotGateway
         + MarketSnapshotGateway
