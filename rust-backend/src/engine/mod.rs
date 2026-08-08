@@ -20,6 +20,7 @@ mod supervisor;
 pub use armed_strategy::{
     ArmedStrategyError, ArmedStrategyLifecycle, ArmedStrategyState, TriggerCondition,
 };
+pub(crate) use bootstrap::ensure_available_margin_snapshot;
 pub use bootstrap::{
     PreparedStrategy, StrategyBootstrapError, activate_armed_strategy, prepare_new_strategy,
 };

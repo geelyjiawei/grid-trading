@@ -6,8 +6,9 @@ use thiserror::Error;
 use crate::{
     domain::{Exchange, GridConfig, OrderKind, OrderSide, TimeInForce},
     exchange::{
-        AccountBalanceSnapshotGateway, AccountBalanceUnit, InstrumentRulesGateway, LeverageGateway,
-        MarketSnapshotGateway, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
+        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
+        InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway, PositionSnapshotGateway,
+        SnapshotError, TradingFeeRateGateway,
     },
 };
 
@@ -259,8 +260,18 @@ async fn ensure_available_margin<G>(
 where
     G: AccountBalanceSnapshotGateway,
 {
-    let requirement = strategy_margin_requirement(config, market, plan)?;
     let snapshot = gateway.account_balance_snapshot(exchange).await?;
+    ensure_available_margin_snapshot(exchange, config, market, plan, &snapshot)
+}
+
+pub(crate) fn ensure_available_margin_snapshot(
+    exchange: Exchange,
+    config: &GridConfig,
+    market: &MarketSnapshot,
+    plan: &GridPlan,
+    snapshot: &AccountBalanceSnapshot,
+) -> Result<(), StrategyBootstrapError> {
+    let requirement = strategy_margin_requirement(config, market, plan)?;
     snapshot.validate()?;
     if snapshot.exchange != exchange {
         return Err(StrategyBootstrapError::BalanceIdentityMismatch);

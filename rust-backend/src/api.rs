@@ -35,7 +35,7 @@ use crate::{
         RuntimeRegistryEntry, ShadowCollectionError, StrategyBootstrapError, StrategyLifecycle,
         StrategyOrderPurpose, StrategyState, StrategyTransition, advance_reference_time_ms,
         build_grid_preview, collect_stable_exchange_view, collect_strategy_shadow_view,
-        load_authoritative_fee_config,
+        ensure_available_margin_snapshot, load_authoritative_fee_config,
     },
     exchange::{
         AccountBalanceSnapshotGateway, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
@@ -558,32 +558,50 @@ fn insufficient_available_margin_response(
     available: Decimal,
     shortfall: Decimal,
 ) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
+    StoredCommandResponse::new(
+        StatusCode::CONFLICT.as_u16(),
+        insufficient_available_margin_body(
+            unit,
+            order_margin,
+            fee_reserve,
+            required,
+            available,
+            shortfall,
+        ),
+    )
+    .map_err(|_| CommandOutcomeUnknown)
+}
+
+fn insufficient_available_margin_body(
+    unit: AccountBalanceUnit,
+    order_margin: Decimal,
+    fee_reserve: Decimal,
+    required: Decimal,
+    available: Decimal,
+    shortfall: Decimal,
+) -> Value {
     let unit = match unit {
         AccountBalanceUnit::Usdt => "USDT",
         AccountBalanceUnit::Usd => "USD",
         AccountBalanceUnit::Usdc => "USDC",
     };
-    StoredCommandResponse::new(
-        StatusCode::CONFLICT.as_u16(),
-        json!({
-            "ok": false,
-            "error": {
-                "code": "insufficient_available_margin",
-                "message": format!(
-                    "Available margin is {available} {unit}, but safe grid deployment requires {required} {unit} (shortfall {shortfall} {unit})"
-                ),
-                "details": {
-                    "unit": unit,
-                    "order_margin": order_margin.to_string(),
-                    "fee_reserve": fee_reserve.to_string(),
-                    "required": required.to_string(),
-                    "available": available.to_string(),
-                    "shortfall": shortfall.to_string(),
-                }
+    json!({
+        "ok": false,
+        "error": {
+            "code": "insufficient_available_margin",
+            "message": format!(
+                "Available margin is {available} {unit}, but safe grid deployment requires {required} {unit} (shortfall {shortfall} {unit})"
+            ),
+            "details": {
+                "unit": unit,
+                "order_margin": order_margin.to_string(),
+                "fee_reserve": fee_reserve.to_string(),
+                "required": required.to_string(),
+                "available": available.to_string(),
+                "shortfall": shortfall.to_string(),
             }
-        }),
-    )
-    .map_err(|_| CommandOutcomeUnknown)
+        }
+    })
 }
 
 fn existing_position_leverage_mismatch_response(
@@ -1371,10 +1389,11 @@ async fn grid_preview(
         Ok(now_ms) => now_ms,
         Err(ClockUnavailable) => return clock_unavailable(),
     };
-    let (authoritative, market, rules) = tokio::join!(
+    let (authoritative, market, rules, balance) = tokio::join!(
         load_authoritative_fee_config(&gateway, &config),
         gateway.market_snapshot(exchange, &config.symbol),
         gateway.instrument_rules(exchange, &config.symbol),
+        gateway.account_balance_snapshot(exchange),
     );
     let authoritative = match authoritative {
         Ok(authoritative) => authoritative,
@@ -1409,12 +1428,17 @@ async fn grid_preview(
         Ok(rules) => rules,
         Err(error) => return snapshot_failure("grid preview instrument", exchange, error),
     };
+    let balance = match balance {
+        Ok(balance) => balance,
+        Err(error) => return snapshot_failure("grid preview balance", exchange, error),
+    };
+    let planning_market = MarketSnapshot {
+        last_price: market.last_price,
+        mark_price: market.mark_price,
+    };
     let preview = match build_grid_preview(
         &authoritative.config,
-        &MarketSnapshot {
-            last_price: market.last_price,
-            mark_price: market.mark_price,
-        },
+        &planning_market,
         &rules,
         authoritative.rates.maker_rate,
         authoritative.rates.taker_rate,
@@ -1429,6 +1453,49 @@ async fn grid_preview(
             );
         }
     };
+    if let Err(error) = ensure_available_margin_snapshot(
+        exchange,
+        &authoritative.config,
+        &planning_market,
+        &preview.plan,
+        &balance,
+    ) {
+        tracing::warn!(?exchange, symbol = config.symbol, error = %error, "grid preview margin preflight failed");
+        return match error {
+            StrategyBootstrapError::InsufficientAvailableBalance {
+                unit,
+                order_margin,
+                fee_reserve,
+                required,
+                available,
+                shortfall,
+            } => no_store_json(
+                StatusCode::CONFLICT,
+                insufficient_available_margin_body(
+                    unit,
+                    order_margin,
+                    fee_reserve,
+                    required,
+                    available,
+                    shortfall,
+                ),
+            ),
+            StrategyBootstrapError::Snapshot(error) => {
+                snapshot_failure("grid preview balance", exchange, error)
+            }
+            StrategyBootstrapError::BalanceIdentityMismatch
+            | StrategyBootstrapError::InvalidAvailableBalance => api_error(
+                StatusCode::BAD_GATEWAY,
+                "balance_snapshot_invalid",
+                "The exchange available-balance snapshot is invalid",
+            ),
+            _ => api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "margin_preflight_unavailable",
+                "The safe grid deployment margin could not be calculated",
+            ),
+        };
+    }
     let representative = &preview.representative_cycle;
     let per_grid_fee = match representative
         .open_fee
