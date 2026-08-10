@@ -1424,39 +1424,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flat_tradifi_position_without_mark_price_uses_public_mark_snapshot() {
-        let transport = MockTransport::default();
-        transport.responses.lock().unwrap().extend([
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"[{
-                    "symbol":"RKLBUSDT","positionSide":"BOTH","positionAmt":"0",
-                    "entryPrice":"0","unRealizedProfit":"0","leverage":"20"
-                }]"#
-                .into(),
-            }),
-            Ok(HttpResponse {
-                status: 200,
-                body: r#"{
-                    "symbol":"RKLBUSDT","markPrice":"75.52","time":1786399426143
-                }"#
-                .into(),
-            }),
-        ]);
+    async fn flat_positions_without_valid_mark_prices_use_symbol_specific_public_marks() {
+        for (symbol, private_mark_field, public_mark, expected_mark) in [
+            ("RKLBUSDT", "", "75.52", Decimal::new(7552, 2)),
+            (
+                "NEWTRADIFIUSDT",
+                r#","markPrice":"0""#,
+                "12.3456",
+                Decimal::new(123456, 4),
+            ),
+        ] {
+            let transport = MockTransport::default();
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(
+                        r#"[{{
+                            "symbol":"{symbol}","positionSide":"BOTH","positionAmt":"0",
+                            "entryPrice":"0"{private_mark_field},"unRealizedProfit":"0","leverage":"20"
+                        }}]"#
+                    ),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(
+                        r#"{{"symbol":"{symbol}","markPrice":"{public_mark}","time":1786399426143}}"#
+                    ),
+                }),
+            ]);
 
-        let snapshot = adapter(transport.clone())
-            .position_snapshot(Exchange::Binance, "RKLBUSDT")
-            .await
-            .unwrap();
-        let requests = transport.all_requests();
+            let snapshot = adapter(transport.clone())
+                .position_snapshot(Exchange::Binance, &symbol.to_ascii_lowercase())
+                .await
+                .unwrap();
+            let requests = transport.all_requests();
 
-        assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
-        assert_eq!(snapshot.one_way_leverage().unwrap(), 20);
-        assert_eq!(snapshot.legs[0].mark_price, Decimal::new(7552, 2));
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].path, "/fapi/v2/positionRisk");
-        assert_eq!(requests[1].path, "/fapi/v1/premiumIndex");
-        assert!(requests[1].query_string().contains("symbol=RKLBUSDT"));
+            assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
+            assert_eq!(snapshot.one_way_leverage().unwrap(), 20);
+            assert_eq!(snapshot.legs[0].mark_price, expected_mark);
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].path, "/fapi/v2/positionRisk");
+            assert_eq!(requests[1].path, "/fapi/v1/premiumIndex");
+            assert!(
+                requests[1]
+                    .query_string()
+                    .contains(&format!("symbol={symbol}"))
+            );
+        }
     }
 
     #[tokio::test]
