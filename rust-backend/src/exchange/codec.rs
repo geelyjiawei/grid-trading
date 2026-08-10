@@ -87,6 +87,19 @@ pub(super) fn parse_market_snapshot(
     })
 }
 
+pub(super) fn parse_mark_price_snapshot(
+    body: &str,
+    expected_symbol: &str,
+) -> Result<Decimal, CodecError> {
+    let premium = parse_json(body)?;
+    require_symbol(&premium, expected_symbol)?;
+    let mark_price = required_decimal(&premium, "markPrice")?;
+    if mark_price <= Decimal::ZERO {
+        return Err(CodecError::InvalidField("markPrice"));
+    }
+    Ok(mark_price)
+}
+
 pub(super) fn parse_instrument_rules(
     body: &str,
     expected_symbol: &str,
@@ -1054,6 +1067,11 @@ mod tests {
         assert_eq!(snapshot.last_price, Decimal::new(101125, 2));
         assert_eq!(snapshot.mark_price, Decimal::new(101120, 2));
         assert_eq!(snapshot.observed_at_ms, 1_700_000_000_000);
+        assert_eq!(
+            parse_mark_price_snapshot(r#"{"symbol":"RKLBUSDT","markPrice":"75.52"}"#, "RKLBUSDT",)
+                .unwrap(),
+            Decimal::new(7552, 2),
+        );
         assert_eq!(
             parse_market_snapshot(
                 r#"{"symbol":"OTHERUSDT","lastPrice":"1011.25"}"#,

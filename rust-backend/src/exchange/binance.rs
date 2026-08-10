@@ -22,13 +22,13 @@ use crate::{
         PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
         TradingFeeRates,
         codec::{
-            build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
-            parse_account_balance_snapshot, parse_authoritative_order,
-            parse_cancellation_acknowledgement, parse_exchange_error, parse_instrument_rules,
-            parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_open_order_execution_progress, parse_open_orders, parse_order_history,
-            parse_placement_acknowledgement, parse_position_snapshot, parse_trading_fee_rates,
-            validate_snapshot_request,
+            CodecError, build_order_parameters, execution_status_is_unknown,
+            order_is_definitively_absent, parse_account_balance_snapshot,
+            parse_authoritative_order, parse_cancellation_acknowledgement, parse_exchange_error,
+            parse_instrument_rules, parse_leverage_acknowledgement, parse_mark_price_snapshot,
+            parse_market_snapshot, parse_open_order_execution_progress, parse_open_orders,
+            parse_order_history, parse_placement_acknowledgement, parse_position_snapshot,
+            parse_trading_fee_rates, validate_snapshot_request,
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
@@ -650,9 +650,38 @@ where
         let body = self
             .execute_snapshot(request, "Binance position snapshot")
             .await?;
-        parse_position_snapshot(&body, Exchange::Binance, &symbol, None).map_err(|error| {
-            SnapshotError::new(format!("invalid Binance position snapshot: {error}"))
-        })
+        match parse_position_snapshot(&body, Exchange::Binance, &symbol, None) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(CodecError::InvalidField("markPrice")) => {
+                let premium = self
+                    .execute_snapshot(
+                        self.public_request(
+                            "/fapi/v1/premiumIndex",
+                            vec![("symbol".into(), symbol.clone())],
+                        ),
+                        "Binance flat-position mark-price snapshot",
+                    )
+                    .await?;
+                let fallback_mark_price =
+                    parse_mark_price_snapshot(&premium, &symbol).map_err(|error| {
+                        SnapshotError::new(format!(
+                            "invalid Binance flat-position mark-price snapshot: {error}"
+                        ))
+                    })?;
+                parse_position_snapshot(
+                    &body,
+                    Exchange::Binance,
+                    &symbol,
+                    Some(fallback_mark_price),
+                )
+                .map_err(|error| {
+                    SnapshotError::new(format!("invalid Binance position snapshot: {error}"))
+                })
+            }
+            Err(error) => Err(SnapshotError::new(format!(
+                "invalid Binance position snapshot: {error}"
+            ))),
+        }
     }
 }
 
@@ -1392,6 +1421,42 @@ mod tests {
         assert_eq!(request.path, "/fapi/v2/positionRisk");
         assert!(request.query_string().contains("symbol=MUUSDT"));
         assert!(request.query_string().contains("signature="));
+    }
+
+    #[tokio::test]
+    async fn flat_tradifi_position_without_mark_price_uses_public_mark_snapshot() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"[{
+                    "symbol":"RKLBUSDT","positionSide":"BOTH","positionAmt":"0",
+                    "entryPrice":"0","unRealizedProfit":"0","leverage":"20"
+                }]"#
+                .into(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{
+                    "symbol":"RKLBUSDT","markPrice":"75.52","time":1786399426143
+                }"#
+                .into(),
+            }),
+        ]);
+
+        let snapshot = adapter(transport.clone())
+            .position_snapshot(Exchange::Binance, "RKLBUSDT")
+            .await
+            .unwrap();
+        let requests = transport.all_requests();
+
+        assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
+        assert_eq!(snapshot.one_way_leverage().unwrap(), 20);
+        assert_eq!(snapshot.legs[0].mark_price, Decimal::new(7552, 2));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/fapi/v2/positionRisk");
+        assert_eq!(requests[1].path, "/fapi/v1/premiumIndex");
+        assert!(requests[1].query_string().contains("symbol=RKLBUSDT"));
     }
 
     #[tokio::test]

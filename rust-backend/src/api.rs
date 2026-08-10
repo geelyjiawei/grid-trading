@@ -523,7 +523,7 @@ impl StartGridCommand for RuntimeStartGridCommand {
             Err(RuntimeCoordinatorError::Start(_)) => command_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "grid_start_preflight_failed",
-                "The exchange and account preflight failed; no strategy orders were scheduled",
+                "交易所或账户启动预检未通过；系统未提交任何策略订单",
             ),
             Err(
                 RuntimeCoordinatorError::CatalogTask
