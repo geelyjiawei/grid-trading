@@ -251,3 +251,16 @@ jobs:
           GRID_RUST_PREVIEW_URL=http://127.0.0.1:18000 \
           GRID_RUST_PREVIEW_EXPECTED_BINDING=127.0.0.1:18000 \
             sh scripts/verify-rust-preview.sh
+
+      - name: Export verified production image
+        if: github.event_name == 'workflow_dispatch'
+        run: docker save grid-trading-vue-rust:test | gzip -1 > grid-trading-vue-rust.tar.gz
+
+      - name: Upload verified production image
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: grid-trading-vue-rust-${{ github.sha }}
+          path: grid-trading-vue-rust.tar.gz
+          if-no-files-found: error
+          retention-days: 1
