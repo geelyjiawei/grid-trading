@@ -477,12 +477,12 @@ fn required(name: &'static str) -> Result<String> {
 }
 
 fn unix_time_ms() -> Result<u64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
         .as_millis()
         .try_into()
-        .context("system timestamp does not fit u64")?)
+        .context("system timestamp does not fit u64")
 }
 
 fn elapsed_ms(started: Instant) -> u128 {
