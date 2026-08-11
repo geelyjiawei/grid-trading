@@ -860,8 +860,7 @@ where
         if self
             .realtime_execution_cache
             .knows_order(&symbol, exchange_order_id)
-        {
-            if let Some(snapshot) = self
+            && let Some(snapshot) = self
                 .realtime_execution_cache
                 .wait_snapshot(
                     &symbol,
@@ -870,14 +869,13 @@ where
                     REALTIME_EXECUTION_SNAPSHOT_WAIT,
                 )
                 .await
-            {
-                tracing::info!(
-                    symbol = symbol.as_str(),
-                    exchange_order_id,
-                    "using Bybit realtime execution snapshot"
-                );
-                return Ok(snapshot);
-            }
+        {
+            tracing::info!(
+                symbol = symbol.as_str(),
+                exchange_order_id,
+                "using Bybit realtime execution snapshot"
+            );
+            return Ok(snapshot);
         }
         let header = self
             .load_order_record(&symbol, client_order_id, Some(exchange_order_id))

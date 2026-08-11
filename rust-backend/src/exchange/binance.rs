@@ -923,8 +923,7 @@ where
         if self
             .realtime_execution_cache
             .knows_order(&symbol, exchange_order_id)
-        {
-            if let Some(snapshot) = self
+            && let Some(snapshot) = self
                 .realtime_execution_cache
                 .wait_snapshot(
                     &symbol,
@@ -933,14 +932,13 @@ where
                     REALTIME_EXECUTION_SNAPSHOT_WAIT,
                 )
                 .await
-            {
-                tracing::info!(
-                    symbol = symbol.as_str(),
-                    exchange_order_id,
-                    "using Binance realtime execution snapshot"
-                );
-                return Ok(snapshot);
-            }
+        {
+            tracing::info!(
+                symbol = symbol.as_str(),
+                exchange_order_id,
+                "using Binance realtime execution snapshot"
+            );
+            return Ok(snapshot);
         }
         let detail_request = self
             .signed_request(
