@@ -4209,6 +4209,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_start_freshness_includes_time_waiting_for_mutation_guard() {
+        let directory = tempdir().unwrap();
+        let coordinator = Arc::new(RuntimeCoordinator::new(
+            directory.path().to_path_buf(),
+            runtime_settings(),
+        ));
+        let first_gateway = MockGateway::new(rules(), 1_100);
+        let first_gate = first_gateway.block_market_snapshot();
+        let first_coordinator = Arc::clone(&coordinator);
+        let first_start = tokio::spawn(async move {
+            first_coordinator
+                .start(first_gateway, config(None), 1_100)
+                .await
+        });
+        first_gate.wait_until_entered().await;
+
+        let second_gateway = MockGateway::new(rules(), 1_250).with_symbol("ALTUSDT");
+        let mut second_config = config(None);
+        second_config.symbol = "ALTUSDT".into();
+        let second_coordinator = Arc::clone(&coordinator);
+        let second_start = tokio::spawn(async move {
+            second_coordinator
+                .start(second_gateway, second_config, 1_100)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        first_gate.release();
+
+        first_start.await.unwrap().unwrap();
+        second_start.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn separate_coordinators_cannot_create_two_live_runs_in_one_catalog() {
         let directory = tempdir().unwrap();
         let first_gateway = MockGateway::new(rules(), 1_100);
