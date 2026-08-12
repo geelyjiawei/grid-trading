@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use futures::future::join_all;
 use thiserror::Error;
@@ -19,6 +19,7 @@ use crate::{
     },
 };
 
+use super::exchange_inputs::advance_reference_time_ms;
 use super::{
     FileStrategyStartError, PreparedStrategyLifecycle, PreparedStrategyStep,
     PreparedStrategyStopOutcome, RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry,
@@ -155,6 +156,7 @@ where
         config: GridConfig,
         now_ms: u64,
     ) -> Result<RuntimeStartReceipt, RuntimeCoordinatorError> {
+        let coordination_started = Instant::now();
         config.validate()?;
         let exchange = config
             .exchange
@@ -203,7 +205,7 @@ where
             self.strategy_root.clone(),
             run_id.clone(),
             config.clone(),
-            now_ms,
+            advance_reference_time_ms(now_ms, coordination_started.elapsed()),
             self.settings.clone(),
         )
         .await?;
