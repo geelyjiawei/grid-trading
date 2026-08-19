@@ -53,7 +53,7 @@ use crate::{
         BeginIdempotency, EncryptedExchangeConfigStore, FileIdempotencyStore, IdempotencyError,
         IdempotencyKey, IdempotencyStore, RequestFingerprint, StoredCommandResponse,
         StoredExchangeConfiguration, StrategyCatalog, StrategyCatalogSnapshot,
-        load_strategy_catalog,
+        load_strategy_catalog, load_strategy_catalog_for_run_ids,
     },
     security::AdminTokenVerifier,
     web_auth::{
@@ -68,6 +68,8 @@ const MAX_CONFIG_SECRET_BYTES: usize = 16 * 1_024;
 const PREVIEW_MARKET_MAX_AGE_MS: u64 = 15_000;
 const PREVIEW_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const MAX_CONCURRENT_RISK_SNAPSHOTS: usize = 1;
+const MAX_CONCURRENT_FULL_CATALOG_SCANS: usize = 1;
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "idempotency-replayed";
 
 #[derive(Serialize)]
@@ -113,6 +115,8 @@ struct ApiState {
     exchange_gateways: ExchangeGatewayRegistry,
     exchange_config_store: Option<EncryptedExchangeConfigStore>,
     exchange_configuration_gate: Arc<tokio::sync::Mutex<()>>,
+    risk_snapshot_gate: Arc<tokio::sync::Semaphore>,
+    full_catalog_scan_gate: Arc<tokio::sync::Semaphore>,
     strategy_root: PathBuf,
 }
 
@@ -139,6 +143,12 @@ impl ApiState {
             exchange_gateways,
             exchange_config_store,
             exchange_configuration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            risk_snapshot_gate: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_RISK_SNAPSHOTS,
+            )),
+            full_catalog_scan_gate: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_FULL_CATALOG_SCANS,
+            )),
             strategy_root,
         }
     }
@@ -162,6 +172,12 @@ impl ApiState {
             exchange_gateways: ExchangeGatewayRegistry::default(),
             exchange_config_store: None,
             exchange_configuration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            risk_snapshot_gate: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_RISK_SNAPSHOTS,
+            )),
+            full_catalog_scan_gate: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_FULL_CATALOG_SCANS,
+            )),
             strategy_root,
         }
     }
@@ -242,6 +258,12 @@ impl ApiState {
             exchange_gateways,
             exchange_config_store,
             exchange_configuration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            risk_snapshot_gate: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_RISK_SNAPSHOTS,
+            )),
+            full_catalog_scan_gate: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_FULL_CATALOG_SCANS,
+            )),
             strategy_root,
         }
     }
@@ -1611,18 +1633,24 @@ async fn strategy_trades(
         Ok(limit) => limit,
         Err(response) => return *response,
     };
-    let (catalog, _) = match stable_runtime_catalog(&state).await {
+    let (live_catalog, _) = match stable_runtime_catalog(&state).await {
         Ok(snapshot) => snapshot,
         Err(response) => return response,
     };
-    let selected = match catalog.select_live(exchange, &symbol) {
+    let selected = match live_catalog.select_live(exchange, &symbol) {
         Ok(Some(snapshot)) => Some(snapshot),
-        Ok(None) => catalog
-            .entries()
-            .iter()
-            .filter(|entry| entry.exchange() == exchange && entry.symbol() == symbol)
-            .max_by_key(|entry| strategy_snapshot_updated_at(entry))
-            .cloned(),
+        Ok(None) => {
+            let catalog = match load_full_catalog_for_observation(&state).await {
+                Ok(catalog) => catalog,
+                Err(response) => return response,
+            };
+            catalog
+                .entries()
+                .iter()
+                .filter(|entry| entry.exchange() == exchange && entry.symbol() == symbol)
+                .max_by_key(|entry| strategy_snapshot_updated_at(entry))
+                .cloned()
+        }
         Err(error) => {
             tracing::error!(?exchange, symbol, error = %error, "multiple live strategies prevent an authoritative trade view");
             return api_error(
@@ -1663,8 +1691,8 @@ async fn strategy_history(
         Ok(limit) => limit,
         Err(response) => return *response,
     };
-    let (catalog, _) = match stable_runtime_catalog(&state).await {
-        Ok(snapshot) => snapshot,
+    let catalog = match load_full_catalog_for_observation(&state).await {
+        Ok(catalog) => catalog,
         Err(response) => return response,
     };
     let mut rows = Vec::with_capacity(catalog.entries().len());
@@ -1867,37 +1895,88 @@ fn strategy_history_row(snapshot: &StrategyCatalogSnapshot) -> Result<Value, Box
 async fn stable_runtime_catalog(
     state: &ApiState,
 ) -> Result<(StrategyCatalog, Vec<RuntimeRegistryEntry>), Response> {
-    for _ in 0..3 {
-        let before = load_catalog_snapshot(state.strategy_root.clone()).await?;
-        let runtime_entries = match &state.runtime {
-            Some(runtime) => runtime.entries().await,
-            None => Vec::new(),
-        };
-        let after = load_catalog_snapshot(state.strategy_root.clone()).await?;
-        if before != after {
-            continue;
-        }
-        if !after.anomalies().is_empty() {
+    let Some(runtime) = state.runtime.as_ref() else {
+        let catalog = load_catalog_snapshot(state.strategy_root.clone()).await?;
+        if !catalog.anomalies().is_empty() {
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "strategy_catalog_anomaly",
                 "The strategy catalog contains unresolved anomalies",
             ));
         }
-        if state.runtime.is_some() && !runtime_catalog_matches(&after, &runtime_entries) {
+        return Ok((catalog, Vec::new()));
+    };
+    if !runtime.recovery_completed() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_catalog_mismatch",
+            "The trading runtime has not completed durable strategy recovery",
+        ));
+    }
+
+    for _ in 0..3 {
+        let before_runtime = runtime.entries().await;
+        let catalog =
+            load_runtime_catalog_snapshot(state.strategy_root.clone(), before_runtime.as_slice())
+                .await?;
+        let after_runtime = runtime.entries().await;
+        if before_runtime != after_runtime {
+            continue;
+        }
+        if !catalog.anomalies().is_empty() {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_anomaly",
+                "The active strategy catalog contains unresolved anomalies",
+            ));
+        }
+        if !runtime_catalog_matches(&catalog, &after_runtime) {
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "runtime_catalog_mismatch",
                 "The runtime registry and durable strategy catalog do not agree",
             ));
         }
-        return Ok((after, runtime_entries));
+        return Ok((catalog, after_runtime));
     }
     Err(api_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "strategy_status_changed",
         "The strategy state changed while it was being read; retry the status request",
     ))
+}
+
+async fn load_runtime_catalog_snapshot(
+    root: PathBuf,
+    runtime_entries: &[RuntimeRegistryEntry],
+) -> Result<StrategyCatalog, Response> {
+    let run_ids = runtime_entries
+        .iter()
+        .map(|entry| entry.run_id.clone())
+        .collect::<Vec<_>>();
+    match tokio::task::spawn_blocking(move || {
+        load_strategy_catalog_for_run_ids(root, run_ids.as_slice())
+    })
+    .await
+    {
+        Ok(Ok(catalog)) => Ok(catalog),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "active strategy catalog could not be read");
+            Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_unavailable",
+                "The active strategy catalog is unavailable",
+            ))
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "active strategy catalog task failed");
+            Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_unavailable",
+                "The active strategy catalog is unavailable",
+            ))
+        }
+    }
 }
 
 async fn load_catalog_snapshot(root: PathBuf) -> Result<StrategyCatalog, Response> {
@@ -1920,6 +1999,32 @@ async fn load_catalog_snapshot(root: PathBuf) -> Result<StrategyCatalog, Respons
             ))
         }
     }
+}
+
+async fn load_full_catalog_for_observation(state: &ApiState) -> Result<StrategyCatalog, Response> {
+    let _permit = match Arc::clone(&state.full_catalog_scan_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "strategy_catalog_busy",
+                "A strategy history scan is already running; retry shortly",
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("2"));
+            return Err(response);
+        }
+    };
+    let catalog = load_catalog_snapshot(state.strategy_root.clone()).await?;
+    if !catalog.anomalies().is_empty() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy_catalog_anomaly",
+            "The strategy catalog contains unresolved anomalies",
+        ));
+    }
+    Ok(catalog)
 }
 
 fn runtime_catalog_matches(
@@ -3085,25 +3190,43 @@ async fn observe_risk_strategy(
     symbol: &str,
 ) -> RiskStrategyObservation {
     let Some(runtime) = state.runtime.as_ref() else {
-        let catalog = load_risk_catalog(state.strategy_root.clone()).await.ok();
+        let catalog = load_risk_catalog(state.strategy_root.clone(), None)
+            .await
+            .ok();
         return build_risk_strategy_observation(catalog, Vec::new(), false, exchange, symbol, None);
     };
+    if !runtime.recovery_completed() {
+        let catalog = load_risk_catalog(state.strategy_root.clone(), None)
+            .await
+            .ok();
+        return build_risk_strategy_observation(
+            catalog,
+            runtime.entries().await,
+            true,
+            exchange,
+            symbol,
+            None,
+        );
+    }
 
     for _ in 0..3 {
         let before_runtime = runtime.entries().await;
-        let catalog = match load_risk_catalog(state.strategy_root.clone()).await {
-            Ok(catalog) => catalog,
-            Err(()) => {
-                return build_risk_strategy_observation(
-                    None,
-                    runtime.entries().await,
-                    true,
-                    exchange,
-                    symbol,
-                    Some("strategy_catalog_unavailable"),
-                );
-            }
-        };
+        let catalog =
+            match load_risk_catalog(state.strategy_root.clone(), Some(before_runtime.as_slice()))
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(()) => {
+                    return build_risk_strategy_observation(
+                        None,
+                        runtime.entries().await,
+                        true,
+                        exchange,
+                        symbol,
+                        Some("strategy_catalog_unavailable"),
+                    );
+                }
+            };
         let after_runtime = runtime.entries().await;
         if before_runtime == after_runtime {
             return build_risk_strategy_observation(
@@ -3118,7 +3241,12 @@ async fn observe_risk_strategy(
     }
 
     let runtime_entries = runtime.entries().await;
-    let catalog = load_risk_catalog(state.strategy_root.clone()).await.ok();
+    let catalog = load_risk_catalog(
+        state.strategy_root.clone(),
+        Some(runtime_entries.as_slice()),
+    )
+    .await
+    .ok();
     build_risk_strategy_observation(
         catalog,
         runtime_entries,
@@ -3129,8 +3257,22 @@ async fn observe_risk_strategy(
     )
 }
 
-async fn load_risk_catalog(root: PathBuf) -> Result<StrategyCatalog, ()> {
-    match tokio::task::spawn_blocking(move || load_strategy_catalog(root)).await {
+async fn load_risk_catalog(
+    root: PathBuf,
+    runtime_entries: Option<&[RuntimeRegistryEntry]>,
+) -> Result<StrategyCatalog, ()> {
+    let run_ids = runtime_entries.map(|entries| {
+        entries
+            .iter()
+            .map(|entry| entry.run_id.clone())
+            .collect::<Vec<_>>()
+    });
+    match tokio::task::spawn_blocking(move || match run_ids {
+        Some(run_ids) => load_strategy_catalog_for_run_ids(root, run_ids.as_slice()),
+        None => load_strategy_catalog(root),
+    })
+    .await
+    {
         Ok(Ok(catalog)) => Ok(catalog),
         Ok(Err(error)) => {
             tracing::warn!(error = %error, "strategy catalog could not be read for risk observation");
@@ -3284,6 +3426,20 @@ async fn exchange_risk(
     let symbol = match normalize_symbol(&symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
+    };
+    let _risk_snapshot_permit = match Arc::clone(&state.risk_snapshot_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "risk_snapshot_busy",
+                "An authoritative risk snapshot is already running; retry shortly",
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("2"));
+            return response;
+        }
     };
     let exchange = selected_exchange(&state, selection);
     let gateway = match read_gateway(&state, exchange) {
@@ -5640,6 +5796,40 @@ mod tests {
         assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
         assert_eq!(risk["profit_calculation_error"], Value::Null);
         assert_eq!(risk["has_risk"], false);
+    }
+
+    #[tokio::test]
+    async fn overlapping_risk_snapshot_is_rejected_before_exchange_work() {
+        let directory = tempdir().unwrap();
+        let state = ApiState::for_test(
+            verifier(),
+            false,
+            Arc::new(FileIdempotencyStore::new(
+                directory.path().join("idempotency"),
+            )),
+            Arc::new(DisabledStartGridCommand),
+        );
+        let _active_snapshot = Arc::clone(&state.risk_snapshot_gate)
+            .try_acquire_owned()
+            .unwrap();
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "2");
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "risk_snapshot_busy"
+        );
     }
 
     #[tokio::test]

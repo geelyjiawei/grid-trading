@@ -27,6 +27,7 @@ pub use runtime_lease::{RuntimeLeaseError, StrategyRuntimeLease};
 pub use strategy_catalog::{
     StrategyCatalog, StrategyCatalogAnomaly, StrategyCatalogAnomalyKind, StrategyCatalogError,
     StrategyCatalogSelectionError, StrategyCatalogSnapshot, load_strategy_catalog,
+    load_strategy_catalog_for_run_ids,
 };
 pub use strategy_state::{
     FileArmedStrategyStateStore, FilePreparedStrategyStore, FileStrategyStateStore,

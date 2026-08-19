@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use thiserror::Error;
 
@@ -124,59 +127,95 @@ pub fn load_strategy_catalog(
     let mut entries = Vec::with_capacity(discovery.strategies.len());
 
     for paths in discovery.strategies {
-        let snapshot = match FilePreparedStrategyStore::load(paths.state()) {
-            Ok(FilePreparedStrategyStore::Armed(store)) => {
-                StrategyCatalogSnapshot::Armed(Box::new(store.snapshot().clone()))
-            }
-            Ok(FilePreparedStrategyStore::Active(store)) => {
-                StrategyCatalogSnapshot::Active(Box::new(store.snapshot().clone()))
-            }
-            Err(error) => {
-                tracing::warn!(path = %paths.state().display(), error = %error, "strategy state catalog entry could not be loaded");
-                anomalies.push(StrategyCatalogAnomaly {
-                    path: paths.state().to_path_buf(),
-                    kind: StrategyCatalogAnomalyKind::StateLoadFailed,
-                });
-                continue;
-            }
-        };
-        if snapshot.run_id() != paths.run_id().as_str() {
-            anomalies.push(StrategyCatalogAnomaly {
-                path: paths.state().to_path_buf(),
-                kind: StrategyCatalogAnomalyKind::RunIdentityMismatch,
-            });
-            continue;
+        if let Some(snapshot) = load_catalog_entry(&paths, &mut anomalies) {
+            entries.push(snapshot);
         }
-        let intent_store = match FileOrderIntentStore::load(paths.intents()) {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::warn!(path = %paths.intents().display(), error = %error, "strategy intent catalog entry could not be loaded");
-                anomalies.push(StrategyCatalogAnomaly {
-                    path: paths.intents().to_path_buf(),
-                    kind: StrategyCatalogAnomalyKind::IntentLedgerLoadFailed,
-                });
-                continue;
-            }
-        };
-        let ledger_matches = match &snapshot {
-            StrategyCatalogSnapshot::Armed(_) => {
-                intent_store.snapshot().intents.is_empty()
-                    && intent_store.snapshot().cancellations.is_empty()
-            }
-            StrategyCatalogSnapshot::Active(state) => {
-                validate_cross_ledger_ownership(state, intent_store.snapshot()).is_ok()
-            }
-        };
-        if !ledger_matches {
-            anomalies.push(StrategyCatalogAnomaly {
-                path: paths.intents().to_path_buf(),
-                kind: StrategyCatalogAnomalyKind::IntentLedgerMismatch,
-            });
-            continue;
-        }
-        entries.push(snapshot);
     }
 
+    finish_catalog(entries, anomalies)
+}
+
+/// Loads only the durable strategies named by the live runtime registry.
+/// Historical strategies can be very large and must not be deserialized on
+/// high-frequency status and risk request paths.
+pub fn load_strategy_catalog_for_run_ids(
+    root: impl AsRef<Path>,
+    run_ids: &[crate::engine::StrategyRunId],
+) -> Result<StrategyCatalog, StrategyCatalogError> {
+    let root = root.as_ref().to_path_buf();
+    let unique_run_ids = run_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut entries = Vec::with_capacity(unique_run_ids.len());
+    let mut anomalies = Vec::new();
+    for run_id in unique_run_ids {
+        let paths = super::StrategyFilePaths::new(root.clone(), run_id)?;
+        if let Some(snapshot) = load_catalog_entry(&paths, &mut anomalies) {
+            entries.push(snapshot);
+        }
+    }
+    finish_catalog(entries, anomalies)
+}
+
+fn load_catalog_entry(
+    paths: &super::StrategyFilePaths,
+    anomalies: &mut Vec<StrategyCatalogAnomaly>,
+) -> Option<StrategyCatalogSnapshot> {
+    let snapshot = match FilePreparedStrategyStore::load(paths.state()) {
+        Ok(FilePreparedStrategyStore::Armed(store)) => {
+            StrategyCatalogSnapshot::Armed(Box::new(store.snapshot().clone()))
+        }
+        Ok(FilePreparedStrategyStore::Active(store)) => {
+            StrategyCatalogSnapshot::Active(Box::new(store.snapshot().clone()))
+        }
+        Err(error) => {
+            tracing::warn!(path = %paths.state().display(), error = %error, "strategy state catalog entry could not be loaded");
+            anomalies.push(StrategyCatalogAnomaly {
+                path: paths.state().to_path_buf(),
+                kind: StrategyCatalogAnomalyKind::StateLoadFailed,
+            });
+            return None;
+        }
+    };
+    if snapshot.run_id() != paths.run_id().as_str() {
+        anomalies.push(StrategyCatalogAnomaly {
+            path: paths.state().to_path_buf(),
+            kind: StrategyCatalogAnomalyKind::RunIdentityMismatch,
+        });
+        return None;
+    }
+    let intent_store = match FileOrderIntentStore::load(paths.intents()) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(path = %paths.intents().display(), error = %error, "strategy intent catalog entry could not be loaded");
+            anomalies.push(StrategyCatalogAnomaly {
+                path: paths.intents().to_path_buf(),
+                kind: StrategyCatalogAnomalyKind::IntentLedgerLoadFailed,
+            });
+            return None;
+        }
+    };
+    let ledger_matches = match &snapshot {
+        StrategyCatalogSnapshot::Armed(_) => {
+            intent_store.snapshot().intents.is_empty()
+                && intent_store.snapshot().cancellations.is_empty()
+        }
+        StrategyCatalogSnapshot::Active(state) => {
+            validate_cross_ledger_ownership(state, intent_store.snapshot()).is_ok()
+        }
+    };
+    if !ledger_matches {
+        anomalies.push(StrategyCatalogAnomaly {
+            path: paths.intents().to_path_buf(),
+            kind: StrategyCatalogAnomalyKind::IntentLedgerMismatch,
+        });
+        return None;
+    }
+    Some(snapshot)
+}
+
+fn finish_catalog(
+    mut entries: Vec<StrategyCatalogSnapshot>,
+    mut anomalies: Vec<StrategyCatalogAnomaly>,
+) -> Result<StrategyCatalog, StrategyCatalogError> {
     entries.sort_by(|left, right| left.run_id().cmp(right.run_id()));
     anomalies.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(StrategyCatalog { entries, anomalies })
@@ -192,6 +231,8 @@ pub enum StrategyCatalogSelectionError {
 pub enum StrategyCatalogError {
     #[error(transparent)]
     Discovery(#[from] StrategyDiscoveryError),
+    #[error(transparent)]
+    Path(#[from] super::StrategyFilePathError),
 }
 
 #[cfg(test)]
@@ -298,6 +339,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(selected.run_id(), "ASTER001");
+        assert!(catalog.anomalies().is_empty());
+    }
+
+    #[test]
+    fn runtime_scoped_catalog_does_not_read_unrelated_historical_state() {
+        let directory = tempdir().unwrap();
+        let live_run = StrategyRunId::parse("ASTER001").unwrap();
+        persist_active(directory.path(), active(live_run.as_str(), "ANSEMUSDT"));
+
+        let unrelated_run = StrategyRunId::parse("HISTORY1").unwrap();
+        let unrelated_paths = StrategyFilePaths::new(directory.path(), unrelated_run).unwrap();
+        fs::create_dir_all(unrelated_paths.directory()).unwrap();
+        fs::write(
+            unrelated_paths.state(),
+            b"this historical state must not be read",
+        )
+        .unwrap();
+
+        let catalog = load_strategy_catalog_for_run_ids(directory.path(), &[live_run]).unwrap();
+
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(catalog.entries()[0].run_id(), "ASTER001");
         assert!(catalog.anomalies().is_empty());
     }
 

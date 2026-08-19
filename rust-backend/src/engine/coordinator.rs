@@ -1,4 +1,11 @@
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use futures::future::join_all;
 use thiserror::Error;
@@ -73,6 +80,7 @@ pub struct RuntimeCoordinator<G> {
     settings: RuntimeSettings,
     registry: Arc<RuntimeRegistry<G>>,
     mutation_guard: Mutex<()>,
+    recovery_completed: AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +111,7 @@ impl<G> RuntimeCoordinator<G> {
             settings,
             registry: Arc::new(RuntimeRegistry::new()),
             mutation_guard: Mutex::new(()),
+            recovery_completed: AtomicBool::new(false),
         }
     }
 
@@ -120,6 +129,10 @@ impl<G> RuntimeCoordinator<G> {
 
     pub async fn entries(&self) -> Vec<RuntimeRegistryEntry> {
         self.registry.entries().await
+    }
+
+    pub fn recovery_completed(&self) -> bool {
+        self.recovery_completed.load(Ordering::Acquire)
     }
 
     fn acquire_catalog_lease(&self) -> Result<StrategyRuntimeLease, RuntimeLeaseError> {
@@ -142,7 +155,9 @@ impl<G> RuntimeCoordinator<G> {
         let discovery = tokio::task::spawn_blocking(move || discover_strategy_files(root))
             .await
             .map_err(|_| RuntimeRecoveryError::DiscoveryTask)??;
-        Ok(recover_discovered_strategies(&self.registry, discovery, provider).await)
+        let report = recover_discovered_strategies(&self.registry, discovery, provider).await;
+        self.recovery_completed.store(true, Ordering::Release);
+        Ok(report)
     }
 }
 

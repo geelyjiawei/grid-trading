@@ -6,10 +6,17 @@ services:
     image: ${GRID_RUST_IMAGE:-grid-trading-vue-rust:production}
     container_name: ${GRID_RUST_PRODUCTION_CONTAINER:-grid-trading-rust}
     restart: unless-stopped
+    init: true
+    mem_limit: 1536m
+    mem_reservation: 768m
+    cpus: 1.5
+    pids_limit: 256
     env_file:
       - .env
     environment:
       TZ: Asia/Shanghai
+      MALLOC_ARENA_MAX: "2"
+      MALLOC_TRIM_THRESHOLD_: "131072"
       GRID_BIND: 0.0.0.0:8000
       GRID_WEB_ROOT: /app/web
       GRID_CONFIG_FILE: /app/data/api_config.json
@@ -27,4 +34,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
     stop_grace_period: 30s
