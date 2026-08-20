@@ -146,7 +146,16 @@ pub(crate) fn normalize_address(value: &str) -> Result<String, TradeXyzCodecErro
 }
 
 pub(crate) fn exchange_coin(symbol: &str) -> Result<String, TradeXyzCodecError> {
-    Ok(format!("{DEX_PREFIX}{}", symbol_base(symbol)?))
+    let base = symbol_base(symbol)?;
+    Ok(format!("{DEX_PREFIX}{}", authoritative_xyz_base(&base)))
+}
+
+fn authoritative_xyz_base(base: &str) -> &str {
+    match base {
+        // TRADE.XYZ displays the equity name while Hyperliquid signs and queries its HIP-3 code.
+        "SKHYNIX" => "SKHX",
+        _ => base,
+    }
 }
 
 pub(crate) fn default_exchange_coin(symbol: &str) -> Result<String, TradeXyzCodecError> {
@@ -528,6 +537,7 @@ mod tests {
     #[test]
     fn symbol_and_precision_contracts_are_strict() {
         assert_eq!(exchange_coin("MUUSDC").unwrap(), "xyz:MU");
+        assert_eq!(exchange_coin("SKHYNIXUSDC").unwrap(), "xyz:SKHX");
         assert_eq!(default_exchange_coin("CASHCATUSDC").unwrap(), "CASHCAT");
         assert_eq!(local_symbol("xyz:MU").unwrap(), "MUUSDC");
         assert_eq!(local_symbol("CASHCAT").unwrap(), "CASHCATUSDC");

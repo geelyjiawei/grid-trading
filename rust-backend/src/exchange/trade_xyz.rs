@@ -2455,6 +2455,21 @@ mod tests {
         response(json!([{"universe": universe}, contexts]))
     }
 
+    fn skhx_market_response() -> HttpResponse {
+        response(json!([{
+            "universe": [{
+                "name": "xyz:SKHX",
+                "szDecimals": 3,
+                "maxLeverage": 10
+            }]
+        }, [{
+            "markPx": "1163.3",
+            "midPx": "1163.85",
+            "prevDayPx": "1150",
+            "dayBaseVlm": "1234.5"
+        }]]))
+    }
+
     fn default_cashcat_market_response() -> HttpResponse {
         let mut universe = (0..231)
             .map(|index| {
@@ -2601,6 +2616,26 @@ mod tests {
         );
         assert_eq!(cached.observed_at_ms, snapshot.observed_at_ms);
         assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn market_snapshot_resolves_the_skhynix_display_alias_to_skhx() {
+        let transport = ScriptedTransport::new([skhx_market_response(), dex_response()]);
+        let adapter = test_adapter(transport.clone());
+
+        let snapshot = adapter
+            .market_snapshot(Exchange::TradeXyz, "SKHYNIXUSDC")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.symbol, "SKHYNIXUSDC");
+        assert_eq!(
+            snapshot.last_price,
+            Decimal::from_str_exact("1163.85").unwrap()
+        );
+        let query: Value =
+            serde_json::from_str(transport.requests()[0].raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(query, json!({"type": "metaAndAssetCtxs", "dex": "xyz"}));
     }
 
     #[tokio::test]

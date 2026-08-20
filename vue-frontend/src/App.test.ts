@@ -272,6 +272,39 @@ describe("workspace request isolation", () => {
     wrapper.unmount();
   });
 
+  it("refreshes a typed symbol without requiring blur or Enter", async () => {
+    const grid: GridStatus = {
+      run_id: "run-trade-xyz-input",
+      exchange: "trade_xyz",
+      symbol: "MUUSDC",
+      running: true,
+      realized_net_profit: "1",
+    };
+    installWorkspaceMocks([grid]);
+    const priceSpy = vi.spyOn(api, "price").mockImplementation(async (_exchange, requestedSymbol) => ({
+      last_price: requestedSymbol === "SKHXUSDC" ? "1163.85" : "859.155",
+      mark_price: requestedSymbol === "SKHXUSDC" ? "1163.3" : "858.77",
+    }));
+    vi.spyOn(api, "risk").mockImplementation(async (exchange, requestedSymbol) => ({
+      exchange,
+      symbol: requestedSymbol,
+      has_risk: false,
+    }));
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => expect(priceSpy).toHaveBeenCalledWith("trade_xyz", "MUUSDC"));
+
+    const symbolInput = wrapper.get<HTMLInputElement>('input[spellcheck="false"]');
+    symbolInput.element.value = "SKHXUSDC";
+    await symbolInput.trigger("input");
+
+    await vi.waitFor(() => {
+      expect(priceSpy).toHaveBeenCalledWith("trade_xyz", "SKHXUSDC");
+      expect(wrapper.find(".market-card").text()).toContain("1,163.85");
+    });
+    wrapper.unmount();
+  });
+
   it("submits cleanup for a selected failed strategy", async () => {
     const failed: GridStatus = {
       run_id: "run-skhynix-failed",

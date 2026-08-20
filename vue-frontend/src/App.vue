@@ -80,6 +80,7 @@ const marketError = ref("");
 const settingsOpen = ref(false);
 let statusTimer: number | undefined;
 let marketTimer: number | undefined;
+let symbolRefreshTimer: number | undefined;
 let statusRefreshRunning = false;
 let previewRequestSequence = 0;
 let marketRequestSequence = 0;
@@ -138,6 +139,22 @@ function messageFrom(reason: unknown, fallback: string): string {
 
 function normalizeSymbol(): void {
   symbol.value = symbol.value.trim().toUpperCase();
+}
+
+function cancelPendingSymbolRefresh(): void {
+  if (symbolRefreshTimer !== undefined) {
+    window.clearTimeout(symbolRefreshTimer);
+    symbolRefreshTimer = undefined;
+  }
+}
+
+function queueSymbolRefresh(): void {
+  prepareWorkspaceContext();
+  cancelPendingSymbolRefresh();
+  symbolRefreshTimer = window.setTimeout(() => {
+    symbolRefreshTimer = undefined;
+    void refreshWorkspace();
+  }, 350);
 }
 
 function alignSymbolWithExchange(exchange: Exchange): void {
@@ -314,6 +331,7 @@ async function refreshMarket(): Promise<void> {
 }
 
 async function refreshWorkspace(): Promise<void> {
+  cancelPendingSymbolRefresh();
   normalizeSymbol();
   prepareWorkspaceContext();
   loading.value = true;
@@ -556,6 +574,7 @@ onMounted(() => void checkAuth());
 onUnmounted(() => {
   window.clearInterval(statusTimer);
   window.clearInterval(marketTimer);
+  cancelPendingSymbolRefresh();
 });
 </script>
 
@@ -623,7 +642,13 @@ onUnmounted(() => {
       </div>
       <label class="symbol-control">
         <span>交易对</span>
-        <input v-model="symbol" spellcheck="false" @change="refreshWorkspace" @keyup.enter="refreshWorkspace" />
+        <input
+          v-model="symbol"
+          spellcheck="false"
+          @input="queueSymbolRefresh"
+          @change="refreshWorkspace"
+          @keyup.enter="refreshWorkspace"
+        />
       </label>
     </section>
 
