@@ -207,7 +207,9 @@ pub struct TradeXyzAdapter<T, N> {
     mainnet: bool,
     dex_metadata: Arc<tokio::sync::OnceCell<DexMetadata>>,
     market_cache: Arc<tokio::sync::Mutex<HashMap<String, (Instant, MarketInfo)>>>,
+    market_refresh: Arc<tokio::sync::Mutex<()>>,
     leverage_cache: Arc<tokio::sync::Mutex<HashMap<String, (Instant, u16)>>>,
+    leverage_refresh: Arc<tokio::sync::Mutex<()>>,
     open_execution_cache:
         Arc<tokio::sync::Mutex<HashMap<String, BTreeMap<ClientOrderId, CachedOpenExecution>>>>,
     execution_fill_cache: Arc<tokio::sync::Mutex<CachedExecutionFills>>,
@@ -293,7 +295,9 @@ impl<T, N> TradeXyzAdapter<T, N> {
             mainnet,
             dex_metadata: Arc::new(tokio::sync::OnceCell::new()),
             market_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            market_refresh: Arc::new(tokio::sync::Mutex::new(())),
             leverage_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            leverage_refresh: Arc::new(tokio::sync::Mutex::new(())),
             open_execution_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             execution_fill_cache,
             execution_order_cache,
@@ -900,24 +904,53 @@ where
 
     async fn market_info(&self, symbol: &str) -> Result<MarketInfo, SnapshotError> {
         let symbol = symbol.to_ascii_uppercase();
-        let mut cache = self.market_cache.lock().await;
         let now = Instant::now();
-        if let Some((cached_at, market)) = cache.get(&symbol)
-            && now.saturating_duration_since(*cached_at) < MARKET_CACHE_TTL
         {
-            return Ok(market.clone());
+            let cache = self.market_cache.lock().await;
+            if let Some((cached_at, market)) = cache.get(&symbol)
+                && now.saturating_duration_since(*cached_at) < MARKET_CACHE_TTL
+            {
+                return Ok(market.clone());
+            }
+        }
+
+        // Keep remote metadata I/O outside the cache lock. A separate single-flight
+        // lock prevents a burst of readers from issuing the same weighted request.
+        let _refresh = self.market_refresh.lock().await;
+        let now = Instant::now();
+        {
+            let cache = self.market_cache.lock().await;
+            if let Some((cached_at, market)) = cache.get(&symbol)
+                && now.saturating_duration_since(*cached_at) < MARKET_CACHE_TTL
+            {
+                return Ok(market.clone());
+            }
         }
         let market = self.fetch_market_info(&symbol).await?;
-        cache.insert(symbol, (Instant::now(), market.clone()));
+        self.market_cache
+            .lock()
+            .await
+            .insert(symbol, (Instant::now(), market.clone()));
         Ok(market)
     }
 
     async fn fresh_market_info(&self, symbol: &str) -> Result<MarketInfo, SnapshotError> {
         let symbol = symbol.to_ascii_uppercase();
-        let mut cache = self.market_cache.lock().await;
+        let _refresh = self.market_refresh.lock().await;
         let market = self.fetch_market_info(&symbol).await?;
-        cache.insert(symbol, (Instant::now(), market.clone()));
+        self.market_cache
+            .lock()
+            .await
+            .insert(symbol, (Instant::now(), market.clone()));
         Ok(market)
+    }
+
+    async fn order_market_info(&self, symbol: &str) -> Result<MarketInfo, SnapshotError> {
+        let symbol = symbol.to_ascii_uppercase();
+        if let Some((_, market)) = self.market_cache.lock().await.get(&symbol) {
+            return Ok(market.clone());
+        }
+        self.market_info(&symbol).await
     }
 
     async fn fetch_market_info(&self, symbol: &str) -> Result<MarketInfo, SnapshotError> {
@@ -1066,12 +1099,25 @@ where
     }
 
     async fn active_asset_leverage(&self, coin: &str) -> Result<u16, SnapshotError> {
-        let mut cache = self.leverage_cache.lock().await;
         let now = Instant::now();
-        if let Some((cached_at, leverage)) = cache.get(coin)
-            && now.saturating_duration_since(*cached_at) < LEVERAGE_CACHE_TTL
         {
-            return Ok(*leverage);
+            let cache = self.leverage_cache.lock().await;
+            if let Some((cached_at, leverage)) = cache.get(coin)
+                && now.saturating_duration_since(*cached_at) < LEVERAGE_CACHE_TTL
+            {
+                return Ok(*leverage);
+            }
+        }
+
+        let _refresh = self.leverage_refresh.lock().await;
+        let now = Instant::now();
+        {
+            let cache = self.leverage_cache.lock().await;
+            if let Some((cached_at, leverage)) = cache.get(coin)
+                && now.saturating_duration_since(*cached_at) < LEVERAGE_CACHE_TTL
+            {
+                return Ok(*leverage);
+            }
         }
         let value = self
             .post_info(
@@ -1090,7 +1136,10 @@ where
             .and_then(|value| u16::try_from(value).ok())
             .filter(|value| *value > 0)
             .ok_or_else(|| SnapshotError::new("TRADE.XYZ active leverage is invalid"))?;
-        cache.insert(coin.to_owned(), (Instant::now(), leverage));
+        self.leverage_cache
+            .lock()
+            .await
+            .insert(coin.to_owned(), (Instant::now(), leverage));
         Ok(leverage)
     }
 }
@@ -1510,7 +1559,7 @@ where
         let market = if intent.shape.kind == OrderKind::Market {
             self.fresh_market_info(&intent.shape.symbol).await
         } else {
-            self.market_info(&intent.shape.symbol).await
+            self.order_market_info(&intent.shape.symbol).await
         }
         .map_err(|error| PlacementError::NotSubmitted {
             message: error.message,
@@ -3118,6 +3167,52 @@ mod tests {
             assert_eq!(order["r"], false);
             assert!(decode_cloid(order["c"].as_str().unwrap()).is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn stale_market_snapshot_does_not_block_concurrent_limit_placements() {
+        let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
+            response(json!({
+                "status": "ok",
+                "response": {"data": {"statuses": [{"resting": {"oid": 41}}]}}
+            })),
+            response(json!({
+                "status": "ok",
+                "response": {"data": {"statuses": [{"resting": {"oid": 42}}]}}
+            })),
+        ]);
+        let adapter = test_adapter(transport.clone());
+
+        adapter
+            .market_snapshot(Exchange::TradeXyz, "MUUSDC")
+            .await
+            .unwrap();
+        adapter
+            .market_cache
+            .lock()
+            .await
+            .get_mut("MUUSDC")
+            .unwrap()
+            .0 = Instant::now() - MARKET_CACHE_TTL - Duration::from_secs(1);
+
+        let first = limit_intent("g_012345abcdef_15_S_1");
+        let second = limit_intent("g_012345abcdef_15_S_2");
+        let (first, second) =
+            tokio::join!(adapter.place_order(&first), adapter.place_order(&second));
+
+        assert_eq!(first.unwrap().exchange_order_id, "41");
+        assert_eq!(second.unwrap().exchange_order_id, "42");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].path, "/info");
+        assert_eq!(requests[1].path, "/info");
+        assert!(
+            requests[2..]
+                .iter()
+                .all(|request| request.path == "/exchange")
+        );
     }
 
     #[tokio::test]
