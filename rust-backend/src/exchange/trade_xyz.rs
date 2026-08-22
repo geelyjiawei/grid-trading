@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -69,6 +72,8 @@ const USER_FILL_STREAM_RECONNECT_MIN: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const USER_FILL_STREAM_RECONNECT_MAX: Duration = Duration::from_secs(30);
 const USER_FILL_STREAM_GRACE: Duration = Duration::from_millis(50);
+const WEBSOCKET_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_ACTION_QUEUE_CAPACITY: usize = 256;
 
 fn minimum_notional() -> Decimal {
     Decimal::new(10, 0)
@@ -136,6 +141,63 @@ struct CachedExecutionOrders {
     rows: HashMap<(String, ClientOrderId), CachedOrderUpdate>,
 }
 
+#[derive(Debug)]
+enum WebsocketActionError {
+    NotSent(String),
+    Unknown(String),
+}
+
+struct WebsocketActionCommand {
+    payload: Value,
+    response: tokio::sync::oneshot::Sender<Result<Value, WebsocketActionError>>,
+}
+
+#[derive(Clone)]
+struct WebsocketActionRelay {
+    sender: tokio::sync::mpsc::Sender<WebsocketActionCommand>,
+    connected: Arc<AtomicBool>,
+}
+
+impl WebsocketActionRelay {
+    async fn post(&self, payload: Value) -> Result<Value, WebsocketActionError> {
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(WebsocketActionError::NotSent(
+                "TRADE.XYZ websocket is disconnected".into(),
+            ));
+        }
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(WebsocketActionCommand { payload, response })
+            .await
+            .map_err(|_| {
+                WebsocketActionError::NotSent("TRADE.XYZ websocket writer is unavailable".into())
+            })?;
+        match tokio::time::timeout(WEBSOCKET_ACTION_TIMEOUT, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(WebsocketActionError::Unknown(
+                "TRADE.XYZ websocket action response channel closed".into(),
+            )),
+            Err(_) => Err(WebsocketActionError::Unknown(
+                "TRADE.XYZ websocket action acknowledgement timed out".into(),
+            )),
+        }
+    }
+}
+
+fn websocket_action_relay() -> (
+    WebsocketActionRelay,
+    tokio::sync::mpsc::Receiver<WebsocketActionCommand>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(WEBSOCKET_ACTION_QUEUE_CAPACITY);
+    (
+        WebsocketActionRelay {
+            sender,
+            connected: Arc::new(AtomicBool::new(false)),
+        },
+        receiver,
+    )
+}
+
 pub struct TradeXyzAdapter<T, N> {
     transport: T,
     signer: HyperliquidSigner,
@@ -150,6 +212,7 @@ pub struct TradeXyzAdapter<T, N> {
         Arc<tokio::sync::Mutex<HashMap<String, BTreeMap<ClientOrderId, CachedOpenExecution>>>>,
     execution_fill_cache: Arc<tokio::sync::Mutex<CachedExecutionFills>>,
     execution_order_cache: Arc<tokio::sync::Mutex<CachedExecutionOrders>>,
+    websocket_action_relay: Option<WebsocketActionRelay>,
     credentials_verified: Arc<tokio::sync::OnceCell<()>>,
 }
 
@@ -211,7 +274,7 @@ impl<T, N> TradeXyzAdapter<T, N> {
             Arc::new(tokio::sync::Mutex::new(CachedExecutionFills::default()));
         let execution_order_cache =
             Arc::new(tokio::sync::Mutex::new(CachedExecutionOrders::default()));
-        spawn_user_fill_stream(
+        let websocket_action_relay = spawn_user_fill_stream(
             if mainnet {
                 PRODUCTION_WEBSOCKET_URL
             } else {
@@ -234,6 +297,7 @@ impl<T, N> TradeXyzAdapter<T, N> {
             open_execution_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             execution_fill_cache,
             execution_order_cache,
+            websocket_action_relay,
             credentials_verified: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
@@ -253,17 +317,21 @@ fn spawn_user_fill_stream(
     account_address: String,
     cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
     order_cache: Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
-) {
+) -> Option<WebsocketActionRelay> {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("TRADE.XYZ user-fill stream was not started outside a Tokio runtime");
-        return;
+        return None;
     };
+    let (relay, receiver) = websocket_action_relay();
     runtime.spawn(run_user_fill_stream(
         websocket_url,
         account_address,
         cache,
         order_cache,
+        relay.connected.clone(),
+        receiver,
     ));
+    Some(relay)
 }
 
 #[cfg(test)]
@@ -272,7 +340,8 @@ fn spawn_user_fill_stream(
     _account_address: String,
     _cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
     _order_cache: Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
-) {
+) -> Option<WebsocketActionRelay> {
+    None
 }
 
 #[cfg(not(test))]
@@ -281,8 +350,11 @@ async fn run_user_fill_stream(
     account_address: String,
     cache: Weak<tokio::sync::Mutex<CachedExecutionFills>>,
     order_cache: Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
+    connected: Arc<AtomicBool>,
+    mut action_commands: tokio::sync::mpsc::Receiver<WebsocketActionCommand>,
 ) {
     let mut reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
+    let mut next_action_id = now_ms().unwrap_or(1);
     loop {
         if cache.upgrade().is_none() || order_cache.upgrade().is_none() {
             return;
@@ -292,7 +364,8 @@ async fn run_user_fill_stream(
             Ok(connection) => connection,
             Err(error) => {
                 tracing::warn!(error = %error, "TRADE.XYZ user-fill stream connection failed");
-                tokio::time::sleep(reconnect_delay).await;
+                connected.store(false, Ordering::Release);
+                reject_actions_while_disconnected(&mut action_commands, reconnect_delay).await;
                 reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
                 continue;
             }
@@ -310,7 +383,8 @@ async fn run_user_fill_stream(
             .await
         {
             tracing::warn!(error = %error, "TRADE.XYZ user-fill subscription failed");
-            tokio::time::sleep(reconnect_delay).await;
+            connected.store(false, Ordering::Release);
+            reject_actions_while_disconnected(&mut action_commands, reconnect_delay).await;
             reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
             continue;
         }
@@ -326,15 +400,18 @@ async fn run_user_fill_stream(
             .await
         {
             tracing::warn!(error = %error, "TRADE.XYZ order-update subscription failed");
-            tokio::time::sleep(reconnect_delay).await;
+            connected.store(false, Ordering::Release);
+            reject_actions_while_disconnected(&mut action_commands, reconnect_delay).await;
             reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
             continue;
         }
         if !set_execution_stream_connected(&cache, &order_cache, true).await {
             return;
         }
+        connected.store(true, Ordering::Release);
         tracing::info!("TRADE.XYZ user-fill and order-update streams connected");
         reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
+        let mut pending_actions = HashMap::new();
         let mut heartbeat = tokio::time::interval(USER_FILL_STREAM_HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await;
@@ -344,15 +421,24 @@ async fn run_user_fill_stream(
                     let Some(message) = message else { break };
                     match message {
                         Ok(Message::Text(text)) => {
+                            if resolve_websocket_action_response(
+                                text.as_ref(),
+                                &mut pending_actions,
+                            ) {
+                                continue;
+                            }
                             if !cache_execution_message(text.as_ref(), &cache, &order_cache).await {
                                 return;
                             }
                         }
                         Ok(Message::Binary(bytes)) => {
-                            if let Ok(text) = std::str::from_utf8(bytes.as_ref())
-                                && !cache_execution_message(text, &cache, &order_cache).await
-                            {
-                                return;
+                            if let Ok(text) = std::str::from_utf8(bytes.as_ref()) {
+                                if resolve_websocket_action_response(text, &mut pending_actions) {
+                                    continue;
+                                }
+                                if !cache_execution_message(text, &cache, &order_cache).await {
+                                    return;
+                                }
                             }
                         }
                         Ok(Message::Ping(payload)) => {
@@ -377,15 +463,113 @@ async fn run_user_fill_stream(
                         break;
                     }
                 }
+                command = action_commands.recv() => {
+                    let Some(command) = command else { return };
+                    if command.response.is_closed() {
+                        continue;
+                    }
+                    next_action_id = next_action_id.wrapping_add(1).max(1);
+                    let request = websocket_action_request(next_action_id, command.payload);
+                    if let Err(error) = socket
+                        .send(Message::Text(request.to_string().into()))
+                        .await
+                    {
+                        let _ = command.response.send(Err(WebsocketActionError::Unknown(
+                            format!("TRADE.XYZ websocket action write failed: {error}"),
+                        )));
+                        break;
+                    }
+                    pending_actions.insert(next_action_id, command.response);
+                }
             }
+        }
+        connected.store(false, Ordering::Release);
+        for response in pending_actions.into_values() {
+            let _ = response.send(Err(WebsocketActionError::Unknown(
+                "TRADE.XYZ websocket disconnected after action submission".into(),
+            )));
         }
         if !set_execution_stream_connected(&cache, &order_cache, false).await {
             return;
         }
         tracing::warn!("TRADE.XYZ user-fill stream disconnected; REST fallback remains active");
-        tokio::time::sleep(reconnect_delay).await;
+        reject_actions_while_disconnected(&mut action_commands, reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
     }
+}
+
+#[cfg(not(test))]
+async fn reject_actions_while_disconnected(
+    commands: &mut tokio::sync::mpsc::Receiver<WebsocketActionCommand>,
+    delay: Duration,
+) {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return,
+            command = commands.recv() => {
+                let Some(command) = command else { return };
+                let _ = command.response.send(Err(WebsocketActionError::NotSent(
+                    "TRADE.XYZ websocket is reconnecting".into(),
+                )));
+            }
+        }
+    }
+}
+
+fn websocket_action_request(id: u64, payload: Value) -> Value {
+    json!({
+        "method": "post",
+        "id": id,
+        "request": {
+            "type": "action",
+            "payload": payload,
+        }
+    })
+}
+
+fn resolve_websocket_action_response(
+    text: &str,
+    pending: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, WebsocketActionError>>>,
+) -> bool {
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if message.get("channel").and_then(Value::as_str) != Some("post") {
+        return false;
+    }
+    let Some(id) = message.pointer("/data/id").and_then(value_u64) else {
+        return true;
+    };
+    let Some(response) = pending.remove(&id) else {
+        return true;
+    };
+    let response_type = message
+        .pointer("/data/response/type")
+        .and_then(Value::as_str);
+    let result = match response_type {
+        Some("action") => message
+            .pointer("/data/response/payload")
+            .cloned()
+            .ok_or_else(|| {
+                WebsocketActionError::Unknown(
+                    "TRADE.XYZ websocket action response has no payload".into(),
+                )
+            }),
+        Some("error") => Err(WebsocketActionError::Unknown(format!(
+            "TRADE.XYZ websocket action error: {}",
+            message
+                .pointer("/data/response/payload")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "unknown error".into())
+        ))),
+        _ => Err(WebsocketActionError::Unknown(
+            "TRADE.XYZ websocket action response type is invalid".into(),
+        )),
+    };
+    let _ = response.send(result);
+    true
 }
 
 #[cfg(not(test))]
@@ -615,6 +799,29 @@ where
         let action = serde_json::to_value(action)
             .map_err(|_| TransportError::Other("Hyperliquid action serialization failed".into()))?;
         let body = action_payload(action, signature, nonce);
+        if let Some(relay) = &self.websocket_action_relay {
+            let websocket_started = Instant::now();
+            match relay.post(body.clone()).await {
+                Ok(value) => {
+                    tracing::info!(
+                        websocket_roundtrip_ms =
+                            u64::try_from(websocket_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                        "TRADE.XYZ exchange action completed over websocket"
+                    );
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: value.to_string(),
+                    });
+                }
+                Err(WebsocketActionError::NotSent(message)) => {
+                    tracing::debug!(reason = %message, "TRADE.XYZ action is falling back to HTTP");
+                }
+                Err(WebsocketActionError::Unknown(message)) => {
+                    return Err(TransportError::Other(message));
+                }
+            }
+        }
         let request = self
             .request("/exchange", body)
             .map_err(|error| TransportError::Other(error.message))?;
@@ -2911,6 +3118,116 @@ mod tests {
             assert_eq!(order["r"], false);
             assert!(decode_cloid(order["c"].as_str().unwrap()).is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn connected_websocket_is_the_primary_order_write_path() {
+        let transport = ScriptedTransport::new([market_response(), dex_response()]);
+        let mut adapter = test_adapter(transport.clone());
+        let (relay, mut commands) = websocket_action_relay();
+        relay
+            .connected
+            .store(true, std::sync::atomic::Ordering::Release);
+        adapter.websocket_action_relay = Some(relay);
+        let responder = tokio::spawn(async move {
+            let command = commands.recv().await.unwrap();
+            assert_eq!(command.payload["action"]["type"], "order");
+            command
+                .response
+                .send(Ok(json!({
+                    "status": "ok",
+                    "response": {"data": {"statuses": [{"resting": {"oid": 44}}]}}
+                })))
+                .unwrap();
+        });
+
+        let acknowledgement = adapter
+            .place_order(&limit_intent("g_012345abcdef_15_S_4"))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(acknowledgement.exchange_order_id, "44");
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .all(|request| request.path != "/exchange")
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_unknown_outcome_never_retries_over_http() {
+        let transport = ScriptedTransport::new([market_response(), dex_response()]);
+        let mut adapter = test_adapter(transport.clone());
+        let (relay, mut commands) = websocket_action_relay();
+        relay.connected.store(true, Ordering::Release);
+        adapter.websocket_action_relay = Some(relay);
+        let responder = tokio::spawn(async move {
+            let command = commands.recv().await.unwrap();
+            command
+                .response
+                .send(Err(WebsocketActionError::Unknown(
+                    "connection closed after write".into(),
+                )))
+                .unwrap();
+        });
+
+        let error = adapter
+            .place_order(&limit_intent("g_012345abcdef_15_S_5"))
+            .await
+            .unwrap_err();
+        responder.await.unwrap();
+
+        assert!(matches!(error, PlacementError::Unknown { .. }));
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .all(|request| request.path != "/exchange")
+        );
+    }
+
+    #[test]
+    fn websocket_action_uses_the_official_post_envelope() {
+        let payload = json!({"action": {"type": "order"}, "nonce": 42});
+        assert_eq!(
+            websocket_action_request(7, payload.clone()),
+            json!({
+                "method": "post",
+                "id": 7,
+                "request": {"type": "action", "payload": payload}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_action_response_is_correlated_by_request_id() {
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        let mut pending = HashMap::from([(7, response)]);
+        let message = json!({
+            "channel": "post",
+            "data": {
+                "id": 7,
+                "response": {
+                    "type": "action",
+                    "payload": {
+                        "status": "ok",
+                        "response": {"data": {"statuses": [{"resting": {"oid": 45}}]}}
+                    }
+                }
+            }
+        });
+
+        assert!(resolve_websocket_action_response(
+            &message.to_string(),
+            &mut pending
+        ));
+        assert!(pending.is_empty());
+        assert_eq!(
+            placement_order_id(&receiver.await.unwrap().unwrap()).unwrap(),
+            "45"
+        );
     }
 
     #[tokio::test]
