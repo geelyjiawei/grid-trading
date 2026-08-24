@@ -138,6 +138,19 @@ where
             )?;
             Ok(ReconciliationResult::NotSubmitted { message })
         }
+        Ok(OrderLookup::NotFound) if legacy_binance_system_throttle_was_not_submitted(&intent) => {
+            let message =
+                "Binance system-level throttle rejected submission; authoritative lookup confirms the order is absent"
+                    .to_owned();
+            store.transition(
+                &intent.client_order_id,
+                IntentState::RetryableNotSubmitted {
+                    message: message.clone(),
+                },
+                now_ms,
+            )?;
+            Ok(ReconciliationResult::NotSubmitted { message })
+        }
         Ok(OrderLookup::NotFound)
             if binance_reduce_only_unknown_is_confirmed_absent(&intent, now_ms) =>
         {
@@ -189,6 +202,16 @@ fn legacy_local_cooldown_was_not_submitted(intent: &OrderIntent) -> bool {
         return false;
     };
     !delay.is_empty() && delay.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn legacy_binance_system_throttle_was_not_submitted(intent: &OrderIntent) -> bool {
+    const MESSAGE: &str = "Request throttled by system-level protection. Reduce-only/close-position orders are exempt. Please try again.";
+
+    intent.exchange == Exchange::Binance
+        && matches!(
+            &intent.state,
+            IntentState::SubmitUnknown { message } if message == MESSAGE
+        )
 }
 
 fn preserve_unknown<S: IntentStore>(
@@ -644,6 +667,50 @@ mod tests {
                 &order.client_order_id,
                 IntentState::SubmitUnknown {
                     message: "Binance request cooldown is active; retry after 5 ms".into(),
+                },
+                101,
+            )
+            .unwrap();
+        let mut service = ReconciliationService::new(
+            FakeLookupGateway {
+                calls: calls.clone(),
+                result: Ok(OrderLookup::NotFound),
+            },
+            store,
+        );
+
+        assert!(matches!(
+            service
+                .reconcile(&order.client_order_id, 102)
+                .await
+                .unwrap(),
+            ReconciliationResult::NotSubmitted { .. }
+        ));
+        assert!(matches!(
+            service
+                .store()
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .state,
+            IntentState::RetryableNotSubmitted { .. }
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authoritative_not_found_migrates_legacy_binance_system_throttle_unknown() {
+        let mut order = intent_on("g_22_S_legacy_system_throttle", Exchange::Binance);
+        order.shape.reduce_only = false;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut store = MemoryOrderIntentStore::default();
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::SubmitUnknown {
+                    message: "Request throttled by system-level protection. Reduce-only/close-position orders are exempt. Please try again.".into(),
                 },
                 101,
             )

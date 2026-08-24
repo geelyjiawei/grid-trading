@@ -730,6 +730,13 @@ where
                 message: error.message,
             });
         }
+        if error.code.as_deref() == Some("-1008") {
+            // Binance documents -1008 system-level throttling as a 100%
+            // failed operation, unlike the ambiguous HTTP 503 timeout form.
+            return Err(PlacementError::NotSubmitted {
+                message: error.message,
+            });
+        }
         if intent.shape.time_in_force == TimeInForce::PostOnly
             && error.code.as_deref() == Some(POST_ONLY_WOULD_TAKE_CODE)
         {
@@ -1621,6 +1628,19 @@ mod tests {
         assert!(matches!(
             adapter(exchange).place_order(&intent()).await,
             Err(PlacementError::Unknown { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_level_throttle_is_known_not_to_have_submitted_an_order() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 503,
+            body: r#"{"code":-1008,"msg":"Request throttled by system-level protection. Reduce-only/close-position orders are exempt. Please try again."}"#.into(),
+        }));
+
+        assert!(matches!(
+            adapter(transport).place_order(&intent()).await,
+            Err(PlacementError::NotSubmitted { .. })
         ));
     }
 
