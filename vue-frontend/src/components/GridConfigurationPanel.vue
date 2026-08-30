@@ -152,7 +152,10 @@ function buildConfig(): GridConfigRequest {
   const leverage = positiveInteger(form.leverage, "杠杆倍数", 1, 125);
   if (!props.fees) throw new Error("账户实际费率尚未读取，不能预览");
   const normalizedSymbol = props.symbol.trim().toUpperCase();
-  if (!/^[A-Z0-9]+$/.test(normalizedSymbol)) throw new Error("交易对格式不正确");
+  const validSymbol = props.exchange === "aster"
+    ? /^[\p{L}\p{N}]+$/u.test(normalizedSymbol)
+    : /^[A-Z0-9]+$/.test(normalizedSymbol);
+  if (!validSymbol) throw new Error("交易对格式不正确");
 
   const totalInvestment = fixedQuantity.value
     ? "0"

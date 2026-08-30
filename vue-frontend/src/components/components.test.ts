@@ -184,6 +184,36 @@ describe("Vue migration components", () => {
     expect(wrapper.find('[data-testid="total-investment"]').exists()).toBe(true);
   });
 
+  it("allows exchange-published Unicode symbols for Aster only", async () => {
+    const mountPanel = (exchange: "aster" | "binance") => mount(GridConfigurationPanel, {
+      props: {
+        exchange,
+        symbol: "牛来USDT",
+        configured: true,
+        fees: { maker_fee_rate: 0.0002, taker_fee_rate: 0.0005 },
+        preview: null,
+        busy: false,
+        error: "",
+      },
+    });
+    const aster = mountPanel("aster");
+    await aster.find('[data-testid="lower-price"]').setValue("0.09");
+    await aster.find('[data-testid="upper-price"]').setValue("0.11");
+    await aster.find('[data-testid="grid-order-qty"]').setValue("1");
+    await aster.find("form").trigger("submit");
+    expect(aster.emitted("preview")?.[0]?.[0]).toMatchObject({
+      exchange: "aster",
+      symbol: "牛来USDT",
+    });
+
+    const binance = mountPanel("binance");
+    await binance.find('[data-testid="lower-price"]').setValue("0.09");
+    await binance.find('[data-testid="upper-price"]').setValue("0.11");
+    await binance.find('[data-testid="grid-order-qty"]').setValue("1");
+    await binance.find("form").trigger("submit");
+    expect(binance.emitted("preview")).toBeUndefined();
+  });
+
   it("labels TRADE.XYZ strategy amounts in USDC", async () => {
     const wrapper = mount(GridConfigurationPanel, {
       props: {
