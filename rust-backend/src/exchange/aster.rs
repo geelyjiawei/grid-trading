@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use k256::ecdsa::SigningKey;
 use rust_decimal::Decimal;
-#[cfg(not(test))]
 use serde_json::Value;
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
@@ -22,14 +21,15 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent, is_valid_symbol_for_exchange},
     exchange::{
-        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
-        CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
-        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
-        InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
-        LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, ActiveOrderStatus,
+        CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
+        ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
+        OrderCancellationGateway, OrderExecutionSnapshot, OrderHistorySnapshotGateway,
+        OrderLifecycle, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_account_balance_snapshot, parse_authoritative_order,
@@ -40,9 +40,9 @@ use crate::{
             validate_snapshot_request,
         },
         execution::{
-            CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
-            parse_historical_minute_open, parse_reconstructable_order_execution_header,
-            parse_trade_page,
+            CommissionConvention, OrderExecutionHeader, assemble_execution_snapshot,
+            numeric_trade_id, parse_historical_minute_open,
+            parse_reconstructable_order_execution_header, parse_trade_page,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -846,8 +846,12 @@ where
         intent
             .validate()
             .map_err(|error| definitive_local_error(&error.to_string()))?;
-        let params = build_order_parameters(&intent.client_order_id, &intent.shape)
+        let mut params = build_order_parameters(&intent.client_order_id, &intent.shape)
             .map_err(|error| definitive_local_error(&error.to_string()))?;
+        // RESULT echoes the accepted order shape and update time. Binding that
+        // identity now lets the official user stream serve the first fill
+        // without a slower /order + /userTrades round trip.
+        params.push(("newOrderRespType".into(), "RESULT".into()));
         let request = self
             .signed_request(HttpMethod::Post, "/fapi/v3/order", params)
             .map_err(|error| definitive_local_error(&error.to_string()))?;
@@ -860,10 +864,25 @@ where
                 })?;
 
         if (200..300).contains(&response.status) {
-            return parse_placement_acknowledgement(&response.body, &intent.client_order_id)
-                .map_err(|error| PlacementError::Unknown {
-                    message: format!("Aster acknowledgement is not authoritative: {error}"),
-                });
+            let acknowledgement =
+                parse_placement_acknowledgement(&response.body, &intent.client_order_id).map_err(
+                    |error| PlacementError::Unknown {
+                        message: format!("Aster acknowledgement is not authoritative: {error}"),
+                    },
+                )?;
+            if let Err(error) = bind_aster_placement_snapshot(
+                &self.realtime_execution_cache,
+                &response.body,
+                intent,
+                &acknowledgement,
+            ) {
+                tracing::debug!(
+                    client_order_id = intent.client_order_id.as_str(),
+                    error = error.as_str(),
+                    "Aster RESULT response could not seed execution cache; REST fallback remains active"
+                );
+            }
+            return Ok(acknowledgement);
         }
 
         let error = parse_exchange_error(&response.body);
@@ -883,6 +902,54 @@ where
             })
         }
     }
+}
+
+fn bind_aster_placement_snapshot(
+    cache: &FuturesExecutionCache,
+    body: &str,
+    intent: &OrderIntent,
+    acknowledgement: &PlacementAcknowledgement,
+) -> Result<(), String> {
+    let order = parse_authoritative_order(
+        body,
+        Exchange::Aster,
+        &intent.shape.symbol,
+        &intent.client_order_id,
+    )
+    .map_err(|error| error.to_string())?;
+    if order.exchange_order_id != acknowledgement.exchange_order_id
+        || order.shape != intent.shape
+        || !matches!(
+            order.lifecycle,
+            OrderLifecycle::Active(ActiveOrderStatus::New)
+        )
+        || order.executed_quantity != Some(Decimal::ZERO)
+    {
+        return Err("Aster RESULT order identity or initial state is inconsistent".into());
+    }
+    let value = serde_json::from_str::<Value>(body).map_err(|error| error.to_string())?;
+    let accepted_at_ms = value
+        .get("updateTime")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.parse::<u64>().ok())
+        })
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Aster RESULT updateTime is missing or invalid".to_owned())?;
+    let snapshot = assemble_execution_snapshot(
+        OrderExecutionHeader {
+            order,
+            cumulative_quantity: Decimal::ZERO,
+            cumulative_quote: Decimal::ZERO,
+            order_time_ms: accepted_at_ms,
+            update_time_ms: accepted_at_ms,
+        },
+        vec![],
+    )
+    .map_err(|error| error.to_string())?;
+    cache.bind_authoritative_snapshot(&snapshot);
+    Ok(())
 }
 
 #[async_trait]
@@ -1792,18 +1859,23 @@ mod tests {
     async fn placement_signs_canonical_v3_message_and_posts_exact_body() {
         let transport = MockTransport::with_response(Ok(HttpResponse {
             status: 200,
-            body: r#"{"orderId":4770039,"clientOrderId":"g_0_B_fixed"}"#.into(),
+            body: r#"{
+                "symbol":"ANSEMUSDT","orderId":4770039,
+                "clientOrderId":"g_0_B_fixed","price":"0.38","origQty":"100",
+                "executedQty":"0","status":"NEW","timeInForce":"GTC",
+                "type":"LIMIT","side":"BUY","reduceOnly":true,
+                "updateTime":1700000000123
+            }"#
+            .into(),
         }));
         let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
-        let acknowledgement = adapter(transport.clone(), signer.clone())
-            .place_order(&intent())
-            .await
-            .unwrap();
+        let gateway = adapter(transport.clone(), signer.clone());
+        let acknowledgement = gateway.place_order(&intent()).await.unwrap();
         let request = transport.request();
 
         let expected_message = concat!(
             "symbol=ANSEMUSDT&side=BUY&type=LIMIT&quantity=100&reduceOnly=true&",
-            "price=0.38&timeInForce=GTC&newClientOrderId=g_0_B_fixed&",
+            "price=0.38&timeInForce=GTC&newClientOrderId=g_0_B_fixed&newOrderRespType=RESULT&",
             "nonce=1700000000123456&user=0x1111111111111111111111111111111111111111&",
             "signer=0x2222222222222222222222222222222222222222"
         );
@@ -1819,6 +1891,62 @@ mod tests {
             request.body_string(),
             format!("{expected_message}&signature=0xfixed-signature")
         );
+
+        let new_event = serde_json::from_str(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1700000000130,"T":1700000000130,
+            "o":{"s":"ANSEMUSDT","c":"g_0_B_fixed","S":"BUY","o":"LIMIT",
+            "f":"GTC","q":"100","p":"0.38","x":"NEW","X":"NEW","i":4770039,
+            "l":"0","z":"0","L":"0","R":true,"T":1700000000130}}"#,
+        )
+        .unwrap();
+        gateway.realtime_execution_cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(&new_event, Exchange::Aster)
+                .unwrap(),
+        );
+        let fill_event = serde_json::from_str(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1700000000140,"T":1700000000140,
+            "o":{"s":"ANSEMUSDT","c":"g_0_B_fixed","S":"BUY","o":"LIMIT",
+            "f":"GTC","q":"100","p":"0.38","x":"TRADE","X":"FILLED","i":4770039,
+            "l":"100","z":"100","L":"0.38","N":"USDT","n":"0.0076",
+            "R":true,"T":1700000000140,"t":581271,"m":true,"rp":"0"}}"#,
+        )
+        .unwrap();
+        gateway.realtime_execution_cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(&fill_event, Exchange::Aster)
+                .unwrap(),
+        );
+        let snapshot = gateway
+            .execution_snapshot(
+                Exchange::Aster,
+                "ANSEMUSDT",
+                &intent().client_order_id,
+                "4770039",
+            )
+            .await
+            .expect("the RESULT acknowledgement must make the first fill authoritative");
+        assert_eq!(snapshot.order_time_ms, 1_700_000_000_123);
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(100, 0));
+        assert_eq!(transport.all_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn placement_keeps_an_authoritative_ack_when_result_details_are_absent() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"orderId":4770039,"clientOrderId":"g_0_B_fixed"}"#.into(),
+        }));
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+        let gateway = adapter(transport.clone(), signer);
+
+        let acknowledgement = gateway.place_order(&intent()).await.unwrap();
+
+        assert_eq!(acknowledgement.exchange_order_id, "4770039");
+        assert!(
+            !gateway
+                .realtime_execution_cache
+                .knows_order("ANSEMUSDT", &acknowledgement.exchange_order_id)
+        );
+        assert_eq!(transport.all_requests().len(), 1);
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ use crate::{
     domain::Exchange,
     engine::{
         PreparedStrategyStep, RuntimeBuildError, RuntimeCoordinator, RuntimeRecoveryError,
-        RuntimeRecoveryProvider, RuntimeSettings,
+        RuntimeRecoveryProvider, RuntimeSettings, SubmissionResult,
     },
     exchange::{
         aster::LocalEip712Signer,
@@ -53,6 +53,7 @@ const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
 const DEFAULT_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const DEFAULT_SUBMISSIONS_PER_TICK: usize = 100;
 const EXECUTION_EVENT_RETRY_DELAY: Duration = Duration::from_millis(125);
+const REPLACEMENT_ACK_SLO_MS: u64 = 1_000;
 
 pub fn app() -> Router {
     build_app(
@@ -488,19 +489,52 @@ fn log_runtime_advance(
         }
         Ok(PreparedStrategyStep::Active(report)) => {
             if execution_event {
+                let completed_at_ms = system_time_ms();
                 let event_to_submit_ms =
-                    event.and_then(|event| system_time_ms()?.checked_sub(event.observed_at_ms));
+                    event.and_then(|event| completed_at_ms?.checked_sub(event.observed_at_ms));
+                let exchange_to_observed_ms = event.and_then(|event| {
+                    event
+                        .exchange_event_time_ms
+                        .and_then(|exchange_time| event.observed_at_ms.checked_sub(exchange_time))
+                });
+                let exchange_to_submit_ms = event.and_then(|event| {
+                    event
+                        .exchange_event_time_ms
+                        .and_then(|exchange_time| completed_at_ms?.checked_sub(exchange_time))
+                });
+                let accepted_submissions = report
+                    .submissions
+                    .iter()
+                    .filter(|submission| {
+                        matches!(&submission.result, SubmissionResult::Accepted { .. })
+                    })
+                    .count();
                 tracing::info!(
                     run_id = advance.run_id.as_str(),
                     exchange = ?event.map(|event| event.exchange),
                     symbol = event.map(|event| event.symbol.as_str()).unwrap_or("-"),
                     execution_syncs = report.execution_syncs,
                     submissions = report.submissions.len(),
+                    accepted_submissions,
                     event_to_submit_ms,
+                    exchange_to_observed_ms,
+                    exchange_to_submit_ms,
                     event_queue_ms,
                     coalesced_events,
                     "execution WebSocket wakeup processed"
                 );
+                if accepted_submissions > 0
+                    && event_to_submit_ms.is_some_and(|elapsed| elapsed > REPLACEMENT_ACK_SLO_MS)
+                {
+                    tracing::warn!(
+                        run_id = advance.run_id.as_str(),
+                        exchange = ?event.map(|event| event.exchange),
+                        symbol = event.map(|event| event.symbol.as_str()).unwrap_or("-"),
+                        event_to_submit_ms,
+                        replacement_ack_slo_ms = REPLACEMENT_ACK_SLO_MS,
+                        "replacement acknowledgement exceeded latency SLO"
+                    );
+                }
             }
             if report.is_blocked() {
                 let representative = report
