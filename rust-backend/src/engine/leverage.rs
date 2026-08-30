@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-    domain::Exchange,
+    domain::{Exchange, is_valid_symbol_for_exchange},
     exchange::{
         LeverageAcknowledgement, LeverageError, LeverageGateway, PositionSnapshotGateway,
         SnapshotError,
@@ -25,13 +25,10 @@ pub async fn ensure_symbol_leverage<G>(
 where
     G: LeverageGateway + PositionSnapshotGateway,
 {
-    if symbol.trim().is_empty()
-        || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        || !(1..=125).contains(&expected_leverage)
-    {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if !is_valid_symbol_for_exchange(exchange, &symbol) || !(1..=125).contains(&expected_leverage) {
         return Err(LeveragePreflightError::InvalidInput);
     }
-    let symbol = symbol.to_ascii_uppercase();
     let (position_quantity, before) =
         observed_position_and_leverage(gateway, exchange, &symbol).await?;
     if before == expected_leverage {

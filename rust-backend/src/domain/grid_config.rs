@@ -107,7 +107,7 @@ pub struct GridConfig {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum GridConfigError {
-    #[error("symbol must contain only uppercase ASCII letters and digits")]
+    #[error("symbol is invalid for the selected exchange")]
     InvalidSymbol,
     #[error("price bounds must be positive and upper_price must exceed lower_price")]
     InvalidRange,
@@ -125,12 +125,11 @@ pub enum GridConfigError {
 
 impl GridConfig {
     pub fn validate(&self) -> Result<(), GridConfigError> {
-        if self.symbol.is_empty()
-            || !self
-                .symbol
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        {
+        let valid_symbol = self.exchange.map_or_else(
+            || super::is_valid_symbol_text(&self.symbol) && self.symbol.is_ascii(),
+            |exchange| super::is_valid_symbol_for_exchange(exchange, &self.symbol),
+        );
+        if !valid_symbol {
             return Err(GridConfigError::InvalidSymbol);
         }
         if self.lower_price <= Decimal::ZERO || self.upper_price <= self.lower_price {
@@ -215,5 +214,16 @@ mod tests {
         let mut config = fixed_config();
         config.leverage = 126;
         assert_eq!(config.validate(), Err(GridConfigError::InvalidLeverage));
+    }
+
+    #[test]
+    fn aster_accepts_exchange_published_unicode_symbol_only() {
+        let mut config = fixed_config();
+        config.exchange = Some(Exchange::Aster);
+        config.symbol = "牛来USDT".into();
+        assert_eq!(config.validate(), Ok(()));
+
+        config.exchange = Some(Exchange::Binance);
+        assert_eq!(config.validate(), Err(GridConfigError::InvalidSymbol));
     }
 }

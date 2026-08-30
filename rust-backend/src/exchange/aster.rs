@@ -19,7 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
 
 use crate::{
-    domain::{ClientOrderId, Exchange, OrderIntent},
+    domain::{ClientOrderId, Exchange, OrderIntent, is_valid_symbol_for_exchange},
     exchange::{
         AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
         CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
@@ -91,13 +91,11 @@ where
         if exchange != Exchange::Aster {
             return Err(invalid_leverage("request belongs to another exchange"));
         }
-        if symbol.trim().is_empty()
-            || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            || !(1..=125).contains(&leverage)
+        let symbol = symbol.trim().to_ascii_uppercase();
+        if !is_valid_symbol_for_exchange(Exchange::Aster, &symbol) || !(1..=125).contains(&leverage)
         {
             return Err(invalid_leverage("symbol or leverage is invalid"));
         }
-        let symbol = symbol.to_ascii_uppercase();
         let request = self
             .signed_request(
                 HttpMethod::Post,

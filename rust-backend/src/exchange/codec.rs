@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::{
     domain::{
         ClientOrderId, Exchange, InstrumentRules, OrderKind, OrderShape, OrderSide, QuantityRules,
-        TerminalOrderStatus, TimeInForce,
+        TerminalOrderStatus, TimeInForce, normalize_symbol_for_exchange,
     },
     exchange::{
         AccountBalanceSnapshot, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
@@ -331,7 +331,7 @@ pub(super) fn validate_snapshot_request(
     if actual_exchange != expected_exchange {
         return Err(SnapshotError::new("snapshot belongs to another exchange"));
     }
-    if symbol.trim().is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+    if normalize_symbol_for_exchange(expected_exchange, symbol).is_none() {
         return Err(SnapshotError::new("snapshot symbol is invalid"));
     }
     Ok(())
@@ -836,6 +836,14 @@ fn optional_positive_u16(value: &Value, field: &'static str) -> Result<Option<u1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_symbol_validation_allows_unicode_for_aster_only() {
+        assert!(validate_snapshot_request(Exchange::Aster, Exchange::Aster, "牛来USDT").is_ok());
+        assert!(
+            validate_snapshot_request(Exchange::Binance, Exchange::Binance, "牛来USDT").is_err()
+        );
+    }
 
     #[test]
     fn account_balance_parser_preserves_authoritative_totals_and_scale() {

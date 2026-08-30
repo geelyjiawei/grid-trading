@@ -67,12 +67,7 @@ impl CancellationIntent {
         if self.exchange_order_id.trim().is_empty() {
             return Err(CancellationIntentError::MissingExchangeOrderId);
         }
-        if self.symbol.is_empty()
-            || !self
-                .symbol
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        {
+        if !super::is_valid_symbol_for_exchange(self.exchange, &self.symbol) {
             return Err(CancellationIntentError::InvalidSymbol);
         }
         if self.updated_at_ms < self.created_at_ms {
@@ -95,7 +90,7 @@ pub enum CancellationIntentError {
     InvalidClientOrderId(#[from] crate::domain::OrderIntentError),
     #[error("exchange order ID is required")]
     MissingExchangeOrderId,
-    #[error("symbol must contain only uppercase ASCII letters and digits")]
+    #[error("symbol is invalid for the selected exchange")]
     InvalidSymbol,
     #[error("updated timestamp precedes created timestamp")]
     InvalidTimestamp,
@@ -136,5 +131,24 @@ mod tests {
             ),
             Err(CancellationIntentError::MissingExchangeOrderId)
         ));
+    }
+
+    #[test]
+    fn aster_unicode_symbol_can_be_cancelled_without_relaxing_binance() {
+        let client_order_id = ClientOrderId::parse("g_unicode_cancel").unwrap();
+        assert!(
+            CancellationIntent::prepare(
+                client_order_id.clone(),
+                "42",
+                Exchange::Aster,
+                "牛来USDT",
+                100,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            CancellationIntent::prepare(client_order_id, "42", Exchange::Binance, "牛来USDT", 100,),
+            Err(CancellationIntentError::InvalidSymbol)
+        );
     }
 }

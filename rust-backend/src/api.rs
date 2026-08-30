@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::{
-    domain::{Exchange, GridConfig, OrderSide},
+    domain::{Exchange, GridConfig, OrderSide, normalize_symbol_for_exchange},
     engine::{
         ArmedStrategyLifecycle, FeeValuationSource, FileStrategyStartError, LeveragePreflightError,
         MarketSnapshot, PreparedStrategyKind, PreparedStrategyLifecycle,
@@ -1067,11 +1067,11 @@ async fn stop_grid_web(
     if let Err(response) = parse_json_object(&body) {
         return *response;
     }
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let exchange = selected_exchange(&state, selection);
     execute_stop_grid(state, key, method, uri, body, exchange, symbol).await
 }
 
@@ -1318,11 +1318,11 @@ async fn grid_symbol_status(
     Path(symbol): Path<String>,
     Query(selection): Query<ExchangeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let exchange = selected_exchange(&state, selection);
     let (catalog, runtime_entries) = match stable_runtime_catalog(&state).await {
         Ok(snapshot) => snapshot,
         Err(response) => return response,
@@ -1622,13 +1622,13 @@ async fn strategy_trades(
     Path(symbol): Path<String>,
     Query(selection): Query<TradeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
-        Ok(symbol) => symbol,
-        Err(error) => return error.response(),
-    };
     let exchange = selection
         .exchange
         .unwrap_or_else(|| state.exchange_gateways.preferred());
+    let symbol = match normalize_symbol(exchange, &symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
     let limit = match validated_limit(selection.limit, 100, 1_000) {
         Ok(limit) => limit,
         Err(response) => return *response,
@@ -2897,11 +2897,11 @@ async fn exchange_price(
     Path(symbol): Path<String>,
     Query(selection): Query<ExchangeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let exchange = selected_exchange(&state, selection);
     let gateway = match read_gateway(&state, exchange) {
         Ok(gateway) => gateway,
         Err(error) => return error.response(),
@@ -2929,11 +2929,11 @@ async fn exchange_fee_rates(
     Path(symbol): Path<String>,
     Query(selection): Query<ExchangeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let exchange = selected_exchange(&state, selection);
     let gateway = match read_gateway(&state, exchange) {
         Ok(gateway) => gateway,
         Err(error) => return error.response(),
@@ -2969,11 +2969,11 @@ async fn exchange_positions(
     Path(symbol): Path<String>,
     Query(selection): Query<ExchangeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let exchange = selected_exchange(&state, selection);
     let gateway = match read_gateway(&state, exchange) {
         Ok(gateway) => gateway,
         Err(error) => return error.response(),
@@ -2997,11 +2997,11 @@ async fn exchange_open_orders(
     Path(symbol): Path<String>,
     Query(selection): Query<ExchangeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let exchange = selected_exchange(&state, selection);
     let gateway = match read_gateway(&state, exchange) {
         Ok(gateway) => gateway,
         Err(error) => return error.response(),
@@ -3091,10 +3091,6 @@ async fn exchange_order_history(
     Path(symbol): Path<String>,
     Query(selection): Query<TradeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
-        Ok(symbol) => symbol,
-        Err(error) => return error.response(),
-    };
     let limit = selection.limit.unwrap_or(50);
     if !(1..=1_000).contains(&limit) {
         return api_error(
@@ -3109,6 +3105,10 @@ async fn exchange_order_history(
             exchange: selection.exchange,
         },
     );
+    let symbol = match normalize_symbol(exchange, &symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
     let gateway = match read_gateway(&state, exchange) {
         Ok(gateway) => gateway,
         Err(error) => return error.response(),
@@ -3423,7 +3423,8 @@ async fn exchange_risk(
     Path(symbol): Path<String>,
     Query(selection): Query<ExchangeSelection>,
 ) -> Response {
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
@@ -3441,7 +3442,6 @@ async fn exchange_risk(
             return response;
         }
     };
-    let exchange = selected_exchange(&state, selection);
     let gateway = match read_gateway(&state, exchange) {
         Ok(gateway) => gateway,
         Err(error) => return error.response(),
@@ -3747,11 +3747,11 @@ async fn cancel_orphan_orders_web(
     if let Err(response) = parse_json_object(&body) {
         return *response;
     }
-    let symbol = match normalize_symbol(&symbol) {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let exchange = selected_exchange(&state, selection);
     let command_state = state.clone();
     let command = Arc::clone(&state.cancel_orders_command);
 
@@ -4006,14 +4006,8 @@ fn read_gateway(
     })
 }
 
-fn normalize_symbol(value: &str) -> Result<String, ReadApiError> {
-    if value.is_empty()
-        || value.len() > 32
-        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return Err(ReadApiError::InvalidSymbol);
-    }
-    Ok(value.to_ascii_uppercase())
+fn normalize_symbol(exchange: Exchange, value: &str) -> Result<String, ReadApiError> {
+    normalize_symbol_for_exchange(exchange, value).ok_or(ReadApiError::InvalidSymbol)
 }
 
 fn decimal_json_number(value: rust_decimal::Decimal) -> Result<f64, ReadApiError> {

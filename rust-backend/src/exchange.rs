@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::domain::{
     ClientOrderId, Exchange, InstrumentRules, OrderIntent, OrderShape, TerminalOrderStatus,
+    is_valid_symbol_for_exchange,
 };
 
 pub(crate) fn strategy_client_order_id(
@@ -229,8 +230,7 @@ impl HistoricalOrder {
                 .exchange_order_id
                 .bytes()
                 .all(|byte| byte.is_ascii_graphic())
-            || self.symbol.is_empty()
-            || !self.symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !is_valid_symbol_for_exchange(self.exchange, &self.symbol)
             || self.price < Decimal::ZERO
             || self.quantity <= Decimal::ZERO
             || self.status.is_empty()
@@ -426,8 +426,7 @@ pub struct TradingFeeRates {
 
 impl TradingFeeRates {
     pub fn validate(&self) -> Result<(), SnapshotError> {
-        if self.symbol.is_empty()
-            || !self.symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        if !is_valid_symbol_for_exchange(self.exchange, &self.symbol)
             || self.maker_rate <= -Decimal::ONE
             || self.maker_rate >= Decimal::ONE
             || self.taker_rate < Decimal::ZERO

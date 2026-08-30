@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::{
-    domain::{Exchange, InstrumentRules},
+    domain::{Exchange, InstrumentRules, is_valid_symbol_for_exchange},
     exchange::{
         InstrumentRulesGateway, MarketSnapshotGateway, PositionSnapshotGateway, SnapshotError,
     },
@@ -85,10 +85,10 @@ where
     if maximum_market_age_ms == 0 {
         return Err(StrategyInputError::InvalidFreshnessWindow);
     }
-    if symbol.trim().is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if !is_valid_symbol_for_exchange(exchange, &symbol) {
         return Err(StrategyInputError::InvalidSymbol);
     }
-    let symbol = symbol.to_ascii_uppercase();
     let collection_started = Instant::now();
     let (market, instrument_rules, position) = tokio::try_join!(
         gateway.market_snapshot(exchange, &symbol),

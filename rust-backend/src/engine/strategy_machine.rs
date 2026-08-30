@@ -360,7 +360,7 @@ impl StrategyState {
         let exchange = config.exchange.ok_or(StrategyStateError::MissingExchange)?;
         let symbol = config.symbol.clone();
         let direction = config.direction;
-        validate_symbol(&symbol)?;
+        validate_symbol(exchange, &symbol)?;
         baseline.validate()?;
         baseline.validate_for_direction(direction)?;
         plan.validate_snapshot(&config, &instrument_rules)
@@ -572,7 +572,7 @@ impl StrategyState {
         self.instrument_rules
             .validate()
             .map_err(StrategyStateError::InvalidInstrument)?;
-        validate_symbol(&self.symbol)?;
+        validate_symbol(self.exchange, &self.symbol)?;
         if self.config.exchange != Some(self.exchange)
             || self.config.symbol != self.symbol
             || self.config.direction != self.direction
@@ -1182,12 +1182,8 @@ fn generated_client_order_id(
     ClientOrderId::parse(value).map_err(StrategyStateError::InvalidOrderIntent)
 }
 
-fn validate_symbol(symbol: &str) -> Result<(), StrategyStateError> {
-    if symbol.is_empty()
-        || !symbol
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-    {
+fn validate_symbol(exchange: Exchange, symbol: &str) -> Result<(), StrategyStateError> {
+    if !crate::domain::is_valid_symbol_for_exchange(exchange, symbol) {
         return Err(StrategyStateError::InvalidSymbol);
     }
     Ok(())

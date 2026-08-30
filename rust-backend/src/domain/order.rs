@@ -66,12 +66,7 @@ pub struct OrderShape {
 
 impl OrderShape {
     pub fn validate(&self) -> Result<(), OrderIntentError> {
-        if self.symbol.is_empty()
-            || !self
-                .symbol
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        {
+        if !super::is_valid_symbol_text(&self.symbol) {
             return Err(OrderIntentError::InvalidSymbol);
         }
         if self.quantity <= Decimal::ZERO {
@@ -172,6 +167,9 @@ impl OrderIntent {
         now_ms: u64,
     ) -> Result<Self, OrderIntentError> {
         shape.validate()?;
+        if !super::is_valid_symbol_for_exchange(exchange, &shape.symbol) {
+            return Err(OrderIntentError::InvalidSymbol);
+        }
         Ok(Self {
             client_order_id,
             exchange,
@@ -185,6 +183,9 @@ impl OrderIntent {
     pub fn validate(&self) -> Result<(), OrderIntentError> {
         ClientOrderId::parse(self.client_order_id.as_str())?;
         self.shape.validate()?;
+        if !super::is_valid_symbol_for_exchange(self.exchange, &self.shape.symbol) {
+            return Err(OrderIntentError::InvalidSymbol);
+        }
         self.state.validate()?;
         if self.updated_at_ms < self.created_at_ms {
             return Err(OrderIntentError::InvalidTimestamp);
@@ -197,7 +198,7 @@ impl OrderIntent {
 pub enum OrderIntentError {
     #[error("client order ID must be 1-36 ASCII letters, digits, underscores, or hyphens")]
     InvalidClientOrderId,
-    #[error("symbol must contain only uppercase ASCII letters and digits")]
+    #[error("symbol is invalid for the selected exchange")]
     InvalidSymbol,
     #[error("quantity must be positive")]
     InvalidQuantity,
@@ -269,6 +270,38 @@ mod tests {
         assert_eq!(
             intent.validate(),
             Err(OrderIntentError::InvalidStateMetadata)
+        );
+    }
+
+    #[test]
+    fn aster_order_intent_preserves_unicode_symbol_without_relaxing_binance() {
+        let shape = OrderShape {
+            symbol: "牛来USDT".into(),
+            side: OrderSide::Buy,
+            price: Some(Decimal::new(1, 1)),
+            quantity: Decimal::ONE,
+            reduce_only: false,
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::Gtc,
+        };
+
+        assert!(
+            OrderIntent::prepare(
+                ClientOrderId::parse("g_unicode_aster").unwrap(),
+                Exchange::Aster,
+                shape.clone(),
+                100,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            OrderIntent::prepare(
+                ClientOrderId::parse("g_unicode_binance").unwrap(),
+                Exchange::Binance,
+                shape,
+                100,
+            ),
+            Err(OrderIntentError::InvalidSymbol)
         );
     }
 }

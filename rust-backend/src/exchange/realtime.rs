@@ -22,7 +22,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     domain::{
-        ClientOrderId, Exchange, OrderKind, OrderShape, OrderSide, TerminalOrderStatus, TimeInForce,
+        ClientOrderId, Exchange, OrderKind, OrderShape, OrderSide, TerminalOrderStatus,
+        TimeInForce, is_valid_symbol_for_exchange,
     },
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, OrderExecutionSnapshot, OrderLifecycle, TradeFill,
@@ -601,7 +602,7 @@ pub(crate) fn publish_execution_wakeup(
     exchange_event_time_ms: Option<u64>,
 ) {
     let symbol = symbol.trim().to_ascii_uppercase();
-    if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+    if !is_valid_symbol_for_exchange(exchange, &symbol) {
         return;
     }
     let observed_at_ms = SystemTime::now()
@@ -899,7 +900,7 @@ pub(crate) fn parse_futures_order_update(
     (message.get("e").and_then(Value::as_str) == Some("ORDER_TRADE_UPDATE")).then_some(())?;
     let row = message.get("o")?;
     let symbol = row.get("s")?.as_str()?.to_ascii_uppercase();
-    if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+    if !is_valid_symbol_for_exchange(exchange, &symbol) {
         return None;
     }
     let client_order_id = ClientOrderId::parse(row.get("c")?.as_str()?.to_owned()).ok()?;
@@ -1661,6 +1662,18 @@ mod tests {
         let trade = update.trade.unwrap();
         assert_eq!(trade.raw_commission, "-0.0076".parse().unwrap());
         assert_eq!(trade.commission_cost, "0.0076".parse().unwrap());
+    }
+
+    #[test]
+    fn aster_unicode_order_update_is_not_dropped() {
+        let message = serde_json::from_str::<Value>(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1010,"T":1010,"o":{"s":"牛来USDT","c":"g_unicode_aster","S":"BUY","o":"LIMIT","f":"GTC","q":"1","p":"0.1","x":"NEW","X":"NEW","i":42,"l":"0","z":"0","L":"0","R":false,"T":1010}}"#,
+        )
+        .unwrap();
+
+        let update = parse_futures_order_update(&message, Exchange::Aster).unwrap();
+        assert_eq!(update.order.shape.symbol, "牛来USDT");
+        assert!(parse_futures_order_update(&message, Exchange::Binance).is_none());
     }
 
     #[tokio::test]
