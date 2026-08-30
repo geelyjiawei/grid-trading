@@ -20,6 +20,8 @@ use super::{
     execution_accounting::{ExecutionAuditRecord, FeeValuationSource, ValuedExecutionReport},
 };
 
+const ASTER_TRADE_TIMESTAMP_ROUNDING_TOLERANCE_MS: u64 = 100;
+
 fn one_u64() -> u64 {
     1
 }
@@ -1688,6 +1690,13 @@ fn validate_execution_audit_payload(
     let mut trade_quantity = Decimal::ZERO;
     let mut trade_quote = Decimal::ZERO;
     let mut fees_by_asset = BTreeMap::new();
+    let earliest_trade_time_ms = if strategy_exchange == Exchange::Aster {
+        snapshot
+            .order_time_ms
+            .saturating_sub(ASTER_TRADE_TIMESTAMP_ROUNDING_TOLERANCE_MS)
+    } else {
+        snapshot.order_time_ms
+    };
     for trade in &snapshot.trades {
         if trades.insert(trade.trade_id.as_str(), trade).is_some()
             || !is_valid_trade_id(&trade.trade_id)
@@ -1699,7 +1708,7 @@ fn validate_execution_audit_payload(
             || trade.quote_quantity <= Decimal::ZERO
             || trade.commission_cost < Decimal::ZERO
             || trade.commission_asset.is_empty()
-            || trade.trade_time_ms < snapshot.order_time_ms
+            || trade.trade_time_ms < earliest_trade_time_ms
             || trade.trade_time_ms > snapshot.update_time_ms
         {
             return Err(StrategyStateError::InvalidExecutionAudit);
@@ -5185,6 +5194,81 @@ mod tests {
             }],
         };
         (snapshot, valued)
+    }
+
+    #[test]
+    fn aster_trade_timestamp_rounding_tolerance_is_bounded_and_exchange_scoped() {
+        let mut machine = small_neutral_risk_machine();
+        let client_order_id = machine
+            .store()
+            .snapshot()
+            .orders
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        accept_strategy_order(&mut machine, &client_order_id, "aster-time-order", 101);
+        let trade_time_ms = 1_000;
+        let price = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&client_order_id)
+            .unwrap()
+            .shape
+            .price
+            .unwrap();
+        let (snapshot, valued) = single_valued_trade(
+            &machine,
+            client_order_id.clone(),
+            ValuedTradeFixture {
+                exchange_order_id: "aster-time-order",
+                trade_id: "aster-time-trade",
+                price,
+                quantity: Decimal::ONE,
+                trade_time_ms,
+                applied_at_ms: 2_000,
+            },
+        );
+        let order = machine
+            .store()
+            .snapshot()
+            .orders
+            .get(&client_order_id)
+            .unwrap()
+            .clone();
+        let validate = |exchange, early_by_ms| {
+            let mut snapshot = snapshot.clone();
+            snapshot.order.exchange = exchange;
+            snapshot.order_time_ms = trade_time_ms + early_by_ms;
+            snapshot.update_time_ms = snapshot.order_time_ms + 1;
+            validate_execution_audit_payload(
+                exchange,
+                &order,
+                &ExecutionAuditRecord {
+                    snapshot,
+                    fee_valuations: valued.fee_valuations.clone(),
+                    synced_at_ms: 2_000,
+                },
+                valued.report.cumulative_quantity,
+                valued.report.cumulative_quote,
+                valued.report.cumulative_fee,
+                valued.report.terminal_status,
+            )
+        };
+
+        assert_eq!(validate(Exchange::Aster, 27), Ok(()));
+        assert_eq!(
+            validate(
+                Exchange::Aster,
+                ASTER_TRADE_TIMESTAMP_ROUNDING_TOLERANCE_MS + 1
+            ),
+            Err(StrategyStateError::InvalidExecutionAudit)
+        );
+        assert_eq!(
+            validate(Exchange::Binance, 1),
+            Err(StrategyStateError::InvalidExecutionAudit)
+        );
     }
 
     fn small_neutral_risk_machine() -> StrategyMachine<MemoryStrategyStateStore> {
