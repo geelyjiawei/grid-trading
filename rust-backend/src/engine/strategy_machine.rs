@@ -2525,7 +2525,15 @@ fn apply_valued_execution_to_state(
                 Some((&valued.report.client_order_id, &candidate)),
             )
         });
-    if audit_validation.is_err() {
+    if let Err(error) = audit_validation {
+        tracing::error!(
+            run_id = next.run_id.as_str(),
+            symbol = next.symbol.as_str(),
+            client_order_id = valued.report.client_order_id.as_str(),
+            exchange_order_id = valued.report.exchange_order_id.as_str(),
+            error = %error,
+            "valued execution audit rejected"
+        );
         return fail_transition(next, "valued execution audit is invalid");
     }
     let previous_trade_count = next

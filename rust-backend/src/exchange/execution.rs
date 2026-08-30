@@ -29,6 +29,12 @@ pub(super) struct OrderExecutionHeader {
     pub update_time_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ReconstructableOrderExecutionHeader {
+    pub header: OrderExecutionHeader,
+    pub cumulative_quote_needs_reconstruction: bool,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(super) enum ExecutionCodecError {
     #[error("execution response is not valid JSON: {0}")]
@@ -50,6 +56,42 @@ pub(super) fn parse_order_execution_header(
     expected_client_order_id: &ClientOrderId,
     expected_exchange_order_id: &str,
 ) -> Result<OrderExecutionHeader, ExecutionCodecError> {
+    parse_order_execution_header_inner(
+        body,
+        exchange,
+        expected_symbol,
+        expected_client_order_id,
+        expected_exchange_order_id,
+        false,
+    )
+    .map(|parsed| parsed.header)
+}
+
+pub(super) fn parse_reconstructable_order_execution_header(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_client_order_id: &ClientOrderId,
+    expected_exchange_order_id: &str,
+) -> Result<ReconstructableOrderExecutionHeader, ExecutionCodecError> {
+    parse_order_execution_header_inner(
+        body,
+        exchange,
+        expected_symbol,
+        expected_client_order_id,
+        expected_exchange_order_id,
+        true,
+    )
+}
+
+fn parse_order_execution_header_inner(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_client_order_id: &ClientOrderId,
+    expected_exchange_order_id: &str,
+    allow_trade_quote_reconstruction: bool,
+) -> Result<ReconstructableOrderExecutionHeader, ExecutionCodecError> {
     if expected_exchange_order_id.trim().is_empty() {
         return Err(ExecutionCodecError::OrderIdentityMismatch);
     }
@@ -67,7 +109,11 @@ pub(super) fn parse_order_execution_header(
     }
     let value = parse_json(body)?;
     let cumulative_quantity = required_decimal(&value, "executedQty")?;
-    let cumulative_quote = required_decimal(&value, "cumQuote")?;
+    let reported_cumulative_quote = optional_decimal(&value, "cumQuote")?;
+    let cumulative_quote_needs_reconstruction = allow_trade_quote_reconstruction
+        && cumulative_quantity > Decimal::ZERO
+        && reported_cumulative_quote.is_none_or(|quote| quote.is_zero());
+    let cumulative_quote = reported_cumulative_quote.unwrap_or(Decimal::ZERO);
     let order_time_ms = required_u64(&value, "time")?;
     let update_time_ms = required_u64(&value, "updateTime")?;
     if cumulative_quantity < Decimal::ZERO
@@ -76,7 +122,10 @@ pub(super) fn parse_order_execution_header(
         || order_time_ms == 0
         || update_time_ms < order_time_ms
         || (cumulative_quantity.is_zero() && !cumulative_quote.is_zero())
-        || (cumulative_quantity > Decimal::ZERO && cumulative_quote <= Decimal::ZERO)
+        || (!allow_trade_quote_reconstruction && reported_cumulative_quote.is_none())
+        || (cumulative_quantity > Decimal::ZERO
+            && cumulative_quote <= Decimal::ZERO
+            && !cumulative_quote_needs_reconstruction)
     {
         return Err(ExecutionCodecError::InvalidField("orderExecutionTotals"));
     }
@@ -102,12 +151,15 @@ pub(super) fn parse_order_execution_header(
         }
         _ => {}
     }
-    Ok(OrderExecutionHeader {
-        order,
-        cumulative_quantity,
-        cumulative_quote,
-        order_time_ms,
-        update_time_ms,
+    Ok(ReconstructableOrderExecutionHeader {
+        header: OrderExecutionHeader {
+            order,
+            cumulative_quantity,
+            cumulative_quote,
+            order_time_ms,
+            update_time_ms,
+        },
+        cumulative_quote_needs_reconstruction,
     })
 }
 

@@ -10,6 +10,7 @@ use async_trait::async_trait;
 #[cfg(not(test))]
 use futures::{SinkExt, StreamExt};
 use k256::ecdsa::SigningKey;
+use rust_decimal::Decimal;
 #[cfg(not(test))]
 use serde_json::Value;
 use sha3::{Digest, Keccak256};
@@ -40,7 +41,8 @@ use crate::{
         },
         execution::{
             CommissionConvention, assemble_execution_snapshot, numeric_trade_id,
-            parse_historical_minute_open, parse_order_execution_header, parse_trade_page,
+            parse_historical_minute_open, parse_reconstructable_order_execution_header,
+            parse_trade_page,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -1132,7 +1134,7 @@ where
             .execute_snapshot(detail_request, "Aster execution order snapshot")
             .await
             .map_err(|error| execution_error(error.to_string()))?;
-        let header = parse_order_execution_header(
+        let parsed_header = parse_reconstructable_order_execution_header(
             &detail_body,
             Exchange::Aster,
             &symbol,
@@ -1140,6 +1142,7 @@ where
             exchange_order_id,
         )
         .map_err(|error| execution_error(format!("invalid Aster order totals: {error}")))?;
+        let mut header = parsed_header.header;
         if header.cumulative_quantity.is_zero() {
             let snapshot = assemble_execution_snapshot(header, vec![])
                 .map_err(|error| execution_error(error.to_string()))?;
@@ -1273,6 +1276,14 @@ where
                 break;
             }
             window_start = window_end + 1;
+        }
+        if parsed_header.cumulative_quote_needs_reconstruction {
+            header.cumulative_quote = trades
+                .iter()
+                .try_fold(Decimal::ZERO, |total, trade| {
+                    total.checked_add(trade.quote_quantity)
+                })
+                .ok_or_else(|| execution_error("Aster trade quote total overflowed"))?;
         }
         let snapshot = assemble_execution_snapshot(header, trades)
             .map_err(|error| execution_error(format!("incomplete Aster execution: {error}")))?;
@@ -2061,6 +2072,49 @@ mod tests {
         assert_eq!(requests[1].path, "/fapi/v3/userTrades");
         assert!(requests[1].query_string().contains("startTime=700000"));
         assert!(requests[1].query_string().contains("endTime=1400000"));
+    }
+
+    #[tokio::test]
+    async fn aster_reconstructs_unavailable_order_quote_from_official_trade_history() {
+        let zero_quote = execution_order_detail("100", "0", "FILLED", 1_000_000, 1_100_000);
+        let missing_quote = zero_quote.replace(",\"cumQuote\":\"0\"", "");
+
+        for order_detail in [zero_quote, missing_quote] {
+            let transport = MockTransport::default();
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: order_detail,
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!("[{}]", aster_trade(7, "100", "38", 1_050_000)),
+                }),
+            ]);
+            let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+            let snapshot = adapter(transport.clone(), signer)
+                .execution_snapshot(
+                    Exchange::Aster,
+                    "ANSEMUSDT",
+                    &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                    "4770039",
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(snapshot.cumulative_quantity, Decimal::new(100, 0));
+            assert_eq!(snapshot.cumulative_quote, Decimal::new(38, 0));
+            assert_eq!(snapshot.trades.len(), 1);
+            assert_eq!(
+                transport
+                    .all_requests()
+                    .iter()
+                    .filter(|request| request.path == "/fapi/v3/userTrades")
+                    .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
