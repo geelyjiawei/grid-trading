@@ -445,6 +445,22 @@ pub(super) fn parse_authoritative_order(
     )
 }
 
+pub(super) fn parse_authoritative_order_without_execution_totals(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_client_order_id: &ClientOrderId,
+) -> Result<AuthoritativeOrder, CodecError> {
+    let value = parse_json(body)?;
+    parse_authoritative_order_value_inner(
+        &value,
+        exchange,
+        expected_symbol,
+        Some(expected_client_order_id),
+        false,
+    )
+}
+
 pub(super) fn parse_open_orders(
     body: &str,
     exchange: Exchange,
@@ -611,6 +627,22 @@ fn parse_authoritative_order_value(
     expected_symbol: &str,
     expected_client_order_id: Option<&ClientOrderId>,
 ) -> Result<AuthoritativeOrder, CodecError> {
+    parse_authoritative_order_value_inner(
+        value,
+        exchange,
+        expected_symbol,
+        expected_client_order_id,
+        true,
+    )
+}
+
+fn parse_authoritative_order_value_inner(
+    value: &Value,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_client_order_id: Option<&ClientOrderId>,
+    require_execution_totals: bool,
+) -> Result<AuthoritativeOrder, CodecError> {
     let symbol = required_string(value, "symbol")?.to_ascii_uppercase();
     if symbol != expected_symbol.to_ascii_uppercase() {
         return Err(CodecError::SymbolMismatch);
@@ -670,27 +702,36 @@ fn parse_authoritative_order_value(
         .map_err(|_| CodecError::InvalidField("orderShape"))?;
 
     let lifecycle = parse_lifecycle(required_string(value, "status")?)?;
-    let executed_quantity = required_decimal(value, "executedQty")?;
-    if executed_quantity < Decimal::ZERO || executed_quantity > quantity {
-        return Err(CodecError::InvalidField("executedQty"));
-    }
-    match lifecycle {
-        OrderLifecycle::Active(ActiveOrderStatus::New) if !executed_quantity.is_zero() => {
-            return Err(CodecError::InvalidField("status"));
+    let executed_quantity = if require_execution_totals {
+        let executed_quantity = required_decimal(value, "executedQty")?;
+        if executed_quantity < Decimal::ZERO || executed_quantity > quantity {
+            return Err(CodecError::InvalidField("executedQty"));
         }
-        OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
-            if executed_quantity <= Decimal::ZERO || executed_quantity >= quantity =>
-        {
-            return Err(CodecError::InvalidField("status"));
+        match lifecycle {
+            OrderLifecycle::Active(ActiveOrderStatus::New) if !executed_quantity.is_zero() => {
+                return Err(CodecError::InvalidField("status"));
+            }
+            OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+                if executed_quantity <= Decimal::ZERO || executed_quantity >= quantity =>
+            {
+                return Err(CodecError::InvalidField("status"));
+            }
+            OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+                if executed_quantity != quantity =>
+            {
+                return Err(CodecError::InvalidField("status"));
+            }
+            OrderLifecycle::Terminal(TerminalOrderStatus::Rejected)
+                if !executed_quantity.is_zero() =>
+            {
+                return Err(CodecError::InvalidField("status"));
+            }
+            _ => {}
         }
-        OrderLifecycle::Terminal(TerminalOrderStatus::Filled) if executed_quantity != quantity => {
-            return Err(CodecError::InvalidField("status"));
-        }
-        OrderLifecycle::Terminal(TerminalOrderStatus::Rejected) if !executed_quantity.is_zero() => {
-            return Err(CodecError::InvalidField("status"));
-        }
-        _ => {}
-    }
+        Some(executed_quantity)
+    } else {
+        None
+    };
 
     Ok(AuthoritativeOrder {
         client_order_id,
@@ -698,7 +739,7 @@ fn parse_authoritative_order_value(
         exchange,
         shape,
         lifecycle,
-        executed_quantity: Some(executed_quantity),
+        executed_quantity,
     })
 }
 

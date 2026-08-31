@@ -9,7 +9,10 @@ use crate::{
     exchange::{
         ActiveOrderStatus, AuthoritativeOrder, HistoricalMinutePrice, OrderExecutionSnapshot,
         OrderLifecycle, TradeFill,
-        codec::{CodecError, parse_authoritative_order},
+        codec::{
+            CodecError, parse_authoritative_order,
+            parse_authoritative_order_without_execution_totals,
+        },
         compare_trade_chronology,
     },
 };
@@ -33,6 +36,13 @@ pub(super) struct OrderExecutionHeader {
 pub(super) struct ReconstructableOrderExecutionHeader {
     pub header: OrderExecutionHeader,
     pub cumulative_quote_needs_reconstruction: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RecoverableOrderExecutionHeader {
+    pub order: AuthoritativeOrder,
+    pub order_time_ms: Option<u64>,
+    pub update_time_ms: Option<u64>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -82,6 +92,111 @@ pub(super) fn parse_reconstructable_order_execution_header(
         expected_exchange_order_id,
         true,
     )
+}
+
+pub(super) fn parse_recoverable_order_execution_header(
+    body: &str,
+    exchange: Exchange,
+    expected_symbol: &str,
+    expected_client_order_id: &ClientOrderId,
+    expected_exchange_order_id: &str,
+) -> Result<RecoverableOrderExecutionHeader, ExecutionCodecError> {
+    if expected_exchange_order_id.trim().is_empty() {
+        return Err(ExecutionCodecError::OrderIdentityMismatch);
+    }
+    let order = parse_authoritative_order_without_execution_totals(
+        body,
+        exchange,
+        expected_symbol,
+        expected_client_order_id,
+    )
+    .map_err(|_| ExecutionCodecError::InvalidField("order"))?;
+    if order.exchange_order_id != expected_exchange_order_id {
+        return Err(ExecutionCodecError::OrderIdentityMismatch);
+    }
+    let value = parse_json(body)?;
+    Ok(RecoverableOrderExecutionHeader {
+        order,
+        order_time_ms: optional_positive_u64(&value, "time"),
+        update_time_ms: optional_positive_u64(&value, "updateTime"),
+    })
+}
+
+pub(super) fn reconstruct_order_execution_header_from_trades(
+    mut recoverable: RecoverableOrderExecutionHeader,
+    trades: &[TradeFill],
+) -> Result<OrderExecutionHeader, ExecutionCodecError> {
+    let mut cumulative_quantity = Decimal::ZERO;
+    let mut cumulative_quote = Decimal::ZERO;
+    let mut first_trade_time_ms = None;
+    let mut last_trade_time_ms = None;
+    for trade in trades {
+        if trade.exchange_order_id != recoverable.order.exchange_order_id
+            || trade.symbol != recoverable.order.shape.symbol
+            || trade.side != recoverable.order.shape.side
+        {
+            return Err(ExecutionCodecError::OrderIdentityMismatch);
+        }
+        cumulative_quantity = cumulative_quantity
+            .checked_add(trade.quantity)
+            .ok_or(ExecutionCodecError::InvalidField("tradeQuantity"))?;
+        cumulative_quote = cumulative_quote
+            .checked_add(trade.quote_quantity)
+            .ok_or(ExecutionCodecError::InvalidField("tradeQuote"))?;
+        first_trade_time_ms = Some(
+            first_trade_time_ms.map_or(trade.trade_time_ms, |time: u64| {
+                time.min(trade.trade_time_ms)
+            }),
+        );
+        last_trade_time_ms = Some(last_trade_time_ms.map_or(trade.trade_time_ms, |time: u64| {
+            time.max(trade.trade_time_ms)
+        }));
+    }
+    if cumulative_quantity > recoverable.order.shape.quantity {
+        return Err(ExecutionCodecError::TotalsMismatch);
+    }
+    match recoverable.order.lifecycle {
+        OrderLifecycle::Active(ActiveOrderStatus::New) if !cumulative_quantity.is_zero() => {
+            return Err(ExecutionCodecError::InvalidField("status"));
+        }
+        OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+            if cumulative_quantity <= Decimal::ZERO
+                || cumulative_quantity >= recoverable.order.shape.quantity =>
+        {
+            return Err(ExecutionCodecError::InvalidField("status"));
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+            if cumulative_quantity != recoverable.order.shape.quantity =>
+        {
+            return Err(ExecutionCodecError::TotalsMismatch);
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Rejected)
+            if !cumulative_quantity.is_zero() =>
+        {
+            return Err(ExecutionCodecError::InvalidField("status"));
+        }
+        _ => {}
+    }
+
+    let order_time_ms = recoverable
+        .order_time_ms
+        .or(first_trade_time_ms)
+        .or(recoverable.update_time_ms)
+        .ok_or(ExecutionCodecError::InvalidField("orderTime"))?;
+    let update_time_ms = recoverable
+        .update_time_ms
+        .filter(|time| *time >= order_time_ms)
+        .unwrap_or(order_time_ms)
+        .max(last_trade_time_ms.unwrap_or(order_time_ms));
+    recoverable.order.executed_quantity = Some(cumulative_quantity);
+
+    Ok(OrderExecutionHeader {
+        order: recoverable.order,
+        cumulative_quantity,
+        cumulative_quote,
+        order_time_ms,
+        update_time_ms,
+    })
 }
 
 fn parse_order_execution_header_inner(
@@ -397,6 +512,14 @@ fn required_u64(value: &Value, field: &'static str) -> Result<u64, ExecutionCode
     required_scalar_text(value, field)?
         .parse::<u64>()
         .map_err(|_| ExecutionCodecError::InvalidField(field))
+}
+
+fn optional_positive_u64(value: &Value, field: &'static str) -> Option<u64> {
+    value
+        .get(field)
+        .and_then(scalar_text)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn required_bool(value: &Value, field: &'static str) -> Result<bool, ExecutionCodecError> {

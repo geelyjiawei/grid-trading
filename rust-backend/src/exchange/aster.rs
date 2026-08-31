@@ -29,7 +29,7 @@ use crate::{
         OrderCancellationGateway, OrderExecutionSnapshot, OrderHistorySnapshotGateway,
         OrderLifecycle, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
         PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        SnapshotError, TradeFill, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_account_balance_snapshot, parse_authoritative_order,
@@ -42,7 +42,8 @@ use crate::{
         execution::{
             CommissionConvention, OrderExecutionHeader, assemble_execution_snapshot,
             numeric_trade_id, parse_historical_minute_open,
-            parse_reconstructable_order_execution_header, parse_trade_page,
+            parse_reconstructable_order_execution_header, parse_recoverable_order_execution_header,
+            parse_trade_page, reconstruct_order_execution_header_from_trades,
         },
         protocol::{
             HttpMethod, HttpTransport, NonceSource, Parameters, PreparedHttpRequest,
@@ -693,6 +694,98 @@ where
     }
 }
 
+impl<T, S, N> AsterAdapter<T, S, N>
+where
+    T: HttpTransport,
+    S: AsterMessageSigner,
+    N: NonceSource,
+{
+    async fn order_trades_by_id(
+        &self,
+        symbol: &str,
+        exchange_order_id: &str,
+    ) -> Result<Vec<TradeFill>, ExecutionSnapshotError> {
+        exchange_order_id
+            .parse::<u64>()
+            .ok()
+            .filter(|order_id| *order_id > 0)
+            .ok_or_else(|| execution_error("Aster exchange order ID is not a positive integer"))?;
+
+        let mut trades = Vec::new();
+        let mut next_from_id: Option<u64> = None;
+        for _ in 0..MAX_TRADE_HISTORY_QUERIES {
+            let mut params = vec![
+                ("symbol".into(), symbol.into()),
+                ("orderId".into(), exchange_order_id.into()),
+                ("limit".into(), TRADE_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(from_id) = next_from_id {
+                params.push(("fromId".into(), from_id.to_string()));
+            }
+            let request = self
+                .signed_request(HttpMethod::Get, "/fapi/v3/userTrades", params)
+                .map_err(|error| execution_error(error.to_string()))?;
+            let body = self
+                .execute_snapshot(request, "Aster order-scoped account trade snapshot")
+                .await
+                .map_err(|error| execution_error(error.to_string()))?;
+            let page = parse_trade_page(
+                &body,
+                symbol,
+                CommissionConvention::SignedBalanceDeltaOrPositiveCost,
+            )
+            .map_err(|error| {
+                execution_error(format!("invalid Aster order-scoped trade page: {error}"))
+            })?;
+            if page.len() > TRADE_PAGE_LIMIT
+                || page
+                    .iter()
+                    .any(|trade| trade.exchange_order_id != exchange_order_id)
+            {
+                return Err(execution_error(
+                    "Aster order-scoped trade page contains invalid order identity",
+                ));
+            }
+            let trade_ids = page
+                .iter()
+                .map(numeric_trade_id)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    execution_error(format!("invalid Aster numeric trade ID: {error}"))
+                })?;
+            if next_from_id
+                .is_some_and(|minimum| trade_ids.iter().any(|trade_id| *trade_id < minimum))
+                || (page.len() == TRADE_PAGE_LIMIT
+                    && trade_ids.windows(2).any(|pair| pair[0] >= pair[1]))
+            {
+                return Err(execution_error(
+                    "Aster order-scoped trade pagination is not strictly increasing",
+                ));
+            }
+            let following_id = if page.len() == TRADE_PAGE_LIMIT {
+                Some(
+                    trade_ids
+                        .last()
+                        .and_then(|trade_id| trade_id.checked_add(1))
+                        .ok_or_else(|| {
+                            execution_error("Aster order trade pagination cannot advance")
+                        })?,
+                )
+            } else {
+                None
+            };
+            trades.extend(page);
+            let Some(following_id) = following_id else {
+                return Ok(trades);
+            };
+            next_from_id = Some(following_id);
+        }
+        Err(execution_error(
+            "Aster order trade history requires too many paginated queries",
+        ))
+    }
+}
+
 #[async_trait]
 impl<T, S, N> MarketSnapshotGateway for AsterAdapter<T, S, N>
 where
@@ -1201,14 +1294,52 @@ where
             .execute_snapshot(detail_request, "Aster execution order snapshot")
             .await
             .map_err(|error| execution_error(error.to_string()))?;
-        let parsed_header = parse_reconstructable_order_execution_header(
+        let parsed_header = match parse_reconstructable_order_execution_header(
             &detail_body,
             Exchange::Aster,
             &symbol,
             client_order_id,
             exchange_order_id,
-        )
-        .map_err(|error| execution_error(format!("invalid Aster order totals: {error}")))?;
+        ) {
+            Ok(parsed_header) => parsed_header,
+            Err(strict_error) => {
+                let recoverable = parse_recoverable_order_execution_header(
+                    &detail_body,
+                    Exchange::Aster,
+                    &symbol,
+                    client_order_id,
+                    exchange_order_id,
+                )
+                .map_err(|recovery_error| {
+                    execution_error(format!(
+                        "invalid Aster order totals ({strict_error}); recovery identity is invalid: {recovery_error}"
+                    ))
+                })?;
+                let trades = self.order_trades_by_id(&symbol, exchange_order_id).await?;
+                let header = reconstruct_order_execution_header_from_trades(recoverable, &trades)
+                    .map_err(|error| {
+                    execution_error(format!(
+                        "Aster order totals cannot be reconstructed from official trades: {error}"
+                    ))
+                })?;
+                let snapshot = assemble_execution_snapshot(header, trades).map_err(|error| {
+                    execution_error(format!(
+                        "incomplete recovered Aster execution snapshot: {error}"
+                    ))
+                })?;
+                tracing::warn!(
+                    symbol = symbol.as_str(),
+                    exchange_order_id,
+                    strict_error = %strict_error,
+                    cumulative_quantity = %snapshot.cumulative_quantity,
+                    trade_count = snapshot.trades.len(),
+                    "reconstructed Aster execution from order-scoped official trades"
+                );
+                self.realtime_execution_cache
+                    .bind_authoritative_snapshot(&snapshot);
+                return Ok(snapshot);
+            }
+        };
         let mut header = parsed_header.header;
         if header.cumulative_quantity.is_zero() {
             let snapshot = assemble_execution_snapshot(header, vec![])
@@ -2243,6 +2374,112 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn aster_recovers_filled_order_when_order_totals_are_invalid() {
+        let invalid_quantity = execution_order_detail("0", "0", "FILLED", 1_000_000, 1_100_000);
+        let invalid_time = execution_order_detail("100", "38", "FILLED", 0, 1_100_000);
+
+        for order_detail in [invalid_quantity, invalid_time] {
+            let transport = MockTransport::default();
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: order_detail,
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!("[{}]", aster_trade(7, "100", "38", 1_050_000)),
+                }),
+            ]);
+            let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+            let snapshot = adapter(transport.clone(), signer)
+                .execution_snapshot(
+                    Exchange::Aster,
+                    "ANSEMUSDT",
+                    &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                    "4770039",
+                )
+                .await
+                .unwrap();
+            let requests = transport.all_requests();
+
+            assert_eq!(snapshot.cumulative_quantity, Decimal::new(100, 0));
+            assert_eq!(snapshot.cumulative_quote, Decimal::new(38, 0));
+            assert_eq!(snapshot.order.executed_quantity, Some(Decimal::new(100, 0)));
+            assert_eq!(snapshot.trades.len(), 1);
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].path, "/fapi/v3/order");
+            assert_eq!(requests[1].path, "/fapi/v3/userTrades");
+            assert!(requests[1].query_string().contains("symbol=ANSEMUSDT"));
+            assert!(requests[1].query_string().contains("orderId=4770039"));
+        }
+    }
+
+    #[tokio::test]
+    async fn aster_recovery_rejects_incomplete_official_trade_totals() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("0", "0", "FILLED", 1_000_000, 1_100_000),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", aster_trade(7, "70", "26.6", 1_050_000)),
+            }),
+        ]);
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+        let error = adapter(transport, signer)
+            .execution_snapshot(
+                Exchange::Aster,
+                "ANSEMUSDT",
+                &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                "4770039",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .message
+                .contains("cannot be reconstructed from official trades")
+        );
+    }
+
+    #[tokio::test]
+    async fn aster_recovery_rejects_trade_from_another_order() {
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("0", "0", "FILLED", 1_000_000, 1_100_000),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!(
+                    "[{}]",
+                    aster_trade(7, "100", "38", 1_050_000)
+                        .replace("\"orderId\":4770039", "\"orderId\":4770040")
+                ),
+            }),
+        ]);
+        let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+
+        let error = adapter(transport, signer)
+            .execution_snapshot(
+                Exchange::Aster,
+                "ANSEMUSDT",
+                &ClientOrderId::parse("g_0_B_fixed").unwrap(),
+                "4770039",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("invalid order identity"));
     }
 
     #[tokio::test]
