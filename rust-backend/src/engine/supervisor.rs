@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -22,7 +29,23 @@ use super::{
 struct RuntimeSlot<G> {
     exchange: Exchange,
     symbol: String,
+    execution_waiters: AtomicUsize,
     strategy: Mutex<PreparedLeasedFileStrategy<G>>,
+}
+
+struct ExecutionWaiter<'a>(&'a AtomicUsize);
+
+impl<'a> ExecutionWaiter<'a> {
+    fn register(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self(waiters)
+    }
+}
+
+impl Drop for ExecutionWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 type RuntimeSlotHandle<G> = Arc<RuntimeSlot<G>>;
@@ -138,6 +161,7 @@ impl<G> RuntimeRegistry<G> {
             Arc::new(RuntimeSlot {
                 exchange,
                 symbol,
+                execution_waiters: AtomicUsize::new(0),
                 strategy: Mutex::new(strategy),
             }),
         );
@@ -197,23 +221,35 @@ impl<G> RuntimeRegistry<G> {
             .collect::<Vec<_>>();
         entries
             .into_iter()
-            .map(|(run_id, slot)| match slot.strategy.try_lock() {
-                Ok(strategy) => RuntimeRegistryEntry {
-                    run_id,
-                    exchange: slot.exchange,
-                    symbol: slot.symbol.clone(),
-                    kind: Some(strategy.kind()),
-                    lifecycle: Some(strategy.lifecycle()),
-                    advancing: false,
-                },
-                Err(_) => RuntimeRegistryEntry {
-                    run_id,
-                    exchange: slot.exchange,
-                    symbol: slot.symbol.clone(),
-                    kind: None,
-                    lifecycle: None,
-                    advancing: true,
-                },
+            .map(|(run_id, slot)| {
+                if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+                    return RuntimeRegistryEntry {
+                        run_id,
+                        exchange: slot.exchange,
+                        symbol: slot.symbol.clone(),
+                        kind: None,
+                        lifecycle: None,
+                        advancing: true,
+                    };
+                }
+                match slot.strategy.try_lock() {
+                    Ok(strategy) => RuntimeRegistryEntry {
+                        run_id,
+                        exchange: slot.exchange,
+                        symbol: slot.symbol.clone(),
+                        kind: Some(strategy.kind()),
+                        lifecycle: Some(strategy.lifecycle()),
+                        advancing: false,
+                    },
+                    Err(_) => RuntimeRegistryEntry {
+                        run_id,
+                        exchange: slot.exchange,
+                        symbol: slot.symbol.clone(),
+                        kind: None,
+                        lifecycle: None,
+                        advancing: true,
+                    },
+                }
             })
             .collect()
     }
@@ -244,10 +280,21 @@ impl<G> RuntimeRegistry<G> {
             .get(run_id)
             .cloned()
             .ok_or_else(|| RuntimeRegistryAdvanceError::NotFound(run_id.clone()))?;
+        if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+            return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
+                run_id.clone(),
+            ));
+        }
         let mut strategy = slot
             .strategy
             .try_lock()
             .map_err(|_| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?;
+        if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+            drop(strategy);
+            return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
+                run_id.clone(),
+            ));
+        }
         strategy.advance(now_ms).await.map_err(Into::into)
     }
 
@@ -281,7 +328,19 @@ impl<G> RuntimeRegistry<G> {
             .iter()
             .find(|(_, slot)| slot.exchange == exchange && slot.symbol == symbol)
             .map(|(run_id, slot)| (run_id.clone(), Arc::clone(slot)))?;
+        let lock_started = Instant::now();
+        let waiter = ExecutionWaiter::register(&slot.execution_waiters);
         let mut strategy = slot.strategy.lock().await;
+        drop(waiter);
+        let strategy_lock_wait_ms =
+            u64::try_from(lock_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            run_id = run_id.as_str(),
+            exchange = ?exchange,
+            symbol,
+            strategy_lock_wait_ms,
+            "execution event acquired strategy lock"
+        );
         let effective_now_ms = now_ms.max(strategy.updated_at_ms());
         let result = strategy
             .advance_execution_event(effective_now_ms, exchange_order_id)

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     str::FromStr,
     sync::{
         Arc, Weak,
@@ -65,6 +65,7 @@ const MARKET_CACHE_TTL: Duration = Duration::from_secs(3);
 const LEVERAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 const EXECUTION_FILL_LOOKBACK_MS: u64 = 60_000;
 const EXECUTION_FILL_CACHE_LIMIT: usize = 10_000;
+const EXECUTION_WAKEUP_DEDUPE_LIMIT: usize = 20_000;
 #[cfg(not(test))]
 const USER_FILL_STREAM_HEARTBEAT: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
@@ -139,6 +140,39 @@ struct CachedOrderUpdate {
 #[derive(Debug, Clone, Default)]
 struct CachedExecutionOrders {
     rows: HashMap<(String, ClientOrderId), CachedOrderUpdate>,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionWakeupDeduplicator {
+    cumulative_by_order: HashMap<(String, String), Decimal>,
+    observations: VecDeque<((String, String), Decimal)>,
+}
+
+impl ExecutionWakeupDeduplicator {
+    fn observe(&mut self, symbol: &str, exchange_order_id: &str, cumulative: Decimal) -> bool {
+        if cumulative <= Decimal::ZERO {
+            return false;
+        }
+        let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
+        if self
+            .cumulative_by_order
+            .get(&key)
+            .is_some_and(|published| *published >= cumulative)
+        {
+            return false;
+        }
+        self.cumulative_by_order.insert(key.clone(), cumulative);
+        self.observations.push_back((key, cumulative));
+        while self.observations.len() > EXECUTION_WAKEUP_DEDUPE_LIMIT {
+            let Some((stale_key, stale_cumulative)) = self.observations.pop_front() else {
+                break;
+            };
+            if self.cumulative_by_order.get(&stale_key) == Some(&stale_cumulative) {
+                self.cumulative_by_order.remove(&stale_key);
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -359,6 +393,7 @@ async fn run_user_fill_stream(
 ) {
     let mut reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
     let mut next_action_id = now_ms().unwrap_or(1);
+    let mut wakeup_deduplicator = ExecutionWakeupDeduplicator::default();
     loop {
         if cache.upgrade().is_none() || order_cache.upgrade().is_none() {
             return;
@@ -431,7 +466,14 @@ async fn run_user_fill_stream(
                             ) {
                                 continue;
                             }
-                            if !cache_execution_message(text.as_ref(), &cache, &order_cache).await {
+                            if !cache_execution_message(
+                                text.as_ref(),
+                                &cache,
+                                &order_cache,
+                                &mut wakeup_deduplicator,
+                            )
+                            .await
+                            {
                                 return;
                             }
                         }
@@ -440,7 +482,14 @@ async fn run_user_fill_stream(
                                 if resolve_websocket_action_response(text, &mut pending_actions) {
                                     continue;
                                 }
-                                if !cache_execution_message(text, &cache, &order_cache).await {
+                                if !cache_execution_message(
+                                    text,
+                                    &cache,
+                                    &order_cache,
+                                    &mut wakeup_deduplicator,
+                                )
+                                .await
+                                {
                                     return;
                                 }
                             }
@@ -599,12 +648,13 @@ async fn cache_execution_message(
     text: &str,
     cache: &Weak<tokio::sync::Mutex<CachedExecutionFills>>,
     order_cache: &Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
+    wakeup_deduplicator: &mut ExecutionWakeupDeduplicator,
 ) -> bool {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return true;
     };
     if message.get("channel").and_then(Value::as_str) == Some("orderUpdates") {
-        return cache_order_update_message(&message, order_cache).await;
+        return cache_order_update_message(&message, order_cache, wakeup_deduplicator).await;
     }
     if message.get("channel").and_then(Value::as_str) != Some("userFills") {
         return true;
@@ -619,14 +669,29 @@ async fn cache_execution_message(
     let Some(cache) = cache.upgrade() else {
         return false;
     };
-    merge_fill_rows(&mut cache.lock().await.rows, fills.iter().cloned());
+    let touched = execution_wakeups_from_fills(fills);
+    let cumulative = {
+        let mut cache = cache.lock().await;
+        merge_fill_rows(&mut cache.rows, fills.iter().cloned());
+        execution_wakeups_from_fills(&cache.rows)
+    };
     let is_snapshot = message
         .get("data")
         .and_then(|data| data.get("isSnapshot"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !is_snapshot {
-        for ((symbol, order_id), event_time) in execution_wakeups_from_fills(fills) {
+    if is_snapshot {
+        for ((symbol, order_id), (_, quantity)) in cumulative {
+            wakeup_deduplicator.observe(&symbol, &order_id, quantity);
+        }
+    } else {
+        for ((symbol, order_id), (event_time, _)) in touched {
+            let Some((_, quantity)) = cumulative.get(&(symbol.clone(), order_id.clone())) else {
+                continue;
+            };
+            if !wakeup_deduplicator.observe(&symbol, &order_id, *quantity) {
+                continue;
+            }
             publish_execution_wakeup(Exchange::TradeXyz, &symbol, Some(order_id), event_time);
         }
     }
@@ -637,31 +702,46 @@ async fn cache_execution_message(
 async fn cache_order_update_message(
     message: &Value,
     cache: &Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
+    wakeup_deduplicator: &mut ExecutionWakeupDeduplicator,
 ) -> bool {
     let updates = parse_order_update_message(message);
     let Some(cache) = cache.upgrade() else {
         return false;
     };
-    let mut cache = cache.lock().await;
-    for update in updates {
-        let key = (update.symbol.clone(), update.client_order_id.clone());
-        if cache
-            .rows
-            .get(&key)
-            .is_some_and(|existing| existing.status_time_ms > update.status_time_ms)
-        {
-            continue;
+    let wakeups = {
+        let mut cache = cache.lock().await;
+        let mut wakeups = Vec::new();
+        for update in updates {
+            let key = (update.symbol.clone(), update.client_order_id.clone());
+            if cache
+                .rows
+                .get(&key)
+                .is_some_and(|existing| existing.status_time_ms > update.status_time_ms)
+            {
+                continue;
+            }
+            let executed = update.original_quantity - update.remaining_quantity;
+            if executed > Decimal::ZERO {
+                wakeups.push((
+                    update.symbol.clone(),
+                    update.exchange_order_id.clone(),
+                    update.status_time_ms,
+                    executed,
+                ));
+            }
+            cache.rows.insert(key, update);
         }
-        let executed = update.original_quantity - update.remaining_quantity;
-        if executed > Decimal::ZERO {
+        wakeups
+    };
+    for (symbol, exchange_order_id, status_time_ms, executed) in wakeups {
+        if wakeup_deduplicator.observe(&symbol, &exchange_order_id, executed) {
             publish_execution_wakeup(
                 Exchange::TradeXyz,
-                &update.symbol,
-                Some(update.exchange_order_id.clone()),
-                Some(update.status_time_ms),
+                &symbol,
+                Some(exchange_order_id),
+                Some(status_time_ms),
             );
         }
-        cache.rows.insert(key, update);
     }
     true
 }
@@ -710,7 +790,9 @@ fn parse_order_update_message(message: &Value) -> Vec<CachedOrderUpdate> {
         .collect()
 }
 
-fn execution_wakeups_from_fills(fills: &[Value]) -> BTreeMap<(String, String), Option<u64>> {
+fn execution_wakeups_from_fills(
+    fills: &[Value],
+) -> BTreeMap<(String, String), (Option<u64>, Decimal)> {
     let mut wakeups = BTreeMap::new();
     for fill in fills {
         let Some(coin) = fill.get("coin").and_then(Value::as_str) else {
@@ -722,13 +804,22 @@ fn execution_wakeups_from_fills(fills: &[Value]) -> BTreeMap<(String, String), O
         let Ok(order_id) = id_string(fill.get("oid")) else {
             continue;
         };
+        let Ok(quantity) = decimal_field(fill, "sz") else {
+            continue;
+        };
+        if quantity <= Decimal::ZERO {
+            continue;
+        }
         let event_time = fill.get("time").and_then(value_u64);
         wakeups
             .entry((symbol, order_id))
-            .and_modify(|current: &mut Option<u64>| {
-                *current = (*current).max(event_time);
+            .and_modify(|current: &mut (Option<u64>, Decimal)| {
+                current.0 = current.0.max(event_time);
+                if let Some(total) = current.1.checked_add(quantity) {
+                    current.1 = total;
+                }
             })
-            .or_insert(event_time);
+            .or_insert((event_time, quantity));
     }
     wakeups
 }
@@ -3724,9 +3815,9 @@ mod tests {
     #[test]
     fn user_fill_wakeups_keep_each_exchange_order_identity() {
         let fills = vec![
-            json!({"coin":"xyz:MU","oid":42,"time":3}),
-            json!({"coin":"xyz:MU","oid":42,"time":4}),
-            json!({"coin":"xyz:MU","oid":43,"time":5}),
+            json!({"coin":"xyz:MU","oid":42,"time":3,"sz":"0.1"}),
+            json!({"coin":"xyz:MU","oid":42,"time":4,"sz":"0.2"}),
+            json!({"coin":"xyz:MU","oid":43,"time":5,"sz":"0.1"}),
         ];
 
         let wakeups = execution_wakeups_from_fills(&fills);
@@ -3734,12 +3825,24 @@ mod tests {
         assert_eq!(wakeups.len(), 2);
         assert_eq!(
             wakeups.get(&("MUUSDC".to_owned(), "42".to_owned())),
-            Some(&Some(4))
+            Some(&(Some(4), Decimal::new(3, 1)))
         );
         assert_eq!(
             wakeups.get(&("MUUSDC".to_owned(), "43".to_owned())),
-            Some(&Some(5))
+            Some(&(Some(5), Decimal::new(1, 1)))
         );
+    }
+
+    #[test]
+    fn execution_wakeups_publish_only_strictly_new_cumulative_progress() {
+        let mut deduplicator = ExecutionWakeupDeduplicator::default();
+
+        assert!(deduplicator.observe("PONSUSDC", "42", Decimal::new(1, 1)));
+        assert!(!deduplicator.observe("PONSUSDC", "42", Decimal::new(1, 1)));
+        assert!(deduplicator.observe("PONSUSDC", "42", Decimal::new(2, 1)));
+        assert!(!deduplicator.observe("PONSUSDC", "42", Decimal::new(1, 1)));
+        assert!(deduplicator.observe("PONSUSDC", "43", Decimal::new(1, 1)));
+        assert!(!deduplicator.observe("PONSUSDC", "43", Decimal::ZERO));
     }
 
     #[tokio::test]

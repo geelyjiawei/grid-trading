@@ -240,6 +240,34 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
         let full_tick_in_flight = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
+                biased;
+                event = execution_wakeups.recv() => {
+                    match event {
+                        Ok(event) => {
+                            queue_execution_wakeup(
+                                &runtime,
+                                &mut execution_dispatches,
+                                &execution_completion_sender,
+                                event,
+                            );
+                            // Let the execution task register its per-strategy waiter before a
+                            // simultaneously-ready full tick can claim the same strategy.
+                            tokio::task::yield_now().await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "execution wakeup receiver lagged; REST fallback remains active");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+                Some(key) = execution_completions.recv() => {
+                    complete_execution_dispatch(
+                        &runtime,
+                        &mut execution_dispatches,
+                        &execution_completion_sender,
+                        key,
+                    );
+                }
                 _ = ticker.tick() => {
                     let Some(tick_lease) = RuntimeTickLease::try_acquire(&full_tick_in_flight) else {
                         continue;
@@ -255,30 +283,6 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                             log_runtime_advance(advance, false, None, None, 0);
                         }
                     });
-                }
-                event = execution_wakeups.recv() => {
-                    match event {
-                        Ok(event) => {
-                            queue_execution_wakeup(
-                                &runtime,
-                                &mut execution_dispatches,
-                                &execution_completion_sender,
-                                event,
-                            );
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "execution wakeup receiver lagged; REST fallback remains active");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-                Some(key) = execution_completions.recv() => {
-                    complete_execution_dispatch(
-                        &runtime,
-                        &mut execution_dispatches,
-                        &execution_completion_sender,
-                        key,
-                    );
                 }
             }
         }
@@ -472,7 +476,7 @@ async fn advance_execution_event(
 }
 
 fn execution_event_needs_retry(report: &crate::engine::RuntimeTickReport) -> bool {
-    report.submissions.is_empty() && (report.execution_syncs == 0 || !report.is_blocked())
+    report.submissions.is_empty() && report.execution_syncs > 0 && !report.is_blocked()
 }
 
 fn log_runtime_advance(
@@ -956,6 +960,19 @@ mod tests {
                 client_order_id: None,
                 message: "authoritative position is inconsistent".into(),
             }],
+        };
+
+        assert!(!execution_event_needs_retry(&report));
+    }
+
+    #[test]
+    fn execution_event_does_not_retry_a_noop_snapshot() {
+        let report = crate::engine::RuntimeTickReport {
+            ledger_reconciliations: 0,
+            execution_syncs: 0,
+            submissions: Vec::new(),
+            cancellations: Vec::new(),
+            blockers: Vec::new(),
         };
 
         assert!(!execution_event_needs_retry(&report));
