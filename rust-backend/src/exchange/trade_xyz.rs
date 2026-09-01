@@ -183,6 +183,8 @@ enum WebsocketActionError {
 
 struct WebsocketActionCommand {
     payload: Value,
+    #[cfg_attr(test, allow(dead_code))]
+    queued_at: Instant,
     response: tokio::sync::oneshot::Sender<Result<Value, WebsocketActionError>>,
 }
 
@@ -201,7 +203,11 @@ impl WebsocketActionRelay {
         }
         let (response, receiver) = tokio::sync::oneshot::channel();
         self.sender
-            .send(WebsocketActionCommand { payload, response })
+            .send(WebsocketActionCommand {
+                payload,
+                queued_at: Instant::now(),
+                response,
+            })
             .await
             .map_err(|_| {
                 WebsocketActionError::NotSent("TRADE.XYZ websocket writer is unavailable".into())
@@ -456,6 +462,34 @@ async fn run_user_fill_stream(
         heartbeat.tick().await;
         loop {
             tokio::select! {
+                biased;
+                command = action_commands.recv() => {
+                    let Some(command) = command else { return };
+                    if command.response.is_closed() {
+                        continue;
+                    }
+                    let websocket_queue_ms = u64::try_from(command.queued_at.elapsed().as_millis())
+                        .unwrap_or(u64::MAX);
+                    next_action_id = next_action_id.wrapping_add(1).max(1);
+                    let request = websocket_action_request(next_action_id, command.payload);
+                    let write_started = Instant::now();
+                    if let Err(error) = socket
+                        .send(Message::Text(request.to_string().into()))
+                        .await
+                    {
+                        let _ = command.response.send(Err(WebsocketActionError::Unknown(
+                            format!("TRADE.XYZ websocket action write failed: {error}"),
+                        )));
+                        break;
+                    }
+                    tracing::info!(
+                        websocket_queue_ms,
+                        websocket_write_ms = u64::try_from(write_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "TRADE.XYZ exchange action written to websocket"
+                    );
+                    pending_actions.insert(next_action_id, command.response);
+                }
                 message = socket.next() => {
                     let Some(message) = message else { break };
                     match message {
@@ -515,24 +549,6 @@ async fn run_user_fill_stream(
                     {
                         break;
                     }
-                }
-                command = action_commands.recv() => {
-                    let Some(command) = command else { return };
-                    if command.response.is_closed() {
-                        continue;
-                    }
-                    next_action_id = next_action_id.wrapping_add(1).max(1);
-                    let request = websocket_action_request(next_action_id, command.payload);
-                    if let Err(error) = socket
-                        .send(Message::Text(request.to_string().into()))
-                        .await
-                    {
-                        let _ = command.response.send(Err(WebsocketActionError::Unknown(
-                            format!("TRADE.XYZ websocket action write failed: {error}"),
-                        )));
-                        break;
-                    }
-                    pending_actions.insert(next_action_id, command.response);
                 }
             }
         }

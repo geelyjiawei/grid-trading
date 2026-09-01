@@ -504,20 +504,101 @@ fn binance_cooldown_response(cooldown: Duration) -> HttpResponse {
     }
 }
 
-const HYPERLIQUID_WEIGHT_INTERVAL: Duration = Duration::from_millis(60);
+const HYPERLIQUID_WEIGHT_WINDOW: Duration = Duration::from_secs(60);
+const HYPERLIQUID_WEIGHT_LIMIT: u32 = 1_000;
+const HYPERLIQUID_CRITICAL_WEIGHT_RESERVE: u32 = 100;
 const HYPERLIQUID_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const HYPERLIQUID_NORMAL_INFLIGHT_LIMIT: usize = 2;
 const HYPERLIQUID_CRITICAL_INFLIGHT_LIMIT: usize = 4;
 
-#[derive(Debug, Default)]
-struct HyperliquidRequestState {
-    next_request_at: Option<Instant>,
+#[derive(Debug, Clone, Copy)]
+struct HyperliquidUsageEvent {
+    recorded_at: Instant,
+    weight: u32,
 }
 
-/// Schedules Hyperliquid REST traffic using the published request weights.
-/// A 60 ms interval per weight unit caps this process at 1,000 weight/minute,
-/// leaving headroom below Hyperliquid's 1,200 weight/minute IP limit. Slow
-/// snapshot responses use a separate bounded lane from trading writes.
+#[derive(Debug, Default)]
+struct HyperliquidRequestState {
+    cooldown_until: Option<Instant>,
+    usage: VecDeque<HyperliquidUsageEvent>,
+}
+
+impl HyperliquidRequestState {
+    fn reserve(
+        &mut self,
+        priority: BinanceRequestPriority,
+        weight: u32,
+        now: Instant,
+    ) -> Option<Duration> {
+        if let Some(cooldown_until) = self.cooldown_until {
+            if cooldown_until > now {
+                return Some(cooldown_until.saturating_duration_since(now));
+            }
+            self.cooldown_until = None;
+        }
+        self.prune(now);
+        let limit = match priority {
+            BinanceRequestPriority::TradingCritical => HYPERLIQUID_WEIGHT_LIMIT,
+            BinanceRequestPriority::Normal => {
+                HYPERLIQUID_WEIGHT_LIMIT - HYPERLIQUID_CRITICAL_WEIGHT_RESERVE
+            }
+        };
+        let used = self.used_weight();
+        if used.saturating_add(weight) <= limit {
+            self.usage.push_back(HyperliquidUsageEvent {
+                recorded_at: now,
+                weight,
+            });
+            return None;
+        }
+
+        let required = used.saturating_add(weight).saturating_sub(limit);
+        let mut expiring_weight = 0_u32;
+        for event in &self.usage {
+            expiring_weight = expiring_weight.saturating_add(event.weight);
+            if expiring_weight >= required {
+                return Some(
+                    event
+                        .recorded_at
+                        .checked_add(HYPERLIQUID_WEIGHT_WINDOW)
+                        .unwrap_or(now)
+                        .saturating_duration_since(now),
+                );
+            }
+        }
+        Some(HYPERLIQUID_WEIGHT_WINDOW)
+    }
+
+    fn record_extra_weight(&mut self, weight: u32, now: Instant) {
+        if weight == 0 {
+            return;
+        }
+        self.prune(now);
+        self.usage.push_back(HyperliquidUsageEvent {
+            recorded_at: now,
+            weight,
+        });
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self.usage.front().is_some_and(|event| {
+            now.saturating_duration_since(event.recorded_at) >= HYPERLIQUID_WEIGHT_WINDOW
+        }) {
+            self.usage.pop_front();
+        }
+    }
+
+    fn used_weight(&self) -> u32 {
+        self.usage
+            .iter()
+            .fold(0_u32, |total, event| total.saturating_add(event.weight))
+    }
+}
+
+/// Schedules Hyperliquid REST traffic using a rolling request-weight window.
+/// Normal snapshots cannot consume the final 100 weight units, so execution
+/// reconciliation and writes do not inherit an artificial multi-second delay.
+/// The combined budget remains below Hyperliquid's 1,200 weight/minute IP limit.
 #[derive(Clone)]
 pub struct HyperliquidRequestGovernor<T> {
     inner: T,
@@ -543,7 +624,12 @@ impl<T> fmt::Debug for HyperliquidRequestGovernor<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HyperliquidRequestGovernor")
-            .field("weight_interval", &HYPERLIQUID_WEIGHT_INTERVAL)
+            .field("weight_window", &HYPERLIQUID_WEIGHT_WINDOW)
+            .field("weight_limit", &HYPERLIQUID_WEIGHT_LIMIT)
+            .field(
+                "critical_weight_reserve",
+                &HYPERLIQUID_CRITICAL_WEIGHT_RESERVE,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -562,37 +648,26 @@ where
         let _inflight_permit = inflight.acquire_owned().await.map_err(|error| {
             TransportError::Other(format!("Hyperliquid request lane is unavailable: {error}"))
         })?;
-        let priority_permit = self.priority_gate.acquire(priority).await;
         let base_weight = hyperliquid_request_weight(&request);
-        {
-            let mut state = self.state.lock().await;
-            let now = Instant::now();
-            if let Some(next_request_at) = state.next_request_at
-                && next_request_at > now
-            {
-                tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
-            }
-
-            let requested_at = Instant::now();
-            state.next_request_at =
-                Some(requested_at + HYPERLIQUID_WEIGHT_INTERVAL.saturating_mul(base_weight));
+        loop {
+            let priority_permit = self.priority_gate.acquire(priority).await;
+            let delay = self
+                .state
+                .lock()
+                .await
+                .reserve(priority, base_weight, Instant::now());
+            drop(priority_permit);
+            let Some(delay) = delay else { break };
+            tokio::time::sleep(delay.max(Duration::from_millis(1))).await;
         }
 
-        drop(priority_permit);
         let response = self.inner.execute(request.clone()).await?;
         let responded_at = Instant::now();
         let extra_weight = hyperliquid_response_extra_weight(&request, &response);
         let mut state = self.state.lock().await;
-        if extra_weight > 0 {
-            let next = state
-                .next_request_at
-                .unwrap_or(responded_at)
-                .max(responded_at);
-            state.next_request_at =
-                Some(next + HYPERLIQUID_WEIGHT_INTERVAL.saturating_mul(extra_weight));
-        }
+        state.record_extra_weight(extra_weight, responded_at);
         if response.status == 429 {
-            state.next_request_at = Some(responded_at + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
+            state.cooldown_until = Some(responded_at + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
         }
         Ok(response)
     }
@@ -1508,6 +1583,60 @@ mod tests {
         assert_eq!(normal.await.unwrap().unwrap().status, 200);
     }
 
+    #[tokio::test]
+    async fn hyperliquid_trading_request_does_not_inherit_normal_request_spacing() {
+        let transport = ScriptedTransport::new([
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+        ]);
+        let governor = HyperliquidRequestGovernor::new(transport.clone());
+
+        governor
+            .execute(hyperliquid_request("/info", r#"{"type":"userRole"}"#))
+            .await
+            .unwrap();
+        let critical = tokio::time::timeout(
+            Duration::from_millis(100),
+            governor.execute(hyperliquid_request(
+                "/exchange",
+                r#"{"action":{"orders":[{}]}}"#,
+            )),
+        )
+        .await
+        .expect("a low-usage critical request must not wait behind normal request spacing")
+        .unwrap();
+
+        assert_eq!(critical.status, 200);
+        assert_eq!(transport.call_count(), 2);
+    }
+
+    #[test]
+    fn hyperliquid_normal_budget_preserves_critical_capacity() {
+        let now = Instant::now();
+        let mut state = HyperliquidRequestState::default();
+        state.usage.push_back(HyperliquidUsageEvent {
+            recorded_at: now,
+            weight: HYPERLIQUID_WEIGHT_LIMIT - HYPERLIQUID_CRITICAL_WEIGHT_RESERVE,
+        });
+
+        assert!(
+            state
+                .reserve(BinanceRequestPriority::Normal, 1, now)
+                .is_some()
+        );
+        assert!(
+            state
+                .reserve(BinanceRequestPriority::TradingCritical, 1, now)
+                .is_none()
+        );
+    }
+
     #[test]
     fn hyperliquid_history_and_candles_charge_response_row_weight() {
         let history = hyperliquid_request("/info", r#"{"type":"historicalOrders"}"#);
@@ -1551,9 +1680,9 @@ mod tests {
         assert_eq!(response.status, 429);
         assert_eq!(transport.call_count(), 1);
         let state = governor.state.lock().await;
-        let next_request_at = state.next_request_at.unwrap();
-        assert!(next_request_at >= before + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
-        assert!(next_request_at <= Instant::now() + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
+        let cooldown_until = state.cooldown_until.unwrap();
+        assert!(cooldown_until >= before + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
+        assert!(cooldown_until <= Instant::now() + HYPERLIQUID_RATE_LIMIT_COOLDOWN);
     }
 
     #[tokio::test]
