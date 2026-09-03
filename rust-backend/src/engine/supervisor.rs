@@ -19,6 +19,8 @@ use crate::exchange::{
 };
 use crate::persistence::{StrategyDiscoveryAnomaly, StrategyDiscoveryReport, StrategyFilePaths};
 
+use super::exchange_inputs::advance_reference_time_ms;
+use super::runtime::PreparedExecutionEventStep;
 use super::{
     FileStrategyRecoveryError, PreparedLeasedFileStrategy, PreparedStrategyKind,
     PreparedStrategyLifecycle, PreparedStrategyStep, PreparedStrategyStepError,
@@ -309,7 +311,8 @@ impl<G> RuntimeRegistry<G> {
         Result<PreparedStrategyStep, RuntimeRegistryAdvanceError>,
     )>
     where
-        G: ExchangeIdentityGateway
+        G: Clone
+            + ExchangeIdentityGateway
             + TradingFeeRateGateway
             + LeverageGateway
             + PositionSnapshotGateway
@@ -331,7 +334,6 @@ impl<G> RuntimeRegistry<G> {
         let lock_started = Instant::now();
         let waiter = ExecutionWaiter::register(&slot.execution_waiters);
         let mut strategy = slot.strategy.lock().await;
-        drop(waiter);
         let strategy_lock_wait_ms =
             u64::try_from(lock_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
@@ -342,6 +344,43 @@ impl<G> RuntimeRegistry<G> {
             "execution event acquired strategy lock"
         );
         let effective_now_ms = now_ms.max(strategy.updated_at_ms());
+        if exchange == Exchange::TradeXyz
+            && let Some(exchange_order_ids) = exchange_order_ids
+        {
+            let prepared = match strategy
+                .prepare_targeted_execution_events(effective_now_ms, exchange_order_ids)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => return Some((run_id, Err(error.into()))),
+            };
+            let prepared = match prepared {
+                PreparedExecutionEventStep::Complete(step) => {
+                    return Some((run_id, Ok(step)));
+                }
+                PreparedExecutionEventStep::Submit(prepared) => prepared,
+            };
+            drop(strategy);
+            let placement_results = prepared.place().await;
+            let completion_lock_started = Instant::now();
+            let mut strategy = slot.strategy.lock().await;
+            let completion_lock_wait_ms =
+                u64::try_from(completion_lock_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::info!(
+                run_id = run_id.as_str(),
+                exchange = ?exchange,
+                symbol,
+                completion_lock_wait_ms,
+                "execution placement acquired strategy lock for durable acknowledgement"
+            );
+            let completion_now_ms = advance_reference_time_ms(now_ms, lock_started.elapsed())
+                .max(strategy.updated_at_ms());
+            let result = strategy
+                .complete_targeted_submission(prepared, placement_results, completion_now_ms)
+                .map_err(Into::into);
+            return Some((run_id, result));
+        }
+        drop(waiter);
         let result = strategy
             .advance_execution_events(effective_now_ms, exchange_order_ids)
             .await

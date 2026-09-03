@@ -56,6 +56,7 @@ const DEFAULT_SUBMISSIONS_PER_TICK: usize = 100;
 const EXECUTION_EVENT_RETRY_DELAY: Duration = Duration::from_millis(125);
 const EXECUTION_WAKEUP_BATCH_WINDOW: Duration = Duration::from_millis(2);
 const MAX_EXECUTION_WAKEUPS_PER_BATCH: usize = 256;
+const MAX_CONCURRENT_EXECUTION_DISPATCHES_PER_MARKET: usize = 4;
 const REPLACEMENT_ACK_SLO_MS: u64 = 1_000;
 
 pub fn app() -> Router {
@@ -335,7 +336,53 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
 
 #[derive(Debug, Default)]
 struct ExecutionDispatchState {
+    in_flight: usize,
     pending: Option<PendingExecutionWakeups>,
+}
+
+impl ExecutionDispatchState {
+    fn dispatch_or_queue(
+        &mut self,
+        pending: PendingExecutionWakeups,
+    ) -> Option<PendingExecutionWakeups> {
+        let maximum_concurrency = execution_dispatch_concurrency(&pending);
+        if self.in_flight < maximum_concurrency {
+            self.in_flight += 1;
+            return Some(pending);
+        }
+        match &mut self.pending {
+            Some(existing) => existing.merge_pending(pending),
+            None => self.pending = Some(pending),
+        }
+        None
+    }
+
+    fn complete(&mut self) -> Option<PendingExecutionWakeups> {
+        debug_assert!(self.in_flight > 0);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| self.in_flight < execution_dispatch_concurrency(pending))
+        {
+            self.in_flight += 1;
+            return self.pending.take();
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.in_flight == 0 && self.pending.is_none()
+    }
+}
+
+fn execution_dispatch_concurrency(pending: &PendingExecutionWakeups) -> usize {
+    match pending.event.exchange {
+        Exchange::TradeXyz if !pending.requires_full_scan => {
+            MAX_CONCURRENT_EXECUTION_DISPATCHES_PER_MARKET
+        }
+        Exchange::Binance | Exchange::Aster | Exchange::Bybit | Exchange::TradeXyz => 1,
+    }
 }
 
 #[derive(Debug)]
@@ -440,15 +487,10 @@ fn queue_execution_wakeups(
     key: String,
     pending: PendingExecutionWakeups,
 ) {
-    if let Some(dispatch) = dispatches.get_mut(&key) {
-        match &mut dispatch.pending {
-            Some(existing) => existing.merge_pending(pending),
-            None => dispatch.pending = Some(pending),
-        }
+    let dispatch = dispatches.entry(key.clone()).or_default();
+    let Some(pending) = dispatch.dispatch_or_queue(pending) else {
         return;
-    }
-
-    dispatches.insert(key.clone(), ExecutionDispatchState::default());
+    };
     spawn_execution_dispatch(Arc::clone(runtime), completion_sender.clone(), key, pending);
 }
 
@@ -458,14 +500,17 @@ fn complete_execution_dispatch(
     completion_sender: &tokio::sync::mpsc::UnboundedSender<String>,
     key: String,
 ) {
-    let Some(mut dispatch) = dispatches.remove(&key) else {
+    let Some(dispatch) = dispatches.get_mut(&key) else {
         return;
     };
-    let Some(pending) = dispatch.pending.take() else {
-        return;
-    };
-    dispatches.insert(key.clone(), ExecutionDispatchState::default());
-    spawn_execution_dispatch(Arc::clone(runtime), completion_sender.clone(), key, pending);
+    let pending = dispatch.complete();
+    let remove = dispatch.is_idle();
+    if remove {
+        dispatches.remove(&key);
+    }
+    if let Some(pending) = pending {
+        spawn_execution_dispatch(Arc::clone(runtime), completion_sender.clone(), key, pending);
+    }
 }
 
 fn spawn_execution_dispatch(
@@ -1061,6 +1106,111 @@ mod tests {
             pending.exchange_order_ids.into_iter().collect::<Vec<_>>(),
             vec!["42"]
         );
+    }
+
+    #[test]
+    fn trade_xyz_dispatch_pipelines_bursts_up_to_the_market_limit() {
+        let mut dispatch = ExecutionDispatchState::default();
+        for order_id in ["41", "42", "43", "44"] {
+            let pending =
+                PendingExecutionWakeups::new(execution_wakeup(Some(order_id), Some(1_000), 1_010));
+            assert!(dispatch.dispatch_or_queue(pending).is_some());
+        }
+        assert_eq!(dispatch.in_flight, 4);
+        assert!(dispatch.pending.is_none());
+
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(execution_wakeup(
+                    Some("45"),
+                    Some(1_001),
+                    1_011,
+                )))
+                .is_none()
+        );
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(execution_wakeup(
+                    Some("46"),
+                    Some(1_002),
+                    1_012,
+                )))
+                .is_none()
+        );
+
+        let promoted = dispatch.complete().expect("queued burst must be promoted");
+        assert_eq!(promoted.event_count, 2);
+        assert_eq!(
+            promoted.exchange_order_ids.into_iter().collect::<Vec<_>>(),
+            vec!["45", "46"]
+        );
+        assert_eq!(dispatch.in_flight, 4);
+        assert!(dispatch.pending.is_none());
+
+        for _ in 0..4 {
+            assert!(dispatch.complete().is_none());
+        }
+        assert!(dispatch.is_idle());
+    }
+
+    #[test]
+    fn binance_dispatch_keeps_a_single_in_flight_batch() {
+        let mut dispatch = ExecutionDispatchState::default();
+        let mut first = execution_wakeup(Some("41"), Some(1_000), 1_010);
+        first.exchange = Exchange::Binance;
+        let mut second = execution_wakeup(Some("42"), Some(1_001), 1_011);
+        second.exchange = Exchange::Binance;
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(first))
+                .is_some()
+        );
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(second))
+                .is_none()
+        );
+
+        let promoted = dispatch.complete().expect("queued wakeup must be promoted");
+        assert_eq!(promoted.event_count, 1);
+        assert_eq!(dispatch.in_flight, 1);
+        assert!(dispatch.complete().is_none());
+        assert!(dispatch.is_idle());
+    }
+
+    #[test]
+    fn trade_xyz_full_scan_waits_for_exact_dispatches_to_drain() {
+        let mut dispatch = ExecutionDispatchState::default();
+        for order_id in ["41", "42", "43"] {
+            assert!(
+                dispatch
+                    .dispatch_or_queue(PendingExecutionWakeups::new(execution_wakeup(
+                        Some(order_id),
+                        Some(1_000),
+                        1_010,
+                    )))
+                    .is_some()
+            );
+        }
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(execution_wakeup(
+                    None,
+                    Some(1_001),
+                    1_011,
+                )))
+                .is_none()
+        );
+
+        assert!(dispatch.complete().is_none());
+        assert!(dispatch.complete().is_none());
+        let full_scan = dispatch
+            .complete()
+            .expect("full scan must start only after exact dispatches finish");
+        assert!(full_scan.requires_full_scan);
+        assert_eq!(dispatch.in_flight, 1);
+        assert!(dispatch.complete().is_none());
+        assert!(dispatch.is_idle());
     }
 
     #[test]

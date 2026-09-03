@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     domain::{
         CancellationIntent, CancellationState, ClientOrderId, Exchange, GridConfig, IntentState,
-        TerminalOrderStatus,
+        OrderIntent, TerminalOrderStatus,
     },
     engine::{
         ArmedStrategyLifecycle, ArmedStrategyState, CancellationResult, CancellationServiceError,
@@ -21,15 +21,16 @@ use crate::{
         StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking, StrategyRunId,
         StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
         StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
-        cancel_many_with, intent_requires_lookup, load_strategy_inputs, prepare_new_strategy,
-        reconcile_lookup_with, resolve_cancellations_with, submit_many_with, submit_with,
+        cancel_many_with, commit_submission_batch, intent_requires_lookup, load_strategy_inputs,
+        prepare_new_strategy, prepare_submission_batch, reconcile_lookup_with,
+        resolve_cancellations_with, submit_many_with, submit_with,
     },
     exchange::{
         AccountBalanceSnapshotGateway, ActiveOrderStatus, ExchangeIdentityGateway,
         ExecutionSnapshotGateway, HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway,
         MarketSnapshotGateway, OpenOrderExecutionProgress, OrderCancellationGateway,
         OrderLifecycle, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PositionSnapshotGateway, TradingFeeRateGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshotGateway, TradingFeeRateGateway,
     },
     persistence::{
         FileArmedStrategyStateStore, FileOrderIntentStore, FilePreparedStrategyStore,
@@ -195,6 +196,46 @@ pub struct StrategyRuntime<G, I, S> {
     maximum_market_age_ms: u64,
     maximum_future_skew_ms: u64,
     maximum_submissions_per_tick: usize,
+}
+
+pub(crate) enum PreparedExecutionEventStep<G> {
+    Complete(PreparedStrategyStep),
+    Submit(PreparedTargetedSubmission<G>),
+}
+
+pub(crate) struct PreparedTargetedSubmission<G> {
+    gateway: G,
+    intents: Vec<OrderIntent>,
+    report: RuntimeTickReport,
+    timing: TargetedExecutionTiming,
+}
+
+enum TargetedExecutionPreparation<G> {
+    Complete(RuntimeTickReport),
+    Submit(PreparedTargetedSubmission<G>),
+}
+
+struct TargetedExecutionTiming {
+    tick_started: Instant,
+    submission_started: Instant,
+    requested_target_count: usize,
+    owned_target_count: usize,
+    preflight_ms: u64,
+    snapshot_ms: u64,
+    accounting_ms: u64,
+    convergence_ms: u64,
+    materialization_ms: u64,
+}
+
+impl<G> PreparedTargetedSubmission<G>
+where
+    G: OrderPlacementGateway,
+{
+    pub(crate) async fn place(&self) -> Vec<Result<PlacementAcknowledgement, PlacementError>> {
+        self.gateway
+            .place_orders(&self.intents, MAX_CONCURRENT_REPLACEMENT_SUBMISSIONS)
+            .await
+    }
 }
 
 pub struct LeasedFileStrategyRuntime<G> {
@@ -479,7 +520,8 @@ impl<G> PreparedLeasedFileStrategy<G> {
         exchange_order_ids: Option<&[String]>,
     ) -> Result<PreparedStrategyStep, PreparedStrategyStepError>
     where
-        G: ExchangeIdentityGateway
+        G: Clone
+            + ExchangeIdentityGateway
             + TradingFeeRateGateway
             + LeverageGateway
             + PositionSnapshotGateway
@@ -502,6 +544,73 @@ impl<G> PreparedLeasedFileStrategy<G> {
                 Ok(PreparedStrategyStep::WaitingForTrigger)
             }
             None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub(crate) async fn prepare_targeted_execution_events(
+        &mut self,
+        now_ms: u64,
+        exchange_order_ids: &[String],
+    ) -> Result<PreparedExecutionEventStep<G>, PreparedStrategyStepError>
+    where
+        G: Clone
+            + ExchangeIdentityGateway
+            + TradingFeeRateGateway
+            + LeverageGateway
+            + PositionSnapshotGateway
+            + MarketSnapshotGateway
+            + InstrumentRulesGateway
+            + OrderPlacementGateway
+            + OrderCancellationGateway
+            + OrderLookupGateway
+            + ExecutionSnapshotGateway
+            + HistoricalPriceGateway,
+    {
+        match self.inner.as_mut() {
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => match runtime
+                .runtime_mut()
+                .prepare_targeted_execution_events(now_ms, exchange_order_ids)
+                .await?
+            {
+                TargetedExecutionPreparation::Complete(report) => Ok(
+                    PreparedExecutionEventStep::Complete(PreparedStrategyStep::Active(report)),
+                ),
+                TargetedExecutionPreparation::Submit(prepared) => {
+                    Ok(PreparedExecutionEventStep::Submit(prepared))
+                }
+            },
+            Some(PreparedLeasedFileStrategyInner::Armed { .. }) => Ok(
+                PreparedExecutionEventStep::Complete(PreparedStrategyStep::WaitingForTrigger),
+            ),
+            None => unreachable!("strategy transition is synchronous"),
+        }
+    }
+
+    pub(crate) fn complete_targeted_submission(
+        &mut self,
+        prepared: PreparedTargetedSubmission<G>,
+        placement_results: Vec<Result<PlacementAcknowledgement, PlacementError>>,
+        now_ms: u64,
+    ) -> Result<PreparedStrategyStep, PreparedStrategyStepError>
+    where
+        G: OrderPlacementGateway
+            + OrderCancellationGateway
+            + OrderLookupGateway
+            + ExecutionSnapshotGateway
+            + HistoricalPriceGateway
+            + MarketSnapshotGateway
+            + InstrumentRulesGateway
+            + PositionSnapshotGateway,
+    {
+        match self.inner.as_mut() {
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => runtime
+                .runtime_mut()
+                .complete_targeted_submission(prepared, placement_results, now_ms)
+                .map(PreparedStrategyStep::Active)
+                .map_err(PreparedStrategyStepError::from),
+            Some(PreparedLeasedFileStrategyInner::Armed { .. }) | None => {
+                unreachable!("an active prepared submission must finish on its active strategy")
+            }
         }
     }
 }
@@ -1603,7 +1712,10 @@ where
         &mut self,
         now_ms: u64,
         exchange_order_id: Option<&str>,
-    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+    ) -> Result<RuntimeTickReport, RuntimeTickError>
+    where
+        G: Clone,
+    {
         if let Some(exchange_order_id) = exchange_order_id {
             let exchange_order_ids = [exchange_order_id.to_owned()];
             return self
@@ -1618,7 +1730,10 @@ where
         &mut self,
         now_ms: u64,
         exchange_order_ids: Option<&[String]>,
-    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+    ) -> Result<RuntimeTickReport, RuntimeTickError>
+    where
+        G: Clone,
+    {
         if let Some(exchange_order_ids) = exchange_order_ids {
             return self
                 .tick_targeted_execution_events(now_ms, exchange_order_ids)
@@ -1632,7 +1747,32 @@ where
         &mut self,
         now_ms: u64,
         exchange_order_ids: &[String],
-    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+    ) -> Result<RuntimeTickReport, RuntimeTickError>
+    where
+        G: Clone,
+    {
+        match self
+            .prepare_targeted_execution_events(now_ms, exchange_order_ids)
+            .await?
+        {
+            TargetedExecutionPreparation::Complete(report) => Ok(report),
+            TargetedExecutionPreparation::Submit(prepared) => {
+                let placement_results = prepared.place().await;
+                let completion_ms =
+                    advance_reference_time_ms(now_ms, prepared.timing.tick_started.elapsed());
+                self.complete_targeted_submission(prepared, placement_results, completion_ms)
+            }
+        }
+    }
+
+    async fn prepare_targeted_execution_events(
+        &mut self,
+        now_ms: u64,
+        exchange_order_ids: &[String],
+    ) -> Result<TargetedExecutionPreparation<G>, RuntimeTickError>
+    where
+        G: Clone,
+    {
         let tick_started = Instant::now();
         self.validate_ledger_ownership()?;
         self.converge_accounted_terminal_intents(now_ms)?;
@@ -1645,7 +1785,7 @@ where
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         if requested_exchange_order_ids.is_empty() {
-            return Ok(report);
+            return Ok(TargetedExecutionPreparation::Complete(report));
         }
         let client_order_ids = self
             .machine
@@ -1667,7 +1807,7 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         if client_order_ids.is_empty() {
-            return Ok(report);
+            return Ok(TargetedExecutionPreparation::Complete(report));
         }
         let execution_requests = client_order_ids
             .iter()
@@ -1764,16 +1904,17 @@ where
             u64::try_from(convergence_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lifecycle = self.machine.store().snapshot().lifecycle;
         if lifecycle == StrategyLifecycle::Failed {
-            return self
+            let report = self
                 .drive_exit(
                     report,
                     lifecycle,
                     advance_reference_time_ms(now_ms, tick_started.elapsed()),
                 )
-                .await;
+                .await?;
+            return Ok(TargetedExecutionPreparation::Complete(report));
         }
         if lifecycle != StrategyLifecycle::Running || report.execution_syncs == 0 {
-            return Ok(report);
+            return Ok(TargetedExecutionPreparation::Complete(report));
         }
         if report.is_blocked()
             && !report
@@ -1781,7 +1922,7 @@ where
                 .iter()
                 .all(|blocker| blocker.stage == RuntimeStage::ExecutionAccounting)
         {
-            return Ok(report);
+            return Ok(TargetedExecutionPreparation::Complete(report));
         }
         let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
         let materialization_started = Instant::now();
@@ -1797,35 +1938,41 @@ where
                 message: "replacement planning failed before targeted order submission".into(),
             });
             self.validate_ledger_ownership()?;
-            return self
+            let report = self
                 .drive_exit(
                     report,
                     StrategyLifecycle::Failed,
                     advance_reference_time_ms(now_ms, tick_started.elapsed()),
                 )
-                .await;
+                .await?;
+            return Ok(TargetedExecutionPreparation::Complete(report));
         }
         let submission_started = Instant::now();
-        self.submit_ready_replacement_orders(&mut report, now_ms)
-            .await?;
-        let submission_ms =
-            u64::try_from(submission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let intents = self.prepare_ready_replacement_submissions(&report, now_ms)?;
         self.validate_ledger_ownership()?;
-        tracing::info!(
-            run_id = self.machine.store().snapshot().run_id.as_str(),
-            symbol = self.machine.store().snapshot().symbol.as_str(),
-            requested_target_count = requested_exchange_order_ids.len(),
-            owned_target_count = client_order_ids.len(),
+        let timing = TargetedExecutionTiming {
+            tick_started,
+            submission_started,
+            requested_target_count: requested_exchange_order_ids.len(),
+            owned_target_count: client_order_ids.len(),
             preflight_ms,
             snapshot_ms,
             accounting_ms,
             convergence_ms,
             materialization_ms,
-            submission_ms,
-            total_ms = u64::try_from(tick_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "batched targeted execution processing stages completed"
-        );
-        Ok(report)
+        };
+        if intents.is_empty() {
+            log_targeted_execution_timing(&self.machine, &timing);
+            return Ok(TargetedExecutionPreparation::Complete(report));
+        }
+        Ok(TargetedExecutionPreparation::Submit(
+            PreparedTargetedSubmission {
+                gateway: self.gateway.clone(),
+                intents,
+                report,
+                timing,
+            },
+        ))
     }
 
     async fn tick_with_mode(
@@ -2332,6 +2479,114 @@ where
                 )
                 .await;
         }
+        Ok(report)
+    }
+
+    fn prepare_ready_replacement_submissions(
+        &mut self,
+        report: &RuntimeTickReport,
+        now_ms: u64,
+    ) -> Result<Vec<OrderIntent>, RuntimeTickError> {
+        let ready = {
+            let state = self.machine.store().snapshot();
+            let retryable_ids = self
+                .intent_store
+                .snapshot()
+                .intents
+                .iter()
+                .filter_map(|(client_order_id, intent)| {
+                    matches!(intent.state, IntentState::RetryableNotSubmitted { .. })
+                        .then_some(client_order_id)
+                })
+                .collect::<BTreeSet<_>>();
+            let mut ready = state.ready_intents(now_ms)?;
+            ready.retain(|intent| {
+                state
+                    .orders
+                    .get(&intent.client_order_id)
+                    .is_some_and(|order| {
+                        matches!(order.purpose, StrategyOrderPurpose::Replacement { .. })
+                    })
+                    && !retryable_ids.contains(&intent.client_order_id)
+            });
+            ready
+        };
+        let remaining_submissions = self
+            .maximum_submissions_per_tick
+            .saturating_sub(report.submissions.len());
+        let ready = ready
+            .into_iter()
+            .take(remaining_submissions)
+            .collect::<Vec<_>>();
+        if !ready.is_empty() {
+            prepare_submission_batch(&mut self.intent_store, &ready, now_ms)?;
+            for intent in &ready {
+                let prepared = self
+                    .intent_store
+                    .snapshot()
+                    .intents
+                    .get(&intent.client_order_id)
+                    .cloned()
+                    .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+                if !matches!(prepared.state, IntentState::Prepared) {
+                    return Err(RuntimeTickError::IntentLedgerMismatch);
+                }
+                self.machine.synchronize_intent(&prepared, now_ms)?;
+            }
+        }
+        Ok(ready)
+    }
+
+    fn complete_targeted_submission(
+        &mut self,
+        prepared: PreparedTargetedSubmission<G>,
+        placement_results: Vec<Result<PlacementAcknowledgement, PlacementError>>,
+        now_ms: u64,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        let PreparedTargetedSubmission {
+            gateway: _,
+            intents,
+            mut report,
+            timing,
+        } = prepared;
+        let submissions =
+            commit_submission_batch(&mut self.intent_store, intents, placement_results, now_ms)?;
+        for (client_order_id, result) in submissions {
+            let persisted = self
+                .intent_store
+                .snapshot()
+                .intents
+                .get(&client_order_id)
+                .cloned()
+                .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+            let transition = self.machine.synchronize_intent(&persisted, now_ms)?;
+            report.submissions.push(RuntimeSubmission {
+                client_order_id: client_order_id.clone(),
+                result: result.clone(),
+            });
+            match result {
+                SubmissionResult::Accepted { .. } | SubmissionResult::NotSubmitted => {}
+                SubmissionResult::SubmitUnknown => report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::SubmissionUnknown,
+                    client_order_id: Some(client_order_id.clone()),
+                    message: "placement outcome is unknown; no later batch will be sent".into(),
+                }),
+                SubmissionResult::Rejected => report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::SubmissionRejected,
+                    client_order_id: Some(client_order_id.clone()),
+                    message: "exchange definitively rejected the order".into(),
+                }),
+            }
+            if matches!(transition, StrategyTransition::Failed { .. }) {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::StrategyFailed,
+                    client_order_id: Some(client_order_id),
+                    message: "submitted intent failed strategy synchronization".into(),
+                });
+            }
+        }
+        self.validate_ledger_ownership()?;
+        log_targeted_execution_timing(&self.machine, &timing);
         Ok(report)
     }
 
@@ -2914,6 +3169,28 @@ where
     }
 }
 
+fn log_targeted_execution_timing<S>(machine: &StrategyMachine<S>, timing: &TargetedExecutionTiming)
+where
+    S: StrategyStateStore,
+{
+    let state = machine.store().snapshot();
+    tracing::info!(
+        run_id = state.run_id.as_str(),
+        symbol = state.symbol.as_str(),
+        requested_target_count = timing.requested_target_count,
+        owned_target_count = timing.owned_target_count,
+        preflight_ms = timing.preflight_ms,
+        snapshot_ms = timing.snapshot_ms,
+        accounting_ms = timing.accounting_ms,
+        convergence_ms = timing.convergence_ms,
+        materialization_ms = timing.materialization_ms,
+        submission_ms =
+            u64::try_from(timing.submission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        total_ms = u64::try_from(timing.tick_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "batched targeted execution processing stages completed"
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeTickMode {
     Full,
@@ -3182,6 +3459,17 @@ mod tests {
             self.state.lock().unwrap().placement_calls.clone()
         }
 
+        fn exchange_order_id(&self, client_order_id: &ClientOrderId) -> String {
+            self.state
+                .lock()
+                .unwrap()
+                .orders
+                .get(client_order_id)
+                .expect("placed order must have an exchange identity")
+                .exchange_order_id
+                .clone()
+        }
+
         fn fail_next_placement(&self, error: PlacementError) {
             self.state.lock().unwrap().next_placement_error = Some(error);
         }
@@ -3195,6 +3483,10 @@ mod tests {
 
         fn maximum_concurrent_placement_count(&self) -> usize {
             self.state.lock().unwrap().maximum_concurrent_placements
+        }
+
+        fn active_placement_count(&self) -> usize {
+            self.state.lock().unwrap().active_placements
         }
 
         fn cancellation_call_count(&self) -> usize {
@@ -3337,6 +3629,16 @@ mod tests {
         }
 
         fn fill_order(&self, client_order_id: &ClientOrderId, price: Decimal, fee: Decimal) {
+            self.fill_order_with_quote_asset(client_order_id, price, fee, "USDT");
+        }
+
+        fn fill_order_with_quote_asset(
+            &self,
+            client_order_id: &ClientOrderId,
+            price: Decimal,
+            fee: Decimal,
+            quote_asset: &str,
+        ) {
             let mut state = self.state.lock().unwrap();
             let previous = state
                 .executions
@@ -3365,7 +3667,7 @@ mod tests {
                 quote_quantity,
                 raw_commission: fee,
                 commission_cost: fee,
-                commission_asset: "USDT".into(),
+                commission_asset: quote_asset.to_owned(),
                 realized_profit: Decimal::ZERO,
                 is_maker: true,
                 trade_time_ms,
@@ -3376,7 +3678,7 @@ mod tests {
                     order,
                     cumulative_quantity: quantity,
                     cumulative_quote: quote_quantity,
-                    fees_by_asset: [("USDT".into(), fee)].into_iter().collect(),
+                    fees_by_asset: [(quote_asset.to_owned(), fee)].into_iter().collect(),
                     trades: vec![trade],
                     order_time_ms: previous.order_time_ms,
                     update_time_ms: trade_time_ms,
@@ -5211,6 +5513,140 @@ mod tests {
                 lifecycle: StrategyLifecycle::StopRequested,
             })
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registry_pipelines_trade_xyz_replacements_and_preserves_stop_during_ack() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100)
+            .with_exchange(Exchange::TradeXyz)
+            .with_symbol("MUUSDC");
+        let run_id = StrategyRunId::parse("pipe0001").unwrap();
+        let mut trade_config = config(None);
+        trade_config.exchange = Some(Exchange::TradeXyz);
+        trade_config.symbol = "MUUSDC".into();
+        let prepared = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            run_id.clone(),
+            trade_config,
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let active = prepared
+            .active_runtime()
+            .expect("an untriggered strategy must start active");
+        let opening_id = opening_id(active.runtime().machine());
+        let opening_quantity = active.runtime().machine().store().snapshot().orders[&opening_id]
+            .shape
+            .quantity;
+        let registry = Arc::new(RuntimeRegistry::new());
+        assert!(matches!(
+            registry.register(prepared).await,
+            RuntimeRegistration::Registered
+        ));
+
+        let PreparedStrategyStep::Active(opening) = registry.advance(&run_id, 1_100).await.unwrap()
+        else {
+            panic!("the opening order must be submitted");
+        };
+        assert_eq!(opening.submissions.len(), 1);
+        gateway.fill_order_with_quote_asset(
+            &opening_id,
+            Decimal::new(1014, 0),
+            Decimal::new(5, 2),
+            "USDC",
+        );
+        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        let PreparedStrategyStep::Active(deployment) =
+            registry.advance(&run_id, 1_200).await.unwrap()
+        else {
+            panic!("the initial grid must be deployed");
+        };
+        assert!(!deployment.is_blocked(), "{deployment:?}");
+
+        let source_intents = gateway
+            .placement_intents()
+            .into_iter()
+            .filter(|intent| intent.client_order_id != opening_id && !intent.shape.reduce_only)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(source_intents.len(), 2);
+        for intent in &source_intents {
+            gateway.fill_order_with_quote_asset(
+                &intent.client_order_id,
+                intent.shape.price.unwrap(),
+                Decimal::new(1, 2),
+                "USDC",
+            );
+        }
+        let added_quantity = source_intents
+            .iter()
+            .map(|intent| intent.shape.quantity)
+            .sum::<Decimal>();
+        gateway.set_position(
+            -(opening_quantity + added_quantity),
+            Some(Decimal::new(1014, 0)),
+        );
+        let first_target = vec![gateway.exchange_order_id(&source_intents[0].client_order_id)];
+        let second_target = vec![gateway.exchange_order_id(&source_intents[1].client_order_id)];
+        gateway.measure_delayed_placements(Duration::from_millis(250));
+
+        let first_registry = Arc::clone(&registry);
+        let second_registry = Arc::clone(&registry);
+        let first = tokio::spawn(async move {
+            first_registry
+                .advance_execution_events(Exchange::TradeXyz, "MUUSDC", Some(&first_target), 1_300)
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_registry
+                .advance_execution_events(Exchange::TradeXyz, "MUUSDC", Some(&second_target), 1_301)
+                .await
+        });
+        for _ in 0..50 {
+            if gateway.active_placement_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(gateway.active_placement_count(), 2);
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                registry.request_stop(&run_id, 1_302),
+            )
+            .await
+            .expect("stop must not wait for remote placement acknowledgements")
+            .unwrap(),
+            PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
+                lifecycle: StrategyLifecycle::StopRequested,
+            })
+        ));
+
+        for advance in [first.await.unwrap(), second.await.unwrap()] {
+            let (_, result) = advance.expect("the active strategy must own the market");
+            let PreparedStrategyStep::Active(report) = result.unwrap() else {
+                panic!("each execution must advance the active strategy");
+            };
+            assert_eq!(report.submissions.len(), 1, "{report:?}");
+            assert!(!report.is_blocked(), "{report:?}");
+        }
+        assert_eq!(gateway.maximum_concurrent_placement_count(), 2);
+
+        gateway.set_cancellation_marks_terminal(true);
+        let PreparedStrategyStep::Active(cleanup) = registry.advance(&run_id, 2_000).await.unwrap()
+        else {
+            panic!("the stopped strategy must clean up its accepted orders");
+        };
+        assert!(cleanup.submissions.is_empty());
+        assert!(!cleanup.cancellations.is_empty());
+        assert_eq!(
+            registry.entries().await[0].lifecycle,
+            Some(PreparedStrategyLifecycle::Stopped)
+        );
     }
 
     #[tokio::test]

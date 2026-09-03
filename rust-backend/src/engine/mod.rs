@@ -82,6 +82,7 @@ pub use strategy_machine::{
 pub use submission::{
     SubmissionError, SubmissionResult, SubmissionService, submit_many_with, submit_with,
 };
+pub(crate) use submission::{commit_submission_batch, prepare_submission_batch};
 pub use supervisor::{
     RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError,
     RuntimeRegistryEntry, RuntimeRegistryStopError, RuntimeStartupFailure, RuntimeStartupReport,

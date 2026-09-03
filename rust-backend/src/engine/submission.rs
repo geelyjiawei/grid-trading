@@ -70,9 +70,32 @@ where
     G: OrderPlacementGateway,
     S: IntentStore,
 {
-    store.prepare_intents(intents.clone(), result_time_ms)?;
-
+    prepare_submission_batch(store, &intents, result_time_ms)?;
     let placement_results = gateway.place_orders(&intents, maximum_concurrency).await;
+    commit_submission_batch(store, intents, placement_results, result_time_ms)
+}
+
+pub(crate) fn prepare_submission_batch<S>(
+    store: &mut S,
+    intents: &[OrderIntent],
+    result_time_ms: u64,
+) -> Result<(), SubmissionError>
+where
+    S: IntentStore,
+{
+    store.prepare_intents(intents.to_vec(), result_time_ms)?;
+    Ok(())
+}
+
+pub(crate) fn commit_submission_batch<S>(
+    store: &mut S,
+    intents: Vec<OrderIntent>,
+    placement_results: Vec<Result<PlacementAcknowledgement, PlacementError>>,
+    result_time_ms: u64,
+) -> Result<Vec<(crate::domain::ClientOrderId, SubmissionResult)>, SubmissionError>
+where
+    S: IntentStore,
+{
     let placement_results = if placement_results.len() == intents.len() {
         placement_results
     } else {
