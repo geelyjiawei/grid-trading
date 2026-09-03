@@ -29,7 +29,23 @@ import StrategyOverview from "./components/StrategyOverview.vue";
 import { exchangeName, quoteAsset, strategyCanStop } from "./format";
 
 const exchanges: Exchange[] = ["binance", "aster", "bybit", "trade_xyz"];
+const SYMBOL_REFRESH_DELAY_MS = 450;
+const PRICE_POLL_INTERVAL_MS = 5_000;
+const SLOW_MARKET_POLL_INTERVAL_MS = 30_000;
 type ColorTheme = "dark" | "light";
+interface MarketRefreshOptions {
+  price: boolean;
+  balance: boolean;
+  fees: boolean;
+  risk: boolean;
+}
+
+const fullMarketRefresh: MarketRefreshOptions = {
+  price: true,
+  balance: true,
+  fees: true,
+  risk: true,
+};
 const themeStorageKey = "grid-console-theme";
 const theme = ref<ColorTheme>(
   document.documentElement.dataset.theme === "light" ? "light" : "dark",
@@ -79,7 +95,8 @@ const strategyError = ref("");
 const marketError = ref("");
 const settingsOpen = ref(false);
 let statusTimer: number | undefined;
-let marketTimer: number | undefined;
+let priceTimer: number | undefined;
+let slowMarketTimer: number | undefined;
 let symbolRefreshTimer: number | undefined;
 let statusRefreshRunning = false;
 let previewRequestSequence = 0;
@@ -153,8 +170,8 @@ function queueSymbolRefresh(): void {
   cancelPendingSymbolRefresh();
   symbolRefreshTimer = window.setTimeout(() => {
     symbolRefreshTimer = undefined;
-    void refreshWorkspace();
-  }, 350);
+    void refreshSymbolWorkspace();
+  }, SYMBOL_REFRESH_DELAY_MS);
 }
 
 function alignSymbolWithExchange(exchange: Exchange): void {
@@ -237,15 +254,15 @@ async function refreshStrategies(): Promise<void> {
   }
 }
 
-async function refreshMarket(): Promise<void> {
+async function refreshMarket(options: MarketRefreshOptions = fullMarketRefresh): Promise<void> {
   if (!authenticated.value || !symbol.value) return;
   prepareWorkspaceContext();
   if (!configured.value) {
     marketRequestSequence += 1;
-    price.value = null;
-    balance.value = null;
-    fees.value = null;
-    risk.value = null;
+    if (options.price) price.value = null;
+    if (options.balance) balance.value = null;
+    if (options.fees) fees.value = null;
+    if (options.risk) risk.value = null;
     marketError.value = "";
     loading.value = false;
     return;
@@ -276,15 +293,30 @@ async function refreshMarket(): Promise<void> {
     }
   };
   try {
-    const priceRequest = api.price(exchange, requestedSymbol);
-    const balanceRequest = configured.value
-      ? api.balance(exchange)
-      : Promise.resolve<BalanceSnapshot | null>(null);
-    const feeRequest = configured.value
-      ? api.feeRates(exchange, requestedSymbol)
-      : Promise.resolve<FeeRates | null>(null);
-    let riskRequest: Promise<RiskSnapshot | null> = Promise.resolve(null);
-    if (configured.value) {
+    const requests: Promise<void>[] = [];
+    if (options.price) {
+      requests.push(settle(
+        api.price(exchange, requestedSymbol),
+        (value) => { price.value = value; },
+        () => { price.value = null; },
+      ));
+    }
+    if (options.balance) {
+      requests.push(settle(
+        api.balance(exchange),
+        (value) => { balance.value = value; },
+        () => { balance.value = null; },
+      ));
+    }
+    if (options.fees) {
+      requests.push(settle(
+        api.feeRates(exchange, requestedSymbol),
+        (value) => { fees.value = value; },
+        () => { fees.value = null; },
+      ));
+    }
+    if (options.risk) {
+      let riskRequest: Promise<RiskSnapshot>;
       const existingRiskRequest = riskRequestsInFlight.get(requestContext);
       if (existingRiskRequest) {
         riskRequest = existingRiskRequest;
@@ -305,15 +337,15 @@ async function refreshMarket(): Promise<void> {
         );
         riskRequest = nextRiskRequest;
       }
+      requests.push(settle(
+        riskRequest,
+        (value) => { risk.value = value; },
+        () => { risk.value = null; },
+      ));
     }
 
     marketError.value = "";
-    await Promise.all([
-      settle(priceRequest, (value) => { price.value = value; }, () => { price.value = null; }),
-      settle(balanceRequest, (value) => { balance.value = value; }, () => { balance.value = null; }),
-      settle(feeRequest, (value) => { fees.value = value; }, () => { fees.value = null; }),
-      settle(riskRequest, (value) => { risk.value = value; }, () => { risk.value = null; }),
-    ]);
+    await Promise.all(requests);
     if (requestIsCurrent()) {
       marketError.value = [...new Set(failures)].join("；");
     }
@@ -340,6 +372,20 @@ async function refreshWorkspace(): Promise<void> {
   } finally {
     loading.value = false;
   }
+}
+
+async function refreshSymbolWorkspace(): Promise<void> {
+  cancelPendingSymbolRefresh();
+  normalizeSymbol();
+  prepareWorkspaceContext();
+  loading.value = true;
+  try {
+    await refreshStrategies();
+    await refreshMarket({ price: true, balance: true, fees: true, risk: false });
+  } finally {
+    loading.value = false;
+  }
+  void refreshDetails();
 }
 
 async function refreshDetails(): Promise<void> {
@@ -486,9 +532,22 @@ async function stopStrategy(): Promise<void> {
 
 function startPolling(): void {
   window.clearInterval(statusTimer);
-  window.clearInterval(marketTimer);
+  window.clearInterval(priceTimer);
+  window.clearInterval(slowMarketTimer);
   statusTimer = window.setInterval(() => void refreshStrategies(), 3000);
-  marketTimer = window.setInterval(() => void refreshMarket(), 5000);
+  priceTimer = window.setInterval(
+    () => void refreshMarket({ price: true, balance: false, fees: false, risk: false }),
+    PRICE_POLL_INTERVAL_MS,
+  );
+  slowMarketTimer = window.setInterval(
+    () => void refreshMarket({
+      price: false,
+      balance: true,
+      fees: false,
+      risk: selectedStatus.value !== null,
+    }),
+    SLOW_MARKET_POLL_INTERVAL_MS,
+  );
 }
 
 async function initializeWorkspace(): Promise<void> {
@@ -573,7 +632,8 @@ async function selectStrategy(grid: GridStatus): Promise<void> {
 onMounted(() => void checkAuth());
 onUnmounted(() => {
   window.clearInterval(statusTimer);
-  window.clearInterval(marketTimer);
+  window.clearInterval(priceTimer);
+  window.clearInterval(slowMarketTimer);
   cancelPendingSymbolRefresh();
 });
 </script>
@@ -646,8 +706,7 @@ onUnmounted(() => {
           v-model="symbol"
           spellcheck="false"
           @input="queueSymbolRefresh"
-          @change="refreshWorkspace"
-          @keyup.enter="refreshWorkspace"
+          @keyup.enter="refreshSymbolWorkspace"
         />
       </label>
     </section>

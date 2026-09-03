@@ -54,6 +54,7 @@ function installWorkspaceMocks(grids: GridStatus[]): void {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   document.documentElement.dataset.theme = "dark";
   window.localStorage.removeItem("grid-console-theme");
 });
@@ -81,6 +82,60 @@ describe("theme control", () => {
 });
 
 describe("workspace request isolation", () => {
+  it("keeps exchange-heavy snapshots out of the five-second price poll", async () => {
+    vi.useFakeTimers();
+    installWorkspaceMocks([{
+      run_id: "run-trade-xyz-poll",
+      exchange: "trade_xyz",
+      symbol: "MUUSDC",
+      running: true,
+      realized_net_profit: "1",
+    }]);
+    const priceSpy = vi.spyOn(api, "price").mockResolvedValue({
+      last_price: "100",
+      mark_price: "100",
+    });
+    const riskSpy = vi.spyOn(api, "risk").mockResolvedValue({
+      exchange: "trade_xyz",
+      symbol: "MUUSDC",
+      has_risk: false,
+    });
+
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    priceSpy.mockClear();
+    riskSpy.mockClear();
+    vi.mocked(api.balance).mockClear();
+    vi.mocked(api.feeRates).mockClear();
+    vi.mocked(api.positions).mockClear();
+    vi.mocked(api.openOrders).mockClear();
+    vi.mocked(api.trades).mockClear();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    expect(priceSpy).toHaveBeenCalledTimes(1);
+    expect(api.balance).not.toHaveBeenCalled();
+    expect(api.feeRates).not.toHaveBeenCalled();
+    expect(riskSpy).not.toHaveBeenCalled();
+    expect(api.positions).not.toHaveBeenCalled();
+    expect(api.openOrders).not.toHaveBeenCalled();
+    expect(api.trades).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(25_000);
+    await flushPromises();
+
+    expect(priceSpy).toHaveBeenCalledTimes(6);
+    expect(api.balance).toHaveBeenCalledTimes(1);
+    expect(api.feeRates).not.toHaveBeenCalled();
+    expect(riskSpy).toHaveBeenCalledTimes(1);
+    expect(api.positions).not.toHaveBeenCalled();
+    expect(api.openOrders).not.toHaveBeenCalled();
+    expect(api.trades).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it("does not poll an unconfigured preferred exchange", async () => {
     vi.spyOn(api, "authStatus").mockResolvedValue({
       required: false,

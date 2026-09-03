@@ -54,7 +54,9 @@ const TRADE_XYZ_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(75);
 const BINANCE_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
 const INSTRUMENT_RULES_CACHE_TTL: Duration = Duration::from_secs(60);
 const TRADING_FEE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-const TRADE_XYZ_EXECUTION_PROGRESS_CACHE_TTL: Duration = Duration::from_secs(3);
+// Program-owned placements, cancellations, and execution events update this cache
+// immediately. REST remains a periodic authority check rather than a per-tick poll.
+const TRADE_XYZ_EXECUTION_PROGRESS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct TimedSnapshotCache<T> {
@@ -1301,6 +1303,22 @@ mod tests {
         );
         assert_eq!(
             cache.get("MUUSDT", inserted_at + Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn trade_xyz_progress_cache_keeps_the_stream_backed_five_second_window() {
+        let cache = TimedSnapshotCache::new(TRADE_XYZ_EXECUTION_PROGRESS_CACHE_TTL);
+        let inserted_at = Instant::now();
+        cache.insert("PONSUSDC".into(), "stream-backed", inserted_at);
+
+        assert_eq!(
+            cache.get("PONSUSDC", inserted_at + Duration::from_millis(4_999)),
+            Some("stream-backed")
+        );
+        assert_eq!(
+            cache.get("PONSUSDC", inserted_at + Duration::from_secs(5)),
             None
         );
     }

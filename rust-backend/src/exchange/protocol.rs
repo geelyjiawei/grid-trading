@@ -505,8 +505,8 @@ fn binance_cooldown_response(cooldown: Duration) -> HttpResponse {
 }
 
 const HYPERLIQUID_WEIGHT_WINDOW: Duration = Duration::from_secs(60);
-const HYPERLIQUID_WEIGHT_LIMIT: u32 = 1_000;
-const HYPERLIQUID_CRITICAL_WEIGHT_RESERVE: u32 = 100;
+const HYPERLIQUID_WEIGHT_LIMIT: u32 = 1_200;
+const HYPERLIQUID_CRITICAL_WEIGHT_RESERVE: u32 = 150;
 const HYPERLIQUID_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const HYPERLIQUID_NORMAL_INFLIGHT_LIMIT: usize = 2;
 const HYPERLIQUID_CRITICAL_INFLIGHT_LIMIT: usize = 4;
@@ -596,9 +596,10 @@ impl HyperliquidRequestState {
 }
 
 /// Schedules Hyperliquid REST traffic using a rolling request-weight window.
-/// Normal snapshots cannot consume the final 100 weight units, so execution
+/// Normal snapshots cannot consume the final 150 weight units, so execution
 /// reconciliation and writes do not inherit an artificial multi-second delay.
-/// The combined budget remains below Hyperliquid's 1,200 weight/minute IP limit.
+/// The combined budget matches Hyperliquid's 1,200 weight/minute IP limit while
+/// preserving a dedicated 150-weight lane for execution reconciliation and writes.
 #[derive(Clone)]
 pub struct HyperliquidRequestGovernor<T> {
     inner: T,
@@ -1614,6 +1615,12 @@ mod tests {
 
         assert_eq!(critical.status, 200);
         assert_eq!(transport.call_count(), 2);
+    }
+
+    #[test]
+    fn hyperliquid_budget_matches_the_published_ip_limit() {
+        assert_eq!(HYPERLIQUID_WEIGHT_LIMIT, 1_200);
+        assert_eq!(HYPERLIQUID_CRITICAL_WEIGHT_RESERVE, 150);
     }
 
     #[test]
