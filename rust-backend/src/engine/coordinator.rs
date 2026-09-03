@@ -286,9 +286,36 @@ where
     }
 
     pub async fn advance_all(&self, now_ms: u64) -> Vec<RuntimeAdvanceResult> {
+        self.advance_matching(now_ms, |_| true).await
+    }
+
+    pub async fn advance_exchange(
+        &self,
+        exchange: Exchange,
+        now_ms: u64,
+    ) -> Vec<RuntimeAdvanceResult> {
+        self.advance_matching(now_ms, |entry| entry.exchange == exchange)
+            .await
+    }
+
+    pub async fn advance_excluding_exchange(
+        &self,
+        exchange: Exchange,
+        now_ms: u64,
+    ) -> Vec<RuntimeAdvanceResult> {
+        self.advance_matching(now_ms, |entry| entry.exchange != exchange)
+            .await
+    }
+
+    async fn advance_matching(
+        &self,
+        now_ms: u64,
+        include: impl Fn(&RuntimeRegistryEntry) -> bool,
+    ) -> Vec<RuntimeAdvanceResult> {
         let entries = self.registry.entries().await;
         let advances = entries.into_iter().filter_map(|entry| {
-            if entry.advancing
+            if !include(&entry)
+                || entry.advancing
                 || entry
                     .lifecycle
                     .is_some_and(PreparedStrategyLifecycle::is_terminal)

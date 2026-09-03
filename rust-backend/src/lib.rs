@@ -49,6 +49,7 @@ const DEFAULT_STRATEGY_ROOT: &str = "/app/data/rust-control/strategies";
 const DEFAULT_WEB_ROOT: &str = "/app/web";
 const DEFAULT_CONFIG_FILE: &str = "/app/data/api_config.json";
 const DEFAULT_RUNTIME_TICK_MS: u64 = 1_000;
+const TRADE_XYZ_RUNTIME_AUDIT_TICK_MS: u64 = 5_000;
 const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
 const DEFAULT_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const DEFAULT_SUBMISSIONS_PER_TICK: usize = 100;
@@ -235,11 +236,15 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_RUNTIME_TICK_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut trade_xyz_audit_ticker =
+            tokio::time::interval(Duration::from_millis(TRADE_XYZ_RUNTIME_AUDIT_TICK_MS));
+        trade_xyz_audit_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut execution_wakeups = subscribe_execution_wakeups();
         let (execution_completion_sender, mut execution_completions) =
             tokio::sync::mpsc::unbounded_channel();
         let mut execution_dispatches = HashMap::<String, ExecutionDispatchState>::new();
         let full_tick_in_flight = Arc::new(AtomicBool::new(false));
+        let trade_xyz_audit_in_flight = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
                 biased;
@@ -302,7 +307,23 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                     let runtime = Arc::clone(&runtime);
                     tokio::spawn(async move {
                         let _tick_lease = tick_lease;
-                        for advance in runtime.advance_all(now_ms).await {
+                        for advance in runtime.advance_excluding_exchange(Exchange::TradeXyz, now_ms).await {
+                            log_runtime_advance(advance, false, None, None, 0);
+                        }
+                    });
+                }
+                _ = trade_xyz_audit_ticker.tick() => {
+                    let Some(tick_lease) = RuntimeTickLease::try_acquire(&trade_xyz_audit_in_flight) else {
+                        continue;
+                    };
+                    let Some(now_ms) = system_time_ms() else {
+                        tracing::error!("system clock is unavailable; TRADE.XYZ audit tick skipped");
+                        continue;
+                    };
+                    let runtime = Arc::clone(&runtime);
+                    tokio::spawn(async move {
+                        let _tick_lease = tick_lease;
+                        for advance in runtime.advance_exchange(Exchange::TradeXyz, now_ms).await {
                             log_runtime_advance(advance, false, None, None, 0);
                         }
                     });

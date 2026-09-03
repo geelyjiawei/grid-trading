@@ -82,6 +82,26 @@ describe("theme control", () => {
 });
 
 describe("workspace request isolation", () => {
+  it("finishes exchange details before scanning global strategy history", async () => {
+    installWorkspaceMocks([]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValue({
+      exchange: "aster",
+      symbol: "BTCUSDT",
+      has_risk: false,
+    });
+    const pendingTrades = deferred<{ trades: [] }>();
+    vi.mocked(api.trades).mockReturnValueOnce(pendingTrades.promise);
+
+    const wrapper = mount(App);
+    await vi.waitFor(() => expect(api.trades).toHaveBeenCalledTimes(1));
+    expect(api.history).not.toHaveBeenCalled();
+
+    pendingTrades.resolve({ trades: [] });
+    await vi.waitFor(() => expect(api.history).toHaveBeenCalledTimes(1));
+    wrapper.unmount();
+  });
+
   it("keeps exchange-heavy snapshots out of the five-second price poll", async () => {
     vi.useFakeTimers();
     installWorkspaceMocks([{

@@ -411,11 +411,10 @@ async function refreshDetails(): Promise<void> {
   const requestSequence = ++detailsRequestSequence;
   detailsLoading.value = true;
   detailsError.value = "";
-  const results = await Promise.allSettled([
+  const exchangeResults = await Promise.allSettled([
     api.positions(exchange, requestedSymbol),
     api.openOrders(exchange, requestedSymbol),
     api.trades(exchange, requestedSymbol),
-    api.history(),
   ]);
   if (
     requestSequence !== detailsRequestSequence
@@ -425,7 +424,7 @@ async function refreshDetails(): Promise<void> {
     return;
   }
 
-  const [positionResult, orderResult, tradeResult, historyResult] = results;
+  const [positionResult, orderResult, tradeResult] = exchangeResults;
   if (positionResult.status === "fulfilled") {
     positions.value = positionResult.value.positions;
   }
@@ -434,6 +433,14 @@ async function refreshDetails(): Promise<void> {
   }
   if (tradeResult.status === "fulfilled") {
     trades.value = tradeResult.value.trades ?? tradeResult.value.result?.list ?? [];
+  }
+  const historyResult = await Promise.allSettled([api.history()]).then((results) => results[0]!);
+  if (
+    requestSequence !== detailsRequestSequence
+    || exchange !== activeExchange.value
+    || requestedSymbol !== symbol.value
+  ) {
+    return;
   }
   if (historyResult.status === "fulfilled") {
     history.value = historyResult.value.runs;
@@ -445,7 +452,7 @@ async function refreshDetails(): Promise<void> {
     history: historyResult.status === "fulfilled",
   };
 
-  const failures = results
+  const failures = [...exchangeResults, historyResult]
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
     .map((result) => messageFrom(result.reason, "策略明细读取失败"));
   detailsError.value = [...new Set(failures)].join("；");

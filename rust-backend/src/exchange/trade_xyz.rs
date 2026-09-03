@@ -61,7 +61,10 @@ const DEX_NAME: &str = "xyz";
 // conservative IP budget. Keep the same snapshot through a complete runtime
 // collection so position validation and the resulting limit order do not
 // request identical market metadata again.
-const MARKET_CACHE_TTL: Duration = Duration::from_secs(3);
+// Runtime safety audits run every five seconds. Reuse one authoritative market
+// response throughout that audit window instead of spending another weight-20
+// metadata request on the same symbol.
+const MARKET_CACHE_TTL: Duration = Duration::from_secs(5);
 const LEVERAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 const EXECUTION_FILL_LOOKBACK_MS: u64 = 60_000;
 const EXECUTION_FILL_CACHE_LIMIT: usize = 10_000;
