@@ -2277,7 +2277,7 @@ where
         now_ms: u64,
         replacements_only: bool,
     ) -> Result<(), RuntimeTickError> {
-        let ready = {
+        let (ready, exchange) = {
             let state = self.machine.store().snapshot();
             let retryable_ids = self
                 .intent_store
@@ -2301,7 +2301,7 @@ where
                         && !retryable_ids.contains(&intent.client_order_id)
                 });
             }
-            ready
+            (ready, state.exchange)
         };
         let remaining_submissions = self
             .maximum_submissions_per_tick
@@ -2322,7 +2322,10 @@ where
                         })
                 })
         };
-        if replacements_only || all_ready_are_replacements {
+        if replacements_only
+            || all_ready_are_replacements
+            || (!ready.is_empty() && exchange == Exchange::TradeXyz)
+        {
             let submissions = submit_many_with(
                 &self.gateway,
                 &mut self.intent_store,
@@ -5609,7 +5612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_deployment_remains_sequential() {
+    async fn initial_deployment_remains_sequential_without_native_batch_placement() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
         gateway.measure_delayed_placements(Duration::from_millis(5));
@@ -5623,6 +5626,28 @@ mod tests {
 
         assert!(gateway.placement_call_count() > 1);
         assert_eq!(gateway.maximum_concurrent_placement_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trade_xyz_initial_deployment_uses_batch_placement() {
+        let rules = rules();
+        let mut trade_xyz_config = config(None);
+        trade_xyz_config.exchange = Some(Exchange::TradeXyz);
+        let gateway = MockGateway::new(rules.clone(), 1_100).with_exchange(Exchange::TradeXyz);
+        gateway.measure_delayed_placements(Duration::from_millis(5));
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(trade_xyz_config, &rules),
+        );
+
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+
+        assert!(gateway.placement_call_count() > 1);
+        assert!(gateway.maximum_concurrent_placement_count() > 1);
+        assert!(
+            gateway.maximum_concurrent_placement_count() <= MAX_CONCURRENT_REPLACEMENT_SUBMISSIONS
+        );
     }
 
     #[tokio::test]

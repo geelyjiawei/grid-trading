@@ -1060,6 +1060,228 @@ where
         self.market_info(&symbol).await
     }
 
+    async fn prepare_wire_order(&self, intent: &OrderIntent) -> Result<WireOrder, PlacementError> {
+        if intent.exchange != Exchange::TradeXyz {
+            return Err(PlacementError::NotSubmitted {
+                message: "TRADE.XYZ exchange identity mismatch".into(),
+            });
+        }
+        intent
+            .validate()
+            .map_err(|error| PlacementError::NotSubmitted {
+                message: error.to_string(),
+            })?;
+        let market = if intent.shape.kind == OrderKind::Market {
+            self.fresh_market_info(&intent.shape.symbol).await
+        } else {
+            self.order_market_info(&intent.shape.symbol).await
+        }
+        .map_err(|error| PlacementError::NotSubmitted {
+            message: error.message,
+        })?;
+        if market.delisted {
+            return Err(PlacementError::Definitive {
+                code: Some("DELISTED".into()),
+                message: "TRADE.XYZ symbol is delisted".into(),
+            });
+        }
+        let step =
+            quantity_step(market.size_decimals).ok_or_else(|| PlacementError::NotSubmitted {
+                message: "TRADE.XYZ quantity precision is invalid".into(),
+            })?;
+        if intent.shape.quantity < step
+            || intent
+                .shape
+                .quantity
+                .checked_div(step)
+                .is_none_or(|steps| !steps.fract().is_zero())
+        {
+            return Err(PlacementError::NotSubmitted {
+                message: "TRADE.XYZ order quantity is not aligned to szDecimals".into(),
+            });
+        }
+        let (price, order_type) = match intent.shape.kind {
+            OrderKind::Limit => {
+                let price = intent
+                    .shape
+                    .price
+                    .ok_or_else(|| PlacementError::NotSubmitted {
+                        message: "TRADE.XYZ limit price is missing".into(),
+                    })?;
+                if !valid_price(price, market.size_decimals) {
+                    return Err(PlacementError::NotSubmitted {
+                        message: "TRADE.XYZ limit price violates Hyperliquid tick precision".into(),
+                    });
+                }
+                let order_type = match intent.shape.time_in_force {
+                    TimeInForce::Gtc => WireOrderType::gtc(),
+                    TimeInForce::PostOnly => WireOrderType::post_only(),
+                };
+                (price, order_type)
+            }
+            OrderKind::Market => {
+                let tick = effective_price_tick(market.mid_price, market.size_decimals)
+                    .ok_or_else(|| PlacementError::NotSubmitted {
+                        message: "TRADE.XYZ market price precision is invalid".into(),
+                    })?;
+                let factor = if intent.shape.side == OrderSide::Buy {
+                    Decimal::ONE + market_slippage()
+                } else {
+                    Decimal::ONE - market_slippage()
+                };
+                let unrounded = market.mid_price * factor;
+                let steps =
+                    unrounded
+                        .checked_div(tick)
+                        .ok_or_else(|| PlacementError::NotSubmitted {
+                            message: "TRADE.XYZ market price overflowed".into(),
+                        })?;
+                let price = if intent.shape.side == OrderSide::Buy {
+                    steps.ceil() * tick
+                } else {
+                    steps.floor() * tick
+                };
+                if !valid_price(price, market.size_decimals) {
+                    return Err(PlacementError::NotSubmitted {
+                        message: "TRADE.XYZ market protection price is invalid".into(),
+                    });
+                }
+                (price, WireOrderType::immediate_or_cancel())
+            }
+        };
+        if intent.shape.quantity * price < minimum_notional() {
+            return Err(PlacementError::Definitive {
+                code: Some("MIN_NOTIONAL".into()),
+                message: "TRADE.XYZ order notional is below 10 USDC".into(),
+            });
+        }
+        let cloid = encode_cloid(&intent.client_order_id).map_err(|error| {
+            PlacementError::NotSubmitted {
+                message: error.to_string(),
+            }
+        })?;
+        Ok(WireOrder {
+            asset: market.asset_id,
+            is_buy: intent.shape.side == OrderSide::Buy,
+            price: wire_decimal(price),
+            size: wire_decimal(intent.shape.quantity),
+            reduce_only: intent.shape.reduce_only,
+            order_type,
+            cloid: Some(cloid),
+        })
+    }
+
+    async fn cache_accepted_limit_orders(
+        &self,
+        intents: &[OrderIntent],
+        placements: &[Result<PlacementAcknowledgement, PlacementError>],
+    ) {
+        let Ok(order_time_ms) = now_ms() else {
+            return;
+        };
+        let mut cache = self.open_execution_cache.lock().await;
+        for (intent, placement) in intents.iter().zip(placements) {
+            let Ok(acknowledgement) = placement else {
+                continue;
+            };
+            if intent.shape.kind != OrderKind::Limit {
+                continue;
+            }
+            cache
+                .entry(intent.shape.symbol.to_ascii_uppercase())
+                .or_default()
+                .insert(
+                    intent.client_order_id.clone(),
+                    CachedOpenExecution {
+                        order: AuthoritativeOrder {
+                            client_order_id: intent.client_order_id.clone(),
+                            exchange_order_id: acknowledgement.exchange_order_id.clone(),
+                            exchange: Exchange::TradeXyz,
+                            shape: intent.shape.clone(),
+                            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                            executed_quantity: Some(Decimal::ZERO),
+                        },
+                        order_time_ms,
+                    },
+                );
+        }
+    }
+
+    async fn place_order_batch(
+        &self,
+        intents: &[OrderIntent],
+    ) -> Vec<Result<PlacementAcknowledgement, PlacementError>> {
+        if intents.is_empty() {
+            return Vec::new();
+        }
+        let mut wire_orders = Vec::with_capacity(intents.len());
+        for (index, intent) in intents.iter().enumerate() {
+            match self.prepare_wire_order(intent).await {
+                Ok(order) => wire_orders.push(order),
+                Err(error) => {
+                    let mut failures = vec![
+                        Err(PlacementError::NotSubmitted {
+                            message: "TRADE.XYZ batch was not sent because one order was invalid"
+                                .into(),
+                        });
+                        intents.len()
+                    ];
+                    failures[index] = Err(error);
+                    return failures;
+                }
+            }
+        }
+
+        let response = match self.post_action(&OrderAction::batch(wire_orders)).await {
+            Ok(response) => response,
+            Err(error) => {
+                return vec![
+                    Err(PlacementError::Unknown {
+                        message: error.to_string(),
+                    });
+                    intents.len()
+                ];
+            }
+        };
+        let value = match parse_write_response(response, "TRADE.XYZ order placement") {
+            Ok(value) => value,
+            Err(error) => {
+                return vec![Err(write_to_placement_error(error)); intents.len()];
+            }
+        };
+        let status_rows = match statuses(&value) {
+            Ok(rows) if rows.len() == intents.len() => rows,
+            Ok(_) => {
+                return vec![
+                    Err(PlacementError::Unknown {
+                        message: "TRADE.XYZ batch acknowledgement count is invalid".into(),
+                    });
+                    intents.len()
+                ];
+            }
+            Err(error) => {
+                return vec![Err(write_to_placement_error(error)); intents.len()];
+            }
+        };
+        let placements = intents
+            .iter()
+            .zip(status_rows)
+            .map(|(intent, status)| {
+                placement_order_id_from_status(status).map_or_else(
+                    |error| Err(write_to_placement_error(error)),
+                    |exchange_order_id| {
+                        Ok(PlacementAcknowledgement {
+                            client_order_id: intent.client_order_id.clone(),
+                            exchange_order_id,
+                        })
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        self.cache_accepted_limit_orders(intents, &placements).await;
+        placements
+    }
+
     async fn fetch_market_info(&self, symbol: &str) -> Result<MarketInfo, SnapshotError> {
         let symbol = symbol.to_ascii_uppercase();
         let xyz_coin =
@@ -1653,148 +1875,23 @@ where
         &self,
         intent: &OrderIntent,
     ) -> Result<PlacementAcknowledgement, PlacementError> {
-        if intent.exchange != Exchange::TradeXyz {
-            return Err(PlacementError::NotSubmitted {
-                message: "TRADE.XYZ exchange identity mismatch".into(),
-            });
-        }
-        intent
-            .validate()
-            .map_err(|error| PlacementError::NotSubmitted {
-                message: error.to_string(),
-            })?;
-        let market = if intent.shape.kind == OrderKind::Market {
-            self.fresh_market_info(&intent.shape.symbol).await
-        } else {
-            self.order_market_info(&intent.shape.symbol).await
-        }
-        .map_err(|error| PlacementError::NotSubmitted {
-            message: error.message,
-        })?;
-        if market.delisted {
-            return Err(PlacementError::Definitive {
-                code: Some("DELISTED".into()),
-                message: "TRADE.XYZ symbol is delisted".into(),
-            });
-        }
-        let step =
-            quantity_step(market.size_decimals).ok_or_else(|| PlacementError::NotSubmitted {
-                message: "TRADE.XYZ quantity precision is invalid".into(),
-            })?;
-        if intent.shape.quantity < step
-            || intent
-                .shape
-                .quantity
-                .checked_div(step)
-                .is_none_or(|steps| !steps.fract().is_zero())
-        {
-            return Err(PlacementError::NotSubmitted {
-                message: "TRADE.XYZ order quantity is not aligned to szDecimals".into(),
-            });
-        }
-        let (price, order_type) = match intent.shape.kind {
-            OrderKind::Limit => {
-                let price = intent
-                    .shape
-                    .price
-                    .ok_or_else(|| PlacementError::NotSubmitted {
-                        message: "TRADE.XYZ limit price is missing".into(),
-                    })?;
-                if !valid_price(price, market.size_decimals) {
-                    return Err(PlacementError::NotSubmitted {
-                        message: "TRADE.XYZ limit price violates Hyperliquid tick precision".into(),
-                    });
-                }
-                let order_type = match intent.shape.time_in_force {
-                    TimeInForce::Gtc => WireOrderType::gtc(),
-                    TimeInForce::PostOnly => WireOrderType::post_only(),
-                };
-                (price, order_type)
-            }
-            OrderKind::Market => {
-                let tick = effective_price_tick(market.mid_price, market.size_decimals)
-                    .ok_or_else(|| PlacementError::NotSubmitted {
-                        message: "TRADE.XYZ market price precision is invalid".into(),
-                    })?;
-                let factor = if intent.shape.side == OrderSide::Buy {
-                    Decimal::ONE + market_slippage()
-                } else {
-                    Decimal::ONE - market_slippage()
-                };
-                let unrounded = market.mid_price * factor;
-                let steps =
-                    unrounded
-                        .checked_div(tick)
-                        .ok_or_else(|| PlacementError::NotSubmitted {
-                            message: "TRADE.XYZ market price overflowed".into(),
-                        })?;
-                let price = if intent.shape.side == OrderSide::Buy {
-                    steps.ceil() * tick
-                } else {
-                    steps.floor() * tick
-                };
-                if !valid_price(price, market.size_decimals) {
-                    return Err(PlacementError::NotSubmitted {
-                        message: "TRADE.XYZ market protection price is invalid".into(),
-                    });
-                }
-                (price, WireOrderType::immediate_or_cancel())
-            }
-        };
-        if intent.shape.quantity * price < minimum_notional() {
-            return Err(PlacementError::Definitive {
-                code: Some("MIN_NOTIONAL".into()),
-                message: "TRADE.XYZ order notional is below 10 USDC".into(),
-            });
-        }
-        let cloid = encode_cloid(&intent.client_order_id).map_err(|error| {
-            PlacementError::NotSubmitted {
-                message: error.to_string(),
-            }
-        })?;
-        let action = OrderAction::single(WireOrder {
-            asset: market.asset_id,
-            is_buy: intent.shape.side == OrderSide::Buy,
-            price: wire_decimal(price),
-            size: wire_decimal(intent.shape.quantity),
-            reduce_only: intent.shape.reduce_only,
-            order_type,
-            cloid: Some(cloid),
-        });
-        let response =
-            self.post_action(&action)
-                .await
-                .map_err(|error| PlacementError::Unknown {
-                    message: error.to_string(),
-                })?;
-        let value = parse_write_response(response, "TRADE.XYZ order placement")
-            .map_err(write_to_placement_error)?;
-        let exchange_order_id = placement_order_id(&value).map_err(write_to_placement_error)?;
-        if intent.shape.kind == OrderKind::Limit
-            && let Ok(order_time_ms) = now_ms()
-        {
-            let cached = CachedOpenExecution {
-                order: AuthoritativeOrder {
-                    client_order_id: intent.client_order_id.clone(),
-                    exchange_order_id: exchange_order_id.clone(),
-                    exchange: Exchange::TradeXyz,
-                    shape: intent.shape.clone(),
-                    lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
-                    executed_quantity: Some(Decimal::ZERO),
-                },
-                order_time_ms,
-            };
-            self.open_execution_cache
-                .lock()
-                .await
-                .entry(intent.shape.symbol.to_ascii_uppercase())
-                .or_default()
-                .insert(intent.client_order_id.clone(), cached);
-        }
-        Ok(PlacementAcknowledgement {
-            client_order_id: intent.client_order_id.clone(),
-            exchange_order_id,
-        })
+        self.place_order_batch(std::slice::from_ref(intent))
+            .await
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                Err(PlacementError::Unknown {
+                    message: "TRADE.XYZ single-order batch returned no result".into(),
+                })
+            })
+    }
+
+    async fn place_orders(
+        &self,
+        intents: &[OrderIntent],
+        _maximum_concurrency: usize,
+    ) -> Vec<Result<PlacementAcknowledgement, PlacementError>> {
+        self.place_order_batch(intents).await
     }
 }
 
@@ -2318,12 +2415,7 @@ fn statuses(value: &Value) -> Result<&Vec<Value>, WriteResponseError> {
         })
 }
 
-fn placement_order_id(value: &Value) -> Result<String, WriteResponseError> {
-    let status = statuses(value)?.first().ok_or_else(|| WriteResponseError {
-        code: None,
-        message: "TRADE.XYZ placement acknowledgement is empty".into(),
-        definitive: false,
-    })?;
+fn placement_order_id_from_status(status: &Value) -> Result<String, WriteResponseError> {
     if let Some(message) = status.get("error").and_then(Value::as_str) {
         return Err(WriteResponseError {
             code: None,
@@ -3085,8 +3177,14 @@ mod tests {
             "status": "ok",
             "response": {"data": {"statuses": [{"filled": {"oid": 43}}]}}
         });
-        assert_eq!(placement_order_id(&resting).unwrap(), "42");
-        assert_eq!(placement_order_id(&filled).unwrap(), "43");
+        assert_eq!(
+            placement_order_id_from_status(&statuses(&resting).unwrap()[0]).unwrap(),
+            "42"
+        );
+        assert_eq!(
+            placement_order_id_from_status(&statuses(&filled).unwrap()[0]).unwrap(),
+            "43"
+        );
     }
 
     #[test]
@@ -3095,7 +3193,7 @@ mod tests {
             "status": "ok",
             "response": {"data": {"statuses": [{"error": "Insufficient margin"}]}}
         });
-        let error = placement_order_id(&rejected).unwrap_err();
+        let error = placement_order_id_from_status(&statuses(&rejected).unwrap()[0]).unwrap_err();
         assert!(error.definitive);
         assert_eq!(error.message, "Insufficient margin");
     }
@@ -3359,6 +3457,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connected_websocket_batches_many_orders_into_one_action() {
+        let transport = ScriptedTransport::new([market_response(), dex_response()]);
+        let mut adapter = test_adapter(transport.clone());
+        let (relay, mut commands) = websocket_action_relay();
+        relay.connected.store(true, Ordering::Release);
+        adapter.websocket_action_relay = Some(relay);
+        let responder = tokio::spawn(async move {
+            let command = commands.recv().await.unwrap();
+            let orders = command.payload["action"]["orders"].as_array().unwrap();
+            assert_eq!(orders.len(), 2);
+            assert_ne!(orders[0]["c"], orders[1]["c"]);
+            assert!(commands.try_recv().is_err());
+            command
+                .response
+                .send(Ok(json!({
+                    "status": "ok",
+                    "response": {"data": {"statuses": [
+                        {"resting": {"oid": 44}},
+                        {"resting": {"oid": 45}}
+                    ]}}
+                })))
+                .unwrap();
+        });
+        let intents = [
+            limit_intent("g_012345abcdef_15_S_4"),
+            limit_intent("g_012345abcdef_16_S_5"),
+        ];
+
+        let placements = adapter.place_orders(&intents, 4).await;
+        responder.await.unwrap();
+
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].as_ref().unwrap().exchange_order_id, "44");
+        assert_eq!(placements[1].as_ref().unwrap().exchange_order_id, "45");
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .all(|request| request.path != "/exchange")
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_acknowledgement_preserves_each_exact_order_result() {
+        let transport = ScriptedTransport::new([market_response(), dex_response()]);
+        let mut adapter = test_adapter(transport);
+        let (relay, mut commands) = websocket_action_relay();
+        relay.connected.store(true, Ordering::Release);
+        adapter.websocket_action_relay = Some(relay);
+        let responder = tokio::spawn(async move {
+            let command = commands.recv().await.unwrap();
+            command
+                .response
+                .send(Ok(json!({
+                    "status": "ok",
+                    "response": {"data": {"statuses": [
+                        {"resting": {"oid": 51}},
+                        {"error": "Order must have minimum value of $10."}
+                    ]}}
+                })))
+                .unwrap();
+        });
+        let intents = [
+            limit_intent("g_012345abcdef_15_S_6"),
+            limit_intent("g_012345abcdef_16_S_7"),
+        ];
+
+        let placements = adapter.place_orders(&intents, 4).await;
+        responder.await.unwrap();
+
+        assert_eq!(placements[0].as_ref().unwrap().exchange_order_id, "51");
+        assert!(matches!(
+            &placements[1],
+            Err(PlacementError::Definitive { message, .. })
+                if message.contains("minimum value")
+        ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_batch_acknowledgement_marks_every_order_unknown() {
+        let transport = ScriptedTransport::new([market_response(), dex_response()]);
+        let mut adapter = test_adapter(transport);
+        let (relay, mut commands) = websocket_action_relay();
+        relay.connected.store(true, Ordering::Release);
+        adapter.websocket_action_relay = Some(relay);
+        let responder = tokio::spawn(async move {
+            let command = commands.recv().await.unwrap();
+            command
+                .response
+                .send(Ok(json!({
+                    "status": "ok",
+                    "response": {"data": {"statuses": [
+                        {"resting": {"oid": 61}}
+                    ]}}
+                })))
+                .unwrap();
+        });
+        let intents = [
+            limit_intent("g_012345abcdef_15_S_8"),
+            limit_intent("g_012345abcdef_16_S_9"),
+        ];
+
+        let placements = adapter.place_orders(&intents, 4).await;
+        responder.await.unwrap();
+
+        assert_eq!(placements.len(), 2);
+        assert!(placements.iter().all(|placement| matches!(
+            placement,
+            Err(PlacementError::Unknown { message })
+                if message.contains("acknowledgement count")
+        )));
+    }
+
+    #[tokio::test]
     async fn websocket_unknown_outcome_never_retries_over_http() {
         let transport = ScriptedTransport::new([market_response(), dex_response()]);
         let mut adapter = test_adapter(transport.clone());
@@ -3427,7 +3639,10 @@ mod tests {
         ));
         assert!(pending.is_empty());
         assert_eq!(
-            placement_order_id(&receiver.await.unwrap().unwrap()).unwrap(),
+            placement_order_id_from_status(
+                &statuses(&receiver.await.unwrap().unwrap()).unwrap()[0]
+            )
+            .unwrap(),
             "45"
         );
     }

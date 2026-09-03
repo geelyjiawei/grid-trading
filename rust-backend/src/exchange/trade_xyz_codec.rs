@@ -373,10 +373,10 @@ pub(crate) struct OrderAction {
 }
 
 impl OrderAction {
-    pub(crate) fn single(order: WireOrder) -> Self {
+    pub(crate) fn batch(orders: Vec<WireOrder>) -> Self {
         Self {
             action_type: "order",
-            orders: vec![order],
+            orders,
             grouping: "na",
         }
     }
@@ -518,7 +518,7 @@ mod tests {
     fn official_hyperliquid_order_signature_vector_matches_byte_for_byte() {
         let signer =
             HyperliquidSigner::from_private_key(&official_public_test_vector_key()).unwrap();
-        let action = OrderAction::single(WireOrder {
+        let action = OrderAction::batch(vec![WireOrder {
             asset: 1,
             is_buy: true,
             price: "2000.0".into(),
@@ -526,7 +526,7 @@ mod tests {
             reduce_only: false,
             order_type: WireOrderType::immediate_or_cancel(),
             cloid: None,
-        });
+        }]);
         let signature = signer.sign_action(&action, 1_583_838, true).unwrap();
         assert_eq!(
             signature.joined_hex(),

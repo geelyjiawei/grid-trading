@@ -66,6 +66,18 @@ pub trait OrderPlacementGateway: Send + Sync {
         &self,
         intent: &OrderIntent,
     ) -> Result<PlacementAcknowledgement, PlacementError>;
+
+    async fn place_orders(
+        &self,
+        intents: &[OrderIntent],
+        maximum_concurrency: usize,
+    ) -> Vec<Result<PlacementAcknowledgement, PlacementError>> {
+        stream::iter(intents.iter().cloned())
+            .map(|intent| async move { self.place_order(&intent).await })
+            .buffered(maximum_concurrency.max(1))
+            .collect()
+            .await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::{StreamExt, stream};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -507,6 +508,34 @@ impl SharedConfiguredExchangeGateway {
                 }
             });
     }
+
+    fn record_limit_placement(
+        &self,
+        intent: &OrderIntent,
+        acknowledgement: &PlacementAcknowledgement,
+    ) {
+        if intent.shape.kind != OrderKind::Limit {
+            return;
+        }
+        self.mutate_trade_xyz_execution_progress(
+            intent.exchange,
+            &intent.shape.symbol,
+            |progress| {
+                progress.retain(|item| item.order.client_order_id != intent.client_order_id);
+                progress.push(OpenOrderExecutionProgress {
+                    order: AuthoritativeOrder {
+                        client_order_id: intent.client_order_id.clone(),
+                        exchange_order_id: acknowledgement.exchange_order_id.clone(),
+                        exchange: intent.exchange,
+                        shape: intent.shape.clone(),
+                        lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                        executed_quantity: Some(Decimal::ZERO),
+                    },
+                    cumulative_quantity: Decimal::ZERO,
+                });
+            },
+        );
+    }
 }
 
 impl fmt::Debug for SharedConfiguredExchangeGateway {
@@ -536,6 +565,19 @@ impl OrderPlacementGateway for ConfiguredExchangeGateway {
             Self::Aster(gateway) => gateway.place_order(intent).await,
             Self::Bybit(gateway) => gateway.place_order(intent).await,
             Self::TradeXyz(gateway) => gateway.place_order(intent).await,
+        }
+    }
+
+    async fn place_orders(
+        &self,
+        intents: &[OrderIntent],
+        maximum_concurrency: usize,
+    ) -> Vec<Result<PlacementAcknowledgement, PlacementError>> {
+        match self {
+            Self::Binance(gateway) => gateway.place_orders(intents, maximum_concurrency).await,
+            Self::Aster(gateway) => gateway.place_orders(intents, maximum_concurrency).await,
+            Self::Bybit(gateway) => gateway.place_orders(intents, maximum_concurrency).await,
+            Self::TradeXyz(gateway) => gateway.place_orders(intents, maximum_concurrency).await,
         }
     }
 }
@@ -889,27 +931,52 @@ impl OrderPlacementGateway for SharedConfiguredExchangeGateway {
             "exchange order placement completed"
         );
         let acknowledgement = placement?;
-        if intent.shape.kind == OrderKind::Limit {
-            self.mutate_trade_xyz_execution_progress(
-                intent.exchange,
-                &intent.shape.symbol,
-                |progress| {
-                    progress.retain(|item| item.order.client_order_id != intent.client_order_id);
-                    progress.push(OpenOrderExecutionProgress {
-                        order: AuthoritativeOrder {
-                            client_order_id: intent.client_order_id.clone(),
-                            exchange_order_id: acknowledgement.exchange_order_id.clone(),
-                            exchange: intent.exchange,
-                            shape: intent.shape.clone(),
-                            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
-                            executed_quantity: Some(Decimal::ZERO),
-                        },
-                        cumulative_quantity: Decimal::ZERO,
-                    });
-                },
-            );
-        }
+        self.record_limit_placement(intent, &acknowledgement);
         Ok(acknowledgement)
+    }
+
+    async fn place_orders(
+        &self,
+        intents: &[OrderIntent],
+        maximum_concurrency: usize,
+    ) -> Vec<Result<PlacementAcknowledgement, PlacementError>> {
+        if intents.is_empty() {
+            return Vec::new();
+        }
+        let native_trade_xyz_batch = self.exchange() == Exchange::TradeXyz
+            && intents
+                .iter()
+                .all(|intent| intent.exchange == Exchange::TradeXyz);
+        if !native_trade_xyz_batch {
+            return stream::iter(intents.iter().cloned())
+                .map(|intent| async move { self.place_order(&intent).await })
+                .buffered(maximum_concurrency.max(1))
+                .collect()
+                .await;
+        }
+
+        let pacer_wait = self.order_placement_pacer.wait_for_slot().await;
+        let exchange_started = Instant::now();
+        let placements = self.inner.place_orders(intents, maximum_concurrency).await;
+        let exchange_roundtrip_ms =
+            u64::try_from(exchange_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        for (index, intent) in intents.iter().enumerate() {
+            let placement = placements.get(index);
+            tracing::info!(
+                exchange = ?intent.exchange,
+                symbol = intent.shape.symbol.as_str(),
+                client_order_id = intent.client_order_id.as_str(),
+                batch_size = intents.len(),
+                pacer_wait_ms = u64::try_from(pacer_wait.as_millis()).unwrap_or(u64::MAX),
+                exchange_roundtrip_ms,
+                accepted = placement.is_some_and(Result::is_ok),
+                "exchange batch order placement completed"
+            );
+            if let Some(Ok(acknowledgement)) = placement {
+                self.record_limit_placement(intent, acknowledgement);
+            }
+        }
+        placements
     }
 }
 

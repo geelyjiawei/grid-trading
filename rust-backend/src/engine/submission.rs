@@ -1,4 +1,3 @@
-use futures::{StreamExt, stream};
 use thiserror::Error;
 
 use crate::{
@@ -73,15 +72,26 @@ where
 {
     store.prepare_intents(intents.clone(), result_time_ms)?;
 
-    let placements = stream::iter(intents.into_iter().map(|intent| async move {
-        let client_order_id = intent.client_order_id.clone();
-        let placement = gateway.place_order(&intent).await;
-        let (next_state, result) = classify_placement(&client_order_id, placement);
-        (client_order_id, next_state, result)
-    }))
-    .buffered(maximum_concurrency.max(1))
-    .collect::<Vec<_>>()
-    .await;
+    let placement_results = gateway.place_orders(&intents, maximum_concurrency).await;
+    let placement_results = if placement_results.len() == intents.len() {
+        placement_results
+    } else {
+        vec![
+            Err(PlacementError::Unknown {
+                message: "exchange batch placement result count did not match the request".into(),
+            });
+            intents.len()
+        ]
+    };
+    let placements = intents
+        .into_iter()
+        .zip(placement_results)
+        .map(|(intent, placement)| {
+            let client_order_id = intent.client_order_id;
+            let (next_state, result) = classify_placement(&client_order_id, placement);
+            (client_order_id, next_state, result)
+        })
+        .collect::<Vec<_>>();
 
     store.transition_intents(
         placements
