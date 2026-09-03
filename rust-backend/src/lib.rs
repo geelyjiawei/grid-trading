@@ -53,6 +53,8 @@ const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
 const DEFAULT_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const DEFAULT_SUBMISSIONS_PER_TICK: usize = 100;
 const EXECUTION_EVENT_RETRY_DELAY: Duration = Duration::from_millis(125);
+const EXECUTION_WAKEUP_BATCH_WINDOW: Duration = Duration::from_millis(2);
+const MAX_EXECUTION_WAKEUPS_PER_BATCH: usize = 256;
 const REPLACEMENT_ACK_SLO_MS: u64 = 1_000;
 
 pub fn app() -> Router {
@@ -244,12 +246,33 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                 event = execution_wakeups.recv() => {
                     match event {
                         Ok(event) => {
-                            queue_execution_wakeup(
-                                &runtime,
-                                &mut execution_dispatches,
-                                &execution_completion_sender,
-                                event,
-                            );
+                            let mut wakeup_batch = HashMap::new();
+                            merge_execution_wakeup(&mut wakeup_batch, event);
+                            // Hyperliquid can publish several order updates from one match
+                            // back-to-back. A tiny window lets one authoritative snapshot
+                            // materialize every corresponding replacement in one exchange action.
+                            tokio::time::sleep(EXECUTION_WAKEUP_BATCH_WINDOW).await;
+                            while wakeup_batch.values().map(|pending| pending.event_count).sum::<usize>()
+                                < MAX_EXECUTION_WAKEUPS_PER_BATCH
+                            {
+                                match execution_wakeups.try_recv() {
+                                    Ok(event) => merge_execution_wakeup(&mut wakeup_batch, event),
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                                        tracing::warn!(skipped, "execution wakeup receiver lagged; REST fallback remains active");
+                                    }
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return,
+                                }
+                            }
+                            for (key, pending) in wakeup_batch {
+                                queue_execution_wakeups(
+                                    &runtime,
+                                    &mut execution_dispatches,
+                                    &execution_completion_sender,
+                                    key,
+                                    pending,
+                                );
+                            }
                             // Let the execution task register its per-strategy waiter before a
                             // simultaneously-ready full tick can claim the same strategy.
                             tokio::task::yield_now().await;
@@ -309,9 +332,18 @@ impl PendingExecutionWakeups {
     }
 
     fn merge(&mut self, event: ExecutionWakeup) {
+        self.event_count = self.event_count.saturating_add(1);
+        self.merge_event(event);
+    }
+
+    fn merge_pending(&mut self, pending: Self) {
+        self.event_count = self.event_count.saturating_add(pending.event_count);
+        self.merge_event(pending.event);
+    }
+
+    fn merge_event(&mut self, event: ExecutionWakeup) {
         debug_assert_eq!(self.event.exchange, event.exchange);
         debug_assert_eq!(self.event.symbol, event.symbol);
-        self.event_count = self.event_count.saturating_add(1);
         self.event.observed_at_ms = self.event.observed_at_ms.min(event.observed_at_ms);
         self.event.exchange_event_time_ms = match (
             self.event.exchange_event_time_ms,
@@ -354,28 +386,36 @@ fn execution_dispatch_key(event: &ExecutionWakeup) -> String {
     format!("{:?}:{}", event.exchange, event.symbol)
 }
 
-fn queue_execution_wakeup(
-    runtime: &Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
-    dispatches: &mut HashMap<String, ExecutionDispatchState>,
-    completion_sender: &tokio::sync::mpsc::UnboundedSender<String>,
+fn merge_execution_wakeup(
+    wakeups: &mut HashMap<String, PendingExecutionWakeups>,
     event: ExecutionWakeup,
 ) {
     let key = execution_dispatch_key(&event);
+    match wakeups.get_mut(&key) {
+        Some(pending) => pending.merge(event),
+        None => {
+            wakeups.insert(key, PendingExecutionWakeups::new(event));
+        }
+    }
+}
+
+fn queue_execution_wakeups(
+    runtime: &Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
+    dispatches: &mut HashMap<String, ExecutionDispatchState>,
+    completion_sender: &tokio::sync::mpsc::UnboundedSender<String>,
+    key: String,
+    pending: PendingExecutionWakeups,
+) {
     if let Some(dispatch) = dispatches.get_mut(&key) {
         match &mut dispatch.pending {
-            Some(pending) => pending.merge(event),
-            None => dispatch.pending = Some(PendingExecutionWakeups::new(event)),
+            Some(existing) => existing.merge_pending(pending),
+            None => dispatch.pending = Some(pending),
         }
         return;
     }
 
     dispatches.insert(key.clone(), ExecutionDispatchState::default());
-    spawn_execution_dispatch(
-        Arc::clone(runtime),
-        completion_sender.clone(),
-        key,
-        PendingExecutionWakeups::new(event),
-    );
+    spawn_execution_dispatch(Arc::clone(runtime), completion_sender.clone(), key, pending);
 }
 
 fn complete_execution_dispatch(
@@ -933,6 +973,31 @@ mod tests {
         assert_eq!(pending.event.exchange_order_id, None);
         assert_eq!(pending.event.exchange_event_time_ms, Some(1_000));
         assert_eq!(pending.event.observed_at_ms, 1_010);
+    }
+
+    #[test]
+    fn scheduler_microbatch_groups_only_wakeups_for_the_same_market() {
+        let first = execution_wakeup(Some("42"), Some(1_000), 1_010);
+        let first_key = execution_dispatch_key(&first);
+        let mut other_market = execution_wakeup(Some("99"), Some(1_008), 1_018);
+        other_market.symbol = "CASHCATUSDC".into();
+        let other_key = execution_dispatch_key(&other_market);
+        let mut wakeups = HashMap::new();
+
+        merge_execution_wakeup(&mut wakeups, first);
+        merge_execution_wakeup(
+            &mut wakeups,
+            execution_wakeup(Some("43"), Some(1_005), 1_015),
+        );
+        merge_execution_wakeup(&mut wakeups, other_market);
+
+        assert_eq!(wakeups.len(), 2);
+        let same_market = wakeups.get(&first_key).unwrap();
+        assert_eq!(same_market.event_count, 2);
+        assert_eq!(same_market.event.exchange_order_id, None);
+        assert_eq!(same_market.event.exchange_event_time_ms, Some(1_000));
+        assert_eq!(same_market.event.observed_at_ms, 1_010);
+        assert_eq!(wakeups.get(&other_key).unwrap().event_count, 1);
     }
 
     #[test]
