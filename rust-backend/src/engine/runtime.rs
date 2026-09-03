@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs, io, path::PathBuf, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::PathBuf,
+    time::Instant,
+};
 
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -468,10 +473,10 @@ impl<G> PreparedLeasedFileStrategy<G> {
         }
     }
 
-    pub async fn advance_execution_event(
+    pub async fn advance_execution_events(
         &mut self,
         now_ms: u64,
-        exchange_order_id: Option<&str>,
+        exchange_order_ids: Option<&[String]>,
     ) -> Result<PreparedStrategyStep, PreparedStrategyStepError>
     where
         G: ExchangeIdentityGateway
@@ -489,7 +494,7 @@ impl<G> PreparedLeasedFileStrategy<G> {
         match self.inner.as_mut() {
             Some(PreparedLeasedFileStrategyInner::Active(runtime)) => runtime
                 .runtime_mut()
-                .tick_execution_event(now_ms, exchange_order_id)
+                .tick_execution_events(now_ms, exchange_order_ids)
                 .await
                 .map(PreparedStrategyStep::Active)
                 .map_err(PreparedStrategyStepError::from),
@@ -1600,90 +1605,158 @@ where
         exchange_order_id: Option<&str>,
     ) -> Result<RuntimeTickReport, RuntimeTickError> {
         if let Some(exchange_order_id) = exchange_order_id {
+            let exchange_order_ids = [exchange_order_id.to_owned()];
             return self
-                .tick_targeted_execution_event(now_ms, exchange_order_id)
+                .tick_targeted_execution_events(now_ms, &exchange_order_ids)
                 .await;
         }
         self.tick_with_mode(now_ms, RuntimeTickMode::ExecutionEvent)
             .await
     }
 
-    async fn tick_targeted_execution_event(
+    pub async fn tick_execution_events(
         &mut self,
         now_ms: u64,
-        exchange_order_id: &str,
+        exchange_order_ids: Option<&[String]>,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        if let Some(exchange_order_ids) = exchange_order_ids {
+            return self
+                .tick_targeted_execution_events(now_ms, exchange_order_ids)
+                .await;
+        }
+        self.tick_with_mode(now_ms, RuntimeTickMode::ExecutionEvent)
+            .await
+    }
+
+    async fn tick_targeted_execution_events(
+        &mut self,
+        now_ms: u64,
+        exchange_order_ids: &[String],
     ) -> Result<RuntimeTickReport, RuntimeTickError> {
         let tick_started = Instant::now();
         self.validate_ledger_ownership()?;
         self.converge_accounted_terminal_intents(now_ms)?;
         self.validate_ledger_ownership()?;
         let mut report = RuntimeTickReport::new();
-        let client_order_id = self
+        let requested_exchange_order_ids = exchange_order_ids
+            .iter()
+            .map(|exchange_order_id| exchange_order_id.trim())
+            .filter(|exchange_order_id| !exchange_order_id.is_empty())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        if requested_exchange_order_ids.is_empty() {
+            return Ok(report);
+        }
+        let client_order_ids = self
             .machine
             .store()
             .snapshot()
             .orders
             .values()
-            .find(|order| {
+            .filter(|order| {
                 !order.terminal_processed
-                    && order.exchange_order_id.as_deref() == Some(exchange_order_id)
+                    && order
+                        .exchange_order_id
+                        .as_ref()
+                        .is_some_and(|exchange_order_id| {
+                            requested_exchange_order_ids.contains(exchange_order_id)
+                        })
             })
-            .map(|order| order.client_order_id.clone());
-        let Some(client_order_id) = client_order_id else {
+            .map(|order| order.client_order_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if client_order_ids.is_empty() {
             return Ok(report);
-        };
-        let request = match self
-            .execution_sync
-            .request_for(&self.machine, &client_order_id)
-        {
-            Ok(request) => request,
-            Err(error) => {
-                report.blockers.push(RuntimeBlocker {
-                    stage: RuntimeStage::ExecutionAccounting,
-                    client_order_id: Some(client_order_id),
-                    message: error.to_string(),
-                });
-                return Ok(report);
-            }
-        };
+        }
+        let execution_requests = client_order_ids
+            .iter()
+            .map(|client_order_id| {
+                (
+                    client_order_id.clone(),
+                    self.execution_sync
+                        .request_for(&self.machine, client_order_id),
+                )
+            })
+            .collect::<Vec<_>>();
         let preflight_ms = u64::try_from(tick_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let snapshot_started = Instant::now();
-        let loaded = self
-            .execution_sync
-            .load_snapshot(&self.gateway, request)
-            .await;
+        let execution_sync = &self.execution_sync;
+        let gateway = &self.gateway;
+        let mut loaded_execution_snapshots = stream::iter(execution_requests.into_iter().map(
+            |(client_order_id, request)| async move {
+                let result = match request {
+                    Ok(request) => execution_sync.load_snapshot(gateway, request).await,
+                    Err(error) => Err(error),
+                };
+                (client_order_id, result)
+            },
+        ))
+        .buffered(MAX_CONCURRENT_EXECUTION_SNAPSHOTS)
+        .collect::<BTreeMap<_, _>>()
+        .await;
         let snapshot_ms = u64::try_from(snapshot_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let accounting_started = Instant::now();
-        let result = match loaded {
-            Ok(loaded) => {
-                self.execution_sync
-                    .apply_loaded_snapshot(&self.gateway, &mut self.machine, loaded, now_ms)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        let accounting_ms =
-            u64::try_from(accounting_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match result {
-            Ok(result) => {
-                report.execution_syncs = 1;
-                if matches!(result.transition, StrategyTransition::Failed { .. }) {
-                    report.blockers.push(RuntimeBlocker {
-                        stage: RuntimeStage::StrategyFailed,
-                        client_order_id: Some(client_order_id.clone()),
-                        message: "execution accounting failed the strategy".into(),
-                    });
+        let mut prepared_execution_syncs = Vec::new();
+        for client_order_id in &client_order_ids {
+            let loaded = loaded_execution_snapshots
+                .remove(client_order_id)
+                .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+            let result = match loaded {
+                Ok(loaded) => {
+                    self.execution_sync
+                        .prepare_loaded_snapshot(&self.gateway, &self.machine, loaded)
+                        .await
                 }
-            }
-            Err(error) => {
-                report.blockers.push(RuntimeBlocker {
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(prepared) => prepared_execution_syncs.push((client_order_id.clone(), prepared)),
+                Err(error) => report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::ExecutionAccounting,
-                    client_order_id: Some(client_order_id),
+                    client_order_id: Some(client_order_id.clone()),
                     message: error.to_string(),
-                });
-                return Ok(report);
+                }),
             }
         }
+        let prepared_reports = prepared_execution_syncs
+            .iter()
+            .map(|(_, prepared)| (prepared.snapshot.clone(), prepared.valued_report.clone()))
+            .collect::<Vec<_>>();
+        let transitions = if prepared_reports.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .machine
+                .apply_valued_executions(&prepared_reports, now_ms)
+            {
+                Ok(transitions) => transitions,
+                Err(error) => {
+                    for (client_order_id, _) in &prepared_execution_syncs {
+                        report.blockers.push(RuntimeBlocker {
+                            stage: RuntimeStage::ExecutionAccounting,
+                            client_order_id: Some(client_order_id.clone()),
+                            message: error.to_string(),
+                        });
+                    }
+                    Vec::new()
+                }
+            }
+        };
+        report.execution_syncs += transitions.len();
+        for ((client_order_id, _), transition) in
+            prepared_execution_syncs.into_iter().zip(transitions)
+        {
+            if matches!(transition, StrategyTransition::Failed { .. }) {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::StrategyFailed,
+                    client_order_id: Some(client_order_id),
+                    message: "execution accounting failed the strategy".into(),
+                });
+            }
+        }
+        let accounting_ms =
+            u64::try_from(accounting_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let convergence_started = Instant::now();
         self.converge_accounted_terminal_intents(now_ms)?;
         self.validate_ledger_ownership()?;
@@ -1699,7 +1772,15 @@ where
                 )
                 .await;
         }
-        if lifecycle != StrategyLifecycle::Running || report.is_blocked() {
+        if lifecycle != StrategyLifecycle::Running || report.execution_syncs == 0 {
+            return Ok(report);
+        }
+        if report.is_blocked()
+            && !report
+                .blockers
+                .iter()
+                .all(|blocker| blocker.stage == RuntimeStage::ExecutionAccounting)
+        {
             return Ok(report);
         }
         let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
@@ -1733,7 +1814,8 @@ where
         tracing::info!(
             run_id = self.machine.store().snapshot().run_id.as_str(),
             symbol = self.machine.store().snapshot().symbol.as_str(),
-            client_order_id = client_order_id.as_str(),
+            requested_target_count = requested_exchange_order_ids.len(),
+            owned_target_count = client_order_ids.len(),
             preflight_ms,
             snapshot_ms,
             accounting_ms,
@@ -1741,7 +1823,7 @@ where
             materialization_ms,
             submission_ms,
             total_ms = u64::try_from(tick_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "targeted execution processing stages completed"
+            "batched targeted execution processing stages completed"
         );
         Ok(report)
     }
@@ -6024,6 +6106,183 @@ mod tests {
         assert!(duplicate.submissions.is_empty());
         assert_eq!(gateway.all_bootstrap_call_count(), slow_reads_before);
         assert_eq!(gateway.open_progress_call_count(), open_progress_before);
+        assert_eq!(gateway.placement_call_count(), placements_before + 1);
+    }
+
+    #[tokio::test]
+    async fn batched_execution_event_keeps_every_exact_target_on_the_fast_path() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+        let stable = runtime.tick(1_250).await.unwrap();
+        assert!(!stable.is_blocked(), "{stable:?}");
+
+        let source_orders = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                matches!(
+                    order.purpose,
+                    StrategyOrderPurpose::InitialGrid {
+                        role: GridOrderRole::Add,
+                        ..
+                    }
+                ) && matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. }
+                    }
+                )
+            })
+            .take(2)
+            .map(|order| {
+                (
+                    order.client_order_id.clone(),
+                    order.shape.clone(),
+                    order.exchange_order_id.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(source_orders.len(), 2);
+        let grid_position_before = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .grid_position_net_quantity;
+        let mut partial_total = Decimal::ZERO;
+        for (client_order_id, shape, _) in &source_orders {
+            let partial_quantity = shape.quantity / Decimal::new(2, 0);
+            partial_total += partial_quantity;
+            gateway.partially_fill_order(
+                client_order_id,
+                partial_quantity,
+                shape.price.unwrap(),
+                Decimal::new(1, 3),
+            );
+        }
+        gateway.measure_delayed_execution_snapshots(Duration::from_millis(20));
+        gateway.measure_delayed_placements(Duration::from_millis(30));
+        let slow_reads_before = gateway.all_bootstrap_call_count();
+        let open_progress_before = gateway.open_progress_call_count();
+        let placements_before = gateway.placement_call_count();
+        let exchange_order_ids = vec![
+            source_orders[0].2.clone(),
+            "external-manual-order".to_owned(),
+            source_orders[1].2.clone(),
+            source_orders[0].2.clone(),
+        ];
+
+        let report = runtime
+            .tick_execution_events(1_300, Some(&exchange_order_ids))
+            .await
+            .unwrap();
+
+        assert!(!report.is_blocked(), "{report:?}");
+        assert_eq!(report.execution_syncs, 2);
+        assert_eq!(report.submissions.len(), 2);
+        assert_eq!(gateway.execution_snapshot_call_count(), 2);
+        assert!(gateway.maximum_concurrent_execution_snapshot_count() > 1);
+        assert!(
+            gateway.maximum_concurrent_execution_snapshot_count()
+                <= MAX_CONCURRENT_EXECUTION_SNAPSHOTS
+        );
+        assert_eq!(gateway.all_bootstrap_call_count(), slow_reads_before);
+        assert_eq!(gateway.open_progress_call_count(), open_progress_before);
+        assert_eq!(gateway.placement_call_count(), placements_before + 2);
+        assert!(gateway.maximum_concurrent_placement_count() > 1);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            grid_position_before - partial_total
+        );
+    }
+
+    #[tokio::test]
+    async fn lagging_target_does_not_delay_an_exact_targeted_replacement() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        let source_orders = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                matches!(
+                    order.purpose,
+                    StrategyOrderPurpose::InitialGrid {
+                        role: GridOrderRole::Add,
+                        ..
+                    }
+                ) && matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. }
+                    }
+                )
+            })
+            .take(2)
+            .map(|order| {
+                (
+                    order.client_order_id.clone(),
+                    order.shape.clone(),
+                    order.exchange_order_id.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(source_orders.len(), 2);
+        for (client_order_id, shape, _) in &source_orders {
+            gateway.partially_fill_order(
+                client_order_id,
+                shape.quantity / Decimal::new(2, 0),
+                shape.price.unwrap(),
+                Decimal::new(1, 3),
+            );
+        }
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .executions
+            .remove(&source_orders[1].0);
+        let slow_reads_before = gateway.all_bootstrap_call_count();
+        let placements_before = gateway.placement_call_count();
+        let exchange_order_ids = source_orders
+            .iter()
+            .map(|(_, _, exchange_order_id)| exchange_order_id.clone())
+            .collect::<Vec<_>>();
+
+        let report = runtime
+            .tick_execution_events(1_300, Some(&exchange_order_ids))
+            .await
+            .unwrap();
+
+        assert!(report.is_blocked(), "{report:?}");
+        assert_eq!(report.execution_syncs, 1);
+        assert_eq!(report.submissions.len(), 1);
+        assert!(report.blockers.iter().any(|blocker| {
+            blocker.stage == RuntimeStage::ExecutionAccounting
+                && blocker.client_order_id.as_ref() == Some(&source_orders[1].0)
+        }));
+        assert_eq!(gateway.all_bootstrap_call_count(), slow_reads_before);
         assert_eq!(gateway.placement_call_count(), placements_before + 1);
     }
 

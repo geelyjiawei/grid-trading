@@ -311,16 +311,16 @@ where
         results
     }
 
-    pub async fn advance_execution_event(
+    pub async fn advance_execution_events(
         &self,
         exchange: Exchange,
         symbol: &str,
-        exchange_order_id: Option<&str>,
+        exchange_order_ids: Option<&[String]>,
         now_ms: u64,
     ) -> Option<RuntimeAdvanceResult> {
         let (run_id, result) = self
             .registry
-            .advance_execution_event(exchange, symbol, exchange_order_id, now_ms)
+            .advance_execution_events(exchange, symbol, exchange_order_ids, now_ms)
             .await?;
         self.registry.prune_terminal().await;
         Some(RuntimeAdvanceResult { run_id, result })

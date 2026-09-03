@@ -7,7 +7,7 @@ pub mod security;
 pub mod web_auth;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env, fs,
     path::PathBuf,
     sync::{
@@ -321,13 +321,19 @@ struct ExecutionDispatchState {
 struct PendingExecutionWakeups {
     event: ExecutionWakeup,
     event_count: usize,
+    exchange_order_ids: BTreeSet<String>,
+    requires_full_scan: bool,
 }
 
 impl PendingExecutionWakeups {
     fn new(event: ExecutionWakeup) -> Self {
+        let exchange_order_ids = event.exchange_order_id.iter().cloned().collect();
+        let requires_full_scan = event.exchange_order_id.is_none();
         Self {
             event,
             event_count: 1,
+            exchange_order_ids,
+            requires_full_scan,
         }
     }
 
@@ -338,10 +344,22 @@ impl PendingExecutionWakeups {
 
     fn merge_pending(&mut self, pending: Self) {
         self.event_count = self.event_count.saturating_add(pending.event_count);
-        self.merge_event(pending.event);
+        self.exchange_order_ids.extend(pending.exchange_order_ids);
+        self.requires_full_scan |= pending.requires_full_scan;
+        self.merge_event_metadata(pending.event);
     }
 
     fn merge_event(&mut self, event: ExecutionWakeup) {
+        match &event.exchange_order_id {
+            Some(exchange_order_id) => {
+                self.exchange_order_ids.insert(exchange_order_id.clone());
+            }
+            None => self.requires_full_scan = true,
+        }
+        self.merge_event_metadata(event);
+    }
+
+    fn merge_event_metadata(&mut self, event: ExecutionWakeup) {
         debug_assert_eq!(self.event.exchange, event.exchange);
         debug_assert_eq!(self.event.symbol, event.symbol);
         self.event.observed_at_ms = self.event.observed_at_ms.min(event.observed_at_ms);
@@ -352,11 +370,6 @@ impl PendingExecutionWakeups {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, right) => left.or(right),
         };
-        if self.event.exchange_order_id != event.exchange_order_id {
-            // Multiple changed orders are cheaper and safer to reconcile in one
-            // bounded exchange snapshot than through serialized per-order reads.
-            self.event.exchange_order_id = None;
-        }
     }
 }
 
@@ -442,7 +455,7 @@ fn spawn_execution_dispatch(
 ) {
     tokio::spawn(async move {
         let _completion = ExecutionDispatchCompletion::new(completion_sender, key);
-        advance_execution_event(runtime, pending.event, pending.event_count).await;
+        advance_execution_events(runtime, pending).await;
     });
 }
 
@@ -463,23 +476,25 @@ impl Drop for RuntimeTickLease {
     }
 }
 
-async fn advance_execution_event(
+async fn advance_execution_events(
     runtime: Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>,
-    event: ExecutionWakeup,
-    coalesced_events: usize,
+    pending: PendingExecutionWakeups,
 ) {
+    let PendingExecutionWakeups {
+        event,
+        event_count: coalesced_events,
+        exchange_order_ids,
+        requires_full_scan,
+    } = pending;
+    let exchange_order_ids = exchange_order_ids.into_iter().collect::<Vec<_>>();
+    let targeted_order_ids = (!requires_full_scan).then_some(exchange_order_ids.as_slice());
     let Some(now_ms) = system_time_ms() else {
         tracing::error!("system clock is unavailable; execution wakeup skipped");
         return;
     };
     let event_queue_ms = now_ms.checked_sub(event.observed_at_ms);
     let Some(advance) = runtime
-        .advance_execution_event(
-            event.exchange,
-            &event.symbol,
-            event.exchange_order_id.as_deref(),
-            now_ms,
-        )
+        .advance_execution_events(event.exchange, &event.symbol, targeted_order_ids, now_ms)
         .await
     else {
         return;
@@ -503,12 +518,7 @@ async fn advance_execution_event(
         return;
     };
     if let Some(retry) = runtime
-        .advance_execution_event(
-            event.exchange,
-            &event.symbol,
-            event.exchange_order_id.as_deref(),
-            now_ms,
-        )
+        .advance_execution_events(event.exchange, &event.symbol, targeted_order_ids, now_ms)
         .await
     {
         log_runtime_advance(retry, true, Some(&event), event_queue_ms, coalesced_events);
@@ -958,19 +968,29 @@ mod tests {
 
         assert_eq!(pending.event_count, 2);
         assert_eq!(pending.event.exchange_order_id.as_deref(), Some("42"));
+        assert_eq!(
+            pending.exchange_order_ids.into_iter().collect::<Vec<_>>(),
+            vec!["42"]
+        );
+        assert!(!pending.requires_full_scan);
         assert_eq!(pending.event.exchange_event_time_ms, Some(1_000));
         assert_eq!(pending.event.observed_at_ms, 1_010);
     }
 
     #[test]
-    fn different_order_wakeups_collapse_to_one_bounded_strategy_snapshot() {
+    fn different_order_wakeups_keep_the_targeted_fast_path() {
         let mut pending =
             PendingExecutionWakeups::new(execution_wakeup(Some("42"), Some(1_000), 1_010));
         pending.merge(execution_wakeup(Some("43"), Some(1_005), 1_015));
         pending.merge(execution_wakeup(Some("44"), Some(1_006), 1_016));
 
         assert_eq!(pending.event_count, 3);
-        assert_eq!(pending.event.exchange_order_id, None);
+        assert_eq!(pending.event.exchange_order_id.as_deref(), Some("42"));
+        assert_eq!(
+            pending.exchange_order_ids.into_iter().collect::<Vec<_>>(),
+            vec!["42", "43", "44"]
+        );
+        assert!(!pending.requires_full_scan);
         assert_eq!(pending.event.exchange_event_time_ms, Some(1_000));
         assert_eq!(pending.event.observed_at_ms, 1_010);
     }
@@ -994,10 +1014,32 @@ mod tests {
         assert_eq!(wakeups.len(), 2);
         let same_market = wakeups.get(&first_key).unwrap();
         assert_eq!(same_market.event_count, 2);
-        assert_eq!(same_market.event.exchange_order_id, None);
+        assert_eq!(same_market.event.exchange_order_id.as_deref(), Some("42"));
+        assert_eq!(
+            same_market
+                .exchange_order_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["42", "43"]
+        );
+        assert!(!same_market.requires_full_scan);
         assert_eq!(same_market.event.exchange_event_time_ms, Some(1_000));
         assert_eq!(same_market.event.observed_at_ms, 1_010);
         assert_eq!(wakeups.get(&other_key).unwrap().event_count, 1);
+    }
+
+    #[test]
+    fn idless_wakeup_explicitly_keeps_the_full_scan_fallback() {
+        let mut pending =
+            PendingExecutionWakeups::new(execution_wakeup(Some("42"), Some(1_000), 1_010));
+        pending.merge(execution_wakeup(None, Some(1_005), 1_015));
+
+        assert!(pending.requires_full_scan);
+        assert_eq!(
+            pending.exchange_order_ids.into_iter().collect::<Vec<_>>(),
+            vec!["42"]
+        );
     }
 
     #[test]

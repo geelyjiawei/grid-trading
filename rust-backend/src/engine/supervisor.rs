@@ -298,11 +298,11 @@ impl<G> RuntimeRegistry<G> {
         strategy.advance(now_ms).await.map_err(Into::into)
     }
 
-    pub async fn advance_execution_event(
+    pub async fn advance_execution_events(
         &self,
         exchange: Exchange,
         symbol: &str,
-        exchange_order_id: Option<&str>,
+        exchange_order_ids: Option<&[String]>,
         now_ms: u64,
     ) -> Option<(
         StrategyRunId,
@@ -343,7 +343,7 @@ impl<G> RuntimeRegistry<G> {
         );
         let effective_now_ms = now_ms.max(strategy.updated_at_ms());
         let result = strategy
-            .advance_execution_event(effective_now_ms, exchange_order_id)
+            .advance_execution_events(effective_now_ms, exchange_order_ids)
             .await
             .map_err(Into::into);
         Some((run_id, result))
