@@ -175,6 +175,34 @@ impl ExecutionWakeupDeduplicator {
     }
 }
 
+#[derive(Debug, Default)]
+struct ExecutionWakeupDeduplicators {
+    order_updates: ExecutionWakeupDeduplicator,
+    user_fills: ExecutionWakeupDeduplicator,
+}
+
+impl ExecutionWakeupDeduplicators {
+    fn observe_order_update(
+        &mut self,
+        symbol: &str,
+        exchange_order_id: &str,
+        cumulative: Decimal,
+    ) -> bool {
+        self.order_updates
+            .observe(symbol, exchange_order_id, cumulative)
+    }
+
+    fn observe_user_fill(
+        &mut self,
+        symbol: &str,
+        exchange_order_id: &str,
+        cumulative: Decimal,
+    ) -> bool {
+        self.user_fills
+            .observe(symbol, exchange_order_id, cumulative)
+    }
+}
+
 #[derive(Debug)]
 enum WebsocketActionError {
     NotSent(String),
@@ -399,7 +427,7 @@ async fn run_user_fill_stream(
 ) {
     let mut reconnect_delay = USER_FILL_STREAM_RECONNECT_MIN;
     let mut next_action_id = now_ms().unwrap_or(1);
-    let mut wakeup_deduplicator = ExecutionWakeupDeduplicator::default();
+    let mut wakeup_deduplicators = ExecutionWakeupDeduplicators::default();
     loop {
         if cache.upgrade().is_none() || order_cache.upgrade().is_none() {
             return;
@@ -504,7 +532,7 @@ async fn run_user_fill_stream(
                                 text.as_ref(),
                                 &cache,
                                 &order_cache,
-                                &mut wakeup_deduplicator,
+                                &mut wakeup_deduplicators,
                             )
                             .await
                             {
@@ -520,7 +548,7 @@ async fn run_user_fill_stream(
                                     text,
                                     &cache,
                                     &order_cache,
-                                    &mut wakeup_deduplicator,
+                                    &mut wakeup_deduplicators,
                                 )
                                 .await
                                 {
@@ -664,13 +692,13 @@ async fn cache_execution_message(
     text: &str,
     cache: &Weak<tokio::sync::Mutex<CachedExecutionFills>>,
     order_cache: &Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
-    wakeup_deduplicator: &mut ExecutionWakeupDeduplicator,
+    wakeup_deduplicators: &mut ExecutionWakeupDeduplicators,
 ) -> bool {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return true;
     };
     if message.get("channel").and_then(Value::as_str) == Some("orderUpdates") {
-        return cache_order_update_message(&message, order_cache, wakeup_deduplicator).await;
+        return cache_order_update_message(&message, order_cache, wakeup_deduplicators).await;
     }
     if message.get("channel").and_then(Value::as_str) != Some("userFills") {
         return true;
@@ -698,14 +726,14 @@ async fn cache_execution_message(
         .unwrap_or(false);
     if is_snapshot {
         for ((symbol, order_id), (_, quantity)) in cumulative {
-            wakeup_deduplicator.observe(&symbol, &order_id, quantity);
+            wakeup_deduplicators.observe_user_fill(&symbol, &order_id, quantity);
         }
     } else {
         for ((symbol, order_id), (event_time, _)) in touched {
             let Some((_, quantity)) = cumulative.get(&(symbol.clone(), order_id.clone())) else {
                 continue;
             };
-            if !wakeup_deduplicator.observe(&symbol, &order_id, *quantity) {
+            if !wakeup_deduplicators.observe_user_fill(&symbol, &order_id, *quantity) {
                 continue;
             }
             publish_execution_wakeup(Exchange::TradeXyz, &symbol, Some(order_id), event_time);
@@ -718,7 +746,7 @@ async fn cache_execution_message(
 async fn cache_order_update_message(
     message: &Value,
     cache: &Weak<tokio::sync::Mutex<CachedExecutionOrders>>,
-    wakeup_deduplicator: &mut ExecutionWakeupDeduplicator,
+    wakeup_deduplicators: &mut ExecutionWakeupDeduplicators,
 ) -> bool {
     let updates = parse_order_update_message(message);
     let Some(cache) = cache.upgrade() else {
@@ -750,7 +778,7 @@ async fn cache_order_update_message(
         wakeups
     };
     for (symbol, exchange_order_id, status_time_ms, executed) in wakeups {
-        if wakeup_deduplicator.observe(&symbol, &exchange_order_id, executed) {
+        if wakeup_deduplicators.observe_order_update(&symbol, &exchange_order_id, executed) {
             publish_execution_wakeup(
                 Exchange::TradeXyz,
                 &symbol,
@@ -4074,6 +4102,17 @@ mod tests {
         assert!(!deduplicator.observe("PONSUSDC", "42", Decimal::new(1, 1)));
         assert!(deduplicator.observe("PONSUSDC", "43", Decimal::new(1, 1)));
         assert!(!deduplicator.observe("PONSUSDC", "43", Decimal::ZERO));
+    }
+
+    #[test]
+    fn order_update_does_not_suppress_later_authoritative_user_fill_wakeup() {
+        let mut deduplicators = ExecutionWakeupDeduplicators::default();
+        let cumulative = Decimal::new(85, 0);
+
+        assert!(deduplicators.observe_order_update("CASHCATUSDC", "42", cumulative));
+        assert!(deduplicators.observe_user_fill("CASHCATUSDC", "42", cumulative));
+        assert!(!deduplicators.observe_order_update("CASHCATUSDC", "42", cumulative));
+        assert!(!deduplicators.observe_user_fill("CASHCATUSDC", "42", cumulative));
     }
 
     #[tokio::test]
