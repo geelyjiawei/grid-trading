@@ -18,6 +18,10 @@ audit_script=$repository_root/scripts/legacy-cutover-audit.py
 verify_script=$repository_root/scripts/verify-rust-production.sh
 login_verify_script=$repository_root/scripts/verify-rust-login.py
 credentials_file=${GRID_RUST_CREDENTIALS_FILE:-$HOME/.grid-trading/rust-admin.txt}
+image=${GRID_RUST_IMAGE:-grid-trading-vue-rust:production}
+image_archive=${GRID_RUST_IMAGE_ARCHIVE:-}
+image_verify_script=$repository_root/scripts/ensure-prebuilt-image.sh
+export GRID_RUST_IMAGE=$image
 
 fail() {
     printf 'Rust production deployment failed: %s\n' "$1" >&2
@@ -44,6 +48,7 @@ test -f "$compose_file" || fail "$compose_file does not exist"
 test -f "$audit_script" || fail "$audit_script does not exist"
 test -f "$verify_script" || fail "$verify_script does not exist"
 test -f "$login_verify_script" || fail "$login_verify_script does not exist"
+test -f "$image_verify_script" || fail "$image_verify_script does not exist"
 
 if git ls-files --error-unmatch .env >/dev/null 2>&1; then
     fail ".env is tracked by Git"
@@ -98,6 +103,9 @@ test "$actual_commit" = "$expected_commit" \
 worktree_status=$(git status --porcelain --untracked-files=all) \
     || fail "the worktree status cannot be inspected"
 test -z "$worktree_status" || fail "the production worktree contains uncommitted source files"
+test -n "${GRID_RUST_IMAGE:-}" \
+    || fail "GRID_RUST_IMAGE must name a prebuilt immutable image"
+sh "$image_verify_script" "$image" "$expected_commit" "$image_archive"
 test -f "$credentials_file" \
     || fail "one-time credentials file is required for login proof: $credentials_file"
 
@@ -146,14 +154,12 @@ chmod 700 "$production_data" "$production_data/rust-control" \
 test ! -f "$production_data/api_config.json" || chmod 600 "$production_data/api_config.json"
 chown -R 10001:10001 "$production_data"
 
-image="grid-trading-vue-rust:$expected_commit"
 export GRID_RUST_IMAGE=$image
 export GRID_RUST_PRODUCTION_EXPECTED_COMMIT=$expected_commit
 export GRID_RUST_PRODUCTION_DATA=$production_data
 
-printf 'Building Rust production commit %s while the legacy service remains online.\n' \
-    "$expected_commit"
-docker compose --project-name "$production_project" -f "$compose_file" build
+printf 'Using verified prebuilt Rust production image %s for commit %s.\n' \
+    "$image" "$expected_commit"
 
 preflight_started=false
 production_started=false

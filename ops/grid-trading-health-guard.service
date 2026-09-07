@@ -1,0 +1,17 @@
+[Unit]
+Description=Pressure-aware health guard for the grid trading service
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/grid-trading-health-guard.sh
+RuntimeDirectory=grid-trading-health-guard
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ReadWritePaths=/run/grid-trading-health-guard

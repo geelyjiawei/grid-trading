@@ -22,6 +22,9 @@ RUN --mount=type=cache,id=grid-trading-cargo-registry,target=/usr/local/cargo/re
 
 FROM debian:bookworm-slim AS runtime
 
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.revision=$VCS_REF
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \

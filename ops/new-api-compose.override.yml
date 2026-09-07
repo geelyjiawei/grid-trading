@@ -1,0 +1,32 @@
+services:
+  new-api:
+    restart: "no"
+    mem_limit: 256m
+    memswap_limit: 384m
+    mem_reservation: 96m
+    cpu_shares: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+  mysql:
+    mem_limit: 768m
+    memswap_limit: 1280m
+    mem_reservation: 256m
+    cpu_shares: 768
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+  redis:
+    mem_limit: 128m
+    memswap_limit: 192m
+    mem_reservation: 32m
+    cpu_shares: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"

@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
@@ -135,8 +136,11 @@ jobs:
             scripts/deploy-rust-preview.sh \
             scripts/verify-rust-preview.sh \
             scripts/deploy-rust-production.sh \
+            scripts/deploy-rust-release.sh \
             scripts/verify-rust-production.sh \
-            scripts/rollback-to-python.sh
+            scripts/rollback-to-python.sh \
+            scripts/ensure-prebuilt-image.sh \
+            ops/grid-trading-health-guard.sh
           python -m py_compile \
             scripts/provision-rust-auth.py \
             scripts/verify-rust-login.py \
@@ -157,9 +161,22 @@ jobs:
           test "$(stat --format='%a' .env)" = "600"
           test "$(stat --format='%a' /tmp/grid-rust-ci-credentials.txt)" = "600"
           GRID_RUST_PRODUCTION_VALIDATE_ONLY=true sh scripts/deploy-rust-production.sh
+          GRID_RUST_RELEASE_VALIDATE_ONLY=true sh scripts/deploy-rust-release.sh
+          ! GRID_RUST_IMAGE=grid-trading-vue-rust:test \
+            docker compose --file docker-compose.rust-production.yml config \
+            | grep --quiet '^ *build:'
+          ! GRID_RUST_PREVIEW_IMAGE=grid-trading-vue-rust:test \
+            docker compose --file docker-compose.rust-vue.yml config \
+            | grep --quiet '^ *build:'
 
       - name: Build locked production image
-        run: docker build --file Dockerfile.rust-vue --tag grid-trading-vue-rust:test .
+        run: |
+          docker build \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --file Dockerfile.rust-vue \
+            --tag grid-trading-vue-rust:test \
+            .
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' grid-trading-vue-rust:test)" = "$GITHUB_SHA"
 
       - name: Exercise authenticated Rust production image in isolation
         run: |
@@ -193,6 +210,7 @@ jobs:
           cp .env.example .env
           sed --in-place 's/^AUTH_REQUIRED=true$/AUTH_REQUIRED=false/' .env
           trap 'docker compose --project-name grid-trading-rust-preview --file docker-compose.rust-vue.yml down --volumes; rm -f .env' EXIT
+          export GRID_RUST_PREVIEW_IMAGE=grid-trading-vue-rust:test
           GRID_RUST_PREVIEW_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
             sh scripts/deploy-rust-preview.sh
 
@@ -255,6 +273,19 @@ jobs:
       - name: Export verified production image
         if: github.event_name == 'workflow_dispatch'
         run: docker save grid-trading-vue-rust:test | gzip -1 > grid-trading-vue-rust.tar.gz
+
+      - name: Publish immutable production image
+        if: github.event_name != 'pull_request'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repository=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/$repository:sha-$GITHUB_SHA"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag grid-trading-vue-rust:test "$image"
+          docker push "$image"
+          printf 'Verified image: `%s`\n' "$image" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload verified production image
         if: github.event_name == 'workflow_dispatch'

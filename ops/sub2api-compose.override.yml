@@ -1,0 +1,31 @@
+services:
+  sub2api:
+    mem_limit: 384m
+    memswap_limit: 512m
+    mem_reservation: 128m
+    cpu_shares: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+  postgres:
+    mem_limit: 512m
+    memswap_limit: 768m
+    mem_reservation: 192m
+    cpu_shares: 768
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+  redis:
+    mem_limit: 128m
+    memswap_limit: 192m
+    mem_reservation: 32m
+    cpu_shares: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"

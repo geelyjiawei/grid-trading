@@ -7,6 +7,10 @@ cd "$repository_root"
 
 compose_file=${GRID_RUST_PREVIEW_COMPOSE:-docker-compose.rust-vue.yml}
 preview_project=${GRID_RUST_PREVIEW_PROJECT:-grid-trading-rust-preview}
+preview_image=${GRID_RUST_PREVIEW_IMAGE:-grid-trading-vue-rust:preview}
+image_archive=${GRID_RUST_IMAGE_ARCHIVE:-}
+image_verify_script=$repository_root/scripts/ensure-prebuilt-image.sh
+export GRID_RUST_PREVIEW_IMAGE=$preview_image
 
 fail() {
     printf 'preview deployment failed: %s\n' "$1" >&2
@@ -17,6 +21,7 @@ command -v git >/dev/null 2>&1 || fail "git is unavailable"
 command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
 test -f .env || fail ".env is required and must remain outside Git"
 test -f "$compose_file" || fail "$compose_file does not exist"
+test -f "$image_verify_script" || fail "$image_verify_script does not exist"
 
 if git ls-files --error-unmatch .env >/dev/null 2>&1; then
     fail ".env is tracked by Git"
@@ -52,6 +57,9 @@ worktree_status=$(git status --porcelain --untracked-files=all) \
     || fail "the preview worktree status cannot be inspected"
 test -z "$worktree_status" \
     || fail "the preview worktree contains uncommitted source files"
+test -n "${GRID_RUST_PREVIEW_IMAGE:-}" \
+    || fail "GRID_RUST_PREVIEW_IMAGE must name a prebuilt immutable image"
+sh "$image_verify_script" "$preview_image" "$expected_commit" "$image_archive"
 GRID_RUST_PREVIEW_EXPECTED_COMMIT=$expected_commit
 export GRID_RUST_PREVIEW_EXPECTED_COMMIT
 
@@ -90,7 +98,7 @@ snapshot_non_preview_containers() {
 
 snapshot_non_preview_containers "$non_preview_before"
 
-docker compose --project-name "$preview_project" -f "$compose_file" up -d --build
+docker compose --project-name "$preview_project" -f "$compose_file" up -d --no-build
 
 snapshot_non_preview_containers "$non_preview_after"
 cmp -s "$non_preview_before" "$non_preview_after" \

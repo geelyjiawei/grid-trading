@@ -1,0 +1,13 @@
+[Unit]
+Description=Rotate Docker JSON logs without restarting containers
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/docker-container-logs
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/docker/containers /var/lib/logrotate

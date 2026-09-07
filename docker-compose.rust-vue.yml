@@ -1,8 +1,6 @@
 services:
   grid-trading-rust-preview:
-    build:
-      context: .
-      dockerfile: Dockerfile.rust-vue
+    image: ${GRID_RUST_PREVIEW_IMAGE:-grid-trading-vue-rust:preview}
     container_name: grid-trading-rust-preview
     restart: unless-stopped
     env_file:
