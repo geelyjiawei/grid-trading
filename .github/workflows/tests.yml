@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
@@ -70,10 +69,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Install stable Rust
+      - name: Install pinned Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
-          rustup default stable
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup default 1.90.0
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -270,12 +269,35 @@ jobs:
           GRID_RUST_PREVIEW_EXPECTED_BINDING=127.0.0.1:18000 \
             sh scripts/verify-rust-preview.sh
 
-      - name: Export verified production image
-        if: github.event_name == 'workflow_dispatch'
-        run: docker save grid-trading-vue-rust:test | gzip -1 > grid-trading-vue-rust.tar.gz
+  release:
+    name: Publish verified image
+    if: github.event_name != 'pull_request'
+    needs:
+      - test
+      - rust
+      - vue
+      - container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build immutable production image
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --file Dockerfile.rust-vue \
+            --tag grid-trading-vue-rust:release \
+            .
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' grid-trading-vue-rust:release)" = "$GITHUB_SHA"
 
       - name: Publish immutable production image
-        if: github.event_name != 'pull_request'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -283,9 +305,13 @@ jobs:
           repository=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           image="ghcr.io/$repository:sha-$GITHUB_SHA"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          docker tag grid-trading-vue-rust:test "$image"
+          docker tag grid-trading-vue-rust:release "$image"
           docker push "$image"
           printf 'Verified image: `%s`\n' "$image" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export verified production image
+        if: github.event_name == 'workflow_dispatch'
+        run: docker save grid-trading-vue-rust:release | gzip -1 > grid-trading-vue-rust.tar.gz
 
       - name: Upload verified production image
         if: github.event_name == 'workflow_dispatch'
