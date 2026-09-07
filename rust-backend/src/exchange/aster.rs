@@ -68,10 +68,24 @@ const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 const ASTER_EXECUTION_DEDUPE_CAPACITY: usize = 4_096;
 #[cfg(not(test))]
 const ASTER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const ASTER_WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
 const ASTER_RECONNECT_MIN: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
 const ASTER_RECONNECT_MAX: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AsterExecutionStreamPolicy {
+    websocket_heartbeat_interval: Duration,
+    established_disconnect_delay: Duration,
+}
+
+const fn aster_execution_stream_policy() -> AsterExecutionStreamPolicy {
+    AsterExecutionStreamPolicy {
+        websocket_heartbeat_interval: ASTER_WEBSOCKET_HEARTBEAT_INTERVAL,
+        established_disconnect_delay: Duration::ZERO,
+    }
+}
 
 pub trait AsterMessageSigner: Send + Sync {
     fn signer_address(&self) -> &str;
@@ -423,6 +437,7 @@ async fn run_aster_execution_stream<T, S, N>(
     S: AsterMessageSigner,
     N: NonceSource,
 {
+    let policy = aster_execution_stream_policy();
     let mut reconnect_delay = ASTER_RECONNECT_MIN;
     while lifetime.upgrade().is_some() {
         let listen_key = match aster_listen_key(&adapter).await {
@@ -435,7 +450,7 @@ async fn run_aster_execution_stream<T, S, N>(
             }
         };
         let stream_url = aster_user_stream_url(testnet, &listen_key);
-        let (mut socket, _) = match connect_async(&stream_url).await {
+        let (socket, _) = match connect_async(&stream_url).await {
             Ok(connection) => connection,
             Err(error) => {
                 tracing::warn!(error = %error, "Aster user execution stream connection failed");
@@ -451,12 +466,16 @@ async fn run_aster_execution_stream<T, S, N>(
         execution_cache.begin_session();
         reconnect_delay = ASTER_RECONNECT_MIN;
         let mut recent = RecentAsterExecutions::default();
+        let (mut socket_writer, mut socket_reader) = socket.split();
         let mut keepalive = tokio::time::interval(ASTER_KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         keepalive.tick().await;
+        let mut websocket_heartbeat = tokio::time::interval(policy.websocket_heartbeat_interval);
+        websocket_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        websocket_heartbeat.tick().await;
         loop {
             tokio::select! {
-                message = socket.next() => {
+                message = socket_reader.next() => {
                     let Some(message) = message else { break };
                     match message {
                         Ok(Message::Text(text)) => {
@@ -472,7 +491,7 @@ async fn run_aster_execution_stream<T, S, N>(
                             }
                         }
                         Ok(Message::Ping(payload)) => {
-                            if socket.send(Message::Pong(payload)).await.is_err() {
+                            if socket_writer.send(Message::Pong(payload)).await.is_err() {
                                 break;
                             }
                         }
@@ -482,6 +501,14 @@ async fn run_aster_execution_stream<T, S, N>(
                             break;
                         }
                         Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                    }
+                }
+                _ = websocket_heartbeat.tick() => {
+                    // Aster permits unsolicited Pong frames. Outbound traffic keeps
+                    // idle private streams hot without adding request weight.
+                    if let Err(error) = socket_writer.send(Message::Pong(Vec::new().into())).await {
+                        tracing::warn!(error = %error, "Aster user execution heartbeat failed");
+                        break;
                     }
                 }
                 _ = keepalive.tick() => {
@@ -499,8 +526,9 @@ async fn run_aster_execution_stream<T, S, N>(
         }
         execution_cache.begin_session();
         tracing::warn!("Aster user execution stream disconnected; REST fallback remains active");
-        tokio::time::sleep(reconnect_delay).await;
-        reconnect_delay = (reconnect_delay * 2).min(ASTER_RECONNECT_MAX);
+        if !policy.established_disconnect_delay.is_zero() {
+            tokio::time::sleep(policy.established_disconnect_delay).await;
+        }
     }
 }
 
@@ -1614,6 +1642,17 @@ mod tests {
             aster_user_stream_url(true, "listen-key"),
             "wss://fstream.asterdex-testnet.com/ws/listen-key"
         );
+    }
+
+    #[test]
+    fn execution_stream_policy_keeps_the_hot_path_alive_and_reconnects_immediately() {
+        let policy = aster_execution_stream_policy();
+
+        assert!(
+            policy.websocket_heartbeat_interval < Duration::from_secs(3 * 60),
+            "the client heartbeat must run before Aster's three-minute server ping interval"
+        );
+        assert_eq!(policy.established_disconnect_delay, Duration::ZERO);
     }
 
     #[derive(Clone)]

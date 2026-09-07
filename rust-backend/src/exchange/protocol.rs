@@ -998,14 +998,33 @@ pub struct ReqwestTransport {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReqwestConnectionPolicy {
+    pool_idle_timeout: Duration,
+    tcp_keepalive: Duration,
+    tcp_nodelay: bool,
+}
+
+const fn reqwest_connection_policy() -> ReqwestConnectionPolicy {
+    ReqwestConnectionPolicy {
+        pool_idle_timeout: Duration::from_secs(15 * 60),
+        tcp_keepalive: Duration::from_secs(30),
+        tcp_nodelay: true,
+    }
+}
+
 impl ReqwestTransport {
     pub fn new(timeout: Duration) -> Result<Self, TransportBuildError> {
         if timeout.is_zero() {
             return Err(TransportBuildError::InvalidTimeout);
         }
+        let connection_policy = reqwest_connection_policy();
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(Duration::from_secs(5)))
+            .pool_idle_timeout(connection_policy.pool_idle_timeout)
+            .tcp_keepalive(connection_policy.tcp_keepalive)
+            .tcp_nodelay(connection_policy.tcp_nodelay)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("grid-trading-rust/0.1")
             .build()
@@ -1201,6 +1220,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn reqwest_connection_policy_keeps_exchange_connections_hot() {
+        let policy = reqwest_connection_policy();
+
+        assert!(policy.pool_idle_timeout >= Duration::from_secs(10 * 60));
+        assert!(policy.tcp_keepalive <= Duration::from_secs(60));
+        assert!(!policy.tcp_keepalive.is_zero());
+        assert!(policy.tcp_nodelay);
+    }
 
     #[derive(Clone)]
     struct ScriptedTransport {
