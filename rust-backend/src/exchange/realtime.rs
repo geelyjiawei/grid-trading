@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use tokio::sync::broadcast;
 #[cfg(not(test))]
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, connect_async_tls_with_config, tungstenite::Message};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -41,8 +41,11 @@ const RECONNECT_MIN: Duration = Duration::from_millis(250);
 const RECONNECT_MAX: Duration = Duration::from_secs(15);
 #[cfg(not(test))]
 const LIFETIME_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-#[cfg(not(test))]
 const BINANCE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const BINANCE_STREAM_DISABLE_NAGLE: bool = true;
+const BINANCE_STREAM_ESTABLISHED_RECONNECT_DELAY: Duration = Duration::ZERO;
+const BINANCE_LISTEN_KEY_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(40 * 60);
+const BINANCE_LISTEN_KEY_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const BYBIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
@@ -662,6 +665,9 @@ async fn run_binance_execution_stream(
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
+        .pool_idle_timeout(BINANCE_LISTEN_KEY_POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(BINANCE_LISTEN_KEY_TCP_KEEPALIVE)
+        .tcp_nodelay(true)
         .build()
     {
         Ok(client) => client,
@@ -682,7 +688,14 @@ async fn run_binance_execution_stream(
             }
         };
         let stream_url = binance_user_stream_url(testnet, &listen_key);
-        let (mut socket, _) = match connect_async(&stream_url).await {
+        let (mut socket, _) = match connect_async_tls_with_config(
+            &stream_url,
+            None,
+            BINANCE_STREAM_DISABLE_NAGLE,
+            None,
+        )
+        .await
+        {
             Ok(connection) => connection,
             Err(error) => {
                 tracing::warn!(error = %error, "Binance user execution stream connection failed");
@@ -696,7 +709,6 @@ async fn run_binance_execution_stream(
             "Binance user execution stream connected"
         );
         execution_cache.begin_session();
-        reconnect_delay = RECONNECT_MIN;
         let mut recent_executions = RecentBinanceExecutions::default();
         let mut keepalive = tokio::time::interval(BINANCE_KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -756,8 +768,10 @@ async fn run_binance_execution_stream(
             }
         }
         tracing::warn!("Binance user execution stream disconnected; REST fallback remains active");
-        tokio::time::sleep(reconnect_delay).await;
-        reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX);
+        if !BINANCE_STREAM_ESTABLISHED_RECONNECT_DELAY.is_zero() {
+            tokio::time::sleep(BINANCE_STREAM_ESTABLISHED_RECONNECT_DELAY).await;
+        }
+        reconnect_delay = RECONNECT_MIN;
     }
 }
 
@@ -1341,6 +1355,14 @@ pub(crate) fn new_realtime_lifetime() -> Arc<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binance_stream_uses_low_latency_connection_and_reconnect_policy() {
+        assert!(std::hint::black_box(BINANCE_STREAM_DISABLE_NAGLE));
+        assert!(BINANCE_STREAM_ESTABLISHED_RECONNECT_DELAY.is_zero());
+        assert!(BINANCE_LISTEN_KEY_POOL_IDLE_TIMEOUT > BINANCE_KEEPALIVE_INTERVAL);
+        assert!(BINANCE_LISTEN_KEY_TCP_KEEPALIVE <= Duration::from_secs(60));
+    }
 
     fn authoritative_new_snapshot(
         update: &FuturesOrderUpdate,

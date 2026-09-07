@@ -28,7 +28,7 @@ use crate::{
         aster::{
             AsterAdapter, AsterSignatureError, LocalEip712Signer, spawn_aster_execution_stream,
         },
-        binance::{BinanceAdapter, HmacSha256Signer, SignatureError},
+        binance::{BinanceAdapter, HmacSha256Signer, SignatureError, spawn_binance_order_stream},
         bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
         protocol::{
             BinanceRequestGovernor, HyperliquidRequestGovernor, MonotonicMicrosecondNonce,
@@ -327,7 +327,7 @@ impl ExchangeGatewayFactory {
             } => {
                 let stream_api_key = Zeroizing::new(api_key.as_str().to_owned());
                 let signer = HmacSha256Signer::new(api_secret.as_bytes())?;
-                let adapter = match self.environment {
+                let mut adapter = match self.environment {
                     ExchangeEnvironment::Production => BinanceAdapter::production(
                         self.binance_transport.clone(),
                         signer,
@@ -347,6 +347,13 @@ impl ExchangeGatewayFactory {
                     adapter.realtime_lifetime(),
                     adapter.realtime_execution_cache(),
                 );
+                if let Some(relay) = spawn_binance_order_stream(
+                    self.environment == ExchangeEnvironment::Testnet,
+                    adapter.realtime_lifetime(),
+                    self.binance_transport.websocket_order_budget(),
+                ) {
+                    adapter.set_websocket_order_relay(relay);
+                }
                 ConfiguredExchangeGateway::Binance(adapter)
             }
             ExchangeCredentials::Aster { private_key } => {

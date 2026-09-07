@@ -374,6 +374,137 @@ impl<T> BinanceRequestGovernor<T> {
             critical_inflight: Arc::new(Semaphore::new(BINANCE_CRITICAL_INFLIGHT_LIMIT)),
         }
     }
+
+    pub(crate) fn websocket_order_budget(&self) -> BinanceWebsocketOrderBudget {
+        BinanceWebsocketOrderBudget {
+            state: Arc::clone(&self.state),
+            priority_gate: self.priority_gate.clone(),
+        }
+    }
+}
+
+/// Reserves Binance's account-wide order windows for WebSocket API orders.
+/// It shares state with REST so switching transports cannot bypass throttling.
+#[derive(Clone)]
+pub(crate) struct BinanceWebsocketOrderBudget {
+    state: Arc<tokio::sync::Mutex<BinanceRequestState>>,
+    priority_gate: BinancePriorityGate,
+}
+
+impl BinanceWebsocketOrderBudget {
+    pub(crate) async fn reserve(&self) -> Result<(), Duration> {
+        let _priority_permit = self
+            .priority_gate
+            .acquire(BinanceRequestPriority::TradingCritical)
+            .await;
+        let request_cost = BinanceRequestCost {
+            weight: 0,
+            orders: 1,
+        };
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+
+        if let Some(cooldown_until) = state.cooldown_until {
+            if cooldown_until > now {
+                return Err(cooldown_until.saturating_duration_since(now));
+            }
+            state.cooldown_until = None;
+        }
+        if let Some(cooldown_until) = state.order_cooldown_until {
+            if cooldown_until > now {
+                return Err(cooldown_until.saturating_duration_since(now));
+            }
+            state.order_cooldown_until = None;
+        }
+
+        prune_binance_usage(&mut state, now);
+        if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
+            let cooldown = match limit {
+                BinanceBudgetCooldown::AllRequests(cooldown) => {
+                    state.cooldown_until = Some(now + cooldown);
+                    cooldown
+                }
+                BinanceBudgetCooldown::Orders(cooldown) => {
+                    state.order_cooldown_until = Some(now + cooldown);
+                    cooldown
+                }
+            };
+            return Err(cooldown);
+        }
+
+        state.usage.push_back(BinanceUsageEvent {
+            at: now,
+            cost: request_cost,
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn observe_response(&self, response: &serde_json::Value) {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let mut cooldown = Duration::ZERO;
+
+        if response.get("status").and_then(serde_json::Value::as_u64) == Some(429) {
+            cooldown = BINANCE_RATE_LIMIT_WINDOW;
+        }
+        let Some(rate_limits) = response
+            .get("rateLimits")
+            .and_then(serde_json::Value::as_array)
+        else {
+            if !cooldown.is_zero() {
+                state.order_cooldown_until = Some(now + cooldown);
+            }
+            return;
+        };
+
+        for rate_limit in rate_limits {
+            if rate_limit
+                .get("rateLimitType")
+                .and_then(serde_json::Value::as_str)
+                != Some("ORDERS")
+            {
+                continue;
+            }
+            let Some(limit) = rate_limit
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                continue;
+            };
+            let Some(count) = rate_limit
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                continue;
+            };
+            let interval = rate_limit
+                .get("interval")
+                .and_then(serde_json::Value::as_str);
+            let interval_num = rate_limit
+                .get("intervalNum")
+                .and_then(serde_json::Value::as_u64);
+            match (interval, interval_num) {
+                (Some("SECOND"), Some(10)) => {
+                    state.order_limit_10s = limit;
+                    if count >= binance_budget(limit) {
+                        cooldown = cooldown.max(BINANCE_ORDER_LIMIT_SHORT_WINDOW);
+                    }
+                }
+                (Some("MINUTE"), Some(1)) => {
+                    state.order_limit = limit;
+                    if count >= binance_budget(limit) {
+                        cooldown = cooldown.max(BINANCE_RATE_LIMIT_WINDOW);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !cooldown.is_zero() {
+            state.order_cooldown_until = Some(now + cooldown);
+        }
+    }
 }
 
 impl<T> fmt::Debug for BinanceRequestGovernor<T> {
@@ -1229,6 +1360,70 @@ mod tests {
         assert!(policy.tcp_keepalive <= Duration::from_secs(60));
         assert!(!policy.tcp_keepalive.is_zero());
         assert!(policy.tcp_nodelay);
+    }
+
+    #[tokio::test]
+    async fn websocket_and_rest_orders_share_one_binance_order_budget() {
+        let transport = ScriptedTransport::new([]);
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+        {
+            let mut state = governor.state.lock().await;
+            state.order_limit_10s = 4;
+            state.order_limit = 100;
+        }
+        let websocket_budget = governor.websocket_order_budget();
+
+        for _ in 0..3 {
+            websocket_budget.reserve().await.unwrap();
+        }
+        assert!(websocket_budget.reserve().await.is_err());
+
+        let blocked = governor
+            .execute(PreparedHttpRequest {
+                method: HttpMethod::Post,
+                base_url: "https://fapi.binance.com".into(),
+                path: "/fapi/v1/order".into(),
+                query: vec![("symbol".into(), "BTCUSDT".into())],
+                body: vec![],
+                raw_body: None,
+                headers: vec![],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(blocked.status, 429);
+        assert!(blocked.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
+        assert_eq!(transport.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_order_response_updates_the_shared_exchange_budget() {
+        let governor = BinanceRequestGovernor::new(ScriptedTransport::new([]), Duration::ZERO);
+        let websocket_budget = governor.websocket_order_budget();
+
+        websocket_budget
+            .observe_response(&serde_json::json!({
+                "status": 200,
+                "rateLimits": [
+                    {
+                        "rateLimitType": "ORDERS",
+                        "interval": "SECOND",
+                        "intervalNum": 10,
+                        "limit": 4,
+                        "count": 3
+                    },
+                    {
+                        "rateLimitType": "ORDERS",
+                        "interval": "MINUTE",
+                        "intervalNum": 1,
+                        "limit": 100,
+                        "count": 3
+                    }
+                ]
+            }))
+            .await;
+
+        assert!(websocket_budget.reserve().await.is_err());
     }
 
     #[derive(Clone)]

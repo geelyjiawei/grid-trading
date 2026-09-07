@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 #[cfg(not(test))]
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 
 use crate::{
     domain::{
@@ -75,6 +75,8 @@ const USER_FILL_STREAM_HEARTBEAT: Duration = Duration::from_secs(30);
 const USER_FILL_STREAM_RECONNECT_MIN: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const USER_FILL_STREAM_RECONNECT_MAX: Duration = Duration::from_secs(30);
+const USER_FILL_STREAM_DISABLE_NAGLE: bool = true;
+const USER_FILL_STREAM_ESTABLISHED_RECONNECT_DELAY: Duration = Duration::ZERO;
 const USER_FILL_STREAM_GRACE: Duration = Duration::from_millis(50);
 const WEBSOCKET_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 const WEBSOCKET_ACTION_QUEUE_CAPACITY: usize = 256;
@@ -435,7 +437,13 @@ async fn run_user_fill_stream(
         if cache.upgrade().is_none() || order_cache.upgrade().is_none() {
             return;
         }
-        let connection = connect_async(websocket_url).await;
+        let connection = connect_async_tls_with_config(
+            websocket_url,
+            None,
+            USER_FILL_STREAM_DISABLE_NAGLE,
+            None,
+        )
+        .await;
         let (mut socket, _) = match connection {
             Ok(connection) => connection,
             Err(error) => {
@@ -593,8 +601,11 @@ async fn run_user_fill_stream(
             return;
         }
         tracing::warn!("TRADE.XYZ user-fill stream disconnected; REST fallback remains active");
-        reject_actions_while_disconnected(&mut action_commands, reconnect_delay).await;
-        reconnect_delay = (reconnect_delay * 2).min(USER_FILL_STREAM_RECONNECT_MAX);
+        reject_actions_while_disconnected(
+            &mut action_commands,
+            USER_FILL_STREAM_ESTABLISHED_RECONNECT_DELAY,
+        )
+        .await;
     }
 }
 
@@ -603,6 +614,14 @@ async fn reject_actions_while_disconnected(
     commands: &mut tokio::sync::mpsc::Receiver<WebsocketActionCommand>,
     delay: Duration,
 ) {
+    if delay.is_zero() {
+        while let Ok(command) = commands.try_recv() {
+            let _ = command.response.send(Err(WebsocketActionError::NotSent(
+                "TRADE.XYZ websocket is reconnecting".into(),
+            )));
+        }
+        return;
+    }
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
     loop {
@@ -2854,6 +2873,12 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    fn websocket_transport_uses_low_latency_established_connection_policy() {
+        assert!(std::hint::black_box(USER_FILL_STREAM_DISABLE_NAGLE));
+        assert!(USER_FILL_STREAM_ESTABLISHED_RECONNECT_DELAY.is_zero());
+    }
 
     fn official_public_test_vector_key() -> String {
         hex::encode([

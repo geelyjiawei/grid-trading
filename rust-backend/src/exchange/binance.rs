@@ -1,12 +1,25 @@
 use std::{
-    sync::{Arc, Weak},
-    time::Duration,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
+#[cfg(not(test))]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::VecDeque;
+
 use async_trait::async_trait;
+#[cfg(not(test))]
+use futures::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
+use serde_json::{Map, Number, Value, json};
 use sha2::Sha256;
 use thiserror::Error;
+#[cfg(not(test))]
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -35,8 +48,8 @@ use crate::{
             parse_historical_minute_open, parse_order_execution_header, parse_trade_page,
         },
         protocol::{
-            BINANCE_LOCAL_COOLDOWN_CODE, HttpMethod, HttpTransport, MillisecondClock, Parameters,
-            PreparedHttpRequest, encode_parameters,
+            BINANCE_LOCAL_COOLDOWN_CODE, BinanceWebsocketOrderBudget, HttpMethod, HttpResponse,
+            HttpTransport, MillisecondClock, Parameters, PreparedHttpRequest, encode_parameters,
         },
         realtime::FuturesExecutionCache,
     },
@@ -49,9 +62,342 @@ const MAX_TRADE_PAGES: usize = 64;
 const MAX_BATCH_CANCELLATIONS: usize = 10;
 const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 const POST_ONLY_WOULD_TAKE_CODE: &str = "-5022";
+const BINANCE_WEBSOCKET_ORDER_TIMEOUT: Duration = Duration::from_secs(10);
+const BINANCE_WEBSOCKET_ORDER_QUEUE_CAPACITY: usize = 256;
+const BINANCE_WEBSOCKET_DISABLE_NAGLE: bool = true;
+#[cfg(not(test))]
+const BINANCE_WEBSOCKET_RECONNECT_MIN: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const BINANCE_WEBSOCKET_RECONNECT_MAX: Duration = Duration::from_secs(15);
+#[cfg(not(test))]
+const BINANCE_WEBSOCKET_LIFETIME_CHECK: Duration = Duration::from_secs(5);
 
 pub trait BinanceRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, SignatureError>;
+}
+
+#[derive(Debug)]
+pub(crate) enum BinanceWebsocketOrderError {
+    NotSent(String),
+    RateLimited(String),
+    Unknown(String),
+}
+
+struct BinanceWebsocketOrderCommand {
+    request: Value,
+    #[cfg_attr(test, allow(dead_code))]
+    queued_at: Instant,
+    response: tokio::sync::oneshot::Sender<Result<Value, BinanceWebsocketOrderError>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BinanceWebsocketOrderRelay {
+    sender: tokio::sync::mpsc::Sender<BinanceWebsocketOrderCommand>,
+    connected: Arc<AtomicBool>,
+    order_budget: Option<BinanceWebsocketOrderBudget>,
+}
+
+impl BinanceWebsocketOrderRelay {
+    async fn post(&self, request: Value) -> Result<Value, BinanceWebsocketOrderError> {
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(BinanceWebsocketOrderError::NotSent(
+                "Binance order WebSocket is disconnected".into(),
+            ));
+        }
+        let permit = self.sender.try_reserve().map_err(|_| {
+            BinanceWebsocketOrderError::NotSent(
+                "Binance order WebSocket writer queue is unavailable".into(),
+            )
+        })?;
+        if let Some(order_budget) = &self.order_budget
+            && let Err(retry_after) = order_budget.reserve().await
+        {
+            return Err(BinanceWebsocketOrderError::RateLimited(format!(
+                "Binance order budget is reserved; retry after {} ms",
+                retry_after.as_millis()
+            )));
+        }
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(BinanceWebsocketOrderError::NotSent(
+                "Binance order WebSocket disconnected before submission".into(),
+            ));
+        }
+
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        permit.send(BinanceWebsocketOrderCommand {
+            request,
+            queued_at: Instant::now(),
+            response,
+        });
+        match tokio::time::timeout(BINANCE_WEBSOCKET_ORDER_TIMEOUT, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(BinanceWebsocketOrderError::Unknown(
+                "Binance order WebSocket response channel closed after submission".into(),
+            )),
+            Err(_) => Err(BinanceWebsocketOrderError::Unknown(
+                "Binance order WebSocket acknowledgement timed out after submission".into(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn scripted_for_test(
+        connected: bool,
+        responses: impl IntoIterator<Item = Result<Value, BinanceWebsocketOrderError>>,
+    ) -> (Self, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<BinanceWebsocketOrderCommand>(
+            BINANCE_WEBSOCKET_ORDER_QUEUE_CAPACITY,
+        );
+        let connected_flag = Arc::new(AtomicBool::new(connected));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let mut responses = responses.into_iter().collect::<VecDeque<_>>();
+        tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                captured.lock().unwrap().push(command.request);
+                let result = responses
+                    .pop_front()
+                    .expect("a scripted Binance WebSocket response is configured");
+                let _ = command.response.send(result);
+            }
+        });
+        (
+            Self {
+                sender,
+                connected: connected_flag,
+                order_budget: None,
+            },
+            requests,
+        )
+    }
+}
+
+#[cfg(not(test))]
+fn binance_websocket_order_relay(
+    order_budget: BinanceWebsocketOrderBudget,
+) -> (
+    BinanceWebsocketOrderRelay,
+    tokio::sync::mpsc::Receiver<BinanceWebsocketOrderCommand>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(BINANCE_WEBSOCKET_ORDER_QUEUE_CAPACITY);
+    (
+        BinanceWebsocketOrderRelay {
+            sender,
+            connected: Arc::new(AtomicBool::new(false)),
+            order_budget: Some(order_budget),
+        },
+        receiver,
+    )
+}
+
+#[cfg(not(test))]
+pub(crate) fn spawn_binance_order_stream(
+    testnet: bool,
+    lifetime: Weak<()>,
+    order_budget: BinanceWebsocketOrderBudget,
+) -> Option<BinanceWebsocketOrderRelay> {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("Binance order WebSocket was not started outside a Tokio runtime");
+        return None;
+    };
+    let (relay, receiver) = binance_websocket_order_relay(order_budget);
+    runtime.spawn(run_binance_order_stream(
+        binance_order_stream_url(testnet),
+        lifetime,
+        relay.connected.clone(),
+        relay
+            .order_budget
+            .clone()
+            .expect("order budget is configured"),
+        receiver,
+    ));
+    Some(relay)
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_binance_order_stream(
+    _testnet: bool,
+    _lifetime: Weak<()>,
+    _order_budget: BinanceWebsocketOrderBudget,
+) -> Option<BinanceWebsocketOrderRelay> {
+    None
+}
+
+fn binance_order_stream_url(testnet: bool) -> &'static str {
+    if testnet {
+        "wss://testnet.binancefuture.com/ws-fapi/v1"
+    } else {
+        "wss://ws-fapi.binance.com/ws-fapi/v1"
+    }
+}
+
+#[cfg(not(test))]
+async fn run_binance_order_stream(
+    websocket_url: &'static str,
+    lifetime: Weak<()>,
+    connected: Arc<AtomicBool>,
+    order_budget: BinanceWebsocketOrderBudget,
+    mut commands: tokio::sync::mpsc::Receiver<BinanceWebsocketOrderCommand>,
+) {
+    let mut reconnect_delay = BINANCE_WEBSOCKET_RECONNECT_MIN;
+    while lifetime.upgrade().is_some() {
+        let connection = connect_async_tls_with_config(
+            websocket_url,
+            None,
+            BINANCE_WEBSOCKET_DISABLE_NAGLE,
+            None,
+        )
+        .await;
+        let (mut socket, _) = match connection {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::warn!(error = %error, "Binance order WebSocket connection failed");
+                connected.store(false, Ordering::Release);
+                reject_binance_orders_while_disconnected(&mut commands, reconnect_delay).await;
+                reconnect_delay = (reconnect_delay * 2).min(BINANCE_WEBSOCKET_RECONNECT_MAX);
+                continue;
+            }
+        };
+
+        connected.store(true, Ordering::Release);
+        reconnect_delay = BINANCE_WEBSOCKET_RECONNECT_MIN;
+        tracing::info!("Binance order WebSocket connected");
+        let mut pending = HashMap::new();
+        let mut lifetime_check = tokio::time::interval(BINANCE_WEBSOCKET_LIFETIME_CHECK);
+        lifetime_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        lifetime_check.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+                command = commands.recv() => {
+                    let Some(command) = command else { return };
+                    if command.response.is_closed() {
+                        continue;
+                    }
+                    let Some(id) = command.request.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                        let _ = command.response.send(Err(BinanceWebsocketOrderError::NotSent(
+                            "Binance order WebSocket request id is invalid".into(),
+                        )));
+                        continue;
+                    };
+                    let queue_ms = u64::try_from(command.queued_at.elapsed().as_millis())
+                        .unwrap_or(u64::MAX);
+                    let write_started = Instant::now();
+                    if let Err(error) = socket
+                        .send(Message::Text(command.request.to_string().into()))
+                        .await
+                    {
+                        let _ = command.response.send(Err(BinanceWebsocketOrderError::Unknown(
+                            format!("Binance order WebSocket write failed after submission began: {error}"),
+                        )));
+                        break;
+                    }
+                    tracing::info!(
+                        websocket_queue_ms = queue_ms,
+                        websocket_write_ms = u64::try_from(write_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "Binance order written to WebSocket"
+                    );
+                    pending.insert(id, command.response);
+                }
+                message = socket.next() => {
+                    let Some(message) = message else { break };
+                    match message {
+                        Ok(Message::Text(text)) => {
+                            resolve_binance_order_response(
+                                text.as_ref(),
+                                &mut pending,
+                                &order_budget,
+                            ).await;
+                        }
+                        Ok(Message::Binary(bytes)) => {
+                            if let Ok(text) = std::str::from_utf8(bytes.as_ref()) {
+                                resolve_binance_order_response(text, &mut pending, &order_budget).await;
+                            }
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Binance order WebSocket read failed");
+                            break;
+                        }
+                        Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                    }
+                }
+                _ = lifetime_check.tick() => {
+                    if lifetime.upgrade().is_none() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        connected.store(false, Ordering::Release);
+        for response in pending.into_values() {
+            let _ = response.send(Err(BinanceWebsocketOrderError::Unknown(
+                "Binance order WebSocket disconnected after submission".into(),
+            )));
+        }
+        tracing::warn!("Binance order WebSocket disconnected; REST fallback remains active");
+        reject_binance_orders_while_disconnected(&mut commands, Duration::ZERO).await;
+    }
+}
+
+#[cfg(not(test))]
+async fn resolve_binance_order_response(
+    text: &str,
+    pending: &mut HashMap<
+        String,
+        tokio::sync::oneshot::Sender<Result<Value, BinanceWebsocketOrderError>>,
+    >,
+    order_budget: &BinanceWebsocketOrderBudget,
+) {
+    let Ok(response) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    let Some(id) = response.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(sender) = pending.remove(id) else {
+        return;
+    };
+    order_budget.observe_response(&response).await;
+    let _ = sender.send(Ok(response));
+}
+
+#[cfg(not(test))]
+async fn reject_binance_orders_while_disconnected(
+    commands: &mut tokio::sync::mpsc::Receiver<BinanceWebsocketOrderCommand>,
+    delay: Duration,
+) {
+    if delay.is_zero() {
+        while let Ok(command) = commands.try_recv() {
+            let _ = command
+                .response
+                .send(Err(BinanceWebsocketOrderError::NotSent(
+                    "Binance order WebSocket is reconnecting".into(),
+                )));
+        }
+        return;
+    }
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return,
+            command = commands.recv() => {
+                let Some(command) = command else { return };
+                let _ = command.response.send(Err(BinanceWebsocketOrderError::NotSent(
+                    "Binance order WebSocket is reconnecting".into(),
+                )));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -410,6 +756,7 @@ pub struct BinanceAdapter<T, S, C> {
     recv_window_ms: u64,
     realtime_lifetime: Arc<()>,
     realtime_execution_cache: FuturesExecutionCache,
+    websocket_order_relay: Option<BinanceWebsocketOrderRelay>,
 }
 
 impl<T, S, C> BinanceAdapter<T, S, C> {
@@ -437,6 +784,7 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
             recv_window_ms: 5_000,
             realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
             realtime_execution_cache: FuturesExecutionCache::default(),
+            websocket_order_relay: None,
         }
     }
 
@@ -450,6 +798,10 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
 
     pub fn set_recv_window_ms(&mut self, recv_window_ms: u64) {
         self.recv_window_ms = recv_window_ms;
+    }
+
+    pub(crate) fn set_websocket_order_relay(&mut self, relay: BinanceWebsocketOrderRelay) {
+        self.websocket_order_relay = Some(relay);
     }
 
     fn public_request(&self, path: &str, parameters: Parameters) -> PreparedHttpRequest {
@@ -470,6 +822,54 @@ where
     S: BinanceRequestSigner,
     C: MillisecondClock,
 {
+    #[cfg(test)]
+    fn websocket_order_request(&self, intent: &OrderIntent) -> Result<Value, SignatureError> {
+        let parameters = build_order_parameters(&intent.client_order_id, &intent.shape)
+            .map_err(|error| SignatureError::Other(error.to_string()))?;
+        self.websocket_order_request_from_parameters(&intent.client_order_id, parameters)
+    }
+
+    fn websocket_order_request_from_parameters(
+        &self,
+        client_order_id: &ClientOrderId,
+        mut parameters: Parameters,
+    ) -> Result<Value, SignatureError> {
+        if self.api_key.trim().is_empty() {
+            return Err(SignatureError::MissingApiKey);
+        }
+        if self.recv_window_ms == 0 {
+            return Err(SignatureError::InvalidRecvWindow);
+        }
+        parameters.push(("apiKey".into(), self.api_key.to_string()));
+        parameters.push(("recvWindow".into(), self.recv_window_ms.to_string()));
+        parameters.push(("timestamp".into(), self.clock.now_millis().to_string()));
+        parameters.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let signature_payload = parameters
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let signature = self.signer.sign(&signature_payload)?;
+        let mut params = Map::new();
+        for (key, value) in parameters {
+            let value = match key.as_str() {
+                "recvWindow" | "timestamp" => Value::Number(Number::from(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| SignatureError::Other(error.to_string()))?,
+                )),
+                _ => Value::String(value),
+            };
+            params.insert(key, value);
+        }
+        params.insert("signature".into(), Value::String(signature));
+        Ok(json!({
+            "id": client_order_id.as_str(),
+            "method": "order.place",
+            "params": params,
+        }))
+    }
+
     fn signed_request(
         &self,
         method: HttpMethod,
@@ -706,6 +1106,39 @@ where
             .map_err(|error| definitive_local_error(&error.to_string()))?;
         let params = build_order_parameters(&intent.client_order_id, &intent.shape)
             .map_err(|error| definitive_local_error(&error.to_string()))?;
+        if let Some(relay) = &self.websocket_order_relay {
+            let request = self
+                .websocket_order_request_from_parameters(&intent.client_order_id, params.clone())
+                .map_err(|error| definitive_local_error(&error.to_string()))?;
+            let websocket_started = Instant::now();
+            match relay.post(request).await {
+                Ok(response) => {
+                    tracing::info!(
+                        websocket_roundtrip_ms =
+                            u64::try_from(websocket_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                        "Binance order action completed over WebSocket"
+                    );
+                    let response = websocket_order_http_response(response).map_err(|message| {
+                        PlacementError::Unknown {
+                            message: format!(
+                                "Binance WebSocket acknowledgement is invalid: {message}"
+                            ),
+                        }
+                    })?;
+                    return interpret_placement_response(response, intent);
+                }
+                Err(BinanceWebsocketOrderError::NotSent(message)) => {
+                    tracing::debug!(reason = %message, "Binance order is falling back to REST");
+                }
+                Err(BinanceWebsocketOrderError::RateLimited(message)) => {
+                    return Err(PlacementError::NotSubmitted { message });
+                }
+                Err(BinanceWebsocketOrderError::Unknown(message)) => {
+                    return Err(PlacementError::Unknown { message });
+                }
+            }
+        }
         let request = self
             .signed_request(HttpMethod::Post, "/fapi/v1/order", params)
             .map_err(|error| definitive_local_error(&error.to_string()))?;
@@ -716,52 +1149,74 @@ where
                 .map_err(|error| PlacementError::Unknown {
                     message: error.to_string(),
                 })?;
+        interpret_placement_response(response, intent)
+    }
+}
 
-        if (200..300).contains(&response.status) {
-            return parse_placement_acknowledgement(&response.body, &intent.client_order_id)
-                .map_err(|error| PlacementError::Unknown {
-                    message: format!("Binance acknowledgement is not authoritative: {error}"),
-                });
-        }
+fn websocket_order_http_response(response: Value) -> Result<HttpResponse, String> {
+    let status = response
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .ok_or_else(|| "status is missing".to_owned())?;
+    let body = if (200..300).contains(&status) {
+        response.get("result")
+    } else {
+        response.get("error")
+    }
+    .ok_or_else(|| "result or error payload is missing".to_owned())?;
+    serde_json::to_string(body).map_or_else(
+        |error| Err(format!("payload serialization failed: {error}")),
+        |body| Ok(HttpResponse { status, body }),
+    )
+}
 
-        let error = parse_exchange_error(&response.body);
-        if response.status == 429 && error.code.as_deref() == Some(BINANCE_LOCAL_COOLDOWN_CODE) {
-            return Err(PlacementError::NotSubmitted {
-                message: error.message,
-            });
-        }
-        if error.code.as_deref() == Some("-1008") {
-            // Binance documents -1008 system-level throttling as a 100%
-            // failed operation, unlike the ambiguous HTTP 503 timeout form.
-            return Err(PlacementError::NotSubmitted {
-                message: error.message,
-            });
-        }
-        if intent.shape.time_in_force == TimeInForce::PostOnly
-            && error.code.as_deref() == Some(POST_ONLY_WOULD_TAKE_CODE)
-        {
-            // Binance guarantees that -5022 creates no order. Keeping the
-            // intent retryable preserves the grid obligation without risking
-            // a duplicate exchange order when the price becomes maker-safe.
-            return Err(PlacementError::NotSubmitted {
-                message: error.message,
-            });
-        }
-        if response.status < 400
-            || response.status == 408
-            || response.status == 429
-            || response.status >= 500
-            || execution_status_is_unknown(error.code.as_deref())
-        {
-            Err(PlacementError::Unknown {
-                message: error.message,
-            })
-        } else {
-            Err(PlacementError::Definitive {
-                code: error.code,
-                message: error.message,
-            })
-        }
+fn interpret_placement_response(
+    response: HttpResponse,
+    intent: &OrderIntent,
+) -> Result<PlacementAcknowledgement, PlacementError> {
+    if (200..300).contains(&response.status) {
+        return parse_placement_acknowledgement(&response.body, &intent.client_order_id).map_err(
+            |error| PlacementError::Unknown {
+                message: format!("Binance acknowledgement is not authoritative: {error}"),
+            },
+        );
+    }
+
+    let error = parse_exchange_error(&response.body);
+    if response.status == 429 && error.code.as_deref() == Some(BINANCE_LOCAL_COOLDOWN_CODE) {
+        return Err(PlacementError::NotSubmitted {
+            message: error.message,
+        });
+    }
+    if error.code.as_deref() == Some("-1008") {
+        // Binance documents -1008 system-level throttling as a 100% failed
+        // operation, unlike a timeout whose execution status is unknown.
+        return Err(PlacementError::NotSubmitted {
+            message: error.message,
+        });
+    }
+    if intent.shape.time_in_force == TimeInForce::PostOnly
+        && error.code.as_deref() == Some(POST_ONLY_WOULD_TAKE_CODE)
+    {
+        return Err(PlacementError::NotSubmitted {
+            message: error.message,
+        });
+    }
+    if response.status < 400
+        || response.status == 408
+        || response.status == 429
+        || response.status >= 500
+        || execution_status_is_unknown(error.code.as_deref())
+    {
+        Err(PlacementError::Unknown {
+            message: error.message,
+        })
+    } else {
+        Err(PlacementError::Definitive {
+            code: error.code,
+            message: error.message,
+        })
     }
 }
 
@@ -1189,6 +1644,19 @@ mod tests {
     }
 
     #[test]
+    fn websocket_order_endpoint_uses_official_low_latency_transport_policy() {
+        assert_eq!(
+            binance_order_stream_url(false),
+            "wss://ws-fapi.binance.com/ws-fapi/v1"
+        );
+        assert_eq!(
+            binance_order_stream_url(true),
+            "wss://testnet.binancefuture.com/ws-fapi/v1"
+        );
+        assert!(std::hint::black_box(BINANCE_WEBSOCKET_DISABLE_NAGLE));
+    }
+
+    #[test]
     fn hmac_signing_matches_fixed_sha256_vector() {
         let signer = HmacSha256Signer::new("key").unwrap();
         assert_eq!(
@@ -1594,6 +2062,97 @@ mod tests {
                 "signature=426919c675812880a3ebf157138dbb77a5131eff743d1b2674908dea3c6c3b55"
             )
         );
+    }
+
+    #[test]
+    fn websocket_order_request_matches_binance_sorted_hmac_contract() {
+        let request = adapter(MockTransport::default())
+            .websocket_order_request(&intent())
+            .unwrap();
+        let params = request.get("params").unwrap();
+
+        assert_eq!(
+            request.get("id").and_then(Value::as_str),
+            Some("g_7_S_fixed")
+        );
+        assert_eq!(
+            request.get("method").and_then(Value::as_str),
+            Some("order.place")
+        );
+        assert_eq!(
+            params.get("timestamp").and_then(Value::as_u64),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            params.get("recvWindow").and_then(Value::as_u64),
+            Some(5_000)
+        );
+        assert_eq!(params.get("price").and_then(Value::as_str), Some("1011"));
+        assert_eq!(params.get("quantity").and_then(Value::as_str), Some("0.2"));
+        assert_eq!(
+            params.get("signature").and_then(Value::as_str),
+            Some("666fba36e5f512b604244724c0c5897c2f4b2a1755326c4718bfda96de5c9572")
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_order_ack_skips_rest_and_preserves_authoritative_identity() {
+        let transport = MockTransport::default();
+        let (relay, requests) = BinanceWebsocketOrderRelay::scripted_for_test(
+            true,
+            [Ok(serde_json::json!({
+                "id": "g_7_S_fixed",
+                "status": 200,
+                "result": {"orderId": 91, "clientOrderId": "g_7_S_fixed"},
+                "rateLimits": []
+            }))],
+        );
+        let mut gateway = adapter(transport.clone());
+        gateway.set_websocket_order_relay(relay);
+
+        let acknowledgement = gateway.place_order(&intent()).await.unwrap();
+
+        assert_eq!(acknowledgement.exchange_order_id, "91");
+        assert!(transport.all_requests().is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_unknown_after_submission_never_falls_back_to_rest() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"orderId":92,"clientOrderId":"g_7_S_fixed"}"#.into(),
+        }));
+        let (relay, _) = BinanceWebsocketOrderRelay::scripted_for_test(
+            true,
+            [Err(BinanceWebsocketOrderError::Unknown(
+                "connection closed after write".into(),
+            ))],
+        );
+        let mut gateway = adapter(transport.clone());
+        gateway.set_websocket_order_relay(relay);
+
+        assert!(matches!(
+            gateway.place_order(&intent()).await,
+            Err(PlacementError::Unknown { .. })
+        ));
+        assert!(transport.all_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_websocket_falls_back_to_governed_rest_before_submission() {
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 200,
+            body: r#"{"orderId":91,"clientOrderId":"g_7_S_fixed"}"#.into(),
+        }));
+        let (relay, _) = BinanceWebsocketOrderRelay::scripted_for_test(false, []);
+        let mut gateway = adapter(transport.clone());
+        gateway.set_websocket_order_relay(relay);
+
+        let acknowledgement = gateway.place_order(&intent()).await.unwrap();
+
+        assert_eq!(acknowledgement.exchange_order_id, "91");
+        assert_eq!(transport.all_requests().len(), 1);
     }
 
     #[tokio::test]
