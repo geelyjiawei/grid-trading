@@ -118,13 +118,32 @@ class GridCapacityRepairTests(unittest.TestCase):
             try:
                 with mock.patch.object(repair, 'main', side_effect=interrupted_main):
                     with mock.patch.object(repair.subprocess, 'run') as run:
-                        with self.assertRaisesRegex(RuntimeError, 'signal'):
+                        with self.assertRaisesRegex(repair.RepairInterrupted, 'signal'):
                             repair.guarded_main()
                         run.assert_called_once_with(['docker', 'stop', '--time', '15', repair.CONTAINER], check=False, timeout=30)
                 self.assertEqual(signal.getsignal(signum), original)
             finally:
                 repair.REPAIR_IN_PROGRESS = False
                 signal.signal(signum, original)
+
+    def test_signal_inside_delete_is_not_swallowed_as_a_network_failure(self):
+        exchange = mock.Mock()
+
+        def interrupt_request(*_args, **_kwargs):
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+        exchange.request.side_effect = interrupt_request
+        repair.REPAIR_IN_PROGRESS = True
+        try:
+            with mock.patch.object(repair, 'main', side_effect=lambda: repair.cancel_target_once(exchange)):
+                with mock.patch.object(repair.subprocess, 'run') as run:
+                    with self.assertRaises(repair.RepairInterrupted):
+                        repair.guarded_main()
+                    run.assert_called_once_with(['docker', 'stop', '--time', '15', repair.CONTAINER], check=False, timeout=30)
+            exchange.request.assert_called_once_with('/fapi/v1/order', [('symbol', repair.SYMBOL), ('orderId', str(repair.ORDER))], method='DELETE')
+            exchange.order.assert_not_called()
+        finally:
+            repair.REPAIR_IN_PROGRESS = False
 
     @unittest.skipUnless(os.name == 'posix', 'production archive durability requires Linux directory fsync')
     def test_backup_is_readable_and_sync_failure_prevents_success(self):

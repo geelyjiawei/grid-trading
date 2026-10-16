@@ -36,6 +36,10 @@ CONTAINER = 'grid-trading-rust'
 REPAIR_IN_PROGRESS = False
 
 
+class RepairInterrupted(BaseException):
+    """Must bypass network Exception handlers and reach the outer safety stop."""
+
+
 def require(condition, message='Repair precondition failed'):
     if not condition:
         raise RuntimeError(message)
@@ -193,6 +197,14 @@ def order_signature(rows):
                                    str(D(row['origQty'])), str(D(row['executedQty'])), row['reduceOnly']) for row in rows}
 
 
+def cancel_target_once(exchange):
+    try:
+        exchange.request('/fapi/v1/order', [('symbol', SYMBOL), ('orderId', str(ORDER))], method='DELETE')
+    except Exception as error:
+        print('CANCEL_RESPONSE_UNCERTAIN', type(error).__name__, flush=True)
+    return exchange.order()
+
+
 def main():
     global REPAIR_IN_PROGRESS
     parser = argparse.ArgumentParser(description=__doc__)
@@ -276,11 +288,7 @@ def main():
     }
     prepared_ledger['revision'] += 1
     atomic_json(ledger_path, prepared_ledger)
-    try:
-        exchange.request('/fapi/v1/order', [('symbol', SYMBOL), ('orderId', str(ORDER))], method='DELETE')
-    except Exception as error:
-        print('CANCEL_RESPONSE_UNCERTAIN', type(error).__name__, flush=True)
-    cancelled = exchange.order()
+    cancelled = cancel_target_once(exchange)
     atomic_json(backup / 'exchange-cancel-receipt.json', cancelled)
     validate_receipt(cancelled, 'CANCELED')
     require(exchange.positions() == before_position, 'Position changed during cancellation')
@@ -338,7 +346,7 @@ def guarded_main():
     previous = {}
 
     def interrupted(signum, _frame):
-        raise RuntimeError('Repair interrupted by signal %s' % signum)
+        raise RepairInterrupted('Repair interrupted by signal %s' % signum)
 
     try:
         for name in ('SIGTERM', 'SIGHUP', 'SIGINT'):
