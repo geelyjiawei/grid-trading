@@ -35,10 +35,20 @@
 
 Evidence before release: original regression failed 21 != 20; corrected grid matrix has 1,194 cases; all 105 strategy-machine and 29 shadow tests pass; both replay integrations and Clippy pass. The actual production ledger copy passes offline candidate validation with all 162 inventory events retained. Local full-suite Windows baseline contains directory-publication PermissionDenied failures; final authority is Linux CI. Local bundled Python lacks legacy application dependencies, so its full-suite attempt cannot replace the isolated CI install.
 
-Ruling: two final maintenance-only review fixes (signal cleanup and backup fsync) are a separate operational commit. Runtime image inputs remain byte-identical to release `efd5e1b9d2b693509baf569c0365d98812c23982`, whose Linux Rust/Python/Vue/container checks passed. Deploy that verified immutable runtime image with the separately reviewed maintenance script after all eight maintenance tests pass on Linux; verify the runtime input diff is empty. This avoids rebuilding an unchanged binary, not a test exemption for changed code.
+Ruling: final maintenance-only review fixes (signal cleanup, backup fsync, and signal propagation through network recovery) are separate operational commits. Runtime image inputs remain byte-identical to release `efd5e1b9d2b693509baf569c0365d98812c23982`, whose Linux Rust/Python/Vue/container checks passed. Deploy that verified immutable runtime image with the separately reviewed `10f66fa` maintenance script after all nine maintenance tests pass on Linux; verify the runtime input diff is empty. This avoids rebuilding an unchanged binary, not a test exemption for changed code.
 
 ### Task 3: Release and Production Verification
-- [ ] Independent safety review, complete Linux CI and immutable image verification.
-- [ ] Re-read exchange orders and positions, quiesce only the bot runtime, back up durable data.
-- [ ] Cancel/replace only the identified excess using a guarded durable repair; preserve all other order identities.
-- [ ] Deploy and compare exchange/state quantities, confirm 20 cells total 4.0 and manual exposure unchanged.
+- [x] Independent safety review, complete Linux CI and immutable image verification.
+- [x] Re-read exchange orders and positions, quiesce only the bot runtime, back up durable data.
+- [x] Cancel/replace only the identified excess using a guarded durable repair; preserve all other order identities.
+- [x] Deploy and compare exchange/state quantities, confirm 20 cells total 4.0 and manual exposure unchanged.
+
+## Production Result
+
+- 2026-10-16 19:44 CST: deployed immutable runtime image `grid-trading-vue-rust:efd5e1b`, image ID `sha256:862431870af19dd19728591635f13e2bad001c22e2b237254e99b7889ad51626`.
+- Full CI: https://github.com/geelyjiawei/grid-trading/actions/runs/38894763546 ; 768 Rust tests, Python 3.12/3.13, Vue, container/Compose gates passed. Nine final maintenance tests passed separately on Linux.
+- Private backup and durable phase journal: `/opt/grid-trading-rust-preview/backups/grid-capacity-20261016T114416Z`.
+- Cancelled exactly exchange order `235064031` (1932 Sell 0.4, zero fills). Runtime accepted `235269469`, client `r_dab0d666a310_5_S_106`, at 1932 Sell 0.2 GTC.
+- Other 37 exchange order identities and quantities unchanged. 38 physical orders represent 20 cells; each cell totals 0.2, aggregate 4.0. Historical fragments remain intentionally untouched.
+- Before/after ANTHROPIC position flat; no position-close request, baseline or historical execution change. All 162 inventory events, 39 completed pairs and financial aggregates retained.
+- Fresh post-deploy exchange/state audit: no identity/shape mismatches, no pending obligations, lifecycle Running, failure null. `/healthz` ready/active=1, container healthy/restarts=0, frontend HTTP 200.
