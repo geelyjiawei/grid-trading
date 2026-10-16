@@ -44,7 +44,7 @@ pub use execution_sync::{ExecutionSyncError, ExecutionSyncResult, ExecutionSyncS
 pub use fee_rates::{AuthoritativeFeeConfig, FeeRateConfigError, load_authoritative_fee_config};
 pub use grid_plan::{
     GridOrderRole, GridPlan, GridPlanError, MarketSnapshot, PlannedGridOrder, PlannedOpeningOrder,
-    build_grid_plan,
+    build_grid_plan, replay_legacy_grid_plan,
 };
 pub use leverage::{LeveragePreflightError, LeveragePreflightResult, ensure_symbol_leverage};
 pub use preview::{GridCycleEstimate, GridPreviewError, GridPreviewMetrics, build_grid_preview};
@@ -52,7 +52,7 @@ pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };
 pub(crate) use reconciliation::{intent_requires_lookup, reconcile_lookup_with};
-pub(crate) use runtime::validate_cross_ledger_ownership;
+pub use runtime::validate_cross_ledger_ownership;
 pub use runtime::{
     FileArmedActivationError, FileArmedLoadError, FileRuntimeLoadError, FileStrategyRecoveryError,
     FileStrategyStartError, LeasedFileArmedStrategy, LeasedFileStrategyRecovery,

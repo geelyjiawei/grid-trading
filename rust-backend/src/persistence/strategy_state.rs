@@ -666,6 +666,7 @@ mod tests {
                 source_client_order_id: source.0,
                 level_index: source.1,
                 shape: source.2,
+                retired_quantity: Decimal::ZERO,
                 created_at_ms: corrupted.updated_at_ms,
                 assigned_client_order_id: None,
             },

@@ -44,6 +44,8 @@ pub struct PlannedGridOrder {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GridPlan {
+    #[serde(default = "legacy_allocation_version")]
+    pub allocation_version: u8,
     pub reference_price: Decimal,
     pub raw_levels: Vec<Decimal>,
     pub levels: Vec<Decimal>,
@@ -52,6 +54,10 @@ pub struct GridPlan {
     pub total_quantity: Decimal,
     pub opening_order: Option<PlannedOpeningOrder>,
     pub grid_orders: Vec<PlannedGridOrder>,
+}
+
+fn legacy_allocation_version() -> u8 {
+    1
 }
 
 impl GridPlan {
@@ -86,11 +92,12 @@ impl GridPlan {
             last_price: self.reference_price,
             mark_price: self.reference_price,
         };
-        let expected = build_grid_plan_at_reference(
+        let expected = build_grid_plan_version(
             config,
             &replay_market,
             &structural_rules,
             self.reference_price,
+            self.allocation_version,
         )?;
         if expected != *self {
             return Err(GridPlanError::PlanSnapshotMismatch);
@@ -131,19 +138,67 @@ pub fn build_grid_plan(
     build_grid_plan_at_reference(config, market, rules, reference_price)
 }
 
+/// Replay the frozen v1 compatibility contract, never used for new starts.
+pub fn replay_legacy_grid_plan(
+    config: &GridConfig,
+    market: &MarketSnapshot,
+    rules: &InstrumentRules,
+) -> Result<GridPlan, GridPlanError> {
+    config.validate()?;
+    rules.validate()?;
+    validate_market(market)?;
+    let reference = reference_price(config, market, rules)?;
+    build_grid_plan_version(config, market, rules, reference, 1)
+}
+
 fn build_grid_plan_at_reference(
     config: &GridConfig,
     market: &MarketSnapshot,
     rules: &InstrumentRules,
     reference_price: Decimal,
 ) -> Result<GridPlan, GridPlanError> {
+    build_grid_plan_version(config, market, rules, reference_price, 2)
+}
+
+fn build_grid_plan_version(
+    config: &GridConfig,
+    market: &MarketSnapshot,
+    rules: &InstrumentRules,
+    reference_price: Decimal,
+    allocation_version: u8,
+) -> Result<GridPlan, GridPlanError> {
+    if !matches!(allocation_version, 1 | 2) {
+        return Err(GridPlanError::PlanSnapshotMismatch);
+    }
     let raw_levels = calculate_levels(config)?;
     let levels = normalize_levels(&raw_levels, rules)?;
     if reference_price <= levels[0] || reference_price >= levels[levels.len() - 1] {
         return Err(GridPlanError::ReferenceOutsideRange);
     }
 
-    let (profit_targets, add_targets) = targets(config.direction, &levels, reference_price);
+    let (profit_targets, mut add_targets) = targets(config.direction, &levels, reference_price);
+    if allocation_version == 2 {
+        // A cell owns one circulating allocation, not one allocation per side.
+        // Directional grids already own the crossing cell through the opening leg.
+        let occupied: BTreeSet<_> = profit_targets
+            .iter()
+            .map(|target| target.level_index)
+            .collect();
+        add_targets.retain(|target| {
+            if config.direction != Direction::Neutral {
+                !occupied.contains(&target.level_index)
+            } else {
+                let index = usize::from(target.level_index);
+                let midpoint = levels[index] + (levels[index + 1] - levels[index]) / Decimal::TWO;
+                target.side
+                    == if reference_price >= midpoint {
+                        OrderSide::Buy
+                    } else {
+                        OrderSide::Sell
+                    }
+            }
+        });
+    }
     let active_targets = if config.direction == Direction::Neutral {
         &add_targets
     } else {
@@ -211,6 +266,9 @@ fn build_grid_plan_at_reference(
     if participating_level_count != config.grid_count {
         return Err(GridPlanError::IncompleteGridCoverage);
     }
+    if allocation_version == 2 && grid_orders.len() != usize::from(config.grid_count) {
+        return Err(GridPlanError::PlanQuantityMismatch);
+    }
     let owned_quantity = grid_orders
         .iter()
         .filter(|order| config.direction == Direction::Neutral || order.reduce_only)
@@ -222,6 +280,7 @@ fn build_grid_plan_at_reference(
     }
 
     Ok(GridPlan {
+        allocation_version,
         reference_price,
         raw_levels,
         levels,
@@ -771,6 +830,57 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_twenty_cells_never_allocate_the_current_interval_twice() {
+        let mut config = fixed_config(Direction::Short);
+        config.symbol = "ANTHROPICUSDT".into();
+        config.lower_price = decimal(1920);
+        config.upper_price = decimal(1960);
+        config.initial_order_type = InitialOrderType::Market;
+        config.initial_order_price = None;
+        let plan = build_grid_plan(&config, &market(Decimal::new(193054, 2)), &rules()).unwrap();
+        assert_eq!(plan.grid_orders.len(), 20);
+        for level in 0..20 {
+            let quantity: Decimal = plan
+                .grid_orders
+                .iter()
+                .filter(|order| order.level_index == level)
+                .map(|order| order.quantity)
+                .sum();
+            assert_eq!(quantity, Decimal::new(2, 1), "cell {level}");
+        }
+        assert_eq!(
+            plan.grid_orders
+                .iter()
+                .map(|order| order.quantity)
+                .sum::<Decimal>(),
+            decimal(4)
+        );
+    }
+
+    #[test]
+    fn legacy_overlapping_plan_remains_readable_without_silently_reallocating_history() {
+        let config = fixed_config(Direction::Short);
+        let reference = Decimal::new(10145, 1);
+        let legacy =
+            build_grid_plan_version(&config, &market(reference), &rules(), reference, 1).unwrap();
+        assert_eq!(legacy.grid_orders.len(), 21);
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        json.as_object_mut().unwrap().remove("allocation_version");
+        let restored: GridPlan = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.allocation_version, 1);
+        let mut config = config;
+        config.initial_order_price = Some(reference);
+        assert_eq!(restored.validate_snapshot(&config, &rules()), Ok(()));
+        let mut new = build_grid_plan(&config, &market(reference), &rules()).unwrap();
+        assert_eq!(new.allocation_version, 2);
+        new.grid_orders.push(new.grid_orders[0].clone());
+        assert_eq!(
+            new.validate_snapshot(&config, &rules()),
+            Err(GridPlanError::PlanSnapshotMismatch)
+        );
+    }
+
+    #[test]
     fn every_supported_plan_shape_passes_deterministic_snapshot_validation() {
         let mut post_only = fixed_config(Direction::Short);
         post_only.initial_order_type = InitialOrderType::PostOnly;
@@ -864,7 +974,7 @@ mod tests {
         assert_eq!(plan.active_grid_count, 15);
         assert_eq!(plan.total_quantity, decimal(3));
         assert_eq!(plan.participating_level_count, 20);
-        assert_eq!(plan.grid_orders.len(), 21);
+        assert_eq!(plan.grid_orders.len(), 20);
         assert_eq!(
             plan.opening_order.as_ref().unwrap().time_in_force,
             TimeInForce::PostOnly
@@ -1029,26 +1139,26 @@ mod tests {
     }
 
     #[test]
-    fn neutral_plan_has_no_opening_order_and_keeps_both_sides_in_the_current_interval() {
+    fn neutral_plan_has_one_allocation_in_the_current_interval() {
         let mut config = fixed_config(Direction::Neutral);
         config.initial_order_price = None;
         let plan = build_grid_plan(&config, &market(Decimal::new(10145, 1)), &rules()).unwrap();
 
         assert!(plan.opening_order.is_none());
-        assert_eq!(plan.active_grid_count, 21);
-        assert_eq!(plan.grid_orders.len(), 21);
+        assert_eq!(plan.active_grid_count, 20);
+        assert_eq!(plan.grid_orders.len(), 20);
         assert_eq!(plan.participating_level_count, 20);
         let interval_orders = plan
             .grid_orders
             .iter()
             .filter(|order| order.level_index == 14)
             .collect::<Vec<_>>();
-        assert_eq!(interval_orders.len(), 2);
-        assert_ne!(interval_orders[0].side, interval_orders[1].side);
+        assert_eq!(interval_orders.len(), 1);
+        assert_eq!(interval_orders[0].side, OrderSide::Buy);
     }
 
     #[test]
-    fn neutral_investment_allocation_keeps_distinct_same_interval_quantities() {
+    fn neutral_investment_allocation_never_duplicates_the_crossing_cell() {
         let reference = Decimal::new(10145, 1);
         let mut config = fixed_config(Direction::Neutral);
         config.position_sizing_mode = PositionSizingMode::Investment;
@@ -1068,9 +1178,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(plan.total_quantity, Decimal::new(246, 2));
-        assert_eq!(interval_orders.len(), 2);
+        assert_eq!(interval_orders.len(), 1);
         assert_eq!(interval_orders[0].quantity, Decimal::new(12, 2));
-        assert_eq!(interval_orders[1].quantity, Decimal::new(11, 2));
         assert_eq!(
             plan.grid_orders
                 .iter()
@@ -1115,38 +1224,52 @@ mod tests {
     #[test]
     fn fixed_grid_table_covers_all_directions_and_two_hundred_reference_prices() {
         for direction in [Direction::Long, Direction::Short, Direction::Neutral] {
-            for tenth in 10_001..10_200 {
-                let reference = Decimal::new(tenth, 1);
-                let mut config = fixed_config(direction);
-                config.initial_order_type = InitialOrderType::Limit;
-                config.initial_order_price = Some(reference);
-                let plan = build_grid_plan(&config, &market(reference), &rules()).unwrap();
+            for mode in [GridMode::Arithmetic, GridMode::Geometric] {
+                for tenth in 10_001..10_200 {
+                    let reference = Decimal::new(tenth, 1);
+                    let mut config = fixed_config(direction);
+                    config.grid_mode = mode;
+                    config.initial_order_type = InitialOrderType::Limit;
+                    config.initial_order_price = Some(reference);
+                    let plan = build_grid_plan(&config, &market(reference), &rules()).unwrap();
 
-                assert!(plan.levels.windows(2).all(|pair| pair[1] > pair[0]));
-                assert_eq!(plan.participating_level_count, 20);
-                assert!(
-                    plan.grid_orders
-                        .iter()
-                        .all(|order| order.quantity == Decimal::new(2, 1))
-                );
-                let identities = plan
-                    .grid_orders
-                    .iter()
-                    .map(|order| (order.level_index, order.side, order.reduce_only))
-                    .collect::<BTreeSet<_>>();
-                assert_eq!(identities.len(), plan.grid_orders.len());
-
-                if direction == Direction::Neutral {
-                    assert!(plan.opening_order.is_none());
-                } else {
-                    let protected = plan
+                    assert!(plan.levels.windows(2).all(|pair| pair[1] > pair[0]));
+                    assert_eq!(plan.participating_level_count, 20);
+                    assert_eq!(plan.grid_orders.len(), 20);
+                    for level in 0..20 {
+                        assert_eq!(
+                            plan.grid_orders
+                                .iter()
+                                .filter(|order| order.level_index == level)
+                                .map(|order| order.quantity)
+                                .sum::<Decimal>(),
+                            Decimal::new(2, 1)
+                        );
+                    }
+                    assert!(
+                        plan.grid_orders
+                            .iter()
+                            .all(|order| order.quantity == Decimal::new(2, 1))
+                    );
+                    let identities = plan
                         .grid_orders
                         .iter()
-                        .filter(|order| order.reduce_only)
-                        .map(|order| order.quantity)
-                        .sum::<Decimal>();
-                    assert_eq!(plan.opening_order.as_ref().unwrap().quantity, protected);
-                    assert_eq!(plan.total_quantity, protected);
+                        .map(|order| (order.level_index, order.side, order.reduce_only))
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(identities.len(), plan.grid_orders.len());
+
+                    if direction == Direction::Neutral {
+                        assert!(plan.opening_order.is_none());
+                    } else {
+                        let protected = plan
+                            .grid_orders
+                            .iter()
+                            .filter(|order| order.reduce_only)
+                            .map(|order| order.quantity)
+                            .sum::<Decimal>();
+                        assert_eq!(plan.opening_order.as_ref().unwrap().quantity, protected);
+                        assert_eq!(plan.total_quantity, protected);
+                    }
                 }
             }
         }

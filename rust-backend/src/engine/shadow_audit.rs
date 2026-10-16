@@ -890,14 +890,14 @@ mod tests {
     }
 
     #[test]
-    fn exact_running_snapshot_is_clean_and_accepts_two_orders_at_one_level() {
+    fn exact_running_snapshot_is_clean_with_one_allocation_per_level() {
         let state = running_neutral_state(Decimal::new(100, 0));
         let orders = observations(&state);
         let report = audit_strategy_shadow(&state, &position(&state, Decimal::ZERO), &orders);
 
         assert!(report.clean);
-        assert_eq!(report.orders.strategy_order_count, 21);
-        assert_eq!(report.orders.exact_authoritative_match_count, 21);
+        assert_eq!(report.orders.strategy_order_count, 20);
+        assert_eq!(report.orders.exact_authoritative_match_count, 20);
         assert_eq!(report.level_coverage.configured_level_count, 20);
         assert_eq!(report.level_coverage.observed_exact_active_levels.len(), 20);
         assert!(report.level_coverage.missing_levels.is_empty());
@@ -914,7 +914,7 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(duplicate_level_count, 2);
+        assert_eq!(duplicate_level_count, 1);
     }
 
     #[test]
@@ -1270,7 +1270,7 @@ mod tests {
         assert!(!report.clean);
         assert_eq!(report.orders.missing_order_count, 1);
         assert_eq!(report.orders.unexpected_order_count, 1);
-        assert_eq!(report.orders.observed_owned_order_count, 21);
+        assert_eq!(report.orders.observed_owned_order_count, 20);
         assert!(report.issues.iter().any(|issue| matches!(
             issue,
             ShadowAuditIssue::UnexpectedOwnedOrder { client_order_id, .. }
@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_really_contains_two_opposite_orders_on_the_same_level() {
+    fn fixture_contains_only_one_allocation_on_the_crossing_level() {
         let state = running_neutral_state(Decimal::new(100, 0));
         let level_fourteen = state
             .orders
@@ -1468,8 +1468,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(level_fourteen.len(), 2);
+        assert_eq!(level_fourteen.len(), 1);
         assert!(level_fourteen.contains(&(GridOrderRole::Add, OrderSide::Buy)));
-        assert!(level_fourteen.contains(&(GridOrderRole::Add, OrderSide::Sell)));
+        assert!(!level_fourteen.contains(&(GridOrderRole::Add, OrderSide::Sell)));
     }
 }

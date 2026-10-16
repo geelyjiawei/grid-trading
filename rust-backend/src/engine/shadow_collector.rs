@@ -579,7 +579,7 @@ mod tests {
 
         assert!(!report.clean);
         assert_eq!(report.orders.unexpected_order_count, 1);
-        assert_eq!(report.orders.observed_owned_order_count, 22);
+        assert_eq!(report.orders.observed_owned_order_count, 21);
         assert!(
             collected
                 .open_orders
@@ -591,7 +591,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_strategy_blocks_before_any_exchange_read() {
         let mut state = strategy();
-        state.version = 2;
+        state.version = 255;
         let gateway = ReadOnlyGateway::stable(Vec::new(), flat_position(&state));
 
         assert!(matches!(

@@ -218,8 +218,19 @@ pub struct ReplacementObligation {
     pub source_client_order_id: ClientOrderId,
     pub level_index: u16,
     pub shape: OrderShape,
+    #[serde(default)]
+    pub retired_quantity: Decimal,
     pub created_at_ms: u64,
     pub assigned_client_order_id: Option<ClientOrderId>,
+}
+
+impl ReplacementObligation {
+    pub fn effective_quantity(&self) -> Option<Decimal> {
+        self.shape
+            .quantity
+            .checked_sub(self.retired_quantity)
+            .filter(|quantity| *quantity >= Decimal::ZERO)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -535,6 +546,20 @@ impl StrategyState {
         ) {
             return Ok(Vec::new());
         }
+        if self.lifecycle != StrategyLifecycle::RiskExitRequested
+            && self.orders.values().any(|order| {
+                order.purpose.level_index().is_some()
+                    && matches!(
+                        order.tracking,
+                        StrategyOrderTracking::Ready
+                            | StrategyOrderTracking::Intent {
+                                state: IntentState::RetryableNotSubmitted { .. }
+                            }
+                    )
+            })
+        {
+            validate_cell_capacity(self, true)?;
+        }
         self.orders
             .values()
             .filter(|order| {
@@ -564,7 +589,7 @@ impl StrategyState {
     }
 
     fn validate_internal(&self, replay_inventory: bool) -> Result<(), StrategyStateError> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             return Err(StrategyStateError::UnsupportedVersion(self.version));
         }
         StrategyRunId::parse(self.run_id.as_str())?;
@@ -917,6 +942,7 @@ impl StrategyState {
             }
         }
         validate_replacement_obligation_ledger(self)?;
+        validate_cell_capacity(self, false)?;
         validate_aggregate_accounting(self)?;
         validate_inventory_event_ledger(self, replay_inventory)?;
         self.expected_exchange_position()?;
@@ -1269,6 +1295,7 @@ fn validate_obligation_against_instrument(
 }
 
 fn validate_replacement_obligation_ledger(state: &StrategyState) -> Result<(), StrategyStateError> {
+    validate_capacity_retirements(state)?;
     let mut counter_quantities = BTreeMap::<ClientOrderId, Decimal>::new();
     let mut cancelled_remainder_sources = BTreeSet::<ClientOrderId>::new();
 
@@ -1373,6 +1400,175 @@ fn validate_replacement_obligation_ledger(state: &StrategyState) -> Result<(), S
             &mut verified,
         ) {
             return Err(StrategyStateError::ReplacementObligationLedgerMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn legacy_duplicate_allowance(state: &StrategyState, level_index: u16) -> Option<Decimal> {
+    if state.plan.allocation_version != 1 || state.direction == Direction::Neutral {
+        return None;
+    }
+    let index = usize::from(level_index);
+    if !(state.plan.levels.get(index)? < &state.plan.reference_price
+        && &state.plan.reference_price < state.plan.levels.get(index + 1)?)
+    {
+        return None;
+    }
+    let legs = state
+        .plan
+        .grid_orders
+        .iter()
+        .filter(|order| order.level_index == level_index)
+        .collect::<Vec<_>>();
+    if legs.len() != 2
+        || legs
+            .iter()
+            .filter(|order| order.role == GridOrderRole::Profit && order.reduce_only)
+            .count()
+            != 1
+    {
+        return None;
+    }
+    legs.iter()
+        .find(|order| order.role == GridOrderRole::Add && !order.reduce_only)
+        .map(|order| order.quantity)
+}
+
+fn validate_capacity_retirements(state: &StrategyState) -> Result<(), StrategyStateError> {
+    let mut retired_by_cell = BTreeMap::<u16, Decimal>::new();
+    for obligation in state.replacement_obligations.values() {
+        if obligation.retired_quantity < Decimal::ZERO
+            || obligation.effective_quantity().is_none()
+            || (obligation.retired_quantity > Decimal::ZERO
+                && !state
+                    .instrument_rules
+                    .limit_quantity
+                    .is_aligned(obligation.retired_quantity))
+        {
+            return Err(StrategyStateError::InvalidCapacityRetirement);
+        }
+        if obligation.retired_quantity.is_zero() {
+            continue;
+        }
+        let source = state
+            .orders
+            .get(&obligation.source_client_order_id)
+            .ok_or(StrategyStateError::InvalidCapacityRetirement)?;
+        let audit = source
+            .execution_audit
+            .as_ref()
+            .ok_or(StrategyStateError::InvalidCapacityRetirement)?;
+        if state.version != 2
+            || obligation.kind != ReplacementObligationKind::RestoreCancelledRemainder
+            || source.shape.reduce_only
+            || source.shape.kind != OrderKind::Limit
+            || source.terminal_status != Some(TerminalOrderStatus::Cancelled)
+            || !source.terminal_processed
+            || !source.cumulative_quantity.is_zero()
+            || !source.cumulative_quote.is_zero()
+            || !source.cumulative_fee.is_zero()
+            || !audit.snapshot.trades.is_empty()
+            || !audit.fee_valuations.is_empty()
+            || audit.snapshot.order.lifecycle
+                != OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled)
+        {
+            return Err(StrategyStateError::InvalidCapacityRetirement);
+        }
+        let allowance = legacy_duplicate_allowance(state, obligation.level_index)
+            .ok_or(StrategyStateError::InvalidCapacityRetirement)?;
+        let total = retired_by_cell.entry(obligation.level_index).or_default();
+        *total = total
+            .checked_add(obligation.retired_quantity)
+            .ok_or(StrategyStateError::NumericOverflow("retired cell quantity"))?;
+        if *total > allowance {
+            return Err(StrategyStateError::InvalidCapacityRetirement);
+        }
+    }
+    Ok(())
+}
+
+fn validate_cell_capacity(
+    state: &StrategyState,
+    before_grid_write: bool,
+) -> Result<(), StrategyStateError> {
+    let legacy_fixed_write = before_grid_write
+        && state.plan.allocation_version == 1
+        && state.config.position_sizing_mode == crate::domain::PositionSizingMode::FixedGridQty;
+    let mut retired_by_cell = BTreeMap::<u16, Decimal>::new();
+    for obligation in state.replacement_obligations.values() {
+        let total = retired_by_cell.entry(obligation.level_index).or_default();
+        *total = total
+            .checked_add(obligation.retired_quantity)
+            .ok_or(StrategyStateError::NumericOverflow("retired cell quantity"))?;
+    }
+    if state.plan.allocation_version != 2
+        && !legacy_fixed_write
+        && retired_by_cell.values().all(Decimal::is_zero)
+    {
+        return Ok(());
+    }
+    let mut limits = BTreeMap::<u16, Decimal>::new();
+    for planned in &state.plan.grid_orders {
+        let limit = limits.entry(planned.level_index).or_default();
+        *limit = limit
+            .checked_add(planned.quantity)
+            .ok_or(StrategyStateError::NumericOverflow("initial cell quantity"))?;
+    }
+    let mut circulating = BTreeMap::<u16, Decimal>::new();
+    for order in state
+        .orders
+        .values()
+        .filter(|order| !order.terminal_processed)
+    {
+        if let Some(level_index) = order.purpose.level_index() {
+            let total = circulating.entry(level_index).or_default();
+            *total = total
+                .checked_add(order.shape.quantity - order.cumulative_quantity)
+                .ok_or(StrategyStateError::NumericOverflow(
+                    "circulating cell quantity",
+                ))?;
+        }
+    }
+    for obligation in state
+        .replacement_obligations
+        .values()
+        .filter(|obligation| obligation.assigned_client_order_id.is_none())
+    {
+        let effective = obligation
+            .effective_quantity()
+            .ok_or(StrategyStateError::InvalidCapacityRetirement)?;
+        let total = circulating.entry(obligation.level_index).or_default();
+        *total = total
+            .checked_add(effective)
+            .ok_or(StrategyStateError::NumericOverflow("pending cell quantity"))?;
+    }
+    for (level_index, initial_limit) in limits {
+        let retired = retired_by_cell
+            .get(&level_index)
+            .copied()
+            .unwrap_or_default();
+        if state.plan.allocation_version != 2 && !legacy_fixed_write && retired.is_zero() {
+            continue;
+        }
+        let limit = if legacy_fixed_write {
+            state
+                .config
+                .grid_order_qty
+                .ok_or(StrategyStateError::InvalidCapacityRetirement)?
+        } else {
+            initial_limit
+                .checked_sub(retired)
+                .filter(|quantity| *quantity >= Decimal::ZERO)
+                .ok_or(StrategyStateError::InvalidCapacityRetirement)?
+        };
+        let quantity = circulating.get(&level_index).copied().unwrap_or_default();
+        if quantity > limit {
+            return Err(StrategyStateError::GridCellCapacityExceeded {
+                level_index,
+                quantity,
+                limit,
+            });
         }
     }
     Ok(())
@@ -3797,6 +3993,7 @@ fn add_obligation(
             source_client_order_id,
             level_index,
             shape,
+            retired_quantity: Decimal::ZERO,
             created_at_ms: now_ms,
             assigned_client_order_id: None,
         },
@@ -4078,7 +4275,13 @@ fn materialize_replacement_orders(
     let mut pending_ids = state
         .replacement_obligations
         .iter()
-        .filter_map(|(id, obligation)| obligation.assigned_client_order_id.is_none().then_some(*id))
+        .filter_map(|(id, obligation)| {
+            (obligation.assigned_client_order_id.is_none()
+                && obligation
+                    .effective_quantity()
+                    .is_some_and(|quantity| quantity > Decimal::ZERO))
+            .then_some(*id)
+        })
         .collect::<Vec<_>>();
     if pending_ids.is_empty() {
         return StrategyTransition::NoChange;
@@ -4276,7 +4479,11 @@ fn plan_compatible_obligation_buckets(
             state
                 .replacement_obligations
                 .get(id)
-                .map(|obligation| (*id, obligation.shape.quantity))
+                .and_then(|obligation| {
+                    obligation
+                        .effective_quantity()
+                        .map(|quantity| (*id, quantity))
+                })
                 .ok_or_else(|| "replacement obligation is missing".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -4390,7 +4597,7 @@ fn combined_obligation_shape(state: &StrategyState, obligation_ids: &[u64]) -> O
     shape.quantity = obligation_ids.iter().try_fold(Decimal::ZERO, |total, id| {
         let obligation = state.replacement_obligations.get(id)?;
         obligations_are_compatible(first, obligation).then_some(())?;
-        total.checked_add(obligation.shape.quantity)
+        total.checked_add(obligation.effective_quantity()?)
     })?;
     Some(shape)
 }
@@ -4557,6 +4764,16 @@ pub enum StrategyStateError {
     ReplacementOrderMismatch,
     #[error("replacement obligations are not fully proven by their source order executions")]
     ReplacementObligationLedgerMismatch,
+    #[error("capacity retirement is not proven by a zero-fill cancelled legacy duplicate cell")]
+    InvalidCapacityRetirement,
+    #[error(
+        "grid cell {level_index} has circulating quantity {quantity} above allocation {limit}; repair legacy excess before submitting more grid orders"
+    )]
+    GridCellCapacityExceeded {
+        level_index: u16,
+        quantity: Decimal,
+        limit: Decimal,
+    },
     #[error("strategy generated a duplicate order identity")]
     DuplicateOrderIdentity,
     #[error("strategy order sequence does not follow the append-only order ledger")]
@@ -4734,6 +4951,574 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    fn legacy_capacity_machine() -> StrategyMachine<MemoryStrategyStateStore> {
+        legacy_capacity_machine_with_evidence(false)
+    }
+
+    fn legacy_capacity_machine_with_evidence(
+        exact_opening: bool,
+    ) -> StrategyMachine<MemoryStrategyStateStore> {
+        let mut config = config(Direction::Short);
+        config.initial_order_price = Some(Decimal::new(10145, 1));
+        let market = MarketSnapshot {
+            last_price: Decimal::new(10145, 1),
+            mark_price: Decimal::new(10145, 1),
+        };
+        let plan = crate::engine::replay_legacy_grid_plan(&config, &market, &instrument()).unwrap();
+        let initial = StrategyState::from_plan(
+            StrategyRunId::parse("REPAIR01").unwrap(),
+            config,
+            instrument(),
+            plan,
+            PositionBaseline::flat(),
+            100,
+        )
+        .unwrap();
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+        let opening = opening_id(machine.store().snapshot());
+        if exact_opening {
+            accept_strategy_order(&mut machine, &opening, "opening", 198);
+            let (mut snapshot, mut valued) = single_valued_trade(
+                &machine,
+                opening,
+                ValuedTradeFixture {
+                    exchange_order_id: "opening",
+                    trade_id: "opening-trade",
+                    price: Decimal::new(10145, 1),
+                    quantity: decimal(3),
+                    trade_time_ms: 199,
+                    applied_at_ms: 200,
+                },
+            );
+            snapshot.order.exchange = Exchange::Binance;
+            snapshot.order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Filled);
+            valued.report.terminal_status = Some(TerminalOrderStatus::Filled);
+            let transition = machine
+                .apply_valued_execution(&snapshot, &valued, 200)
+                .unwrap();
+            assert!(
+                !matches!(transition, StrategyTransition::Failed { .. }),
+                "{transition:?}"
+            );
+        } else {
+            machine
+                .apply_execution(
+                    &report(
+                        opening,
+                        "opening",
+                        decimal(3),
+                        Decimal::new(30435, 1),
+                        Some(TerminalOrderStatus::Filled),
+                    ),
+                    200,
+                )
+                .unwrap();
+        }
+        // Reconstruct historical accepts without routing legacy orders through today's write gate.
+        let initial_orders = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| order.purpose.is_initial_grid())
+            .map(|order| (order.client_order_id.clone(), order.shape.clone()))
+            .collect::<Vec<_>>();
+        for (index, (id, shape)) in initial_orders.into_iter().enumerate() {
+            let mut intent = OrderIntent::prepare(id, Exchange::Binance, shape, 201).unwrap();
+            intent.state = IntentState::Accepted {
+                exchange_order_id: format!("initial-{index}"),
+            };
+            machine
+                .synchronize_intent(&intent, 202 + index as u64)
+                .unwrap();
+        }
+        machine
+    }
+
+    fn cancelled_capacity_source() -> (
+        StrategyMachine<MemoryStrategyStateStore>,
+        ClientOrderId,
+        u64,
+    ) {
+        let mut machine = legacy_capacity_machine();
+        let add = grid_id(machine.store().snapshot(), 14, OrderSide::Sell, false);
+        let add_exchange_id = machine.store().snapshot().orders[&add]
+            .exchange_order_id
+            .clone()
+            .unwrap();
+        machine
+            .apply_execution(
+                &report(
+                    add,
+                    &add_exchange_id,
+                    Decimal::new(2, 1),
+                    decimal(203),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                300,
+            )
+            .unwrap();
+        let rules = instrument();
+        machine.materialize_replacements(&rules, 301).unwrap();
+        let buy = replacement_orders(machine.store().snapshot())[0]
+            .client_order_id
+            .clone();
+        accept_strategy_order(&mut machine, &buy, "counter-buy", 302);
+        machine
+            .apply_execution(
+                &report(
+                    buy,
+                    "counter-buy",
+                    Decimal::new(2, 1),
+                    Decimal::new(2028, 1),
+                    Some(TerminalOrderStatus::Filled),
+                ),
+                303,
+            )
+            .unwrap();
+        let profits = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| order.purpose.is_initial_grid() && order.shape.reduce_only)
+            .map(|order| {
+                (
+                    order.client_order_id.clone(),
+                    order.exchange_order_id.clone().unwrap(),
+                    order.shape.price.unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, (id, exchange_id, price)) in profits.into_iter().enumerate() {
+            machine
+                .apply_execution(
+                    &report(
+                        id,
+                        &exchange_id,
+                        Decimal::new(2, 1),
+                        price * Decimal::new(2, 1),
+                        Some(TerminalOrderStatus::Filled),
+                    ),
+                    304 + index as u64,
+                )
+                .unwrap();
+        }
+        machine.materialize_replacements(&rules, 330).unwrap();
+        let source = replacement_orders(machine.store().snapshot())
+            .into_iter()
+            .find(|order| {
+                order.purpose.level_index() == Some(14)
+                    && order.shape.side == OrderSide::Sell
+                    && order.shape.quantity == Decimal::new(4, 1)
+            })
+            .unwrap()
+            .client_order_id
+            .clone();
+        accept_strategy_order(&mut machine, &source, "235064031", 331);
+        apply_zero_cancel_audit(&mut machine, &source, 340);
+        let obligation_id = machine
+            .store()
+            .snapshot()
+            .replacement_obligations
+            .values()
+            .find(|obligation| {
+                obligation.source_client_order_id == source
+                    && obligation.kind == ReplacementObligationKind::RestoreCancelledRemainder
+            })
+            .unwrap()
+            .id;
+        assert_eq!(
+            machine.store().snapshot().grid_position_net_quantity,
+            Decimal::ZERO
+        );
+        (machine, source, obligation_id)
+    }
+
+    fn apply_zero_cancel_audit(
+        machine: &mut StrategyMachine<MemoryStrategyStateStore>,
+        source: &ClientOrderId,
+        now_ms: u64,
+    ) {
+        let order = machine.store().snapshot().orders[source].clone();
+        let exchange_id = order.exchange_order_id.clone().unwrap();
+        let snapshot = OrderExecutionSnapshot {
+            order: AuthoritativeOrder {
+                client_order_id: source.clone(),
+                exchange_order_id: exchange_id.clone(),
+                exchange: machine.store().snapshot().exchange,
+                shape: order.shape,
+                lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled),
+                executed_quantity: Some(Decimal::ZERO),
+            },
+            cumulative_quantity: Decimal::ZERO,
+            cumulative_quote: Decimal::ZERO,
+            fees_by_asset: BTreeMap::new(),
+            trades: vec![],
+            order_time_ms: now_ms - 1,
+            update_time_ms: now_ms,
+        };
+        let valued = ValuedExecutionReport {
+            report: report(
+                source.clone(),
+                &exchange_id,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Some(TerminalOrderStatus::Cancelled),
+            ),
+            fee_valuations: vec![],
+        };
+        machine
+            .apply_valued_execution(&snapshot, &valued, now_ms)
+            .unwrap();
+    }
+
+    fn retirement_candidate(
+        state: &StrategyState,
+        obligation_id: u64,
+        quantity: Decimal,
+        version: u8,
+    ) -> StrategyState {
+        let mut json = serde_json::to_value(state).unwrap();
+        json["version"] = serde_json::json!(version);
+        json["replacement_obligations"][obligation_id.to_string()]["retired_quantity"] =
+            serde_json::json!(quantity.to_string());
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn capacity_retirement_requires_schema_opt_in_instead_of_silent_old_binary_revival() {
+        let (machine, _, obligation_id) = cancelled_capacity_source();
+        let candidate = retirement_candidate(
+            machine.store().snapshot(),
+            obligation_id,
+            Decimal::new(2, 1),
+            1,
+        );
+        assert!(
+            candidate.validate().is_err(),
+            "v1 readers must not silently ignore capacity retirement"
+        );
+    }
+
+    #[test]
+    fn capacity_retirement_materializes_only_effective_remainder_and_round_trips() {
+        let (machine, source, obligation_id) = cancelled_capacity_source();
+        let before = machine.store().snapshot().clone();
+        let candidate = retirement_candidate(&before, obligation_id, Decimal::new(2, 1), 2);
+        assert_eq!(candidate.validate(), Ok(()));
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(candidate));
+        machine
+            .materialize_replacements(&instrument(), 341)
+            .unwrap();
+        let repaired = machine.store().snapshot();
+        assert_eq!(
+            repaired.replacement_obligations[&obligation_id]
+                .shape
+                .quantity,
+            Decimal::new(4, 1)
+        );
+        let replacement_id = repaired.replacement_obligations[&obligation_id]
+            .assigned_client_order_id
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            repaired.orders[replacement_id].shape.quantity,
+            Decimal::new(2, 1)
+        );
+        assert_eq!(
+            repaired.orders[replacement_id].tracking,
+            StrategyOrderTracking::Ready
+        );
+        assert_eq!(repaired.orders[&source], before.orders[&source]);
+        assert_eq!(repaired.plan, before.plan);
+        assert_eq!(repaired.baseline, before.baseline);
+        assert_eq!(repaired.inventory_events, before.inventory_events);
+        assert_eq!(repaired.total_volume, before.total_volume);
+        assert_eq!(repaired.total_fee, before.total_fee);
+        assert_eq!(repaired.gross_realized_profit, before.gross_realized_profit);
+        assert_eq!(
+            repaired.expected_exchange_position().unwrap(),
+            Decimal::ZERO
+        );
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("repair.json");
+        FileStrategyStateStore::create(&path, repaired.clone()).unwrap();
+        let restored = FileStrategyStateStore::load(path).unwrap();
+        assert_eq!(restored.snapshot(), repaired);
+        assert!(
+            restored
+                .snapshot()
+                .ready_intents(342)
+                .unwrap()
+                .iter()
+                .any(|intent| &intent.client_order_id == replacement_id)
+        );
+    }
+
+    #[test]
+    fn capacity_retirement_cannot_exceed_proven_duplicate_cell_or_rewrite_counter_evidence() {
+        let (machine, source, obligation_id) = cancelled_capacity_source();
+        let before = machine.store().snapshot();
+        let valid = retirement_candidate(before, obligation_id, Decimal::new(2, 1), 2);
+        assert_eq!(valid.validate(), Ok(()));
+        for quantity in [
+            Decimal::new(-1, 1),
+            Decimal::new(1, 2),
+            Decimal::new(3, 1),
+            Decimal::new(5, 1),
+        ] {
+            assert!(
+                retirement_candidate(before, obligation_id, quantity, 2)
+                    .validate()
+                    .is_err(),
+                "invalid retirement {quantity}"
+            );
+        }
+        let counter_id = match &before.orders[&source].purpose {
+            StrategyOrderPurpose::Replacement { obligation_ids, .. } => obligation_ids[0],
+            _ => panic!("expected replacement source"),
+        };
+        assert!(
+            retirement_candidate(before, counter_id, Decimal::new(1, 1), 2)
+                .validate()
+                .is_err()
+        );
+        let mut missing_audit = valid.clone();
+        missing_audit
+            .orders
+            .get_mut(&source)
+            .unwrap()
+            .execution_audit = None;
+        assert!(missing_audit.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_excess_is_loadable_but_blocks_new_grid_writes_until_retired() {
+        let (machine, _, _) = cancelled_capacity_source();
+        assert_eq!(machine.store().snapshot().validate(), Ok(()));
+        assert!(
+            machine.store().snapshot().ready_intents(341).is_err(),
+            "legacy .4 circulating cell must block further grid writes"
+        );
+        let mut stopped = machine.store().snapshot().clone();
+        stopped.lifecycle = StrategyLifecycle::StopRequested;
+        assert!(stopped.ready_intents(341).unwrap().is_empty());
+    }
+
+    #[test]
+    fn capacity_retirement_rejects_partially_filled_reduce_only_and_nonduplicate_sources() {
+        let mut partial = legacy_capacity_machine_with_evidence(true);
+        let source = grid_id(partial.store().snapshot(), 14, OrderSide::Sell, false);
+        let exchange_id = partial.store().snapshot().orders[&source]
+            .exchange_order_id
+            .clone()
+            .unwrap();
+        let (mut snapshot, valued) = single_valued_trade(
+            &partial,
+            source.clone(),
+            ValuedTradeFixture {
+                exchange_order_id: &exchange_id,
+                trade_id: "partial-repair",
+                price: decimal(1015),
+                quantity: Decimal::new(1, 1),
+                trade_time_ms: 300,
+                applied_at_ms: 300,
+            },
+        );
+        snapshot.order.exchange = Exchange::Binance;
+        partial
+            .apply_valued_execution(&snapshot, &valued, 300)
+            .unwrap();
+        let id = partial
+            .store()
+            .snapshot()
+            .replacement_obligations
+            .values()
+            .find(|obligation| {
+                obligation.kind == ReplacementObligationKind::RestoreCancelledRemainder
+            })
+            .unwrap()
+            .id;
+        assert_eq!(partial.store().snapshot().validate(), Ok(()));
+        assert_eq!(
+            retirement_candidate(partial.store().snapshot(), id, Decimal::new(1, 1), 2).validate(),
+            Err(StrategyStateError::InvalidCapacityRetirement)
+        );
+
+        for (level, side, reduce_only) in [(14, OrderSide::Buy, true), (15, OrderSide::Sell, false)]
+        {
+            let mut machine = legacy_capacity_machine();
+            let source = grid_id(machine.store().snapshot(), level, side, reduce_only);
+            apply_zero_cancel_audit(&mut machine, &source, 300);
+            let id = machine
+                .store()
+                .snapshot()
+                .replacement_obligations
+                .values()
+                .find(|obligation| obligation.source_client_order_id == source)
+                .unwrap()
+                .id;
+            assert_eq!(
+                retirement_candidate(machine.store().snapshot(), id, Decimal::new(1, 1), 2)
+                    .validate(),
+                Err(StrategyStateError::InvalidCapacityRetirement)
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_retirement_is_cumulative_across_descendants_and_zero_effective_is_never_submitted()
+    {
+        let (machine, _, id) = cancelled_capacity_source();
+        let candidate = retirement_candidate(machine.store().snapshot(), id, Decimal::new(1, 1), 2);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(candidate));
+        machine
+            .materialize_replacements(&instrument(), 341)
+            .unwrap();
+        let child = machine.store().snapshot().replacement_obligations[&id]
+            .assigned_client_order_id
+            .clone()
+            .unwrap();
+        accept_strategy_order(&mut machine, &child, "repair-child", 342);
+        apply_zero_cancel_audit(&mut machine, &child, 343);
+        let child_id = machine
+            .store()
+            .snapshot()
+            .replacement_obligations
+            .values()
+            .find(|obligation| obligation.source_client_order_id == child)
+            .unwrap()
+            .id;
+        assert_eq!(
+            retirement_candidate(machine.store().snapshot(), child_id, Decimal::new(2, 1), 2)
+                .validate(),
+            Err(StrategyStateError::InvalidCapacityRetirement)
+        );
+
+        let mut machine = legacy_capacity_machine();
+        let source = grid_id(machine.store().snapshot(), 14, OrderSide::Sell, false);
+        apply_zero_cancel_audit(&mut machine, &source, 300);
+        let id = machine
+            .store()
+            .snapshot()
+            .replacement_obligations
+            .values()
+            .next()
+            .unwrap()
+            .id;
+        let candidate = retirement_candidate(machine.store().snapshot(), id, Decimal::new(2, 1), 2);
+        assert_eq!(candidate.validate(), Ok(()));
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(candidate));
+        assert_eq!(
+            machine
+                .materialize_replacements(&instrument(), 301)
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert!(
+            machine.store().snapshot().replacement_obligations[&id]
+                .assigned_client_order_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn v2_cell_capacity_counts_partial_remainders_and_pending_or_assigned_fragments_once() {
+        let mut machine = small_neutral_machine();
+        assert_eq!(machine.store().snapshot().plan.allocation_version, 2);
+        let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        machine
+            .apply_execution(
+                &report(
+                    buy.clone(),
+                    "v2-buy",
+                    decimal(8),
+                    Decimal::new(224, 2),
+                    None,
+                ),
+                101,
+            )
+            .unwrap();
+        assert_eq!(
+            validate_cell_capacity(machine.store().snapshot(), false),
+            Ok(())
+        );
+        assert!(
+            !machine
+                .store()
+                .snapshot()
+                .ready_intents(102)
+                .unwrap()
+                .is_empty()
+        );
+        let mut inflated = machine.store().snapshot().clone();
+        inflated
+            .replacement_obligations
+            .get_mut(&1)
+            .unwrap()
+            .shape
+            .quantity = decimal(9);
+        assert!(
+            matches!(inflated.ready_intents(102), Err(StrategyStateError::GridCellCapacityExceeded { level_index: 1, quantity, limit }) if quantity == decimal(21) && limit == decimal(20))
+        );
+        machine
+            .apply_execution(
+                &report(buy, "v2-buy", decimal(17), Decimal::new(476, 2), None),
+                103,
+            )
+            .unwrap();
+        machine
+            .materialize_replacements(&machine.store().snapshot().instrument_rules.clone(), 104)
+            .unwrap();
+        assert_eq!(
+            replacement_orders(machine.store().snapshot())[0]
+                .shape
+                .quantity,
+            decimal(17)
+        );
+        assert_eq!(
+            validate_cell_capacity(machine.store().snapshot(), false),
+            Ok(())
+        );
+        assert!(
+            !machine
+                .store()
+                .snapshot()
+                .ready_intents(105)
+                .unwrap()
+                .is_empty()
+        );
+        let id = replacement_orders(machine.store().snapshot())[0]
+            .client_order_id
+            .clone();
+        let mut inflated = machine.store().snapshot().clone();
+        inflated.orders.get_mut(&id).unwrap().shape.quantity = decimal(18);
+        assert!(matches!(
+            validate_cell_capacity(&inflated, false),
+            Err(StrategyStateError::GridCellCapacityExceeded { level_index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn capacity_retirement_is_serde_defaulted_without_requiring_history_rewrite() {
+        let (machine, _, id) = cancelled_capacity_source();
+        let mut json = serde_json::to_value(machine.store().snapshot()).unwrap();
+        for value in json["replacement_obligations"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            value.as_object_mut().unwrap().remove("retired_quantity");
+        }
+        let restored: StrategyState = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.validate(), Ok(()));
+        assert_eq!(
+            restored.replacement_obligations[&id].effective_quantity(),
+            Some(Decimal::new(4, 1))
+        );
     }
 
     #[test]
@@ -4995,6 +5780,19 @@ mod tests {
     fn small_neutral_machine_with_max(
         maximum_quantity: Option<Decimal>,
     ) -> StrategyMachine<MemoryStrategyStateStore> {
+        small_neutral_machine_at_version(maximum_quantity, 2)
+    }
+
+    fn legacy_small_neutral_machine(
+        maximum_quantity: Option<Decimal>,
+    ) -> StrategyMachine<MemoryStrategyStateStore> {
+        small_neutral_machine_at_version(maximum_quantity, 1)
+    }
+
+    fn small_neutral_machine_at_version(
+        maximum_quantity: Option<Decimal>,
+        allocation_version: u8,
+    ) -> StrategyMachine<MemoryStrategyStateStore> {
         let config = GridConfig {
             exchange: Some(Exchange::Aster),
             symbol: "ANSEMUSDT".into(),
@@ -5032,14 +5830,15 @@ mod tests {
             },
             min_notional: decimal(5),
         };
-        let plan = build_grid_plan(
-            &config,
-            &MarketSnapshot {
-                last_price: Decimal::new(29, 2),
-                mark_price: Decimal::new(29, 2),
-            },
-            &instrument,
-        )
+        let market = MarketSnapshot {
+            last_price: Decimal::new(29, 2),
+            mark_price: Decimal::new(29, 2),
+        };
+        let plan = if allocation_version == 1 {
+            crate::engine::replay_legacy_grid_plan(&config, &market, &instrument)
+        } else {
+            build_grid_plan(&config, &market, &instrument)
+        }
         .unwrap();
         let state = StrategyState::from_plan(
             StrategyRunId::parse("ANSEM001").unwrap(),
@@ -5064,7 +5863,7 @@ mod tests {
             .instrument_rules
             .clone();
         instrument.min_notional = Decimal::ZERO;
-        let plan = build_grid_plan(
+        let plan = crate::engine::replay_legacy_grid_plan(
             &config,
             &MarketSnapshot {
                 last_price: Decimal::new(33, 2),
@@ -5091,14 +5890,16 @@ mod tests {
         exchange_order_id: &str,
         accepted_at_ms: u64,
     ) {
-        let mut accepted = machine
-            .store()
-            .snapshot()
-            .ready_intents(accepted_at_ms)
-            .unwrap()
-            .into_iter()
-            .find(|intent| intent.client_order_id == *client_order_id)
-            .unwrap();
+        let state = machine.store().snapshot();
+        let order = &state.orders[client_order_id];
+        assert_eq!(order.tracking, StrategyOrderTracking::Ready);
+        let mut accepted = OrderIntent::prepare(
+            client_order_id.clone(),
+            state.exchange,
+            order.shape.clone(),
+            accepted_at_ms,
+        )
+        .unwrap();
         accepted.state = IntentState::Accepted {
             exchange_order_id: exchange_order_id.into(),
         };
@@ -7524,7 +8325,7 @@ mod tests {
 
     #[test]
     fn neutral_fill_that_crosses_zero_closes_then_opens_only_the_remainder() {
-        let mut machine = small_neutral_machine();
+        let mut machine = legacy_small_neutral_machine(None);
         let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
         let sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
         machine
@@ -7563,7 +8364,7 @@ mod tests {
 
     #[test]
     fn neutral_multi_trade_snapshot_uses_each_execution_price_across_zero() {
-        let mut machine = small_neutral_machine();
+        let mut machine = legacy_small_neutral_machine(None);
         let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
         accept_strategy_order(&mut machine, &buy, "neutral-existing-long", 101);
         apply_single_valued_trade(
@@ -7588,18 +8389,7 @@ mod tests {
             .unwrap()
             .shape
             .clone();
-        let mut accepted = machine
-            .store()
-            .snapshot()
-            .ready_intents(103)
-            .unwrap()
-            .into_iter()
-            .find(|intent| intent.client_order_id == sell)
-            .unwrap();
-        accepted.state = IntentState::Accepted {
-            exchange_order_id: "neutral-multi-sell".into(),
-        };
-        machine.synchronize_intent(&accepted, 103).unwrap();
+        accept_strategy_order(&mut machine, &sell, "neutral-multi-sell", 103);
 
         let trades = vec![
             TradeFill {
@@ -8673,6 +9463,7 @@ mod tests {
                 source_client_order_id,
                 level_index: 13,
                 shape: counter_shape(&corrupted, 13, &source.shape, source.shape.quantity).unwrap(),
+                retired_quantity: Decimal::ZERO,
                 created_at_ms: corrupted.updated_at_ms,
                 assigned_client_order_id: None,
             },
@@ -8842,7 +9633,7 @@ mod tests {
     fn machine_with_small_and_submit_safe_sell_obligations(
         maximum_quantity: Decimal,
     ) -> StrategyMachine<MemoryStrategyStateStore> {
-        let mut machine = small_neutral_machine_with_max(Some(maximum_quantity));
+        let mut machine = legacy_small_neutral_machine(Some(maximum_quantity));
         let initial_sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
         machine
             .apply_execution(
@@ -8967,7 +9758,7 @@ mod tests {
 
     #[test]
     fn later_sub_minimum_residual_combines_with_an_earlier_submit_safe_obligation() {
-        let mut machine = small_neutral_machine_with_max(Some(decimal(30)));
+        let mut machine = legacy_small_neutral_machine(Some(decimal(30)));
         let initial_sell = grid_id(machine.store().snapshot(), 1, OrderSide::Sell, false);
         machine
             .apply_execution(

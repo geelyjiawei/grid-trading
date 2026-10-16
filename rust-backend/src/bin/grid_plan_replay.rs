@@ -3,7 +3,7 @@ use std::{env, fs, path::Path};
 use anyhow::{Context, bail};
 use grid_trading_server::{
     domain::{GridConfig, InstrumentRules, OrderKind, OrderSide, TimeInForce},
-    engine::{GridOrderRole, GridPlan, MarketSnapshot, build_grid_plan},
+    engine::{GridOrderRole, GridPlan, MarketSnapshot, build_grid_plan, replay_legacy_grid_plan},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -76,12 +76,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     let fixture = load_fixture(Path::new(&path))?;
-    if fixture.version != 1 {
+    if !matches!(fixture.version, 1 | 2) {
         bail!("unsupported replay fixture version {}", fixture.version);
     }
     let mut results = Vec::with_capacity(fixture.cases.len());
     for case in fixture.cases {
-        let plan = build_grid_plan(&case.config, &case.market, &case.rules)
+        let builder = if fixture.version == 1 {
+            replay_legacy_grid_plan
+        } else {
+            build_grid_plan
+        };
+        let plan = builder(&case.config, &case.market, &case.rules)
             .with_context(|| format!("grid replay case {} failed", case.name))?;
         results.push(ReplayResult {
             name: case.name,
@@ -89,7 +94,7 @@ fn main() -> anyhow::Result<()> {
         });
     }
     let output = ReplayOutput {
-        version: 1,
+        version: fixture.version,
         results,
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
