@@ -689,6 +689,24 @@ impl OrderCancellationGateway for ConfiguredExchangeGateway {
 
 #[async_trait]
 impl OrderLookupGateway for ConfiguredExchangeGateway {
+    async fn lookup_order_intent(
+        &self,
+        intent: &OrderIntent,
+        now_ms: u64,
+    ) -> Result<OrderLookup, LookupError> {
+        match self {
+            Self::Binance(gateway) => gateway.lookup_order_intent(intent, now_ms).await,
+            _ => {
+                self.lookup_order_by_client_id(
+                    intent.exchange,
+                    &intent.shape.symbol,
+                    &intent.client_order_id,
+                )
+                .await
+            }
+        }
+    }
+
     async fn lookup_order_by_client_id(
         &self,
         exchange: Exchange,
@@ -1068,6 +1086,14 @@ impl OrderCancellationGateway for SharedConfiguredExchangeGateway {
 
 #[async_trait]
 impl OrderLookupGateway for SharedConfiguredExchangeGateway {
+    async fn lookup_order_intent(
+        &self,
+        intent: &OrderIntent,
+        now_ms: u64,
+    ) -> Result<OrderLookup, LookupError> {
+        self.inner.lookup_order_intent(intent, now_ms).await
+    }
+
     async fn lookup_order_by_client_id(
         &self,
         exchange: Exchange,

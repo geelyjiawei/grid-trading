@@ -194,6 +194,8 @@ pub struct OpenOrderExecutionProgress {
 pub enum OrderLookup {
     Found(AuthoritativeOrder),
     NotFound,
+    /// The submission window expired and complete exchange history also excludes this intent.
+    ConfirmedNotSubmitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -210,6 +212,19 @@ pub trait OrderLookupGateway: Send + Sync {
         symbol: &str,
         client_order_id: &ClientOrderId,
     ) -> Result<OrderLookup, LookupError>;
+
+    async fn lookup_order_intent(
+        &self,
+        intent: &OrderIntent,
+        _now_ms: u64,
+    ) -> Result<OrderLookup, LookupError> {
+        self.lookup_order_by_client_id(
+            intent.exchange,
+            &intent.shape.symbol,
+            &intent.client_order_id,
+        )
+        .await
+    }
 }
 
 #[async_trait]

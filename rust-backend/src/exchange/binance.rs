@@ -23,7 +23,7 @@ use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 use zeroize::Zeroizing;
 
 use crate::{
-    domain::{ClientOrderId, Exchange, OrderIntent, TimeInForce},
+    domain::{ClientOrderId, Exchange, IntentState, OrderIntent, TimeInForce},
     exchange::{
         AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
         CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
@@ -1227,6 +1227,121 @@ where
     S: BinanceRequestSigner,
     C: MillisecondClock,
 {
+    async fn lookup_order_intent(
+        &self,
+        intent: &OrderIntent,
+        now_ms: u64,
+    ) -> Result<OrderLookup, LookupError> {
+        let lookup = self
+            .lookup_order_by_client_id(
+                intent.exchange,
+                &intent.shape.symbol,
+                &intent.client_order_id,
+            )
+            .await?;
+        let confirmation_delay = self.recv_window_ms.saturating_add(5_000).max(10_000);
+        // Never infer absence for an accepted order, during its acceptance window,
+        // or after Binance may have removed unfilled cancelled orders from history.
+        if lookup != OrderLookup::NotFound
+            || !matches!(
+                intent.state,
+                IntentState::Prepared | IntentState::SubmitUnknown { .. }
+            )
+            || now_ms.saturating_sub(intent.updated_at_ms) < confirmation_delay
+            || now_ms < intent.created_at_ms
+            || now_ms - intent.created_at_ms > 86_400_000
+        {
+            return Ok(lookup);
+        }
+        let start = intent.created_at_ms.saturating_sub(60_000);
+        let end = self.clock.now_millis().max(now_ms);
+        if end.saturating_sub(start) > 86_460_000 {
+            return Err(lookup_error(
+                "unknown order is outside the complete history confirmation window",
+            ));
+        }
+        let request = self
+            .signed_request(
+                HttpMethod::Get,
+                "/fapi/v1/allOrders",
+                vec![
+                    ("symbol".into(), intent.shape.symbol.clone()),
+                    ("startTime".into(), start.to_string()),
+                    ("endTime".into(), end.to_string()),
+                    ("limit".into(), "1000".into()),
+                ],
+            )
+            .map_err(|error| lookup_error(&error.to_string()))?;
+        let response = self
+            .transport
+            .execute(request)
+            .await
+            .map_err(|error| lookup_error(&error.to_string()))?;
+        if !(200..300).contains(&response.status) {
+            return Err(lookup_error(&parse_exchange_error(&response.body).message));
+        }
+        let value: Value = serde_json::from_str(&response.body)
+            .map_err(|_| lookup_error("unknown order history is invalid"))?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| lookup_error("unknown order history is not an array"))?;
+        let mut matched = None;
+        for row in rows {
+            let identity = row
+                .get("clientOrderId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| lookup_error("unknown order history is missing client identity"))?;
+            let time = row
+                .get("time")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| lookup_error("unknown order history is missing creation time"))?;
+            if row.get("symbol").and_then(Value::as_str) != Some(intent.shape.symbol.as_str())
+                || time < start
+                || time > end
+            {
+                return Err(lookup_error(
+                    "unknown order history does not cover the requested market and time window",
+                ));
+            }
+            if identity == intent.client_order_id.as_str() {
+                if matched.is_some() {
+                    return Err(lookup_error(
+                        "unknown order history contains duplicate client identities",
+                    ));
+                }
+                matched = Some(row);
+            }
+        }
+        if let Some(row) = matched {
+            return parse_authoritative_order(
+                &row.to_string(),
+                intent.exchange,
+                &intent.shape.symbol,
+                &intent.client_order_id,
+            )
+            .map(OrderLookup::Found)
+            .map_err(|error| lookup_error(&format!("invalid recovered Binance order: {error}")));
+        }
+        if rows.len() >= 1000 {
+            return Err(lookup_error(
+                "unknown order history is truncated; absence cannot be confirmed",
+            ));
+        }
+        // A second exact lookup after history catches visibility changing during collection.
+        match self
+            .lookup_order_by_client_id(
+                intent.exchange,
+                &intent.shape.symbol,
+                &intent.client_order_id,
+            )
+            .await?
+        {
+            OrderLookup::NotFound => Ok(OrderLookup::ConfirmedNotSubmitted),
+            found => Ok(found),
+        }
+    }
+
     async fn lookup_order_by_client_id(
         &self,
         exchange: Exchange,
@@ -2548,6 +2663,186 @@ mod tests {
                 .query_string()
                 .contains("symbol=MUUSDT&origClientOrderId=g_7_S_fixed&timestamp=1700000000123")
         );
+    }
+
+    #[tokio::test]
+    async fn missing_unknown_opening_recovers_only_after_complete_history_and_a_second_lookup() {
+        use crate::{
+            engine::{ReconciliationResult, reconcile_with},
+            persistence::{IntentStore, MemoryOrderIntentStore},
+        };
+
+        let now = 1_700_000_000_123;
+        let mut order = intent();
+        order.created_at_ms = now - 20_000;
+        order.updated_at_ms = order.created_at_ms;
+        let mut store = MemoryOrderIntentStore::default();
+        store.insert_prepared(order.clone()).unwrap();
+        store
+            .transition(
+                &order.client_order_id,
+                IntentState::SubmitUnknown {
+                    message: "Binance order WebSocket disconnected after submission".into(),
+                },
+                order.created_at_ms,
+            )
+            .unwrap();
+        let transport = MockTransport::default();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse { status: 400, body: r#"{"code":-2013,"msg":"Order does not exist."}"#.into() }),
+            Ok(HttpResponse { status: 200, body: format!(r#"[{{"symbol":"MUUSDT","clientOrderId":"web_manual_short","time":{},"orderId":50}}]"#, now - 5_000) }),
+            Ok(HttpResponse { status: 400, body: r#"{"code":-2013,"msg":"Order does not exist."}"#.into() }),
+        ]);
+
+        let result = reconcile_with(
+            &adapter(transport.clone()),
+            &mut store,
+            &order.client_order_id,
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ReconciliationResult::NotSubmitted { .. }),
+            "{result:?}"
+        );
+        assert!(matches!(
+            store.snapshot().intents[&order.client_order_id].state,
+            IntentState::RetryableNotSubmitted { .. }
+        ));
+        let requests = transport.all_requests();
+        assert_eq!(
+            requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/fapi/v1/order", "/fapi/v1/allOrders", "/fapi/v1/order"]
+        );
+        assert!(requests.iter().all(|r| r.method == HttpMethod::Get));
+        assert!(requests[1].query.contains(&("limit".into(), "1000".into())));
+    }
+
+    #[tokio::test]
+    async fn unknown_opening_absence_never_overrides_live_filled_or_incomplete_evidence() {
+        use crate::{
+            engine::{ReconciliationResult, reconcile_with},
+            persistence::{IntentStore, MemoryOrderIntentStore},
+        };
+        let now = 1_700_000_000_123;
+        let detail = format!(
+            r#"{{"symbol":"MUUSDT","orderId":91,"clientOrderId":"g_7_S_fixed","side":"SELL","price":"1011","origQty":"0.2","executedQty":"0.2","status":"FILLED","reduceOnly":false,"timeInForce":"GTX","type":"LIMIT","time":{},"updateTime":{}}}"#,
+            now - 20_000,
+            now - 10_000
+        );
+        let manual = json!({"symbol":"MUUSDT", "clientOrderId":"web_manual", "time":now-1000});
+        let cases = [
+            ("recent", 9_999, 5_000, vec![], false),
+            ("extended receive window", 20_000, 60_000, vec![], false),
+            (
+                "expired history retention",
+                86_400_001,
+                5_000,
+                vec![],
+                false,
+            ),
+            (
+                "history request failed",
+                20_000,
+                5_000,
+                vec![(503, r#"{"code":-1000,"msg":"Unavailable"}"#.to_owned())],
+                false,
+            ),
+            (
+                "history identity missing",
+                20_000,
+                5_000,
+                vec![(
+                    200,
+                    r#"[{"symbol":"MUUSDT","time":1700000000000}]"#.to_owned(),
+                )],
+                false,
+            ),
+            (
+                "history page full",
+                20_000,
+                5_000,
+                vec![(200, serde_json::to_string(&vec![manual; 1000]).unwrap())],
+                false,
+            ),
+            (
+                "filled order in history",
+                20_000,
+                5_000,
+                vec![(200, format!("[{detail}]"))],
+                true,
+            ),
+            (
+                "order appeared during confirmation",
+                20_000,
+                5_000,
+                vec![(200, "[]".into()), (200, detail)],
+                true,
+            ),
+        ];
+        for (name, age, window, responses, found) in cases {
+            let mut order = intent();
+            order.created_at_ms = now - age;
+            order.updated_at_ms = order.created_at_ms;
+            let mut store = MemoryOrderIntentStore::default();
+            store.insert_prepared(order.clone()).unwrap();
+            store
+                .transition(
+                    &order.client_order_id,
+                    IntentState::SubmitUnknown {
+                        message: "lost acknowledgement".into(),
+                    },
+                    order.created_at_ms,
+                )
+                .unwrap();
+            let transport = MockTransport::with_response(Ok(HttpResponse {
+                status: 400,
+                body: r#"{"code":-2013,"msg":"Order does not exist."}"#.into(),
+            }));
+            transport.responses.lock().unwrap().extend(
+                responses
+                    .into_iter()
+                    .map(|(status, body)| Ok(HttpResponse { status, body })),
+            );
+            let mut gateway = adapter(transport.clone());
+            gateway.set_recv_window_ms(window);
+            let result = reconcile_with(&gateway, &mut store, &order.client_order_id, now)
+                .await
+                .unwrap();
+            if found {
+                assert!(
+                    matches!(
+                        result,
+                        ReconciliationResult::Terminal {
+                            status: TerminalOrderStatus::Filled,
+                            ..
+                        }
+                    ),
+                    "{name}: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, ReconciliationResult::StillUnknown { .. }),
+                    "{name}: {result:?}"
+                );
+                assert!(
+                    matches!(
+                        store.snapshot().intents[&order.client_order_id].state,
+                        IntentState::SubmitUnknown { .. }
+                    ),
+                    "{name}"
+                );
+            }
+            assert!(
+                transport
+                    .all_requests()
+                    .iter()
+                    .all(|r| r.method == HttpMethod::Get),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

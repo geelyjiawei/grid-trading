@@ -2052,13 +2052,21 @@ where
             })
             .collect::<Vec<_>>();
         let gateway = &self.gateway;
-        let lookup_symbol = symbol.as_str();
+        let lookup_intents = lookup_ids
+            .into_iter()
+            .map(|id| {
+                self.intent_store
+                    .snapshot()
+                    .intents
+                    .get(&id)
+                    .cloned()
+                    .ok_or(RuntimeTickError::IntentLedgerMismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut lookup_results =
-            stream::iter(lookup_ids.into_iter().map(|client_order_id| async move {
-                let result = gateway
-                    .lookup_order_by_client_id(exchange, lookup_symbol, &client_order_id)
-                    .await;
-                (client_order_id, result)
+            stream::iter(lookup_intents.into_iter().map(|intent| async move {
+                let result = gateway.lookup_order_intent(&intent, now_ms).await;
+                (intent.client_order_id, result)
             }))
             .buffered(MAX_CONCURRENT_ORDER_LOOKUPS)
             .collect::<BTreeMap<_, _>>()
@@ -2108,11 +2116,11 @@ where
                 .cloned()
                 .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
             let transition = self.machine.synchronize_intent_if_needed(&intent, now_ms)?;
-            if matches!(result, ReconciliationResult::StillUnknown { .. }) {
+            if let ReconciliationResult::StillUnknown { ref message } = result {
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::LedgerReconciliation,
                     client_order_id: Some(client_order_id.clone()),
-                    message: "order submission remains unknown".into(),
+                    message: format!("order submission remains unknown: {message}"),
                 });
             }
             if matches!(result, ReconciliationResult::OwnershipConflict { .. })
@@ -3325,6 +3333,7 @@ mod tests {
     struct MockGatewayState {
         placement_calls: Vec<OrderIntent>,
         next_placement_error: Option<PlacementError>,
+        confirm_missing_orders: bool,
         active_placements: usize,
         maximum_concurrent_placements: usize,
         placement_delay: Option<Duration>,
@@ -3387,6 +3396,7 @@ mod tests {
                 state: Arc::new(Mutex::new(MockGatewayState {
                     placement_calls: Vec::new(),
                     next_placement_error: None,
+                    confirm_missing_orders: false,
                     active_placements: 0,
                     maximum_concurrent_placements: 0,
                     placement_delay: None,
@@ -3916,6 +3926,32 @@ mod tests {
 
     #[async_trait]
     impl OrderLookupGateway for MockGateway {
+        async fn lookup_order_intent(
+            &self,
+            intent: &OrderIntent,
+            now_ms: u64,
+        ) -> Result<OrderLookup, LookupError> {
+            let lookup = self
+                .lookup_order_by_client_id(
+                    intent.exchange,
+                    &intent.shape.symbol,
+                    &intent.client_order_id,
+                )
+                .await?;
+            if self.state.lock().unwrap().confirm_missing_orders
+                && lookup == OrderLookup::NotFound
+                && matches!(
+                    intent.state,
+                    IntentState::Prepared | IntentState::SubmitUnknown { .. }
+                )
+                && now_ms.saturating_sub(intent.updated_at_ms) >= 10_000
+            {
+                Ok(OrderLookup::ConfirmedNotSubmitted)
+            } else {
+                Ok(lookup)
+            }
+        }
+
         async fn lookup_order_by_client_id(
             &self,
             _exchange: Exchange,
@@ -6851,6 +6887,128 @@ mod tests {
         assert_eq!(first.blockers[0].stage, RuntimeStage::SubmissionUnknown);
         assert_eq!(second.blockers[0].stage, RuntimeStage::LedgerReconciliation);
         assert!(second.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirmed_missing_opening_retries_the_same_intent_after_position_reconciliation() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.state.lock().unwrap().confirm_missing_orders = true;
+        gateway.fail_next_placement(PlacementError::Unknown {
+            message: "Binance order WebSocket disconnected after submission".into(),
+        });
+        let machine = machine(config(None), &rules);
+        let id = opening_id(&machine);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        assert!(runtime.tick(1_200).await.unwrap().is_blocked());
+        gateway.set_market_price(Decimal::new(1014, 0), 11_100);
+        let recovered = runtime.tick(11_100).await.unwrap();
+        assert!(!recovered.is_blocked(), "{recovered:?}");
+        assert_eq!(gateway.placement_ids(), vec![id.clone(), id.clone()]);
+        assert_eq!(recovered.submissions.len(), 1);
+        assert!(matches!(
+            runtime.intent_store().snapshot().intents[&id].state,
+            IntentState::Accepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirmed_missing_opening_stop_preserves_manual_half_short_and_manual_order() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.state.lock().unwrap().confirm_missing_orders = true;
+        gateway.fail_next_placement(PlacementError::Unknown {
+            message: "Binance order WebSocket disconnected after submission".into(),
+        });
+        let machine = machine(config(None), &rules);
+        let opening = machine.store().snapshot().orders[&opening_id(&machine)].clone();
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        let manual_id = ClientOrderId::parse("web_manual_short").unwrap();
+        let mut manual_shape = opening.shape.clone();
+        manual_shape.quantity = Decimal::new(5, 1);
+        let manual_order = AuthoritativeOrder {
+            client_order_id: manual_id.clone(),
+            exchange_order_id: "manual-order".into(),
+            exchange: Exchange::Binance,
+            shape: manual_shape,
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            executed_quantity: Some(Decimal::ZERO),
+        };
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .orders
+            .insert(manual_id.clone(), manual_order.clone());
+        gateway.set_position(Decimal::new(-5, 1), Some(Decimal::new(194888, 2)));
+        runtime.machine_mut().request_stop(1_250).unwrap();
+        let stopped = runtime.tick(11_100).await.unwrap();
+        assert!(!stopped.is_blocked(), "{stopped:?}");
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .grid_position_net_quantity,
+            Decimal::ZERO
+        );
+        assert_eq!(gateway.placement_call_count(), 1);
+        assert_eq!(gateway.cancellation_call_count(), 0);
+        let state = gateway.state.lock().unwrap();
+        assert_eq!(state.position_quantity, Decimal::new(-5, 1));
+        assert_eq!(state.orders[&manual_id], manual_order);
+    }
+
+    #[tokio::test]
+    async fn confirmed_missing_opening_cannot_retry_into_a_changed_manual_position() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.state.lock().unwrap().confirm_missing_orders = true;
+        gateway.fail_next_placement(PlacementError::Unknown {
+            message: "lost acknowledgement".into(),
+        });
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        runtime.tick(1_100).await.unwrap();
+        gateway.set_market_price(Decimal::new(1014, 0), 11_100);
+        gateway.set_position(Decimal::new(-5, 1), Some(Decimal::new(194888, 2)));
+        let blocked = runtime.tick(11_100).await.unwrap();
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|b| b.stage == RuntimeStage::PositionReconciliation)
+        );
+        assert_eq!(gateway.placement_call_count(), 1);
+        assert!(
+            runtime
+                .tick_execution_event(11_101, None)
+                .await
+                .unwrap()
+                .submissions
+                .is_empty()
+        );
+        runtime.machine_mut().request_stop(11_150).unwrap();
+        let stopped = runtime.tick(11_200).await.unwrap();
+        assert!(!stopped.is_blocked(), "{stopped:?}");
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
+        assert_eq!(
+            gateway.state.lock().unwrap().position_quantity,
+            Decimal::new(-5, 1)
+        );
         assert_eq!(gateway.placement_call_count(), 1);
     }
 

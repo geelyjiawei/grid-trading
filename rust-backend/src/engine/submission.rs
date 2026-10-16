@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use thiserror::Error;
 
 use crate::{
@@ -53,9 +55,17 @@ where
 {
     prepare_intent(store, &intent, result_time_ms)?;
     let client_order_id = intent.client_order_id.clone();
+    let submission_started = Instant::now();
     let (next_state, result) =
         classify_placement(&client_order_id, gateway.place_order(&intent).await);
-    store.transition(&client_order_id, next_state, result_time_ms)?;
+    let observed_at_ms = if matches!(result, SubmissionResult::SubmitUnknown) {
+        result_time_ms.saturating_add(
+            u64::try_from(submission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    } else {
+        result_time_ms
+    };
+    store.transition(&client_order_id, next_state, observed_at_ms)?;
     Ok(result)
 }
 
@@ -71,8 +81,12 @@ where
     S: IntentStore,
 {
     prepare_submission_batch(store, &intents, result_time_ms)?;
+    let submission_started = Instant::now();
     let placement_results = gateway.place_orders(&intents, maximum_concurrency).await;
-    commit_submission_batch(store, intents, placement_results, result_time_ms)
+    let observed_at_ms = result_time_ms.saturating_add(
+        u64::try_from(submission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    commit_submission_batch(store, intents, placement_results, observed_at_ms)
 }
 
 pub(crate) fn prepare_submission_batch<S>(
@@ -278,6 +292,34 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unknown_confirmation_grace_starts_after_slow_submission_returns() {
+        struct SlowUnknown;
+        #[async_trait]
+        impl OrderPlacementGateway for SlowUnknown {
+            async fn place_order(
+                &self,
+                _: &OrderIntent,
+            ) -> Result<PlacementAcknowledgement, PlacementError> {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                Err(PlacementError::Unknown {
+                    message: "connection reset after a delayed submission".into(),
+                })
+            }
+        }
+        let order = intent("g_0_B_slow_unknown");
+        let mut store = MemoryOrderIntentStore::default();
+        submit_with(&SlowUnknown, &mut store, order.clone(), 101)
+            .await
+            .unwrap();
+        assert!(store.snapshot().intents[&order.client_order_id].updated_at_ms >= 126);
+        let mut batch_store = MemoryOrderIntentStore::default();
+        submit_many_with(&SlowUnknown, &mut batch_store, vec![order.clone()], 101, 1)
+            .await
+            .unwrap();
+        assert!(batch_store.snapshot().intents[&order.client_order_id].updated_at_ms >= 126);
     }
 
     #[tokio::test]

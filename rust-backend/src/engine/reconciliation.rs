@@ -77,13 +77,7 @@ where
         return Ok(ReconciliationResult::AlreadyFinal);
     }
 
-    let lookup = gateway
-        .lookup_order_by_client_id(
-            intent.exchange,
-            &intent.shape.symbol,
-            &intent.client_order_id,
-        )
-        .await;
+    let lookup = gateway.lookup_order_intent(&intent, now_ms).await;
 
     reconcile_lookup_with(store, client_order_id, lookup, now_ms)
 }
@@ -125,6 +119,29 @@ where
 
     match lookup {
         Ok(OrderLookup::Found(snapshot)) => reconcile_found(store, intent, snapshot, now_ms),
+        Ok(OrderLookup::ConfirmedNotSubmitted)
+            if intent.exchange == Exchange::Binance
+                && matches!(
+                    intent.state,
+                    IntentState::Prepared | IntentState::SubmitUnknown { .. }
+                ) =>
+        {
+            let message = "Binance submission window expired; exact lookup and complete order history confirm this intent was not submitted".to_owned();
+            store.transition(
+                &intent.client_order_id,
+                IntentState::RetryableNotSubmitted {
+                    message: message.clone(),
+                },
+                now_ms,
+            )?;
+            Ok(ReconciliationResult::NotSubmitted { message })
+        }
+        Ok(OrderLookup::ConfirmedNotSubmitted) => preserve_unknown(
+            store,
+            intent,
+            "absence confirmation cannot replace a known exchange order identity",
+            now_ms,
+        ),
         Ok(OrderLookup::NotFound) if legacy_local_cooldown_was_not_submitted(&intent) => {
             let message =
                 "local Binance cooldown prevented submission; authoritative lookup confirms the order is absent"
@@ -825,7 +842,7 @@ mod tests {
             OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
         ) {
             OrderLookup::Found(snapshot) => snapshot,
-            OrderLookup::NotFound => unreachable!(),
+            OrderLookup::NotFound | OrderLookup::ConfirmedNotSubmitted => unreachable!(),
         };
         snapshot.shape.quantity = Decimal::new(70, 0);
         let (mut service, calls) = service(&order, Ok(OrderLookup::Found(snapshot)));

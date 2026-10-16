@@ -390,7 +390,7 @@ where
                 cancellation_accepted: cancellation_accepted.clone(),
             })?;
         let authoritative = match lookup {
-            OrderLookup::NotFound => {
+            OrderLookup::NotFound | OrderLookup::ConfirmedNotSubmitted => {
                 already_terminal.push(target.exchange_order_id);
                 continue;
             }
