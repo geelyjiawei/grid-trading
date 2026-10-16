@@ -532,7 +532,12 @@ fn validate_transition(current: &IntentState, next: &IntentState) -> Result<(), 
             | IntentState::Rejected { .. }
             | IntentState::OwnershipConflict { .. },
         )
-        | (IntentState::RetryableNotSubmitted { .. }, IntentState::Prepared)
+        | (
+            IntentState::RetryableNotSubmitted { .. },
+            IntentState::Prepared
+            | IntentState::Accepted { .. }
+            | IntentState::OwnershipConflict { .. },
+        )
         | (IntentState::Accepted { .. }, IntentState::OwnershipConflict { .. }) => true,
         (
             IntentState::Accepted {

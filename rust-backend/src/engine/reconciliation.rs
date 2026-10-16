@@ -113,7 +113,10 @@ where
         .get(client_order_id)
         .cloned()
         .ok_or_else(|| LedgerError::MissingIntent(client_order_id.as_str().to_owned()))?;
-    if !intent_requires_lookup(&intent) {
+    let positive_retryable_evidence =
+        matches!(intent.state, IntentState::RetryableNotSubmitted { .. })
+            && matches!(&lookup, Ok(OrderLookup::Found(_)));
+    if !intent_requires_lookup(&intent) && !positive_retryable_evidence {
         return Ok(ReconciliationResult::AlreadyFinal);
     }
 

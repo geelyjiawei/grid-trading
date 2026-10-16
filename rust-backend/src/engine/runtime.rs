@@ -2034,7 +2034,10 @@ where
                             StrategyOrderTracking::Intent { state } if state == &intent.state
                         )
                     });
-                (intent_requires_lookup(intent) && !has_matching_progress
+                let has_open_evidence = open_progress
+                    .as_ref()
+                    .is_some_and(|progress| progress.contains_key(client_order_id));
+                ((intent_requires_lookup(intent) || has_open_evidence) && !has_matching_progress
                     || !strategy_is_synchronized)
                     .then_some(client_order_id.clone())
             })
@@ -2083,7 +2086,8 @@ where
             let observed_progress = open_progress
                 .as_ref()
                 .and_then(|progress| progress.get(client_order_id));
-            let result = if !intent_requires_lookup(&current_intent) {
+            let result = if !intent_requires_lookup(&current_intent) && observed_progress.is_none()
+            {
                 ReconciliationResult::AlreadyFinal
             } else {
                 // Positive open-order evidence takes precedence over negative lookups,
@@ -2633,6 +2637,7 @@ where
         now_ms: u64,
         replacements_only: bool,
     ) -> Result<(), RuntimeTickError> {
+        let submissions_started = Instant::now();
         let (ready, exchange) = {
             let state = self.machine.store().snapshot();
             let retryable_ids = self
@@ -2730,7 +2735,14 @@ where
 
         for intent in ready {
             let client_order_id = intent.client_order_id.clone();
-            let result = submit_with(&self.gateway, &mut self.intent_store, intent, now_ms).await?;
+            let submission_time = advance_reference_time_ms(now_ms, submissions_started.elapsed());
+            let result = submit_with(
+                &self.gateway,
+                &mut self.intent_store,
+                intent,
+                submission_time,
+            )
+            .await?;
             let persisted = self
                 .intent_store
                 .snapshot()
@@ -2738,7 +2750,9 @@ where
                 .get(&client_order_id)
                 .cloned()
                 .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
-            let transition = self.machine.synchronize_intent(&persisted, now_ms)?;
+            let transition = self
+                .machine
+                .synchronize_intent(&persisted, submission_time)?;
             report.submissions.push(RuntimeSubmission {
                 client_order_id: client_order_id.clone(),
                 result: result.clone(),
@@ -3348,6 +3362,7 @@ mod tests {
     struct MockGatewayState {
         placement_calls: Vec<OrderIntent>,
         next_placement_error: Option<PlacementError>,
+        placement_error_on_call: Option<usize>,
         confirm_missing_orders: bool,
         missing_exact_lookups: bool,
         active_placements: usize,
@@ -3412,6 +3427,7 @@ mod tests {
                 state: Arc::new(Mutex::new(MockGatewayState {
                     placement_calls: Vec::new(),
                     next_placement_error: None,
+                    placement_error_on_call: None,
                     confirm_missing_orders: false,
                     missing_exact_lookups: false,
                     active_placements: 0,
@@ -3833,7 +3849,14 @@ mod tests {
                     .max(state.active_placements);
                 (
                     state.placement_delay,
-                    state.next_placement_error.take(),
+                    if state
+                        .placement_error_on_call
+                        .is_none_or(|call| call == state.placement_calls.len())
+                    {
+                        state.next_placement_error.take()
+                    } else {
+                        None
+                    },
                     format!("exchange-{}", state.placement_calls.len()),
                 )
             };
@@ -6913,73 +6936,124 @@ mod tests {
 
     #[tokio::test]
     async fn open_order_evidence_overrides_absence_and_stop_cancels_only_the_owned_order() {
+        for previously_retryable in [false, true] {
+            let rules = rules();
+            let gateway = MockGateway::new(rules.clone(), 1_100);
+            gateway.fail_next_placement(PlacementError::Unknown {
+                message: "lost acknowledgement".into(),
+            });
+            let mut runtime = runtime(
+                gateway.clone(),
+                MemoryOrderIntentStore::default(),
+                machine(config(None), &rules),
+            );
+            runtime.tick(1_100).await.unwrap();
+            let intent = runtime
+                .intent_store()
+                .snapshot()
+                .intents
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            if previously_retryable {
+                runtime
+                    .intent_store
+                    .transition(
+                        &intent.client_order_id,
+                        IntentState::RetryableNotSubmitted {
+                            message: "previous absence was confirmed".into(),
+                        },
+                        1_200,
+                    )
+                    .unwrap();
+                let retryable =
+                    runtime.intent_store.snapshot().intents[&intent.client_order_id].clone();
+                runtime
+                    .machine_mut()
+                    .synchronize_intent(&retryable, 1_200)
+                    .unwrap();
+            }
+            let order = AuthoritativeOrder {
+                client_order_id: intent.client_order_id.clone(),
+                exchange_order_id: "late-visible".into(),
+                exchange: intent.exchange,
+                shape: intent.shape.clone(),
+                lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+                executed_quantity: Some(Decimal::ZERO),
+            };
+            {
+                let mut state = gateway.state.lock().unwrap();
+                state.confirm_missing_orders = true;
+                state.missing_exact_lookups = true;
+                state.open_progress_enabled = true;
+                state.cancellation_marks_terminal = true;
+                state
+                    .orders
+                    .insert(intent.client_order_id.clone(), order.clone());
+                state.executions.insert(
+                    intent.client_order_id.clone(),
+                    OrderExecutionSnapshot {
+                        order,
+                        cumulative_quantity: Decimal::ZERO,
+                        cumulative_quote: Decimal::ZERO,
+                        fees_by_asset: BTreeMap::new(),
+                        trades: vec![],
+                        order_time_ms: 1_100,
+                        update_time_ms: 1_100,
+                    },
+                );
+                state.position_quantity = Decimal::new(-5, 1);
+                state.position_entry_price = Some(Decimal::new(194888, 2));
+            }
+            runtime.machine_mut().request_stop(1_250).unwrap();
+            let lookups_before = gateway.order_lookup_call_count();
+            let stopped = runtime.tick(11_100).await.unwrap();
+            assert!(!stopped.is_blocked(), "{stopped:?}");
+            assert_eq!(
+                runtime.machine().store().snapshot().lifecycle,
+                StrategyLifecycle::Stopped
+            );
+            assert_eq!(gateway.placement_call_count(), 1);
+            assert_eq!(gateway.order_lookup_call_count(), lookups_before);
+            let state = gateway.state.lock().unwrap();
+            assert_eq!(
+                state.cancellation_calls,
+                vec![(intent.client_order_id, "late-visible".into())]
+            );
+            assert_eq!(state.position_quantity, Decimal::new(-5, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_timestamp_includes_earlier_successful_sequential_orders() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
-        gateway.fail_next_placement(PlacementError::Unknown {
-            message: "lost acknowledgement".into(),
-        });
-        let mut runtime = runtime(
-            gateway.clone(),
-            MemoryOrderIntentStore::default(),
-            machine(config(None), &rules),
-        );
+        let machine = machine(config(None), &rules);
+        let opening = opening_id(&machine);
+        let quantity = machine.store().snapshot().orders[&opening].shape.quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
         runtime.tick(1_100).await.unwrap();
-        let intent = runtime
+        gateway.fill_order(&opening, Decimal::new(1014, 0), Decimal::ZERO);
+        gateway.set_position(-quantity, Some(Decimal::new(1014, 0)));
+        {
+            let mut state = gateway.state.lock().unwrap();
+            state.placement_delay = Some(Duration::from_millis(25));
+            state.placement_error_on_call = Some(3);
+            state.next_placement_error = Some(PlacementError::Unknown {
+                message: "later sequential write lost acknowledgement".into(),
+            });
+        }
+        runtime.tick(1_200).await.unwrap();
+        let unknown = runtime
             .intent_store()
             .snapshot()
             .intents
             .values()
-            .next()
-            .unwrap()
-            .clone();
-        let order = AuthoritativeOrder {
-            client_order_id: intent.client_order_id.clone(),
-            exchange_order_id: "late-visible".into(),
-            exchange: intent.exchange,
-            shape: intent.shape.clone(),
-            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
-            executed_quantity: Some(Decimal::ZERO),
-        };
-        {
-            let mut state = gateway.state.lock().unwrap();
-            state.confirm_missing_orders = true;
-            state.missing_exact_lookups = true;
-            state.open_progress_enabled = true;
-            state.cancellation_marks_terminal = true;
-            state
-                .orders
-                .insert(intent.client_order_id.clone(), order.clone());
-            state.executions.insert(
-                intent.client_order_id.clone(),
-                OrderExecutionSnapshot {
-                    order,
-                    cumulative_quantity: Decimal::ZERO,
-                    cumulative_quote: Decimal::ZERO,
-                    fees_by_asset: BTreeMap::new(),
-                    trades: vec![],
-                    order_time_ms: 1_100,
-                    update_time_ms: 1_100,
-                },
-            );
-            state.position_quantity = Decimal::new(-5, 1);
-            state.position_entry_price = Some(Decimal::new(194888, 2));
-        }
-        runtime.machine_mut().request_stop(1_250).unwrap();
-        let lookups_before = gateway.order_lookup_call_count();
-        let stopped = runtime.tick(11_100).await.unwrap();
-        assert!(!stopped.is_blocked(), "{stopped:?}");
-        assert_eq!(
-            runtime.machine().store().snapshot().lifecycle,
-            StrategyLifecycle::Stopped
-        );
-        assert_eq!(gateway.placement_call_count(), 1);
-        assert_eq!(gateway.order_lookup_call_count(), lookups_before);
-        let state = gateway.state.lock().unwrap();
-        assert_eq!(
-            state.cancellation_calls,
-            vec![(intent.client_order_id, "late-visible".into())]
-        );
-        assert_eq!(state.position_quantity, Decimal::new(-5, 1));
+            .find(|intent| matches!(intent.state, IntentState::SubmitUnknown { .. }))
+            .unwrap();
+        assert!(unknown.updated_at_ms >= 1_250, "{}", unknown.updated_at_ms);
+        assert_eq!(gateway.placement_call_count(), 3);
     }
 
     #[tokio::test]
@@ -7168,9 +7242,9 @@ mod tests {
         assert!(recent.submissions.is_empty());
         assert_eq!(gateway.placement_call_count(), placements_before + 1);
 
-        gateway.set_market_price(Decimal::new(1014, 0), 11_300);
+        gateway.set_market_price(Decimal::new(1014, 0), 12_300);
         gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
-        let mismatched = runtime.tick(11_300).await.unwrap();
+        let mismatched = runtime.tick(12_300).await.unwrap();
         assert!(mismatched.is_blocked(), "{mismatched:?}");
         assert!(
             mismatched
@@ -7190,13 +7264,13 @@ mod tests {
             IntentState::RetryableNotSubmitted { .. }
         ));
 
-        let fast_event = runtime.tick_execution_event(11_301, None).await.unwrap();
+        let fast_event = runtime.tick_execution_event(12_301, None).await.unwrap();
         assert!(fast_event.submissions.is_empty(), "{fast_event:?}");
         assert_eq!(gateway.placement_call_count(), placements_before + 1);
 
-        gateway.set_market_price(Decimal::new(1014, 0), 11_302);
+        gateway.set_market_price(Decimal::new(1014, 0), 12_302);
         gateway.set_position(expected_position, Some(Decimal::new(1014, 0)));
-        let recovered = runtime.tick(11_302).await.unwrap();
+        let recovered = runtime.tick(12_302).await.unwrap();
         assert!(!recovered.is_blocked(), "{recovered:?}");
         assert_eq!(recovered.submissions.len(), 1);
         assert_eq!(recovered.submissions[0].client_order_id, replacement_id);
