@@ -5,6 +5,8 @@ import unittest
 from unittest import mock
 import os
 import tempfile
+import signal
+import tarfile
 
 
 spec = importlib.util.spec_from_file_location(
@@ -99,6 +101,47 @@ class GridCapacityRepairTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-O', '-c', code], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('RuntimeError: blocked', result.stderr)
+
+    def test_termination_and_hangup_signals_quiesce_runtime_and_restore_handlers(self):
+        for name in ('SIGTERM', 'SIGHUP'):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            original = signal.getsignal(signum)
+
+            def interrupted_main():
+                handler = signal.getsignal(signum)
+                self.assertTrue(callable(handler))
+                handler(signum, None)
+
+            repair.REPAIR_IN_PROGRESS = True
+            try:
+                with mock.patch.object(repair, 'main', side_effect=interrupted_main):
+                    with mock.patch.object(repair.subprocess, 'run') as run:
+                        with self.assertRaisesRegex(RuntimeError, 'signal'):
+                            repair.guarded_main()
+                        run.assert_called_once_with(['docker', 'stop', '--time', '15', repair.CONTAINER], check=False, timeout=30)
+                self.assertEqual(signal.getsignal(signum), original)
+            finally:
+                repair.REPAIR_IN_PROGRESS = False
+                signal.signal(signum, original)
+
+    @unittest.skipUnless(os.name == 'posix', 'production archive durability requires Linux directory fsync')
+    def test_backup_is_readable_and_sync_failure_prevents_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / 'data'
+            data.mkdir()
+            (data / 'strategy.json').write_text('{"history":"preserved"}')
+            backup = root / 'backup'
+            backup.mkdir()
+            with mock.patch.object(repair, 'DATA', data):
+                repair.durable_backup(backup)
+                with tarfile.open(backup / 'data-before.tar.gz') as archive:
+                    self.assertEqual(archive.extractfile('data-rust-production/strategy.json').read(), b'{"history":"preserved"}')
+                with mock.patch.object(repair.os, 'fsync', side_effect=OSError('sync failed')):
+                    with self.assertRaisesRegex(OSError, 'sync failed'):
+                        repair.durable_backup(backup)
 
 
 if __name__ == '__main__':

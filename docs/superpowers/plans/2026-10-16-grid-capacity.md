@@ -35,6 +35,8 @@
 
 Evidence before release: original regression failed 21 != 20; corrected grid matrix has 1,194 cases; all 105 strategy-machine and 29 shadow tests pass; both replay integrations and Clippy pass. The actual production ledger copy passes offline candidate validation with all 162 inventory events retained. Local full-suite Windows baseline contains directory-publication PermissionDenied failures; final authority is Linux CI. Local bundled Python lacks legacy application dependencies, so its full-suite attempt cannot replace the isolated CI install.
 
+Ruling: two final maintenance-only review fixes (signal cleanup and backup fsync) are a separate operational commit. Runtime image inputs remain byte-identical to release `efd5e1b9d2b693509baf569c0365d98812c23982`, whose Linux Rust/Python/Vue/container checks passed. Deploy that verified immutable runtime image with the separately reviewed maintenance script after all eight maintenance tests pass on Linux; verify the runtime input diff is empty. This avoids rebuilding an unchanged binary, not a test exemption for changed code.
+
 ### Task 3: Release and Production Verification
 - [ ] Independent safety review, complete Linux CI and immutable image verification.
 - [ ] Re-read exchange orders and positions, quiesce only the bot runtime, back up durable data.

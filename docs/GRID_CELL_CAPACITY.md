@@ -24,9 +24,9 @@ Retirement requires a confirmed cancelled non-reduce-only limit order with zero 
 
 `scripts/repair-anthropic-capacity.py` is deliberately restricted to run `dab0d666a310`, client `r_dab0d666a310_5_S_80`, exchange order `235064031`, Sell 1932, quantity 0.4, retaining 0.2. It defaults to read-only and refuses changed identity, fills, other strategies, positions or order sets.
 
-The operator workflow verifies the immutable image, quiesces the bot (without cancelling other exchange orders), backs up data, validates candidate ledgers in a no-network container, journals the exact cancellation before issuing it, confirms the result by exchange GET, validates again and commits both ledgers while no runtime can read intermediate state. Atomic replacements preserve existing ownership and permissions. The new runtime submits only the retained Ready order through its normal GTC path.
+The operator workflow verifies the immutable image, quiesces the bot (without cancelling other exchange orders), backs up data and fsyncs both archive and directory entries, validates candidate ledgers in a no-network container, journals the exact cancellation before issuing it, confirms the result by exchange GET, validates again and commits both ledgers while no runtime can read intermediate state. Atomic replacements preserve existing ownership and permissions. The new runtime submits only the retained Ready order through its normal GTC path.
 
-On any failed post-quiesce verification the runtime remains paused; there is no compensating position trade. Interrupted repairs require inspection of the private backup receipt and phase journal before any restart. Do not restore an old binary against repaired schema-2 data. Never infer cancellation success from a missing order or retry placement blindly.
+On any failed post-quiesce verification or caught SIGTERM/SIGHUP/SIGINT the runtime remains paused; there is no compensating position trade. Uncatchable power loss/SIGKILL still requires inspection of the durable phase journal before any restart. Interrupted repairs require inspection of the private backup receipt and phase journal before any restart. Do not restore an old binary against repaired schema-2 data. Never infer cancellation success from a missing order or retry placement blindly.
 
 ## Verification
 

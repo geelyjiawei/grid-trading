@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import os
+import signal
 import stat
 from pathlib import Path
 import subprocess
@@ -62,6 +63,20 @@ def atomic_json(path, value):
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def durable_backup(backup):
+    archive = backup / 'data-before.tar.gz'
+    with tarfile.open(archive, 'w:gz', compresslevel=1) as tar:
+        tar.add(DATA, arcname='data-rust-production')
+    with open(archive, 'rb') as stream:
+        os.fsync(stream.fileno())
+    for path in (backup, backup.parent):
+        directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def validate_receipt(receipt, status):
@@ -221,8 +236,7 @@ def main():
     REPAIR_IN_PROGRESS = True
     command('docker', 'stop', '--time', '15', CONTAINER)
     require(not json.loads(command('docker', 'inspect', CONTAINER))[0]['State']['Running'], 'Runtime did not quiesce')
-    with tarfile.open(backup / 'data-before.tar.gz', 'w:gz', compresslevel=1) as tar:
-        tar.add(DATA, arcname='data-rust-production')
+    durable_backup(backup)
     wrapper = json.loads(path.read_text())
     ledger = json.loads(ledger_path.read_text())
     before_orders = exchange.orders()
@@ -321,13 +335,27 @@ def main():
 
 
 def guarded_main():
+    previous = {}
+
+    def interrupted(signum, _frame):
+        raise RuntimeError('Repair interrupted by signal %s' % signum)
+
     try:
+        for name in ('SIGTERM', 'SIGHUP', 'SIGINT'):
+            signum = getattr(signal, name, None)
+            if signum is not None:
+                previous[signum] = signal.signal(signum, interrupted)
         main()
     except BaseException:
         if REPAIR_IN_PROGRESS:
             # Never leave an unverified writer running and never compensate by trading.
+            for signum in previous:
+                signal.signal(signum, signal.SIG_IGN)
             subprocess.run(['docker', 'stop', '--time', '15', CONTAINER], check=False, timeout=30)
         raise
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == '__main__':
