@@ -11,6 +11,9 @@ manual stop.
 - Reconciliation is scoped to the persisted exchange, symbol, and client order ID.
 - An unknown or prepared Binance intent waits at least its receive window plus
   five seconds, with a ten-second minimum, before absence confirmation.
+- A newly constructed adapter also observes that grace before confirming a
+  recovered intent absent. Positive open-order evidence always takes precedence
+  over missing exact/history observations, with ownership and shape validation.
 - Absence requires an exact order lookup, a complete `allOrders` time window
   covering the submission, and another exact lookup after the history read.
 - A matching live or filled historical order is recovered and accounted instead
@@ -30,6 +33,9 @@ manual stop.
 
 Unknown submission timestamps include time spent awaiting the gateway, so a
 slow submission cannot consume the subsequent confirmation grace in advance.
+The runtime advances its time reference through preflight before dispatch.
+After a proven-unsent attempt is re-prepared, its intent creation time starts
+the new attempt's history window; the strategy's original creation time is retained.
 This applies to individual and batched submissions. No database migration or
 manual editing of strategy state is required.
 

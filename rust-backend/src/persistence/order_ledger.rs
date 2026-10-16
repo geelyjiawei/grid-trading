@@ -592,6 +592,9 @@ fn apply_intent_preparations(
                 }
                 validate_transition(&existing.state, &IntentState::Prepared)?;
                 existing.state = IntentState::Prepared;
+                // The previous attempt was proven unsent before becoming retryable.
+                // History confirmation for this new attempt must start here.
+                existing.created_at_ms = now_ms;
                 existing.updated_at_ms = now_ms;
             }
             Some(_) => {

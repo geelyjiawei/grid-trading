@@ -160,7 +160,7 @@ where
                 && existing.exchange == intent.exchange
                 && existing.shape == intent.shape =>
         {
-            store.transition(&client_order_id, IntentState::Prepared, result_time_ms)?;
+            store.prepare_intents(vec![intent.clone()], result_time_ms)?;
         }
         Some(_) => {
             return Err(

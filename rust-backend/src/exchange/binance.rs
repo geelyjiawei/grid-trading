@@ -754,17 +754,24 @@ pub struct BinanceAdapter<T, S, C> {
     api_key: Zeroizing<String>,
     base_url: String,
     recv_window_ms: u64,
+    recovery_started_at_ms: u64,
     realtime_lifetime: Arc<()>,
     realtime_execution_cache: FuturesExecutionCache,
     websocket_order_relay: Option<BinanceWebsocketOrderRelay>,
 }
 
 impl<T, S, C> BinanceAdapter<T, S, C> {
-    pub fn production(transport: T, signer: S, clock: C, api_key: impl Into<String>) -> Self {
+    pub fn production(transport: T, signer: S, clock: C, api_key: impl Into<String>) -> Self
+    where
+        C: MillisecondClock,
+    {
         Self::with_base_url(transport, signer, clock, api_key, PRODUCTION_BASE_URL)
     }
 
-    pub fn testnet(transport: T, signer: S, clock: C, api_key: impl Into<String>) -> Self {
+    pub fn testnet(transport: T, signer: S, clock: C, api_key: impl Into<String>) -> Self
+    where
+        C: MillisecondClock,
+    {
         Self::with_base_url(transport, signer, clock, api_key, TESTNET_BASE_URL)
     }
 
@@ -774,7 +781,11 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
         clock: C,
         api_key: impl Into<String>,
         base_url: impl Into<String>,
-    ) -> Self {
+    ) -> Self
+    where
+        C: MillisecondClock,
+    {
+        let recovery_started_at_ms = clock.now_millis();
         Self {
             transport,
             signer,
@@ -782,6 +793,7 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
             api_key: Zeroizing::new(api_key.into()),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             recv_window_ms: 5_000,
+            recovery_started_at_ms,
             realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
             realtime_execution_cache: FuturesExecutionCache::default(),
             websocket_order_relay: None,
@@ -1248,6 +1260,7 @@ where
                 IntentState::Prepared | IntentState::SubmitUnknown { .. }
             )
             || now_ms.saturating_sub(intent.updated_at_ms) < confirmation_delay
+            || now_ms.saturating_sub(self.recovery_started_at_ms) < confirmation_delay
             || now_ms < intent.created_at_ms
             || now_ms - intent.created_at_ms > 86_400_000
         {
@@ -2672,7 +2685,7 @@ mod tests {
             persistence::{IntentStore, MemoryOrderIntentStore},
         };
 
-        let now = 1_700_000_000_123;
+        let now = 1_700_000_020_123;
         let mut order = intent();
         order.created_at_ms = now - 20_000;
         order.updated_at_ms = order.created_at_ms;
@@ -2721,12 +2734,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_opening_absence_never_overrides_live_filled_or_incomplete_evidence() {
+    async fn recovered_prepared_order_waits_for_the_new_adapter_confirmation_grace() {
         use crate::{
             engine::{ReconciliationResult, reconcile_with},
             persistence::{IntentStore, MemoryOrderIntentStore},
         };
         let now = 1_700_000_000_123;
+        let mut order = intent();
+        order.created_at_ms = now - 20_000;
+        order.updated_at_ms = order.created_at_ms;
+        let mut store = MemoryOrderIntentStore::default();
+        store.insert_prepared(order.clone()).unwrap();
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 400,
+            body: r#"{"code":-2013,"msg":"Order does not exist."}"#.into(),
+        }));
+        let result = reconcile_with(
+            &adapter(transport.clone()),
+            &mut store,
+            &order.client_order_id,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ReconciliationResult::StillUnknown { .. }));
+        assert_eq!(
+            store.snapshot().intents[&order.client_order_id].updated_at_ms,
+            now
+        );
+        assert_eq!(transport.all_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_opening_absence_never_overrides_live_filled_or_incomplete_evidence() {
+        use crate::{
+            engine::{ReconciliationResult, reconcile_with},
+            persistence::{IntentStore, MemoryOrderIntentStore},
+        };
+        let now = 1_700_000_080_123;
         let detail = format!(
             r#"{{"symbol":"MUUSDT","orderId":91,"clientOrderId":"g_7_S_fixed","side":"SELL","price":"1011","origQty":"0.2","executedQty":"0.2","status":"FILLED","reduceOnly":false,"timeInForce":"GTX","type":"LIMIT","time":{},"updateTime":{}}}"#,
             now - 20_000,

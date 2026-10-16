@@ -2043,11 +2043,11 @@ where
             .iter()
             .filter_map(|client_order_id| {
                 let intent = self.intent_store.snapshot().intents.get(client_order_id)?;
-                let has_matching_progress = open_progress
+                let has_open_evidence = open_progress
                     .as_ref()
                     .and_then(|progress| progress.get(client_order_id))
-                    .is_some_and(|progress| accepted_progress_matches(intent, progress));
-                (intent_requires_lookup(intent) && !has_matching_progress)
+                    .is_some();
+                (intent_requires_lookup(intent) && !has_open_evidence)
                     .then_some(client_order_id.clone())
             })
             .collect::<Vec<_>>();
@@ -2080,20 +2080,21 @@ where
                 .get(client_order_id)
                 .cloned()
                 .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
-            let accepted_progress = open_progress
+            let observed_progress = open_progress
                 .as_ref()
-                .and_then(|progress| progress.get(client_order_id))
-                .filter(|progress| accepted_progress_matches(&current_intent, progress));
-            let result = if let Some(progress) = accepted_progress {
-                ReconciliationResult::Accepted {
-                    exchange_order_id: progress.order.exchange_order_id.clone(),
-                }
-            } else if !intent_requires_lookup(&current_intent) {
+                .and_then(|progress| progress.get(client_order_id));
+            let result = if !intent_requires_lookup(&current_intent) {
                 ReconciliationResult::AlreadyFinal
             } else {
-                let lookup = lookup_results
-                    .remove(client_order_id)
-                    .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
+                // Positive open-order evidence takes precedence over negative lookups,
+                // including when the submission acknowledgement was lost.
+                let lookup = if let Some(progress) = observed_progress {
+                    Ok(OrderLookup::Found(progress.order.clone()))
+                } else {
+                    lookup_results
+                        .remove(client_order_id)
+                        .ok_or(RuntimeTickError::IntentLedgerMismatch)?
+                };
                 if let Ok(OrderLookup::Found(order)) = &lookup
                     && let Some(cumulative_quantity) = order.executed_quantity
                 {
@@ -2335,8 +2336,11 @@ where
                     )
                     .await;
             }
-            self.submit_ready_replacement_orders(&mut report, now_ms)
-                .await?;
+            self.submit_ready_replacement_orders(
+                &mut report,
+                advance_reference_time_ms(now_ms, tick_started.elapsed()),
+            )
+            .await?;
             self.validate_ledger_ownership()?;
             return Ok(report);
         }
@@ -2370,8 +2374,11 @@ where
                     )
                     .await;
             }
-            self.submit_ready_replacement_orders(&mut report, now_ms)
-                .await?;
+            self.submit_ready_replacement_orders(
+                &mut report,
+                advance_reference_time_ms(now_ms, tick_started.elapsed()),
+            )
+            .await?;
             self.validate_ledger_ownership()?;
         }
         if report.is_blocked() {
@@ -2476,7 +2483,11 @@ where
                 )
                 .await;
         }
-        self.submit_ready_orders(&mut report, now_ms).await?;
+        self.submit_ready_orders(
+            &mut report,
+            advance_reference_time_ms(now_ms, tick_started.elapsed()),
+        )
+        .await?;
         self.validate_ledger_ownership()?;
         if self.machine.store().snapshot().lifecycle == StrategyLifecycle::Failed {
             return self
@@ -3160,7 +3171,11 @@ where
                     });
                     return Ok(report);
                 }
-                self.submit_ready_orders(&mut report, now_ms).await?;
+                self.submit_ready_orders(
+                    &mut report,
+                    advance_reference_time_ms(now_ms, exit_started.elapsed()),
+                )
+                .await?;
                 if self.machine.store().snapshot().lifecycle == StrategyLifecycle::RiskExitRequested
                 {
                     report.blockers.push(RuntimeBlocker {
@@ -3334,6 +3349,7 @@ mod tests {
         placement_calls: Vec<OrderIntent>,
         next_placement_error: Option<PlacementError>,
         confirm_missing_orders: bool,
+        missing_exact_lookups: bool,
         active_placements: usize,
         maximum_concurrent_placements: usize,
         placement_delay: Option<Duration>,
@@ -3397,6 +3413,7 @@ mod tests {
                     placement_calls: Vec::new(),
                     next_placement_error: None,
                     confirm_missing_orders: false,
+                    missing_exact_lookups: false,
                     active_placements: 0,
                     maximum_concurrent_placements: 0,
                     placement_delay: None,
@@ -3967,12 +3984,16 @@ mod tests {
                     .max(state.active_order_lookups);
                 (
                     state.order_lookup_delay,
-                    state
-                        .orders
-                        .get(client_order_id)
-                        .cloned()
-                        .map(OrderLookup::Found)
-                        .unwrap_or(OrderLookup::NotFound),
+                    if state.missing_exact_lookups {
+                        OrderLookup::NotFound
+                    } else {
+                        state
+                            .orders
+                            .get(client_order_id)
+                            .cloned()
+                            .map(OrderLookup::Found)
+                            .unwrap_or(OrderLookup::NotFound)
+                    },
                 )
             };
             if let Some(delay) = delay {
@@ -6891,6 +6912,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_order_evidence_overrides_absence_and_stop_cancels_only_the_owned_order() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.fail_next_placement(PlacementError::Unknown {
+            message: "lost acknowledgement".into(),
+        });
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        runtime.tick(1_100).await.unwrap();
+        let intent = runtime
+            .intent_store()
+            .snapshot()
+            .intents
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let order = AuthoritativeOrder {
+            client_order_id: intent.client_order_id.clone(),
+            exchange_order_id: "late-visible".into(),
+            exchange: intent.exchange,
+            shape: intent.shape.clone(),
+            lifecycle: OrderLifecycle::Active(ActiveOrderStatus::New),
+            executed_quantity: Some(Decimal::ZERO),
+        };
+        {
+            let mut state = gateway.state.lock().unwrap();
+            state.confirm_missing_orders = true;
+            state.missing_exact_lookups = true;
+            state.open_progress_enabled = true;
+            state.cancellation_marks_terminal = true;
+            state
+                .orders
+                .insert(intent.client_order_id.clone(), order.clone());
+            state.executions.insert(
+                intent.client_order_id.clone(),
+                OrderExecutionSnapshot {
+                    order,
+                    cumulative_quantity: Decimal::ZERO,
+                    cumulative_quote: Decimal::ZERO,
+                    fees_by_asset: BTreeMap::new(),
+                    trades: vec![],
+                    order_time_ms: 1_100,
+                    update_time_ms: 1_100,
+                },
+            );
+            state.position_quantity = Decimal::new(-5, 1);
+            state.position_entry_price = Some(Decimal::new(194888, 2));
+        }
+        runtime.machine_mut().request_stop(1_250).unwrap();
+        let lookups_before = gateway.order_lookup_call_count();
+        let stopped = runtime.tick(11_100).await.unwrap();
+        assert!(!stopped.is_blocked(), "{stopped:?}");
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped
+        );
+        assert_eq!(gateway.placement_call_count(), 1);
+        assert_eq!(gateway.order_lookup_call_count(), lookups_before);
+        let state = gateway.state.lock().unwrap();
+        assert_eq!(
+            state.cancellation_calls,
+            vec![(intent.client_order_id, "late-visible".into())]
+        );
+        assert_eq!(state.position_quantity, Decimal::new(-5, 1));
+    }
+
+    #[tokio::test]
+    async fn unknown_timestamp_includes_slow_preflight_before_the_dispatch() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        gateway.fail_next_placement(PlacementError::Unknown {
+            message: "lost acknowledgement".into(),
+        });
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let gate = MarketGate::new();
+        gateway.state.lock().unwrap().market_gate = Some(gate.clone());
+        let task = tokio::spawn(async move {
+            runtime.tick(1_100).await.unwrap();
+            runtime
+        });
+        gate.wait_until_entered().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        gate.release();
+        let runtime = task.await.unwrap();
+        let intent = runtime
+            .intent_store()
+            .snapshot()
+            .intents
+            .values()
+            .next()
+            .unwrap();
+        assert!(matches!(intent.state, IntentState::SubmitUnknown { .. }));
+        assert!(intent.updated_at_ms >= 1_125, "{}", intent.updated_at_ms);
+    }
+
+    #[tokio::test]
     async fn confirmed_missing_opening_retries_the_same_intent_after_position_reconciliation() {
         let rules = rules();
         let gateway = MockGateway::new(rules.clone(), 1_100);
@@ -6903,8 +7028,8 @@ mod tests {
         let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
         runtime.tick(1_100).await.unwrap();
         assert!(runtime.tick(1_200).await.unwrap().is_blocked());
-        gateway.set_market_price(Decimal::new(1014, 0), 11_100);
-        let recovered = runtime.tick(11_100).await.unwrap();
+        gateway.set_market_price(Decimal::new(1014, 0), 12_000);
+        let recovered = runtime.tick(12_000).await.unwrap();
         assert!(!recovered.is_blocked(), "{recovered:?}");
         assert_eq!(gateway.placement_ids(), vec![id.clone(), id.clone()]);
         assert_eq!(recovered.submissions.len(), 1);
@@ -6912,6 +7037,7 @@ mod tests {
             runtime.intent_store().snapshot().intents[&id].state,
             IntentState::Accepted { .. }
         ));
+        assert!(runtime.intent_store().snapshot().intents[&id].created_at_ms >= 12_000);
     }
 
     #[tokio::test]
@@ -6945,7 +7071,7 @@ mod tests {
             .insert(manual_id.clone(), manual_order.clone());
         gateway.set_position(Decimal::new(-5, 1), Some(Decimal::new(194888, 2)));
         runtime.machine_mut().request_stop(1_250).unwrap();
-        let stopped = runtime.tick(11_100).await.unwrap();
+        let stopped = runtime.tick(12_000).await.unwrap();
         assert!(!stopped.is_blocked(), "{stopped:?}");
         assert_eq!(
             runtime.machine().store().snapshot().lifecycle,
@@ -6980,9 +7106,9 @@ mod tests {
             machine(config(None), &rules),
         );
         runtime.tick(1_100).await.unwrap();
-        gateway.set_market_price(Decimal::new(1014, 0), 11_100);
+        gateway.set_market_price(Decimal::new(1014, 0), 12_000);
         gateway.set_position(Decimal::new(-5, 1), Some(Decimal::new(194888, 2)));
-        let blocked = runtime.tick(11_100).await.unwrap();
+        let blocked = runtime.tick(12_000).await.unwrap();
         assert!(
             blocked
                 .blockers
@@ -6992,14 +7118,14 @@ mod tests {
         assert_eq!(gateway.placement_call_count(), 1);
         assert!(
             runtime
-                .tick_execution_event(11_101, None)
+                .tick_execution_event(12_001, None)
                 .await
                 .unwrap()
                 .submissions
                 .is_empty()
         );
-        runtime.machine_mut().request_stop(11_150).unwrap();
-        let stopped = runtime.tick(11_200).await.unwrap();
+        runtime.machine_mut().request_stop(12_050).unwrap();
+        let stopped = runtime.tick(12_100).await.unwrap();
         assert!(!stopped.is_blocked(), "{stopped:?}");
         assert_eq!(
             runtime.machine().store().snapshot().lifecycle,
