@@ -260,6 +260,11 @@ fn reconcile_found<S: IntentStore>(
     snapshot: AuthoritativeOrder,
     now_ms: u64,
 ) -> Result<ReconciliationResult, ReconciliationError> {
+    if matches!(intent.state, IntentState::RetryableNotSubmitted { .. }) {
+        // Reopen reconciliation for late positive evidence without placing an order
+        // or relaxing the ledger's retryable -> prepared transition invariant.
+        store.transition(&intent.client_order_id, IntentState::Prepared, now_ms)?;
+    }
     if let Some(message) = ownership_conflict(&intent, &snapshot) {
         if matches!(intent.state, IntentState::Terminal { .. }) {
             return Ok(ReconciliationResult::OwnershipConflict { message });
