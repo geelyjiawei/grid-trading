@@ -55,6 +55,7 @@ struct BinanceExecutionEvent {
     order_id: String,
     trade_id: Option<String>,
     event_time_ms: Option<u64>,
+    full_order_update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +68,7 @@ enum BinanceStreamEvent {
 #[derive(Debug, Default)]
 struct RecentBinanceExecutions {
     order: VecDeque<(String, String, String)>,
-    keys: BTreeSet<(String, String, String)>,
+    keys: BTreeMap<(String, String, String), bool>,
 }
 
 impl RecentBinanceExecutions {
@@ -80,9 +81,16 @@ impl RecentBinanceExecutions {
             event.order_id.clone(),
             trade_id.clone(),
         );
-        if !self.keys.insert(key.clone()) {
+        if let Some(full_seen) = self.keys.get_mut(&key) {
+            // TRADE_LITE can precede the auditable cache update. Wake once more
+            // when that full update arrives instead of deferring to the REST tick.
+            if event.full_order_update && !*full_seen {
+                *full_seen = true;
+                return true;
+            }
             return false;
         }
+        self.keys.insert(key.clone(), event.full_order_update);
         self.order.push_back(key);
         while self.order.len() > RECENT_BINANCE_EXECUTION_CAPACITY {
             if let Some(expired) = self.order.pop_front() {
@@ -613,6 +621,14 @@ pub(crate) fn publish_execution_wakeup(
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or_default();
+    tracing::info!(
+        exchange = ?exchange,
+        symbol = symbol.as_str(),
+        exchange_order_id = exchange_order_id.as_deref().unwrap_or("-"),
+        exchange_event_time_ms,
+        observed_at_ms,
+        "execution stream published wakeup"
+    );
     let _ = execution_wakeup_sender().send(ExecutionWakeup {
         exchange,
         symbol,
@@ -878,6 +894,7 @@ fn parse_binance_stream_event_value(message: &Value) -> BinanceStreamEvent {
                 order_id,
                 trade_id: value_identifier(message.get("t")),
                 event_time_ms: message.get("E").and_then(Value::as_u64),
+                full_order_update: false,
             })
         }
         Some("ORDER_TRADE_UPDATE") => {
@@ -900,6 +917,7 @@ fn parse_binance_stream_event_value(message: &Value) -> BinanceStreamEvent {
                 order_id,
                 trade_id: value_identifier(order.get("t")),
                 event_time_ms: message.get("E").and_then(Value::as_u64),
+                full_order_update: true,
             })
         }
         Some("listenKeyExpired") => BinanceStreamEvent::ListenKeyExpired,
@@ -1405,6 +1423,7 @@ mod tests {
                 order_id,
                 trade_id: Some(trade_id),
                 event_time_ms: Some(123),
+                full_order_update: false,
             }) if symbol == "MUUSDT" && order_id == "789" && trade_id == "456"
         ));
     }
@@ -1424,20 +1443,31 @@ mod tests {
     }
 
     #[test]
-    fn binance_deduplicates_trade_lite_and_order_update_for_the_same_fill() {
+    fn binance_full_update_wakes_again_after_lite_but_duplicates_do_not() {
         let mut recent = RecentBinanceExecutions::default();
-        let lite = BinanceExecutionEvent {
-            symbol: "MUUSDT".into(),
-            order_id: "789".into(),
-            trade_id: Some("456".into()),
-            event_time_ms: Some(123),
+        let BinanceStreamEvent::Execution(lite) = parse_binance_stream_event(
+            r#"{"e":"TRADE_LITE","E":123,"s":"MUUSDT","l":"0.25","t":456,"i":789}"#,
+        ) else {
+            panic!("expected lite fill");
         };
-        let full = BinanceExecutionEvent {
-            event_time_ms: Some(124),
-            ..lite.clone()
+        let BinanceStreamEvent::Execution(full) = parse_binance_stream_event(
+            r#"{"e":"ORDER_TRADE_UPDATE","E":124,"o":{"x":"TRADE","l":"0.25","s":"MUUSDT","t":456,"i":789}}"#,
+        ) else {
+            panic!("expected full fill");
         };
         assert!(recent.is_new(&lite));
+        assert!(!recent.is_new(&lite));
+        assert!(
+            recent.is_new(&full),
+            "the cache-ready full update must not be lost after an early lite wakeup"
+        );
         assert!(!recent.is_new(&full));
+        assert!(!recent.is_new(&lite));
+
+        let mut reverse = RecentBinanceExecutions::default();
+        assert!(reverse.is_new(&full));
+        assert!(!reverse.is_new(&lite));
+        assert!(!reverse.is_new(&full));
     }
 
     #[test]

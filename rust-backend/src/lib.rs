@@ -378,7 +378,7 @@ impl ExecutionDispatchState {
 
 fn execution_dispatch_concurrency(pending: &PendingExecutionWakeups) -> usize {
     match pending.event.exchange {
-        Exchange::TradeXyz if !pending.requires_full_scan => {
+        Exchange::Binance | Exchange::TradeXyz if !pending.requires_full_scan => {
             MAX_CONCURRENT_EXECUTION_DISPATCHES_PER_MARKET
         }
         Exchange::Binance | Exchange::Aster | Exchange::Bybit | Exchange::TradeXyz => 1,
@@ -633,6 +633,7 @@ fn log_runtime_advance(
                     run_id = advance.run_id.as_str(),
                     exchange = ?event.map(|event| event.exchange),
                     symbol = event.map(|event| event.symbol.as_str()).unwrap_or("-"),
+                    exchange_order_id = event.and_then(|event| event.exchange_order_id.as_deref()).unwrap_or("-"),
                     execution_syncs = report.execution_syncs,
                     submissions = report.submissions.len(),
                     accepted_submissions,
@@ -1154,12 +1155,12 @@ mod tests {
     }
 
     #[test]
-    fn binance_dispatch_keeps_a_single_in_flight_batch() {
+    fn aster_dispatch_keeps_a_single_in_flight_batch() {
         let mut dispatch = ExecutionDispatchState::default();
         let mut first = execution_wakeup(Some("41"), Some(1_000), 1_010);
-        first.exchange = Exchange::Binance;
+        first.exchange = Exchange::Aster;
         let mut second = execution_wakeup(Some("42"), Some(1_001), 1_011);
-        second.exchange = Exchange::Binance;
+        second.exchange = Exchange::Aster;
         assert!(
             dispatch
                 .dispatch_or_queue(PendingExecutionWakeups::new(first))
@@ -1173,6 +1174,41 @@ mod tests {
 
         let promoted = dispatch.complete().expect("queued wakeup must be promoted");
         assert_eq!(promoted.event_count, 1);
+        assert_eq!(dispatch.in_flight, 1);
+        assert!(dispatch.complete().is_none());
+        assert!(dispatch.is_idle());
+    }
+
+    #[test]
+    fn binance_dispatch_pipelines_exact_bursts_but_drains_before_full_scan() {
+        let mut dispatch = ExecutionDispatchState::default();
+        for order_id in ["41", "42", "43", "44"] {
+            let mut event = execution_wakeup(Some(order_id), Some(1_000), 1_010);
+            event.exchange = Exchange::Binance;
+            assert!(
+                dispatch
+                    .dispatch_or_queue(PendingExecutionWakeups::new(event))
+                    .is_some()
+            );
+        }
+        let mut overflow = execution_wakeup(Some("45"), Some(1_001), 1_011);
+        overflow.exchange = Exchange::Binance;
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(overflow))
+                .is_none()
+        );
+        let mut full_scan = execution_wakeup(None, Some(1_002), 1_012);
+        full_scan.exchange = Exchange::Binance;
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(full_scan))
+                .is_none()
+        );
+        for _ in 0..3 {
+            assert!(dispatch.complete().is_none());
+        }
+        assert!(dispatch.complete().unwrap().requires_full_scan);
         assert_eq!(dispatch.in_flight, 1);
         assert!(dispatch.complete().is_none());
         assert!(dispatch.is_idle());

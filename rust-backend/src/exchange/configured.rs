@@ -48,7 +48,7 @@ type TradeXyzGateway =
     TradeXyzAdapter<HyperliquidRequestGovernor<ReqwestTransport>, MonotonicMillisecondNonce>;
 
 // Leave account-wide headroom below each exchange's published order limit.
-const BINANCE_ASTER_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(60);
+const ASTER_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(60);
 const BYBIT_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(110);
 const TRADE_XYZ_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(75);
 const BINANCE_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
@@ -147,7 +147,11 @@ struct OrderPlacementPacer {
 impl OrderPlacementPacer {
     fn for_exchange(exchange: Exchange) -> Self {
         let interval = match exchange {
-            Exchange::Binance | Exchange::Aster => BINANCE_ASTER_ORDER_PLACEMENT_INTERVAL,
+            // Binance REST and WebSocket already reserve the same rolling order
+            // windows in BinanceRequestGovernor. A second fixed pacer serializes
+            // a valid fill burst even when that account budget is almost empty.
+            Exchange::Binance => Duration::ZERO,
+            Exchange::Aster => ASTER_ORDER_PLACEMENT_INTERVAL,
             Exchange::Bybit => BYBIT_ORDER_PLACEMENT_INTERVAL,
             Exchange::TradeXyz => TRADE_XYZ_ORDER_PLACEMENT_INTERVAL,
         };
@@ -1322,6 +1326,18 @@ mod tests {
             clone.order_placement_pacer.reserve(now),
             BYBIT_ORDER_PLACEMENT_INTERVAL
         );
+    }
+
+    #[test]
+    fn binance_burst_does_not_duplicate_the_shared_exchange_window_budget() {
+        let pacer = OrderPlacementPacer::for_exchange(Exchange::Binance);
+        let now = Instant::now();
+        for _ in 0..20 {
+            assert_eq!(pacer.reserve(now), Duration::ZERO);
+        }
+        let aster = OrderPlacementPacer::for_exchange(Exchange::Aster);
+        assert_eq!(aster.reserve(now), Duration::ZERO);
+        assert_eq!(aster.reserve(now), Duration::from_millis(60));
     }
 
     #[test]

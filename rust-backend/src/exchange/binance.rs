@@ -294,6 +294,7 @@ async fn run_binance_order_stream(
                         break;
                     }
                     tracing::info!(
+                        websocket_request_id = id.as_str(),
                         websocket_queue_ms = queue_ms,
                         websocket_write_ms = u64::try_from(write_started.elapsed().as_millis())
                             .unwrap_or(u64::MAX),
@@ -1126,6 +1127,7 @@ where
             match relay.post(request).await {
                 Ok(response) => {
                     tracing::info!(
+                        client_order_id = intent.client_order_id.as_str(),
                         websocket_roundtrip_ms =
                             u64::try_from(websocket_started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX),

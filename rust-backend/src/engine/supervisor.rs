@@ -344,7 +344,7 @@ impl<G> RuntimeRegistry<G> {
             "execution event acquired strategy lock"
         );
         let effective_now_ms = now_ms.max(strategy.updated_at_ms());
-        if exchange == Exchange::TradeXyz
+        if matches!(exchange, Exchange::Binance | Exchange::TradeXyz)
             && let Some(exchange_order_ids) = exchange_order_ids
         {
             let prepared = match strategy
