@@ -1,5 +1,16 @@
 # Vue + Rust migration
 
+## Current Production Policy (2026-10-17)
+
+The production trading backend is Rust + Axum only, with the Vue frontend.
+The legacy Python backend is abandoned: do not start it, deploy it, or use it as
+a rollback target. Rollback means selecting a previously verified Rust image
+with compatible persisted state. Legacy Python sources and migration scripts
+are retained as historical references, not as an alternative execution engine.
+The original migration/cutover notes below describe historical safeguards and
+must not override this current policy. One-off maintenance or compatibility
+test tooling is not part of the trading backend or its runtime image.
+
 ## Required production architecture
 
 - Frontend: Vue 3 + TypeScript from `vue-frontend/`.

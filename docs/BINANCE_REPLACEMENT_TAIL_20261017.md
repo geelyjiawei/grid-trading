@@ -51,10 +51,11 @@ cannot establish the exact network/queue/persistence split for every order.
    steps. `SharedConfiguredExchangeGateway` imposed a 60 ms placement pacer on
    top of Binance's existing shared REST/WebSocket rolling-window budget. Twenty
    reservations at one instant mechanically added 1,140 ms to the last slot.
-2. Binance allowed only one event dispatch per market and held the strategy lock
-   until exchange acknowledgements completed. An unrelated pending replacement
-   therefore delayed later exact execution processing. The already-existing
-   durable prepare/place/commit pipeline was used only for TRADE.XYZ.
+2. Execution-critical REST order/trade snapshots also shared the ordinary-query
+   60 ms pacing deadline despite having separate bounded network lanes and the
+   same weighted rolling-window protection. A cold 20-order fill burst can need
+   40 detail/trade reads, mechanically adding about 2.4 seconds before accounting
+   and replacement placement even after the outer placement pacer is removed.
 3. Trade-ID deduplication suppressed `ORDER_TRADE_UPDATE` after `TRADE_LITE` for
    the same fill. The lite wakeup can observe the previous cached snapshot; when
    the full cache update arrives its wakeup was discarded, leaving a periodic
@@ -68,6 +69,10 @@ cannot establish the exact network/queue/persistence split for every order.
   pacing are unchanged. Binance's shared 10-second/minute budgets, 75% headroom,
   exchange-provided limit updates and cooldowns remain enforced below the adapter.
   REST fallback still uses its existing request governor.
+- Apply the REST governor's fixed minimum interval only to ordinary queries.
+  Critical execution/order requests still reserve every weight/order unit, check
+  the same cooldowns and rolling windows, and use the same four-request in-flight
+  cap. They do not consume or wait for the ordinary-query spacing deadline.
 - Keep Binance event batches serialized per market so a child fill cannot
   overtake persistence of its parent's placement acknowledgement. The existing
   within-batch placement concurrency remains four; without the redundant pacer
@@ -88,7 +93,9 @@ Limits are window budgets, not a mandatory 60 ms interval between every order.
 
 Regression tests cover a 20-order pacer burst, Binance child-fill deferral until
 the parent acknowledgement, lite/full ordering and duplicates, and TRADE.XYZ's
-existing stop and duplicate-fill behavior during acknowledgement. Existing
+existing stop and duplicate-fill behavior during acknowledgement. Additional
+tests exercise a 20-snapshot critical burst behind a reserved normal query
+deadline and prove ordinary-query spacing is unchanged. Existing
 quantity conservation, ownership, unknown-outcome and rate-limit suites remain
 release gates. Local Windows file-backed tests have an existing atomic directory
 publication permission failure; the full Linux CI suite is authoritative for

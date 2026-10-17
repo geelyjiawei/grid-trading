@@ -569,14 +569,20 @@ where
                 return Ok(binance_cooldown_response(cooldown));
             }
 
-            if let Some(next_request_at) = state.next_request_at
+            if priority == BinanceRequestPriority::Normal
+                && let Some(next_request_at) = state.next_request_at
                 && next_request_at > now
             {
                 tokio::time::sleep(next_request_at.saturating_duration_since(now)).await;
             }
 
             let requested_at = Instant::now();
-            state.next_request_at = Some(requested_at + self.minimum_interval);
+            // Critical traffic already has rolling weight/order reservations and
+            // a bounded network lane. Ordinary-query spacing must not serialize
+            // the order/trade snapshots needed to replace a burst of fills.
+            if priority == BinanceRequestPriority::Normal {
+                state.next_request_at = Some(requested_at + self.minimum_interval);
+            }
             state.usage.push_back(BinanceUsageEvent {
                 at: requested_at,
                 cost: request_cost,
@@ -2019,6 +2025,52 @@ mod tests {
         let cooldown_until = state.cooldown_until.unwrap();
         assert!(cooldown_until >= before + Duration::from_secs(38));
         assert!(cooldown_until <= Instant::now() + Duration::from_secs(39));
+    }
+
+    #[tokio::test]
+    async fn binance_critical_burst_uses_window_budgets_without_normal_spacing() {
+        let transport = ScriptedTransport::new((0..20).map(|_| HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }));
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::from_millis(60));
+        let normal_reserved_at = Instant::now() + Duration::from_secs(5);
+        governor.state.lock().await.next_request_at = Some(normal_reserved_at);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            for _ in 0..20 {
+                let response = governor
+                    .execute(symbol_request(HttpMethod::Get, "/fapi/v1/userTrades"))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status, 200);
+            }
+        })
+        .await
+        .expect("a valid execution-snapshot burst must not wait for ordinary-query spacing");
+        assert_eq!(transport.call_count(), 20);
+        let state = governor.state.lock().await;
+        assert_eq!(state.next_request_at, Some(normal_reserved_at));
+        assert_eq!(
+            state.usage.len(),
+            20,
+            "critical reads must still reserve their full request weight"
+        );
+    }
+
+    #[tokio::test]
+    async fn binance_normal_queries_keep_the_reserved_spacing() {
+        let transport = ScriptedTransport::new([HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }]);
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::from_millis(60));
+        governor.state.lock().await.next_request_at = Some(Instant::now() + Duration::from_secs(5));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), governor.execute(test_request()))
+                .await
+                .is_err()
+        );
+        assert_eq!(transport.call_count(), 0);
     }
 
     #[tokio::test]
