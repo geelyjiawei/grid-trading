@@ -378,7 +378,7 @@ impl ExecutionDispatchState {
 
 fn execution_dispatch_concurrency(pending: &PendingExecutionWakeups) -> usize {
     match pending.event.exchange {
-        Exchange::Binance | Exchange::TradeXyz if !pending.requires_full_scan => {
+        Exchange::TradeXyz if !pending.requires_full_scan => {
             MAX_CONCURRENT_EXECUTION_DISPATCHES_PER_MARKET
         }
         Exchange::Binance | Exchange::Aster | Exchange::Bybit | Exchange::TradeXyz => 1,
@@ -1155,12 +1155,12 @@ mod tests {
     }
 
     #[test]
-    fn aster_dispatch_keeps_a_single_in_flight_batch() {
+    fn binance_dispatch_keeps_a_single_in_flight_batch() {
         let mut dispatch = ExecutionDispatchState::default();
         let mut first = execution_wakeup(Some("41"), Some(1_000), 1_010);
-        first.exchange = Exchange::Aster;
+        first.exchange = Exchange::Binance;
         let mut second = execution_wakeup(Some("42"), Some(1_001), 1_011);
-        second.exchange = Exchange::Aster;
+        second.exchange = Exchange::Binance;
         assert!(
             dispatch
                 .dispatch_or_queue(PendingExecutionWakeups::new(first))
@@ -1180,35 +1180,37 @@ mod tests {
     }
 
     #[test]
-    fn binance_dispatch_pipelines_exact_bursts_but_drains_before_full_scan() {
+    fn binance_child_fill_waits_for_the_parent_batch_acknowledgement() {
         let mut dispatch = ExecutionDispatchState::default();
-        for order_id in ["41", "42", "43", "44"] {
-            let mut event = execution_wakeup(Some(order_id), Some(1_000), 1_010);
-            event.exchange = Exchange::Binance;
-            assert!(
-                dispatch
-                    .dispatch_or_queue(PendingExecutionWakeups::new(event))
-                    .is_some()
-            );
-        }
-        let mut overflow = execution_wakeup(Some("45"), Some(1_001), 1_011);
-        overflow.exchange = Exchange::Binance;
+        let mut parent = execution_wakeup(Some("41"), Some(1_000), 1_010);
+        parent.exchange = Exchange::Binance;
         assert!(
             dispatch
-                .dispatch_or_queue(PendingExecutionWakeups::new(overflow))
-                .is_none()
+                .dispatch_or_queue(PendingExecutionWakeups::new(parent))
+                .is_some()
         );
-        let mut full_scan = execution_wakeup(None, Some(1_002), 1_012);
-        full_scan.exchange = Exchange::Binance;
+        let mut child = execution_wakeup(Some("new_child"), Some(1_001), 1_011);
+        child.exchange = Exchange::Binance;
         assert!(
             dispatch
-                .dispatch_or_queue(PendingExecutionWakeups::new(full_scan))
+                .dispatch_or_queue(PendingExecutionWakeups::new(child))
                 .is_none()
         );
-        for _ in 0..3 {
-            assert!(dispatch.complete().is_none());
-        }
-        assert!(dispatch.complete().unwrap().requires_full_scan);
+        let mut full = execution_wakeup(Some("new_child"), Some(1_002), 1_012);
+        full.exchange = Exchange::Binance;
+        assert!(
+            dispatch
+                .dispatch_or_queue(PendingExecutionWakeups::new(full))
+                .is_none()
+        );
+        let promoted = dispatch
+            .complete()
+            .expect("the child fill must survive until the parent ACK commits");
+        assert_eq!(promoted.event_count, 2);
+        assert_eq!(
+            promoted.exchange_order_ids.into_iter().collect::<Vec<_>>(),
+            vec!["new_child"]
+        );
         assert_eq!(dispatch.in_flight, 1);
         assert!(dispatch.complete().is_none());
         assert!(dispatch.is_idle());

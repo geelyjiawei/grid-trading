@@ -5597,37 +5597,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn registry_pipelines_trade_xyz_replacements_and_preserves_stop_during_ack() {
-        registry_pipelines_replacements_and_preserves_stop_during_ack(
-            Exchange::TradeXyz,
-            "MUUSDC",
-            "USDC",
-        )
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn registry_pipelines_binance_replacements_and_preserves_stop_during_ack() {
-        registry_pipelines_replacements_and_preserves_stop_during_ack(
-            Exchange::Binance,
-            "MUUSDT",
-            "USDT",
-        )
-        .await;
-    }
-
-    async fn registry_pipelines_replacements_and_preserves_stop_during_ack(
-        exchange: Exchange,
-        symbol: &str,
-        quote: &str,
-    ) {
         let directory = tempdir().unwrap();
         let gateway = MockGateway::new(rules(), 1_100)
-            .with_exchange(exchange)
-            .with_symbol(symbol);
+            .with_exchange(Exchange::TradeXyz)
+            .with_symbol("MUUSDC");
         let run_id = StrategyRunId::parse("pipe0001").unwrap();
         let mut trade_config = config(None);
-        trade_config.exchange = Some(exchange);
-        trade_config.symbol = symbol.into();
+        trade_config.exchange = Some(Exchange::TradeXyz);
+        trade_config.symbol = "MUUSDC".into();
         let prepared = prepare_leased_file_strategy(
             gateway.clone(),
             directory.path(),
@@ -5660,7 +5637,7 @@ mod tests {
             &opening_id,
             Decimal::new(1014, 0),
             Decimal::new(5, 2),
-            quote,
+            "USDC",
         );
         gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
         let PreparedStrategyStep::Active(deployment) =
@@ -5682,7 +5659,7 @@ mod tests {
                 &intent.client_order_id,
                 intent.shape.price.unwrap(),
                 Decimal::new(1, 2),
-                quote,
+                "USDC",
             );
         }
         let added_quantity = source_intents
@@ -5699,16 +5676,14 @@ mod tests {
 
         let first_registry = Arc::clone(&registry);
         let second_registry = Arc::clone(&registry);
-        let first_symbol = symbol.to_owned();
-        let second_symbol = symbol.to_owned();
         let first = tokio::spawn(async move {
             first_registry
-                .advance_execution_events(exchange, &first_symbol, Some(&first_target), 1_300)
+                .advance_execution_events(Exchange::TradeXyz, "MUUSDC", Some(&first_target), 1_300)
                 .await
         });
         let second = tokio::spawn(async move {
             second_registry
-                .advance_execution_events(exchange, &second_symbol, Some(&second_target), 1_301)
+                .advance_execution_events(Exchange::TradeXyz, "MUUSDC", Some(&second_target), 1_301)
                 .await
         });
         for _ in 0..50 {
@@ -5721,7 +5696,12 @@ mod tests {
         let duplicate_target = vec![gateway.exchange_order_id(&source_intents[0].client_order_id)];
         let (_, duplicate) = tokio::time::timeout(
             Duration::from_millis(100),
-            registry.advance_execution_events(exchange, symbol, Some(&duplicate_target), 1_302),
+            registry.advance_execution_events(
+                Exchange::TradeXyz,
+                "MUUSDC",
+                Some(&duplicate_target),
+                1_302,
+            ),
         )
         .await
         .expect("a duplicate fill must not wait for another placement acknowledgement")

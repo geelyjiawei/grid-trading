@@ -68,11 +68,13 @@ cannot establish the exact network/queue/persistence split for every order.
   pacing are unchanged. Binance's shared 10-second/minute budgets, 75% headroom,
   exchange-provided limit updates and cooldowns remain enforced below the adapter.
   REST fallback still uses its existing request governor.
-- Pipeline up to four exact Binance event batches per market. Durable accounting
-  and prepared intents still happen under one strategy lock before network I/O;
-  acknowledgements are committed under that same lock. An execution waiter stays
-  registered throughout I/O so periodic reconciliation cannot race the prepared
-  intents. Unspecified-order/full-scan events remain serialized.
+- Keep Binance event batches serialized per market so a child fill cannot
+  overtake persistence of its parent's placement acknowledgement. The existing
+  within-batch placement concurrency remains four; without the redundant pacer
+  this can submit a valid burst without adding 60 ms for every later order.
+  Cross-batch pipelining was evaluated but rejected at review because an early
+  child fill could otherwise be dropped before its exchange order ID is bound.
+  TRADE.XYZ's pre-existing dispatch pipeline is not expanded by this release.
 - Permit one full-update wakeup after an earlier lite wakeup; suppress repeated
   lite/full events and late lite events after a full update. Trade-ID accounting,
   obligation allocation and cell-capacity validation remain unchanged.
@@ -84,9 +86,9 @@ Limits are window budgets, not a mandatory 60 ms interval between every order.
 
 ## Verification and release gates
 
-Regression tests cover a 20-order pacer burst, bounded Binance dispatch/full-scan
-draining, lite/full ordering and duplicates, concurrent durable preparation,
-duplicate fills during acknowledgement, and stop during acknowledgement. Existing
+Regression tests cover a 20-order pacer burst, Binance child-fill deferral until
+the parent acknowledgement, lite/full ordering and duplicates, and TRADE.XYZ's
+existing stop and duplicate-fill behavior during acknowledgement. Existing
 quantity conservation, ownership, unknown-outcome and rate-limit suites remain
 release gates. Local Windows file-backed tests have an existing atomic directory
 publication permission failure; the full Linux CI suite is authoritative for
