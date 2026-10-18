@@ -526,7 +526,8 @@ impl<G> RuntimeRegistry<G> {
             strategy_lock_wait_ms,
             "execution event acquired strategy lock"
         );
-        let effective_now_ms = now_ms.max(strategy.updated_at_ms());
+        let effective_now_ms =
+            advance_reference_time_ms(now_ms, lock_started.elapsed()).max(strategy.updated_at_ms());
         if matches!(exchange, Exchange::TradeXyz | Exchange::Bybit)
             && let Some(exchange_order_ids) = exchange_order_ids
         {

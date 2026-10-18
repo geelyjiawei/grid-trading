@@ -61,7 +61,7 @@ Files: `rust-backend/src/engine/supervisor.rs`, relevant runtime tests, and `rus
 - [x] Write a failing regression proving Bybit placement does not retain the strategy mutex while awaiting network ACK.
 - [x] Reuse the TradeXyz prepare/place/complete path for Bybit; retain execution reservation while the lock is released.
 - [x] Enable bounded read-only periodic preemption for Bybit so GET work can yield to execution/stop without abandoning writes or starving audits.
-- [ ] Test same-level fill bursts, stop during ACK, exact quantities, and unchanged manual baseline.
+- [x] Test same-level fill bursts, stop during ACK, exact quantities, and unchanged manual baseline.
 
 ### 4. Verification, Release, and Measurement
 
@@ -79,3 +79,5 @@ Files: `rust-backend/src/engine/supervisor.rs`, relevant runtime tests, and `rus
 - Final scoped adapter/codec/real local WebSocket transport tests: 54 passed, 0 failed. Realtime/cache tests: 46 passed, 0 failed, including all 24 placement/order/trade arrival permutations and epoch-bound REST seeds.
 - Fresh whole-workspace formatting and strict Clippy (`--workspace --all-targets -- -D warnings`) pass. Full native-Linux CI is still the release gate.
 - Independent whole-bundle review found no confirmed introduced Rust defect. Its rollout acceptance finding was repaired with a RED-to-GREEN test: manual-account mismatches now hold acceptance before reporting a successful deployment, with no stale ledger restore or corrective trades.
+- Release `3fdb129` passed native Linux CI `39136229884` (897 Rust tests, zero failures), Vue/container/compatibility gates, offline candidate-state validation, and isolated live Bybit GET/WS-authentication checks. It was deployed at 2026-10-18 22:37:19 +08:00. Backlogged exchange executions were recovered by normal Rust reconciliation; position delta returned to zero, with protected manual account observations unchanged.
+- Startup catch-up exposed an additional clock boundary: batch ACKs persisted with elapsed network time, while strategy synchronization used the pre-submit timestamp. `bybit_immediate_fill_after_delayed_batch_keeps_ledger_clock_monotonic` reproduced `IntentLedger(TimestampRegression)` before the fix, then passed with the strategy clock advanced to persisted ACK time. Registry execution-entry time also includes mutex wait. Quantity/duplicate/manual ownership checks remain unchanged. A fresh exact-SHA Linux image and post-deployment measurement are required for this follow-up.

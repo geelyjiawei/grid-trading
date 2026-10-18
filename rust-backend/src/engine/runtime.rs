@@ -2905,7 +2905,14 @@ where
                         .ok_or(RuntimeTickError::IntentLedgerMismatch)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let transitions = self.machine.synchronize_intents(&persisted, now_ms)?;
+            // Batch acknowledgements include network time; the strategy clock must
+            // not lag their durable intent clock when an immediate fill is queued.
+            let synchronized_at_ms = persisted
+                .iter()
+                .fold(now_ms, |time, intent| time.max(intent.updated_at_ms));
+            let transitions = self
+                .machine
+                .synchronize_intents(&persisted, synchronized_at_ms)?;
             for ((client_order_id, result), transition) in submissions.into_iter().zip(transitions)
             {
                 report.submissions.push(RuntimeSubmission {
@@ -6794,6 +6801,64 @@ mod tests {
         assert!(stable.submissions.is_empty(), "{stable:?}");
         assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
         assert_eq!(gateway.cancellation_call_count(), cancellations_before_fill);
+    }
+
+    #[tokio::test]
+    async fn bybit_immediate_fill_after_delayed_batch_keeps_ledger_clock_monotonic() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100).with_exchange(Exchange::Bybit);
+        let mut cfg = config(None);
+        cfg.exchange = Some(Exchange::Bybit);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(cfg, &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        gateway.fill_order(&source_id, source_shape.price.unwrap(), Decimal::ZERO);
+        let current = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .grid_position_net_quantity;
+        gateway.set_position(current - source_shape.quantity, Some(Decimal::new(1014, 0)));
+        gateway.measure_delayed_placements(Duration::from_millis(50));
+        let report = runtime.tick(1_300).await.unwrap();
+        assert!(!report.is_blocked(), "{report:?}");
+        assert_eq!(report.submissions.len(), 1);
+        let counter_id = report.submissions[0].client_order_id.clone();
+        let acknowledged_at = runtime.intent_store().snapshot().intents[&counter_id].updated_at_ms;
+        assert!(acknowledged_at >= 1_350);
+        let counter = runtime.machine().store().snapshot().orders[&counter_id].clone();
+        gateway.fill_order(&counter_id, counter.shape.price.unwrap(), Decimal::ZERO);
+        let before = gateway.placement_call_count();
+        let event_time = runtime.machine().store().snapshot().updated_at_ms + 1;
+        let result = runtime
+            .tick_execution_event(event_time, counter.exchange_order_id.as_deref())
+            .await
+            .expect("a fill queued during batch acknowledgement must not regress the intent clock");
+        assert!(!result.is_blocked(), "{result:?}");
+        assert_eq!(result.submissions.len(), 1);
+        let state = runtime.machine().store().snapshot();
+        assert!(state.updated_at_ms >= acknowledged_at);
+        assert_eq!(
+            state.orders[&result.submissions[0].client_order_id]
+                .shape
+                .quantity,
+            source_shape.quantity
+        );
+        assert_eq!(state.baseline.signed_quantity, Decimal::ZERO);
+        let duplicate = runtime
+            .tick_execution_event(
+                runtime.machine().store().snapshot().updated_at_ms + 1,
+                counter.exchange_order_id.as_deref(),
+            )
+            .await
+            .unwrap();
+        assert!(duplicate.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), before + 1);
+        assert_eq!(gateway.cancellation_call_count(), 0);
     }
 
     #[tokio::test]
