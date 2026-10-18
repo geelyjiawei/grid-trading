@@ -1874,6 +1874,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bybit_start_signed_exact_symbol_preserves_cursor_and_fractional_leverage() {
+        let transport = MockTransport::default();
+        transport.push(ok(
+            r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"QUSDT","lastPrice":"0.10413","markPrice":"0.104129"}]},"time":1700000000123}"#,
+        ));
+        transport.push(ok(
+            r#"{"retCode":0,"result":{"category":"linear","nextPageCursor":"QUSDT%2C0","list":[{"symbol":"QUSDT","positionIdx":0,"side":"","size":"0","avgPrice":"0","markPrice":"0.104129","unrealisedPnl":"","leverage":"12.5","positionStatus":"Normal","updatedTime":"1792296317559"}]},"time":1700000000123}"#,
+        ));
+        // Continuation placeholders must not overwrite the exact-symbol response.
+        transport.push(ok(
+            r#"{"retCode":0,"result":{"category":"linear","nextPageCursor":"","list":[{"symbol":"QUSDT","positionIdx":0,"side":"","size":"0","avgPrice":"","markPrice":"","unrealisedPnl":"","leverage":"10","positionStatus":"","updatedTime":""}]},"time":1700000000123}"#,
+        ));
+        let snapshot = adapter(transport.clone())
+            .position_snapshot(Exchange::Bybit, "qusdt")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.one_way_position().unwrap(), (Decimal::ZERO, None));
+        assert_eq!(
+            snapshot.one_way_leverage_decimal().unwrap(),
+            Decimal::new(125, 1)
+        );
+        assert_eq!(snapshot.legs[0].mark_price, Decimal::new(104129, 6));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == HttpMethod::Get)
+        );
+        assert_eq!(requests[1].path, "/v5/position/list");
+        assert_eq!(
+            requests[1].query,
+            vec![
+                ("category".into(), "linear".into()),
+                ("symbol".into(), "QUSDT".into())
+            ]
+        );
+        assert!(
+            requests[1]
+                .headers
+                .iter()
+                .any(|(name, _)| name == "X-BAPI-SIGN")
+        );
+    }
+
+    #[tokio::test]
     async fn signed_position_snapshot_preserves_old_short_and_detects_hedge_mode() {
         let short_transport = MockTransport::default();
         short_transport.push(ok(

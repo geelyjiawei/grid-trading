@@ -598,9 +598,9 @@ pub(super) fn parse_position_snapshot(
     let root = success_root(body)?;
     let result = result_object(&root)?;
     require_category(result)?;
-    if optional_string(result, "nextPageCursor")?.is_some_and(|cursor| !cursor.is_empty()) {
-        return Err(BybitCodecError::DuplicateRecord);
-    }
+    // This is an exact-symbol query; a cursor is metadata, not a duplicate identity.
+    // Uniqueness and mode completeness are checked using the bounded position indexes.
+    optional_string(result, "nextPageCursor")?;
     let rows = required_array(result, "list")?;
     let mut legs = Vec::new();
     let mut indexes = BTreeSet::new();
@@ -646,7 +646,10 @@ pub(super) fn parse_position_snapshot(
             _ => return Err(BybitCodecError::InvalidField("markPrice")),
         };
         let unrealized_profit = optional_decimal(row, "unrealisedPnl")?.unwrap_or(Decimal::ZERO);
-        let leverage = optional_positive_u16(row, "leverage")?;
+        let leverage = optional_decimal(row, "leverage")?;
+        if leverage.is_some_and(|value| value <= Decimal::ZERO) {
+            return Err(BybitCodecError::InvalidField("leverage"));
+        }
         legs.push(PositionLeg {
             side,
             signed_quantity,
@@ -823,23 +826,6 @@ fn optional_decimal(
             .and_then(|text| text.parse::<Decimal>().ok())
             .map(Some)
             .ok_or(BybitCodecError::InvalidField(field)),
-    }
-}
-
-fn optional_positive_u16(
-    value: &Value,
-    field: &'static str,
-) -> Result<Option<u16>, BybitCodecError> {
-    match value.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) if text.is_empty() => Ok(None),
-        Some(item) => {
-            let leverage = scalar_text(item)
-                .and_then(|text| text.parse::<u16>().ok())
-                .filter(|leverage| *leverage > 0)
-                .ok_or(BybitCodecError::InvalidField(field))?;
-            Ok(Some(leverage))
-        }
     }
 }
 
@@ -1108,6 +1094,89 @@ mod tests {
             (Decimal::new(-3, 0), Some(Decimal::new(1011, 0)))
         );
         assert_eq!(position.one_way_leverage().unwrap(), 5);
+    }
+
+    #[test]
+    fn bybit_start_position_cursor_is_not_a_duplicate_record() {
+        let position = parse_position_snapshot(
+            r#"{"retCode":0,"result":{"category":"linear","nextPageCursor":"QUSDT%2C0","list":[{"symbol":"QUSDT","positionIdx":0,"side":"","size":"0","avgPrice":"0","markPrice":"0.104129","unrealisedPnl":"","leverage":"10"}]}}"#,
+            "QUSDT",
+            Decimal::new(104129, 6),
+        )
+        .unwrap();
+        assert_eq!(position.one_way_position().unwrap(), (Decimal::ZERO, None));
+        assert_eq!(position.legs.len(), 1);
+    }
+
+    #[test]
+    fn bybit_start_position_fractional_leverage_is_preserved_exactly() {
+        let position = parse_position_snapshot(
+            r#"{"retCode":0,"result":{"category":"linear","list":[{"symbol":"QUSDT","positionIdx":0,"side":"","size":"0","avgPrice":"0","markPrice":"0.104129","unrealisedPnl":"","leverage":"12.5"}]}}"#,
+            "QUSDT",
+            Decimal::new(104129, 6),
+        )
+        .unwrap();
+        assert_eq!(position.legs[0].leverage.unwrap().to_string(), "12.5");
+    }
+
+    #[test]
+    fn bybit_start_cursor_compatibility_keeps_position_validation_fail_closed() {
+        let base = serde_json::json!({"retCode":0,"result":{"category":"linear","nextPageCursor":"cursor:2","list":[{
+            "symbol":"QUSDT","positionIdx":0,"side":"","size":"0","avgPrice":"0",
+            "markPrice":"0.104129","unrealisedPnl":"","leverage":"12.5"
+        }]}});
+        let mut cases = Vec::new();
+        for cursor in [
+            serde_json::json!(1),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ] {
+            let mut value = base.clone();
+            value["result"]["nextPageCursor"] = cursor;
+            cases.push(value);
+        }
+        for (field, invalid) in [
+            ("symbol", serde_json::json!("BTCUSDT")),
+            ("positionIdx", serde_json::json!(3)),
+            ("size", serde_json::json!("-1")),
+            ("leverage", serde_json::json!("0")),
+            ("leverage", serde_json::json!("-0.5")),
+            ("leverage", serde_json::json!("NaN")),
+        ] {
+            let mut value = base.clone();
+            value["result"]["list"][0][field] = invalid;
+            cases.push(value);
+        }
+        let mut duplicate = base.clone();
+        duplicate["result"]["list"]
+            .as_array_mut()
+            .unwrap()
+            .push(base["result"]["list"][0].clone());
+        cases.push(duplicate);
+        let mut mixed = base.clone();
+        let mut hedge = base["result"]["list"][0].clone();
+        hedge["positionIdx"] = serde_json::json!(1);
+        mixed["result"]["list"].as_array_mut().unwrap().push(hedge);
+        cases.push(mixed);
+        let mut empty = base.clone();
+        empty["result"]["list"] = serde_json::json!([]);
+        cases.push(empty);
+        let mut category = base.clone();
+        category["result"]["category"] = serde_json::json!("inverse");
+        cases.push(category);
+        for value in cases {
+            assert!(
+                parse_position_snapshot(&value.to_string(), "QUSDT", Decimal::ONE).is_err(),
+                "{value}"
+            );
+        }
+        let position = parse_position_snapshot(&base.to_string(), "QUSDT", Decimal::ONE).unwrap();
+        assert_eq!(position.one_way_position().unwrap(), (Decimal::ZERO, None));
+        assert_eq!(
+            position.one_way_leverage_decimal().unwrap(),
+            Decimal::new(125, 1)
+        );
+        assert!(position.one_way_leverage().is_err());
     }
 
     #[test]

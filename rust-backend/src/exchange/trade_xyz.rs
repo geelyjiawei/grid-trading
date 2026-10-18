@@ -1647,7 +1647,7 @@ where
                 mark_price: market.mark_price,
                 unrealized_profit: optional_decimal(position, "unrealizedPnl")?
                     .unwrap_or(Decimal::ZERO),
-                leverage: Some(active_leverage),
+                leverage: Some(Decimal::from(active_leverage)),
             }
         } else {
             PositionLeg {
@@ -1656,7 +1656,7 @@ where
                 entry_price: None,
                 mark_price: market.mark_price,
                 unrealized_profit: Decimal::ZERO,
-                leverage: Some(active_leverage),
+                leverage: Some(Decimal::from(active_leverage)),
             }
         };
         Ok(PositionSnapshot {

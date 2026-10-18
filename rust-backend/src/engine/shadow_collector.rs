@@ -445,7 +445,7 @@ mod tests {
                 entry_price: None,
                 mark_price: Decimal::new(10145, 1),
                 unrealized_profit: Decimal::ZERO,
-                leverage: Some(5),
+                leverage: Some(Decimal::from(5)),
             }],
         }
     }

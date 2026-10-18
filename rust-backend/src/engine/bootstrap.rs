@@ -587,7 +587,7 @@ mod tests {
                         .then_some(Decimal::new(1016, 0)),
                     mark_price: state.market_price,
                     unrealized_profit: Decimal::ZERO,
-                    leverage: Some(state.leverage),
+                    leverage: Some(Decimal::from(state.leverage)),
                 }],
             })
         }

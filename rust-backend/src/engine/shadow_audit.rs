@@ -68,7 +68,7 @@ pub fn audit_strategy_shadow(
             if position.legs[0].mark_price <= Decimal::ZERO
                 || position.legs[0]
                     .leverage
-                    .is_some_and(|leverage| leverage == 0)
+                    .is_some_and(|leverage| leverage <= Decimal::ZERO)
                 || (actual_quantity.is_zero()
                     && entry_price.is_some_and(|price| price <= Decimal::ZERO))
                 || (!actual_quantity.is_zero()
@@ -884,7 +884,7 @@ mod tests {
                 entry_price: (!quantity.is_zero()).then_some(Decimal::new(10145, 1)),
                 mark_price: Decimal::new(10145, 1),
                 unrealized_profit: Decimal::ZERO,
-                leverage: Some(5),
+                leverage: Some(Decimal::from(5)),
             }],
         }
     }
@@ -932,7 +932,7 @@ mod tests {
                     entry_price: Some(Decimal::new(1030, 0)),
                     mark_price: Decimal::new(10145, 1),
                     unrealized_profit: Decimal::ZERO,
-                    leverage: Some(5),
+                    leverage: Some(Decimal::from(5)),
                 }],
             },
             &orders,
@@ -960,7 +960,7 @@ mod tests {
                     entry_price: Some(Decimal::new(1030, 0)),
                     mark_price: Decimal::new(10145, 1),
                     unrealized_profit: Decimal::ZERO,
-                    leverage: Some(5),
+                    leverage: Some(Decimal::from(5)),
                 }],
             },
             &observations(&state),
@@ -1235,7 +1235,7 @@ mod tests {
         let mut invalid_mark = position(&state, Decimal::ZERO);
         invalid_mark.legs[0].mark_price = Decimal::ZERO;
         let mut invalid_leverage = position(&state, Decimal::ZERO);
-        invalid_leverage.legs[0].leverage = Some(0);
+        invalid_leverage.legs[0].leverage = Some(Decimal::ZERO);
         let mut missing_entry = position(&state, Decimal::ONE);
         missing_entry.legs[0].entry_price = None;
 
@@ -1375,7 +1375,7 @@ mod tests {
                     entry_price: Some(Decimal::new(1014, 0)),
                     mark_price: Decimal::new(10145, 1),
                     unrealized_profit: Decimal::ZERO,
-                    leverage: Some(5),
+                    leverage: Some(Decimal::from(5)),
                 },
                 PositionLeg {
                     side: PositionSide::Short,
@@ -1383,7 +1383,7 @@ mod tests {
                     entry_price: Some(Decimal::new(1014, 0)),
                     mark_price: Decimal::new(10145, 1),
                     unrealized_profit: Decimal::ZERO,
-                    leverage: Some(5),
+                    leverage: Some(Decimal::from(5)),
                 },
             ],
         };

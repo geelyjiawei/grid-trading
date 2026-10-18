@@ -628,14 +628,14 @@ fn insufficient_available_margin_body(
 
 fn existing_position_leverage_mismatch_response(
     symbol: &str,
-    observed: u16,
+    observed: Decimal,
     requested: u16,
 ) -> Result<StoredCommandResponse, CommandOutcomeUnknown> {
     command_response(
         StatusCode::CONFLICT,
         "existing_position_leverage_mismatch",
         format!(
-            "{symbol} already has an open position at {observed}x leverage, but this strategy requested {requested}x. The bot will not change leverage on an existing position; start the grid at {observed}x or manage the existing position first."
+            "{symbol} already has an open position at {observed}x leverage, but this strategy requested {requested}x. The bot will not change leverage on an existing position; use matching leverage supported by the strategy or review the existing position first."
         ),
     )
 }
@@ -3899,7 +3899,9 @@ fn validated_one_way_quantity(
     let (quantity, entry_price) = position.one_way_position()?;
     let leg = &position.legs[0];
     if leg.mark_price <= Decimal::ZERO
-        || leg.leverage.is_some_and(|leverage| leverage == 0)
+        || leg
+            .leverage
+            .is_some_and(|leverage| leverage <= Decimal::ZERO)
         || (quantity.is_zero() && entry_price.is_some_and(|price| price <= Decimal::ZERO))
         || (!quantity.is_zero() && entry_price.is_none_or(|price| price <= Decimal::ZERO))
     {
@@ -4081,7 +4083,7 @@ fn position_response(leg: &PositionLeg) -> Option<Value> {
         "entry_price": leg.entry_price.map(|price| price.to_string()),
         "mark_price": leg.mark_price.to_string(),
         "unrealised_pnl": leg.unrealized_profit.to_string(),
-        "leverage": leg.leverage,
+        "leverage": crate::exchange::observed_leverage_json(leg.leverage),
     }))
 }
 
@@ -4309,7 +4311,8 @@ mod tests {
 
     #[test]
     fn existing_position_leverage_conflict_is_actionable_and_fail_closed() {
-        let response = existing_position_leverage_mismatch_response("SKHYUSDT", 20, 3).unwrap();
+        let response =
+            existing_position_leverage_mismatch_response("SKHYUSDT", Decimal::from(20), 3).unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT.as_u16());
         assert_eq!(
@@ -4615,7 +4618,7 @@ mod tests {
                     entry_price: Some(Decimal::from_str_exact("0.40010").unwrap()),
                     mark_price: Decimal::from_str_exact("0.37990").unwrap(),
                     unrealized_profit: Decimal::from_str_exact("26.78660").unwrap(),
-                    leverage: Some(5),
+                    leverage: Some(Decimal::from(5)),
                 }],
             })
         }
@@ -5050,7 +5053,7 @@ mod tests {
                 entry_price: None,
                 mark_price: Decimal::from_str_exact("0.40000").unwrap(),
                 unrealized_profit: Decimal::ZERO,
-                leverage: Some(3),
+                leverage: Some(Decimal::from(3)),
             }],
         };
         (
@@ -6632,7 +6635,7 @@ mod tests {
                     entry_price: None,
                     mark_price: Decimal::from_str_exact("0.40000").unwrap(),
                     unrealized_profit: Decimal::ZERO,
-                    leverage: Some(3),
+                    leverage: Some(Decimal::from(3)),
                 }],
             },
         };
@@ -6773,7 +6776,7 @@ mod tests {
                     entry_price: Some(Decimal::from_str_exact("0.41000").unwrap()),
                     mark_price: Decimal::from_str_exact("0.40000").unwrap(),
                     unrealized_profit: Decimal::from(3),
-                    leverage: Some(3),
+                    leverage: Some(Decimal::from(3)),
                 }],
             },
         };

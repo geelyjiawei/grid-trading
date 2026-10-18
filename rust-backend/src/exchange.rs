@@ -2,7 +2,7 @@ use std::{cmp::Ordering, collections::BTreeMap};
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -571,8 +571,25 @@ pub struct PositionLeg {
     pub entry_price: Option<Decimal>,
     pub mark_price: Decimal,
     pub unrealized_profit: Decimal,
-    #[serde(default)]
-    pub leverage: Option<u16>,
+    #[serde(default, serialize_with = "serialize_observed_leverage")]
+    pub leverage: Option<Decimal>,
+}
+
+pub(crate) fn observed_leverage_json(leverage: Option<Decimal>) -> serde_json::Value {
+    match leverage {
+        Some(value) if value.fract().is_zero() && value.to_u16().is_some() => {
+            serde_json::json!(value.to_u16())
+        }
+        Some(value) => serde_json::json!(value),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn serialize_observed_leverage<S: serde::Serializer>(
+    leverage: &Option<Decimal>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    observed_leverage_json(*leverage).serialize(serializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -593,6 +610,16 @@ impl PositionSnapshot {
     }
 
     pub fn one_way_leverage(&self) -> Result<u16, SnapshotError> {
+        let leverage = self.one_way_leverage_decimal()?;
+        if !leverage.fract().is_zero() {
+            return Err(SnapshotError::new("position leverage is not an integer"));
+        }
+        leverage
+            .to_u16()
+            .ok_or_else(|| SnapshotError::new("position leverage exceeds integer representation"))
+    }
+
+    pub fn one_way_leverage_decimal(&self) -> Result<Decimal, SnapshotError> {
         if self.legs.len() != 1 || self.legs[0].side != PositionSide::Both {
             return Err(SnapshotError::new(
                 "hedge-mode position has no single strategy leverage",
@@ -600,7 +627,7 @@ impl PositionSnapshot {
         }
         self.legs[0]
             .leverage
-            .filter(|leverage| *leverage > 0)
+            .filter(|leverage| *leverage > Decimal::ZERO)
             .ok_or_else(|| SnapshotError::new("position leverage is unavailable"))
     }
 }
@@ -719,6 +746,22 @@ mod snapshot_tests {
         assert!(results.iter().all(Result::is_ok));
         assert_eq!(gateway.maximum_active.load(AtomicOrdering::SeqCst), 8);
         assert_eq!(gateway.active.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bybit_start_leverage_json_preserves_legacy_integer_and_exact_fraction() {
+        for (leverage, expected) in [
+            (serde_json::json!(10), serde_json::json!(10)),
+            (serde_json::json!("10.0"), serde_json::json!(10)),
+            (serde_json::json!("12.5"), serde_json::json!("12.5")),
+        ] {
+            let leg: PositionLeg = serde_json::from_value(serde_json::json!({
+                "side":"Both", "signed_quantity":"0", "entry_price":null,
+                "mark_price":"0.1", "unrealized_profit":"0", "leverage":leverage
+            }))
+            .unwrap();
+            assert_eq!(serde_json::to_value(&leg).unwrap()["leverage"], expected);
+        }
     }
 
     #[test]

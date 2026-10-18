@@ -229,7 +229,7 @@ pub(super) fn parse_position_snapshot(
             entry_price,
             mark_price,
             unrealized_profit,
-            leverage,
+            leverage: leverage.map(Decimal::from),
         });
     }
     if legs.is_empty() {

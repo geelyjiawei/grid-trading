@@ -31,7 +31,7 @@ where
     }
     let (position_quantity, before) =
         observed_position_and_leverage(gateway, exchange, &symbol).await?;
-    if before == expected_leverage {
+    if before == Decimal::from(expected_leverage) {
         return Ok(LeveragePreflightResult::AlreadyConfigured);
     }
     if !position_quantity.is_zero() {
@@ -54,7 +54,7 @@ where
         }
         Err(LeverageError::Unknown { message }) => {
             return match observed_position_and_leverage(gateway, exchange, &symbol).await {
-                Ok((_, observed)) if observed == expected_leverage => {
+                Ok((_, observed)) if observed == Decimal::from(expected_leverage) => {
                     Ok(LeveragePreflightResult::ReconciledAfterUnknown)
                 }
                 Ok((_, observed)) => Err(LeveragePreflightError::Unknown {
@@ -70,7 +70,7 @@ where
     };
     validate_acknowledgement(&acknowledgement, exchange, &symbol, expected_leverage)?;
     let (_, observed) = observed_position_and_leverage(gateway, exchange, &symbol).await?;
-    if observed != expected_leverage {
+    if observed != Decimal::from(expected_leverage) {
         return Err(LeveragePreflightError::NotVerified {
             expected: expected_leverage,
             observed,
@@ -83,7 +83,7 @@ async fn observed_position_and_leverage<G>(
     gateway: &G,
     exchange: Exchange,
     symbol: &str,
-) -> Result<(Decimal, u16), LeveragePreflightError>
+) -> Result<(Decimal, Decimal), LeveragePreflightError>
 where
     G: PositionSnapshotGateway,
 {
@@ -97,7 +97,7 @@ where
         .one_way_position()
         .map_err(LeveragePreflightError::Snapshot)?;
     let leverage = snapshot
-        .one_way_leverage()
+        .one_way_leverage_decimal()
         .map_err(LeveragePreflightError::Snapshot)?;
     Ok((signed_quantity, leverage))
 }
@@ -124,7 +124,7 @@ pub enum LeveragePreflightError {
     #[error(
         "existing position leverage is {observed}; refusing to change it to requested leverage {requested}"
     )]
-    ExistingPositionLeverageMismatch { observed: u16, requested: u16 },
+    ExistingPositionLeverageMismatch { observed: Decimal, requested: u16 },
     #[error("leverage request is invalid: {0}")]
     InvalidRequest(String),
     #[error("exchange definitively rejected leverage: {message}")]
@@ -139,7 +139,7 @@ pub enum LeveragePreflightError {
     #[error(
         "leverage change was acknowledged but not verified: expected {expected}, observed {observed}"
     )]
-    NotVerified { expected: u16, observed: u16 },
+    NotVerified { expected: u16, observed: Decimal },
     #[error("leverage snapshot failed: {0}")]
     Snapshot(#[from] SnapshotError),
 }
@@ -242,8 +242,161 @@ mod tests {
                 entry_price: (!signed_quantity.is_zero()).then_some(Decimal::new(1011, 0)),
                 mark_price: Decimal::new(1010, 0),
                 unrealized_profit: Decimal::ZERO,
-                leverage,
+                leverage: leverage.map(Decimal::from),
             }],
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_start_flat_fractional_leverage_can_be_configured_and_verified() {
+        let gateway = FakeGateway {
+            state: Arc::new(Mutex::new(FakeState {
+                snapshots: [
+                    Ok(bybit_reported_position("12.5", Decimal::ZERO)),
+                    Ok(bybit_reported_position("10.0", Decimal::ZERO)),
+                ]
+                .into_iter()
+                .collect(),
+                setting: Ok(bybit_acknowledgement(10)),
+                set_calls: 0,
+            })),
+        };
+        assert_eq!(
+            ensure_symbol_leverage(&gateway, Exchange::Bybit, "MUUSDT", 10)
+                .await
+                .unwrap(),
+            LeveragePreflightResult::ConfiguredAndVerified
+        );
+        assert_eq!(gateway.set_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn bybit_start_existing_fractional_leverage_never_changes_manual_position() {
+        for quantity in [Decimal::new(-5, 1), Decimal::new(5, 1)] {
+            let gateway = FakeGateway {
+                state: Arc::new(Mutex::new(FakeState {
+                    snapshots: [Ok(bybit_reported_position("12.5", quantity))]
+                        .into_iter()
+                        .collect(),
+                    setting: Ok(bybit_acknowledgement(10)),
+                    set_calls: 0,
+                })),
+            };
+            let error = ensure_symbol_leverage(&gateway, Exchange::Bybit, "MUUSDT", 10)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LeveragePreflightError::ExistingPositionLeverageMismatch { .. }
+            ));
+            assert!(error.to_string().contains("12.5"));
+            assert_eq!(gateway.set_calls(), 0);
+        }
+    }
+
+    fn bybit_reported_position(leverage: &str, quantity: Decimal) -> PositionSnapshot {
+        let mut value = serde_json::to_value(position_with_quantity(Some(10), quantity)).unwrap();
+        value["exchange"] = serde_json::json!("bybit");
+        value["legs"][0]["leverage"] = serde_json::json!(leverage);
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn bybit_acknowledgement(leverage: u16) -> LeverageAcknowledgement {
+        LeverageAcknowledgement {
+            exchange: Exchange::Bybit,
+            ..acknowledgement(leverage)
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_start_fractional_post_write_verification_is_never_truncated() {
+        for setting in [
+            Ok(bybit_acknowledgement(10)),
+            Err(LeverageError::Unknown {
+                message: "timeout".into(),
+            }),
+        ] {
+            let acknowledged = setting.is_ok();
+            let gateway = FakeGateway {
+                state: Arc::new(Mutex::new(FakeState {
+                    snapshots: [
+                        Ok(bybit_reported_position("12.5", Decimal::ZERO)),
+                        Ok(bybit_reported_position("10.5", Decimal::ZERO)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    setting,
+                    set_calls: 0,
+                })),
+            };
+            let error = ensure_symbol_leverage(&gateway, Exchange::Bybit, "MUUSDT", 10)
+                .await
+                .unwrap_err();
+            if acknowledged {
+                assert!(
+                    matches!(error, LeveragePreflightError::NotVerified { observed, .. } if observed == Decimal::new(105, 1))
+                );
+            } else {
+                assert!(matches!(error, LeveragePreflightError::Unknown { .. }));
+            }
+            assert!(error.to_string().contains("10.5"));
+            assert_eq!(gateway.set_calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_start_integer_decimal_equivalence_does_not_send_a_write() {
+        let gateway = FakeGateway {
+            state: Arc::new(Mutex::new(FakeState {
+                snapshots: [Ok(bybit_reported_position("10.0", Decimal::ONE))]
+                    .into_iter()
+                    .collect(),
+                setting: Ok(bybit_acknowledgement(10)),
+                set_calls: 0,
+            })),
+        };
+        assert_eq!(
+            ensure_symbol_leverage(&gateway, Exchange::Bybit, "MUUSDT", 10)
+                .await
+                .unwrap(),
+            LeveragePreflightResult::AlreadyConfigured
+        );
+        assert_eq!(gateway.set_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn bybit_start_hedge_mode_never_changes_leverage_even_when_flat() {
+        for quantities in [
+            vec![Decimal::ZERO],
+            vec![Decimal::ZERO, Decimal::ZERO],
+            vec![Decimal::ONE, -Decimal::ONE],
+        ] {
+            let mut snapshot = bybit_reported_position("12.5", Decimal::ZERO);
+            snapshot.legs = quantities
+                .into_iter()
+                .enumerate()
+                .map(|(index, quantity)| {
+                    let mut leg = bybit_reported_position("12.5", quantity).legs.remove(0);
+                    leg.side = if index == 0 {
+                        PositionSide::Long
+                    } else {
+                        PositionSide::Short
+                    };
+                    leg
+                })
+                .collect();
+            let gateway = FakeGateway {
+                state: Arc::new(Mutex::new(FakeState {
+                    snapshots: [Ok(snapshot)].into_iter().collect(),
+                    setting: Ok(bybit_acknowledgement(10)),
+                    set_calls: 0,
+                })),
+            };
+            assert!(matches!(
+                ensure_symbol_leverage(&gateway, Exchange::Bybit, "MUUSDT", 10).await,
+                Err(LeveragePreflightError::Snapshot(_))
+            ));
+            assert_eq!(gateway.set_calls(), 0);
         }
     }
 
@@ -272,9 +425,9 @@ mod tests {
         assert!(matches!(
             ensure_symbol_leverage(&gateway, Exchange::Binance, "MUUSDT", 5).await,
             Err(LeveragePreflightError::ExistingPositionLeverageMismatch {
-                observed: 3,
+                observed,
                 requested: 5
-            })
+            }) if observed == Decimal::from(3)
         ));
         assert_eq!(gateway.set_calls(), 0);
     }

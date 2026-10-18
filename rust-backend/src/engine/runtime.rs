@@ -4360,7 +4360,7 @@ mod tests {
                     entry_price: state.position_entry_price,
                     mark_price: state.market.mark_price,
                     unrealized_profit: Decimal::ZERO,
-                    leverage: Some(5),
+                    leverage: Some(Decimal::from(5)),
                 }],
             })
         }
