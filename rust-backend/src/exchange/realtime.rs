@@ -252,7 +252,7 @@ impl FuturesExecutionCache {
             if observed
                 .trades
                 .get(&trade.trade_id)
-                .is_some_and(|cached| cached != &trade)
+                .is_some_and(|cached| !cached.execution_evidence_matches(&trade))
             {
                 quarantine_futures_order(
                     observed,
@@ -263,7 +263,9 @@ impl FuturesExecutionCache {
                 self.changed.notify_waiters();
                 return;
             }
-            new_evidence = !observed.trades.contains_key(&trade.trade_id);
+            new_evidence = observed.trades.get(&trade.trade_id).is_none_or(|cached| {
+                cached.realized_profit.is_none() && trade.realized_profit.is_some()
+            });
             observed
                 .stream_cumulative_quantities
                 .entry(trade.trade_id.clone())
@@ -274,6 +276,9 @@ impl FuturesExecutionCache {
             observed
                 .trades
                 .entry(trade.trade_id.clone())
+                .and_modify(|cached| {
+                    cached.merge_reported_metadata(&trade);
+                })
                 .or_insert(trade);
         }
         if update.update_time_ms >= observed.last_update_time_ms
@@ -399,6 +404,9 @@ impl FuturesExecutionCache {
                 observed
                     .trades
                     .entry(trade.trade_id.clone())
+                    .and_modify(|cached| {
+                        cached.merge_reported_metadata(trade);
+                    })
                     .or_insert_with(|| trade.clone());
             }
             refresh_futures_snapshot(observed);
@@ -567,6 +575,9 @@ impl FuturesExecutionCache {
             observed
                 .trades
                 .entry(trade.trade_id.clone())
+                .and_modify(|cached| {
+                    cached.merge_reported_metadata(trade);
+                })
                 .or_insert_with(|| trade.clone());
         }
         refresh_futures_snapshot(observed);
@@ -706,7 +717,7 @@ fn futures_trades_conflict(observed: &FuturesObservedOrder, trades: &[TradeFill]
         observed
             .trades
             .get(&trade.trade_id)
-            .is_some_and(|cached| cached != trade)
+            .is_some_and(|cached| !cached.execution_evidence_matches(trade))
     })
 }
 
@@ -830,8 +841,17 @@ impl BybitExecutionCache {
         epoch: u64,
         snapshot: &OrderExecutionSnapshot,
     ) -> bool {
+        self.merge_verified_snapshot(epoch, &mut snapshot.clone())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn merge_verified_snapshot(
+        &self,
+        epoch: u64,
+        snapshot: &mut OrderExecutionSnapshot,
+    ) -> Result<bool, crate::exchange::ExecutionSnapshotError> {
         let Some(header) = verified_bybit_seed_header(snapshot) else {
-            return false;
+            return Ok(false);
         };
         let key = (
             snapshot.order.shape.symbol.clone(),
@@ -842,7 +862,7 @@ impl BybitExecutionCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.session != epoch {
-            return false;
+            return Ok(false);
         }
         let trades = snapshot
             .trades
@@ -851,9 +871,14 @@ impl BybitExecutionCache {
             .collect::<BTreeMap<_, _>>();
         let mut replace_header = true;
         let mut covers_stream = true;
+        let mut cacheable = snapshot.trades.len() <= FUTURES_EXECUTION_CACHE_CAPACITY;
         if let Some(observed) = state.entries.get(&key) {
-            if observed.conflicted
-                || observed.client_order_id != snapshot.order.client_order_id
+            if observed.conflicted {
+                return Err(crate::exchange::ExecutionSnapshotError::new(
+                    "Bybit execution evidence remains quarantined after a conflict",
+                ));
+            }
+            if observed.client_order_id != snapshot.order.client_order_id
                 || observed
                     .initial_shape
                     .as_ref()
@@ -863,14 +888,16 @@ impl BybitExecutionCache {
                     .as_ref()
                     .is_some_and(|previous| previous.order_time_ms != snapshot.order_time_ms)
             {
-                return false;
+                return Err(crate::exchange::ExecutionSnapshotError::new(
+                    "conflicting Bybit REST and realtime order identity",
+                ));
             }
             let conflicting = observed.trades.values().any(|trade| {
                 trade.side != snapshot.order.shape.side
                     || trade.trade_time_ms < snapshot.order_time_ms
                     || trades
                         .get(trade.trade_id.as_str())
-                        .is_some_and(|rest| *rest != trade)
+                        .is_some_and(|rest| !rest.execution_evidence_matches(trade))
             }) || observed.header.as_ref().is_some_and(|previous| {
                 previous.cumulative_quantity == snapshot.cumulative_quantity
                     && previous.cumulative_quote != snapshot.cumulative_quote
@@ -890,7 +917,9 @@ impl BybitExecutionCache {
                 observed.snapshot = None;
                 drop(state);
                 self.changed.notify_waiters();
-                return false;
+                return Err(crate::exchange::ExecutionSnapshotError::new(
+                    "conflicting Bybit REST and realtime trade evidence",
+                ));
             }
             let additional_trades = snapshot
                 .trades
@@ -898,7 +927,7 @@ impl BybitExecutionCache {
                 .filter(|trade| !observed.trades.contains_key(&trade.trade_id))
                 .count();
             if observed.trades.len() + additional_trades > FUTURES_EXECUTION_CACHE_CAPACITY {
-                return false;
+                cacheable = false;
             }
             if let Some(previous) = &observed.header {
                 replace_header = snapshot.update_time_ms >= previous.update_time_ms
@@ -916,6 +945,17 @@ impl BybitExecutionCache {
                     .iter()
                     .all(|id| trades.contains_key(id.as_str()));
         }
+        drop(trades);
+        if let Some(observed) = state.entries.get(&key) {
+            for trade in &mut snapshot.trades {
+                if let Some(known) = observed.trades.get(&trade.trade_id) {
+                    trade.realized_profit = trade.realized_profit.or(known.realized_profit);
+                }
+            }
+        }
+        if !cacheable {
+            return Ok(false);
+        }
         let observed = bybit_observed_order(&mut state, &key, &snapshot.order.client_order_id);
         observed.initial_shape = Some(snapshot.order.shape.clone());
         observed.identity_bound = true;
@@ -927,9 +967,13 @@ impl BybitExecutionCache {
             observed
                 .trades
                 .entry(trade.trade_id.clone())
+                .and_modify(|cached| {
+                    cached.merge_reported_metadata(trade);
+                })
                 .or_insert_with(|| trade.clone());
         }
-        // REST is already returned to its caller. Do not consume newer, uncovered WS evidence.
+        // The caller receives the merged evidence before this generation is consumed.
+        // Do not consume newer WS executions absent from the authoritative REST totals.
         if covers_stream {
             observed.consumed_stream_generation = observed.stream_generation;
             observed.published_stream_generation = observed.stream_generation;
@@ -937,7 +981,7 @@ impl BybitExecutionCache {
         refresh_bybit_snapshot(observed);
         drop(state);
         self.changed.notify_waiters();
-        true
+        Ok(true)
     }
 
     pub(crate) fn register_placement(
@@ -1087,7 +1131,7 @@ impl BybitExecutionCache {
             || observed
                 .trades
                 .get(&trade.trade_id)
-                .is_some_and(|previous| previous != &trade)
+                .is_some_and(|previous| !previous.execution_evidence_matches(&trade))
         {
             observed.conflicted = true;
             observed.snapshot = None;
@@ -1095,7 +1139,15 @@ impl BybitExecutionCache {
             self.changed.notify_waiters();
             return;
         }
-        if observed.trades.contains_key(&trade.trade_id) {
+        if let Some(previous) = observed.trades.get_mut(&trade.trade_id) {
+            let enriched = previous.realized_profit.is_none() && trade.realized_profit.is_some();
+            previous.merge_reported_metadata(&trade);
+            if enriched {
+                observed.stream_generation = observed.stream_generation.wrapping_add(1);
+                refresh_bybit_snapshot(observed);
+                drop(state);
+                self.changed.notify_waiters();
+            }
             return;
         }
         // Bound pre-ACK evidence as well as very large orders; REST remains authoritative.
@@ -1221,7 +1273,6 @@ fn verified_bybit_seed_header(snapshot: &OrderExecutionSnapshot) -> Option<Order
         || (quantity > Decimal::ZERO && snapshot.cumulative_quote <= Decimal::ZERO)
         || snapshot.order_time_ms == 0
         || snapshot.update_time_ms < snapshot.order_time_ms
-        || snapshot.trades.len() > FUTURES_EXECUTION_CACHE_CAPACITY
     {
         return None;
     }
@@ -1803,7 +1854,7 @@ pub(crate) fn parse_futures_order_update(
                 raw_commission
             },
             commission_asset,
-            realized_profit,
+            realized_profit: Some(realized_profit),
             is_maker,
             trade_time_ms: update_time_ms,
         })
@@ -2884,6 +2935,244 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_fallback_returns_pnl_received_during_the_read_before_consuming_it() {
+        use crate::exchange::{
+            ExecutionSnapshotGateway,
+            bybit::{BybitAdapter, BybitHmacSha256Signer},
+            protocol::{
+                HttpMethod, HttpResponse, HttpTransport, PreparedHttpRequest, SystemClock,
+                TransportError,
+            },
+        };
+        #[derive(Clone)]
+        struct RacingRestTransport {
+            cache: Arc<Mutex<Option<BybitExecutionCache>>>,
+            requests: Arc<Mutex<Vec<PreparedHttpRequest>>>,
+            terminal: bool,
+            rest_pnl: Option<&'static str>,
+        }
+        #[async_trait::async_trait]
+        impl HttpTransport for RacingRestTransport {
+            async fn execute(
+                &self,
+                request: PreparedHttpRequest,
+            ) -> Result<HttpResponse, TransportError> {
+                let path = request.path.clone();
+                self.requests.lock().unwrap().push(request);
+                let quantity = if self.terminal { "500" } else { "210" };
+                let quote = if self.terminal { "1000" } else { "420" };
+                let row = json!({
+                    "category":"linear","symbol":"MUUSDT","orderId":"42","orderLinkId":"r_run_0_B_1",
+                    "positionIdx":0,"side":"Buy","orderType":"Limit","qty":"500","price":"2",
+                    "timeInForce":"GTC","reduceOnly":true,"orderStatus":if self.terminal { "Filled" } else { "PartiallyFilled" },
+                    "cumExecQty":quantity,"cumExecValue":quote,"createdTime":"1000","updatedTime":"1011"
+                });
+                let rows = match path.as_str() {
+                    "/v5/order/realtime" => vec![row],
+                    "/v5/execution/list" => {
+                        let mut trade = json!({
+                            "category":"linear","symbol":"MUUSDT","orderId":"42","orderLinkId":"r_run_0_B_1",
+                            "execType":"Trade","execId":"trade-1","execPrice":"2","execQty":quantity,
+                            "execValue":quote,"execFee":"0.01","execTime":"1010","feeCurrency":"USDT",
+                            "side":"Buy","isMaker":true
+                        });
+                        if let Some(pnl) = self.rest_pnl {
+                            trade["execPnl"] = json!(pnl);
+                        }
+                        let mut stream_trade = trade.clone();
+                        stream_trade["execPnl"] = json!("0.54026203");
+                        let cache = self.cache.lock().unwrap().clone().unwrap();
+                        publish_bybit_message(
+                            &json!({"topic":"order.linear","data":[row]}).to_string(),
+                            &cache,
+                        );
+                        publish_bybit_message(
+                            &json!({"topic":"execution.linear","data":[stream_trade]}).to_string(),
+                            &cache,
+                        );
+                        vec![trade]
+                    }
+                    other => panic!("unexpected read path: {other}"),
+                };
+                Ok(HttpResponse { status: 200, body: json!({"retCode":0,"result":{"category":"linear","list":rows,"nextPageCursor":""}}).to_string() })
+            }
+        }
+        for terminal in [false, true] {
+            for rest_pnl in [None, Some("0"), Some("0.54026203")] {
+                let transport = RacingRestTransport {
+                    cache: Arc::new(Mutex::new(None)),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    terminal,
+                    rest_pnl,
+                };
+                let gateway = BybitAdapter::with_base_url(
+                    transport.clone(),
+                    BybitHmacSha256Signer::new("test-secret").unwrap(),
+                    SystemClock,
+                    "test-key",
+                    "https://example.test",
+                );
+                let cache = gateway.realtime_execution_cache();
+                *transport.cache.lock().unwrap() = Some(cache.clone());
+                let id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+                let result = gateway
+                    .execution_snapshot(Exchange::Bybit, "MUUSDT", &id, "42")
+                    .await;
+                if rest_pnl == Some("0") {
+                    assert!(
+                        result.is_err(),
+                        "an explicit REST zero conflicting with a known WS value must not reach accounting"
+                    );
+                    assert!(!cache.knows_order("MUUSDT", "42"));
+                    continue;
+                }
+                let snapshot = result.unwrap();
+                assert_eq!(
+                    snapshot.trades[0].realized_profit,
+                    Some(Decimal::new(54026203, 8)),
+                    "received WS metadata must reach the durable caller, including a terminal fill"
+                );
+                assert_eq!(
+                    snapshot.cumulative_quantity,
+                    Decimal::from(if terminal { 500 } else { 210 })
+                );
+                assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::new(1, 2));
+                assert!(
+                    cache
+                        .wait_snapshot("MUUSDT", &id, "42", Duration::ZERO)
+                        .await
+                        .is_none(),
+                    "returned evidence must not become a duplicate fresh execution"
+                );
+                let requests = transport.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| request.method == HttpMethod::Get)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_large_rest_pnl_merge_validates_conflicts_even_without_cache_admission() {
+        for rest_pnl in [Some(Decimal::ZERO), None, Some(Decimal::new(54026203, 8))] {
+            let cache = BybitExecutionCache::default();
+            let id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+            cache.apply_order(bybit_header("42", "New", "0", 1000));
+            let mut first = bybit_trade("42", "trade-1", "210", 1010);
+            first.realized_profit = Some(Decimal::new(54026203, 8));
+            cache.apply_trade(&id, first.clone());
+            cache.apply_order(bybit_header("42", "PartiallyFilled", "210", 1011));
+            first.realized_profit = rest_pnl;
+            let mut trades = vec![first];
+            for index in 0..4096 {
+                trades.push(bybit_trade(
+                    "42",
+                    &format!("rest-{index}"),
+                    "0.01",
+                    1012 + index,
+                ));
+            }
+            let mut snapshot = assemble_execution_snapshot(
+                bybit_header("42", "PartiallyFilled", "250.96", 10_000),
+                trades,
+            )
+            .unwrap();
+            let result = cache.merge_verified_snapshot(cache.session_epoch(), &mut snapshot);
+            if rest_pnl == Some(Decimal::ZERO) {
+                assert!(
+                    result.is_err(),
+                    "cache capacity must not bypass a proven PnL conflict"
+                );
+                assert!(!cache.knows_order("MUUSDT", "42"));
+                snapshot.trades[0].realized_profit = None;
+                assert!(
+                    cache
+                        .merge_verified_snapshot(cache.session_epoch(), &mut snapshot)
+                        .is_err(),
+                    "omission must not clear an existing quarantine"
+                );
+            } else {
+                assert!(
+                    !result.unwrap(),
+                    "a complete large REST response need not enter the bounded stream cache"
+                );
+                assert_eq!(snapshot.trades.len(), 4097);
+                assert_eq!(snapshot.cumulative_quantity, Decimal::new(25096, 2));
+                assert_eq!(
+                    snapshot.trades[0].realized_profit,
+                    Some(Decimal::new(54026203, 8))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_missing_rest_pnl_does_not_quarantine_known_stream_trade() {
+        let cache = BybitExecutionCache::default();
+        cache.begin_session();
+        let id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        cache.apply_order(bybit_header("42", "New", "0", 1000));
+        let mut known = serde_json::to_value(bybit_trade("42", "trade-1", "210", 1010)).unwrap();
+        known["realized_profit"] = json!("0.54026203");
+        let known: TradeFill = serde_json::from_value(known).unwrap();
+        cache.apply_trade(&id, known);
+        cache.apply_order(bybit_header("42", "PartiallyFilled", "210", 1011));
+        let partial = bybit_read(&cache, "42").await.unwrap();
+        let mut rest = serde_json::to_value(&partial).unwrap();
+        rest["trades"][0]["realized_profit"] = Value::Null;
+        let rest: OrderExecutionSnapshot = serde_json::from_value(rest).unwrap();
+        assert!(cache.seed_verified_snapshot(cache.session_epoch(), &rest));
+        assert!(cache.knows_order("MUUSDT", "42"));
+        cache.apply_trade(&id, bybit_trade("42", "trade-2", "290", 1012));
+        cache.apply_order(bybit_header("42", "Filled", "500", 1013));
+        let full = bybit_read(&cache, "42").await.unwrap();
+        assert_eq!(full.cumulative_quantity, Decimal::from(500));
+        assert_eq!(full.trades.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&full.trades[0]).unwrap()["realized_profit"],
+            "0.54026203"
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_optional_pnl_enrichment_is_fresh_but_known_conflicts_still_quarantine() {
+        let cache = BybitExecutionCache::default();
+        let id = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        cache.apply_order(bybit_header("42", "New", "0", 1000));
+        let mut unknown = serde_json::to_value(bybit_trade("42", "trade-1", "210", 1010)).unwrap();
+        unknown["realized_profit"] = Value::Null;
+        let unknown: TradeFill = serde_json::from_value(unknown).unwrap();
+        cache.apply_trade(&id, unknown.clone());
+        cache.apply_order(bybit_header("42", "PartiallyFilled", "210", 1011));
+        assert!(serde_json::to_value(bybit_read(&cache, "42").await.unwrap()).unwrap()["trades"][0]["realized_profit"].is_null());
+        cache.apply_trade(&id, bybit_trade("42", "trade-1", "210", 1010));
+        let enriched = bybit_read(&cache, "42")
+            .await
+            .expect("new optional evidence must remain usable");
+        assert_eq!(
+            serde_json::to_value(&enriched).unwrap()["trades"][0]["realized_profit"],
+            "0"
+        );
+        assert_eq!(enriched.cumulative_quantity, Decimal::from(210));
+        cache.apply_trade(&id, unknown);
+        assert!(cache.knows_order("MUUSDT", "42"));
+        assert!(
+            bybit_read(&cache, "42").await.is_none(),
+            "missing duplicate metadata must not invent a new fill"
+        );
+        let mut conflict = serde_json::to_value(bybit_trade("42", "trade-1", "210", 1010)).unwrap();
+        conflict["realized_profit"] = json!("0.54026203");
+        cache.apply_trade(&id, serde_json::from_value(conflict).unwrap());
+        assert!(
+            !cache.knows_order("MUUSDT", "42"),
+            "two explicitly different PnL values remain a real conflict"
+        );
     }
 
     #[tokio::test]

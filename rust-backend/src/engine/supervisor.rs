@@ -1032,7 +1032,7 @@ mod fee_settlement_tests {
                     raw_commission: Decimal::new(1, 2),
                     commission_cost: Decimal::new(1, 2),
                     commission_asset: "BNB".into(),
-                    realized_profit: Decimal::ZERO,
+                    realized_profit: Some(Decimal::ZERO),
                     is_maker: true,
                     trade_time_ms,
                 }],

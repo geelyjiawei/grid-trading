@@ -582,7 +582,7 @@ mod tests {
             raw_commission: fee,
             commission_cost: fee,
             commission_asset: asset.into(),
-            realized_profit: Decimal::ZERO,
+            realized_profit: Some(Decimal::ZERO),
             is_maker: true,
             trade_time_ms: time,
         }

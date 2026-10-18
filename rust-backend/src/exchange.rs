@@ -298,9 +298,36 @@ pub struct TradeFill {
     /// Positive fee cost under the exchange-specific commission convention.
     pub commission_cost: Decimal,
     pub commission_asset: String,
-    pub realized_profit: Decimal,
+    /// None means the exchange omitted PnL; Some(0) is an explicit reported zero.
+    #[serde(default)]
+    pub realized_profit: Option<Decimal>,
     pub is_maker: bool,
     pub trade_time_ms: u64,
+}
+
+impl TradeFill {
+    pub(crate) fn execution_evidence_matches(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        if matches!((self.realized_profit, other.realized_profit), (Some(left), Some(right)) if left != right)
+        {
+            return false;
+        }
+        // Only omitted optional metadata may differ. Derived equality keeps every
+        // economic/identity field (including future additions) exact.
+        let mut comparable = other.clone();
+        comparable.realized_profit = self.realized_profit;
+        self == &comparable
+    }
+
+    pub(crate) fn merge_reported_metadata(&mut self, other: &Self) -> bool {
+        if !self.execution_evidence_matches(other) {
+            return false;
+        }
+        self.realized_profit = self.realized_profit.or(other.realized_profit);
+        true
+    }
 }
 
 pub(crate) fn is_valid_trade_id(value: &str) -> bool {
@@ -682,6 +709,81 @@ mod snapshot_tests {
 
     use super::*;
     use crate::domain::{OrderKind, OrderSide, TimeInForce};
+
+    fn legacy_pnl_trade() -> serde_json::Value {
+        serde_json::json!({
+            "trade_id":"fa4268e8-4994-541c-9709-18423acb3515",
+            "exchange_order_id":"f89eccf9-f3df-4021-b5bb-d69ce1fb3ab5",
+            "symbol":"QUSDT","side":"Buy","price":"0.1162","quantity":"210",
+            "quote_quantity":"24.402","raw_commission":"0.0097608",
+            "commission_cost":"0.0097608","commission_asset":"USDT",
+            "realized_profit":"0","is_maker":true,"trade_time_ms":1792336092619u64
+        })
+    }
+
+    #[test]
+    fn optional_pnl_serde_preserves_legacy_values_and_absence() {
+        for text in ["0", "0.54026203", "-0.25"] {
+            let mut value = legacy_pnl_trade();
+            value["realized_profit"] = serde_json::json!(text);
+            let trade: TradeFill = serde_json::from_value(value).unwrap();
+            assert_eq!(trade.realized_profit, Some(text.parse().unwrap()));
+            let restored: TradeFill =
+                serde_json::from_slice(&serde_json::to_vec(&trade).unwrap()).unwrap();
+            assert_eq!(restored, trade);
+        }
+        for omit in [false, true] {
+            let mut value = legacy_pnl_trade();
+            if omit {
+                value.as_object_mut().unwrap().remove("realized_profit");
+            } else {
+                value["realized_profit"] = serde_json::Value::Null;
+            }
+            let trade: TradeFill = serde_json::from_value(value).unwrap();
+            assert_eq!(trade.realized_profit, None);
+            assert!(serde_json::to_value(&trade).unwrap()["realized_profit"].is_null());
+        }
+    }
+
+    #[test]
+    fn optional_pnl_merge_never_changes_economic_evidence_or_explicit_values() {
+        let zero: TradeFill = serde_json::from_value(legacy_pnl_trade()).unwrap();
+        let mut unknown = zero.clone();
+        unknown.realized_profit = None;
+        assert!(unknown.merge_reported_metadata(&zero));
+        assert_eq!(unknown, zero);
+        let mut known = zero.clone();
+        let mut missing = zero.clone();
+        missing.realized_profit = None;
+        assert!(known.merge_reported_metadata(&missing));
+        assert_eq!(known, zero);
+
+        for (field, value) in [
+            ("realized_profit", serde_json::json!("0.54026203")),
+            ("quantity", serde_json::json!("500")),
+            ("price", serde_json::json!("0.1163")),
+            ("quote_quantity", serde_json::json!("58.1")),
+            ("raw_commission", serde_json::json!("0.01")),
+            ("commission_cost", serde_json::json!("0.01")),
+            ("commission_asset", serde_json::json!("MNT")),
+            ("trade_id", serde_json::json!("another-trade")),
+            ("exchange_order_id", serde_json::json!("another-order")),
+            ("symbol", serde_json::json!("OTHERUSDT")),
+            ("side", serde_json::json!("Sell")),
+            ("is_maker", serde_json::json!(false)),
+            ("trade_time_ms", serde_json::json!(1792336092620u64)),
+        ] {
+            let mut payload = legacy_pnl_trade();
+            payload[field] = value;
+            let altered: TradeFill = serde_json::from_value(payload).unwrap();
+            let mut baseline = zero.clone();
+            assert!(
+                !baseline.merge_reported_metadata(&altered),
+                "{field} must remain immutable"
+            );
+            assert_eq!(baseline, zero, "failed merge must be atomic");
+        }
+    }
 
     #[derive(Default)]
     struct ConcurrentCancellationGateway {

@@ -3927,7 +3927,7 @@ mod tests {
                 raw_commission: fee,
                 commission_cost: fee,
                 commission_asset: quote_asset.to_owned(),
-                realized_profit: Decimal::ZERO,
+                realized_profit: Some(Decimal::ZERO),
                 is_maker: true,
                 trade_time_ms,
             };
@@ -3980,7 +3980,7 @@ mod tests {
                 raw_commission: fee,
                 commission_cost: fee,
                 commission_asset: "USDT".into(),
-                realized_profit: Decimal::ZERO,
+                realized_profit: Some(Decimal::ZERO),
                 is_maker: true,
                 trade_time_ms,
             };
@@ -9746,9 +9746,17 @@ mod tests {
         gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
         gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
         runtime.tick(1_200).await.unwrap();
-        runtime.machine_mut().request_stop(1_250).unwrap();
+        // Batch ACK time includes elapsed I/O, even with a synthetic test clock.
+        let stop_at = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .updated_at_ms
+            .max(1_200)
+            + 50;
+        runtime.machine_mut().request_stop(stop_at).unwrap();
         runtime.maximum_submissions_per_tick = 1;
-        runtime.tick(1_300).await.unwrap();
+        runtime.tick(stop_at + 50).await.unwrap();
 
         let raced_id = gateway.cancellation_ids()[0].clone();
         let raced_shape = gateway
@@ -9770,7 +9778,13 @@ mod tests {
         gateway.set_cancellation_marks_terminal(true);
         runtime.maximum_submissions_per_tick = 100;
 
-        let race_reconciliation = runtime.tick(1_400).await.unwrap();
+        let reconcile_at = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .updated_at_ms
+            .max(stop_at + 150);
+        let race_reconciliation = runtime.tick(reconcile_at).await.unwrap();
         assert!(
             !race_reconciliation
                 .blockers
@@ -9779,7 +9793,13 @@ mod tests {
             "{race_reconciliation:?}; failure={:?}",
             runtime.machine().store().snapshot().failure
         );
-        let stopped = runtime.tick(1_500).await.unwrap();
+        let completed_at = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .updated_at_ms
+            .max(reconcile_at + 100);
+        let stopped = runtime.tick(completed_at).await.unwrap();
 
         assert!(!stopped.is_blocked(), "{stopped:?}");
         assert_eq!(

@@ -1775,14 +1775,18 @@ fn strategy_trade_rows(
             };
             let profit = trade
                 .realized_profit
-                .checked_sub(valuation.quote_value)
-                .ok_or_else(|| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "trade_numeric_overflow",
-                        "The durable execution audit arithmetic overflowed",
-                    ))
-                })?;
+                .map(|realized_profit| {
+                    realized_profit
+                        .checked_sub(valuation.quote_value)
+                        .ok_or_else(|| {
+                            Box::new(api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "trade_numeric_overflow",
+                                "The durable execution audit arithmetic overflowed",
+                            ))
+                        })
+                })
+                .transpose()?;
             let level_idx = match &order.purpose {
                 StrategyOrderPurpose::InitialGrid { level_index, .. }
                 | StrategyOrderPurpose::Replacement { level_index, .. } => Some(*level_index),
@@ -1804,9 +1808,10 @@ fn strategy_trade_rows(
                 fee_source: fee_valuation_source_name(valuation.source),
                 liquidity: if trade.is_maker { "maker" } else { "taker" },
                 is_maker: trade.is_maker,
-                realized_pnl: trade.realized_profit.to_string(),
-                profit: (valuation.source != FeeValuationSource::PendingHistoricalPrice)
-                    .then(|| profit.to_string()),
+                realized_pnl: trade.realized_profit.map(|profit| profit.to_string()),
+                profit: profit
+                    .filter(|_| valuation.source != FeeValuationSource::PendingHistoricalPrice)
+                    .map(|profit| profit.to_string()),
                 reduce_only: order.shape.reduce_only,
                 level_idx,
                 time: trade.trade_time_ms,
@@ -2395,7 +2400,8 @@ struct StrategyTradeRow {
     fee_source: &'static str,
     liquidity: &'static str,
     is_maker: bool,
-    realized_pnl: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    realized_pnl: Option<String>,
     profit: Option<String>,
     reduce_only: bool,
     level_idx: Option<u16>,
@@ -5124,7 +5130,7 @@ mod tests {
             raw_commission: Decimal::from_str_exact("0.0277").unwrap(),
             commission_cost: Decimal::from_str_exact("0.0277").unwrap(),
             commission_asset: "BNB".into(),
-            realized_profit: Decimal::from_str_exact("1.5").unwrap(),
+            realized_profit: Some(Decimal::from_str_exact("1.5").unwrap()),
             is_maker: false,
             trade_time_ms: 1_779_550_014_852,
         };
@@ -5182,6 +5188,113 @@ mod tests {
         assert!(row["profit"].is_null());
         assert_eq!(row["fee_source"], "pending_historical_price");
         assert_eq!(row["fee"], "0.0277");
+        assert_eq!(row["realized_pnl"], "1.5");
+    }
+
+    #[test]
+    fn strategy_trade_rows_omit_unknown_realized_pnl_without_fabricating_profit() {
+        for missing_field in [false, true] {
+            let directory = tempdir().unwrap();
+            let mut strategy = strategy_with_trade_audit(directory.path());
+            let audit = strategy
+                .orders
+                .values_mut()
+                .find_map(|order| order.execution_audit.as_mut())
+                .unwrap();
+            let mut trade = serde_json::to_value(&audit.snapshot.trades[0]).unwrap();
+            if missing_field {
+                trade.as_object_mut().unwrap().remove("realized_profit");
+            } else {
+                trade["realized_profit"] = Value::Null;
+            }
+            audit.snapshot.trades[0] = serde_json::from_value(trade).unwrap();
+
+            let rows = strategy_trade_rows(&strategy, 100).unwrap();
+            assert_eq!(rows.len(), 1);
+            let row = serde_json::to_value(&rows[0]).unwrap();
+
+            assert!(row.get("realized_pnl").is_none());
+            assert_eq!(row["profit"], Value::Null);
+            assert_eq!(row["trade_id"], "opaque-trade-1");
+            assert_eq!(row["price"], "15.95");
+            assert_eq!(row["qty"], "3.14");
+            assert_eq!(row["volume"], "50.083");
+            assert_eq!(row["fee"], "0.0277");
+            assert_eq!(row["fee_usdt"], "0.12");
+            assert_eq!(row["fee_asset"], "BNB");
+            assert_eq!(row["fee_quote_asset"], "USDT");
+            assert_eq!(row["fee_source"], "historical_minute_open");
+            assert_eq!(row["liquidity"], "taker");
+        }
+    }
+
+    #[test]
+    fn strategy_trade_rows_preserve_explicit_zero_and_negative_realized_pnl() {
+        for (realized_pnl, profit) in [("0", "-0.12"), ("-0.54026203", "-0.66026203")] {
+            let directory = tempdir().unwrap();
+            let mut strategy = strategy_with_trade_audit(directory.path());
+            let audit = strategy
+                .orders
+                .values_mut()
+                .find_map(|order| order.execution_audit.as_mut())
+                .unwrap();
+            let mut trade = serde_json::to_value(&audit.snapshot.trades[0]).unwrap();
+            trade["realized_profit"] = json!(realized_pnl);
+            audit.snapshot.trades[0] = serde_json::from_value(trade).unwrap();
+
+            let rows = strategy_trade_rows(&strategy, 100).unwrap();
+            let row = serde_json::to_value(&rows[0]).unwrap();
+
+            assert_eq!(row["realized_pnl"], realized_pnl);
+            assert_eq!(row["profit"], profit);
+            assert_eq!(row["qty"], "3.14");
+            assert_eq!(row["fee_usdt"], "0.12");
+        }
+    }
+
+    #[test]
+    fn strategy_trade_rows_unknown_pnl_still_requires_one_matching_fee_valuation() {
+        for invalid_valuation in ["missing", "mismatched", "duplicate"] {
+            let directory = tempdir().unwrap();
+            let mut strategy = strategy_with_trade_audit(directory.path());
+            let audit = strategy
+                .orders
+                .values_mut()
+                .find_map(|order| order.execution_audit.as_mut())
+                .unwrap();
+            let mut trade = serde_json::to_value(&audit.snapshot.trades[0]).unwrap();
+            trade["realized_profit"] = Value::Null;
+            audit.snapshot.trades[0] = serde_json::from_value(trade).unwrap();
+            match invalid_valuation {
+                "missing" => audit.fee_valuations.clear(),
+                "mismatched" => audit.fee_valuations[0].trade_id = "other-trade".into(),
+                "duplicate" => audit.fee_valuations.push(audit.fee_valuations[0].clone()),
+                _ => unreachable!(),
+            }
+
+            let response = strategy_trade_rows(&strategy, 100).unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[test]
+    fn strategy_trade_rows_known_pnl_overflow_fails_closed() {
+        let directory = tempdir().unwrap();
+        let mut strategy = strategy_with_trade_audit(directory.path());
+        let audit = strategy
+            .orders
+            .values_mut()
+            .find_map(|order| order.execution_audit.as_mut())
+            .unwrap();
+        let mut trade = serde_json::to_value(&audit.snapshot.trades[0]).unwrap();
+        trade["realized_profit"] = json!(Decimal::MIN);
+        audit.snapshot.trades[0] = serde_json::from_value(trade).unwrap();
+        audit.fee_valuations[0].quote_value = Decimal::ONE;
+
+        let response = strategy_trade_rows(&strategy, 100).unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -5201,7 +5314,7 @@ mod tests {
         assert_eq!(rows[0].fee_asset, "BNB");
         assert_eq!(rows[0].fee_quote_asset, "USDT");
         assert_eq!(rows[0].liquidity, "taker");
-        assert_eq!(rows[0].realized_pnl, "1.5");
+        assert_eq!(rows[0].realized_pnl.as_deref(), Some("1.5"));
         assert_eq!(rows[0].profit.as_deref(), Some("1.38"));
     }
 

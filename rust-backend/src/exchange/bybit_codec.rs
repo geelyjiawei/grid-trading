@@ -511,7 +511,7 @@ pub(super) fn parse_execution_page(
         {
             return Err(BybitCodecError::InvalidField("feeCurrency"));
         }
-        let realized_profit = optional_decimal(row, "execPnl")?.unwrap_or(Decimal::ZERO);
+        let realized_profit = optional_decimal(row, "execPnl")?;
         trades.push(TradeFill {
             trade_id,
             exchange_order_id: exchange_order_id.into(),
@@ -1048,6 +1048,52 @@ mod tests {
             parse_exact_order_record(&body.to_string(), "MUUSDT", &client_id(), None),
             Err(BybitCodecError::InvalidField("nextPageCursor"))
         );
+    }
+
+    #[test]
+    fn bybit_execution_pnl_preserves_missing_zero_and_invalid_values() {
+        let base = serde_json::json!({"retCode":0,"result":{"category":"linear","nextPageCursor":"","list":[{
+            "symbol":"MUUSDT","orderId":"order-42","orderLinkId":"g_0_S_bybit-test",
+            "side":"Sell","execType":"Trade","execFee":"0.5","execId":"trade-1",
+            "execPrice":"1014","execQty":"2.8","execValue":"2839.2",
+            "execTime":"1700000000500","feeCurrency":"USDT","isMaker":true
+        }]}});
+        for missing in [None, Some(Value::Null), Some(serde_json::json!(""))] {
+            let mut body = base.clone();
+            if let Some(value) = missing {
+                body["result"]["list"][0]["execPnl"] = value;
+            }
+            let page = parse_execution_page(&body.to_string(), "MUUSDT", &client_id(), "order-42")
+                .unwrap();
+            let serialized = serde_json::to_value(&page.trades[0]).unwrap();
+            assert!(
+                serialized["realized_profit"].is_null(),
+                "missing PnL is not a reported zero: {serialized}"
+            );
+        }
+        for text in ["0", "0.54026203", "-0.25"] {
+            let mut body = base.clone();
+            body["result"]["list"][0]["execPnl"] = serde_json::json!(text);
+            let page = parse_execution_page(&body.to_string(), "MUUSDT", &client_id(), "order-42")
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&page.trades[0]).unwrap()["realized_profit"],
+                text
+            );
+        }
+        for invalid in [
+            serde_json::json!("NaN"),
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ] {
+            let mut body = base.clone();
+            body["result"]["list"][0]["execPnl"] = invalid;
+            assert!(
+                parse_execution_page(&body.to_string(), "MUUSDT", &client_id(), "order-42")
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -2036,10 +2036,13 @@ fn validate_execution_audit_extension(
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
-    if !candidate
-        .snapshot
-        .trades
-        .starts_with(&previous.snapshot.trades)
+    if candidate.snapshot.trades.len() < previous.snapshot.trades.len()
+        || previous
+            .snapshot
+            .trades
+            .iter()
+            .zip(&candidate.snapshot.trades)
+            .any(|(old, new)| !old.execution_evidence_matches(new))
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
@@ -2894,7 +2897,7 @@ fn apply_valued_execution_to_state(
     valued: &ValuedExecutionReport,
     now_ms: u64,
 ) -> StrategyTransition {
-    let candidate = ExecutionAuditRecord {
+    let mut candidate = ExecutionAuditRecord {
         snapshot: snapshot.clone(),
         fee_valuations: valued.fee_valuations.clone(),
         synced_at_ms: now_ms,
@@ -2915,6 +2918,14 @@ fn apply_valued_execution_to_state(
             )?;
             if let Some(previous) = &order.execution_audit {
                 validate_execution_audit_extension(previous, &candidate)?;
+                for (known, incoming) in previous
+                    .snapshot
+                    .trades
+                    .iter()
+                    .zip(&mut candidate.snapshot.trades)
+                {
+                    incoming.realized_profit = incoming.realized_profit.or(known.realized_profit);
+                }
             }
             Ok(())
         })
@@ -6148,7 +6159,7 @@ mod tests {
             raw_commission: Decimal::ZERO,
             commission_cost: Decimal::ZERO,
             commission_asset: "USDT".into(),
-            realized_profit: Decimal::ZERO,
+            realized_profit: Some(Decimal::ZERO),
             is_maker: true,
             trade_time_ms: fixture.trade_time_ms,
         };
@@ -7903,7 +7914,7 @@ mod tests {
             raw_commission: Decimal::ZERO,
             commission_cost: Decimal::ZERO,
             commission_asset: "USDT".into(),
-            realized_profit: Decimal::ZERO,
+            realized_profit: Some(Decimal::ZERO),
             is_maker: true,
             trade_time_ms: 102,
         };
@@ -8013,7 +8024,7 @@ mod tests {
             raw_commission: Decimal::ZERO,
             commission_cost: Decimal::ZERO,
             commission_asset: "USDT".into(),
-            realized_profit: Decimal::ZERO,
+            realized_profit: Some(Decimal::ZERO),
             is_maker: true,
             trade_time_ms: 102,
         };
@@ -9063,7 +9074,7 @@ mod tests {
                 raw_commission: Decimal::ZERO,
                 commission_cost: Decimal::ZERO,
                 commission_asset: "USDT".into(),
-                realized_profit: Decimal::ONE,
+                realized_profit: Some(Decimal::ONE),
                 is_maker: true,
                 trade_time_ms: 104,
             },
@@ -9078,7 +9089,7 @@ mod tests {
                 raw_commission: Decimal::ZERO,
                 commission_cost: Decimal::ZERO,
                 commission_asset: "USDT".into(),
-                realized_profit: Decimal::ZERO,
+                realized_profit: Some(Decimal::ZERO),
                 is_maker: true,
                 trade_time_ms: 105,
             },

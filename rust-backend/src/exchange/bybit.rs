@@ -1034,10 +1034,10 @@ where
             .map_err(|error| execution_error(error.to_string()))?
             .ok_or_else(|| execution_error("Bybit order snapshot is not available"))?;
         if header.cumulative_quantity.is_zero() {
-            let snapshot = assemble_execution_snapshot(header, vec![])
+            let mut snapshot = assemble_execution_snapshot(header, vec![])
                 .map_err(|error| execution_error(error.to_string()))?;
             self.realtime_execution_cache
-                .seed_verified_snapshot(cache_epoch, &snapshot);
+                .merge_verified_snapshot(cache_epoch, &mut snapshot)?;
             return Ok(snapshot);
         }
 
@@ -1086,10 +1086,10 @@ where
                 "Bybit execution history exceeded bounded pagination",
             ));
         }
-        let snapshot = assemble_execution_snapshot(header, trades)
+        let mut snapshot = assemble_execution_snapshot(header, trades)
             .map_err(|error| execution_error(format!("incomplete Bybit execution: {error}")))?;
         self.realtime_execution_cache
-            .seed_verified_snapshot(cache_epoch, &snapshot);
+            .merge_verified_snapshot(cache_epoch, &mut snapshot)?;
         Ok(snapshot)
     }
 }

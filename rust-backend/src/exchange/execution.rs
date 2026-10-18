@@ -329,7 +329,7 @@ pub(super) fn parse_trade_page(
         {
             return Err(ExecutionCodecError::InvalidField("commissionAsset"));
         }
-        let realized_profit = optional_decimal(row, "realizedPnl")?.unwrap_or(Decimal::ZERO);
+        let realized_profit = optional_decimal(row, "realizedPnl")?;
         let is_maker = required_bool(row, "maker")?;
         let trade_time_ms = required_u64(row, "time")?;
         if numeric_trade_id == 0

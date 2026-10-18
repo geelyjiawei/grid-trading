@@ -2718,9 +2718,7 @@ fn parse_trade_fill(
         commission_asset: text_field(row, "feeToken")
             .map_err(snapshot_to_execution)?
             .to_ascii_uppercase(),
-        realized_profit: optional_decimal(row, "closedPnl")
-            .map_err(snapshot_to_execution)?
-            .unwrap_or(Decimal::ZERO),
+        realized_profit: optional_decimal(row, "closedPnl").map_err(snapshot_to_execution)?,
         is_maker: !row
             .get("crossed")
             .and_then(Value::as_bool)

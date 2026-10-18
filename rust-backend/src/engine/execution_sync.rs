@@ -420,7 +420,7 @@ mod tests {
             raw_commission: fee,
             commission_cost: fee,
             commission_asset: "USDT".into(),
-            realized_profit: Decimal::ZERO,
+            realized_profit: Some(Decimal::ZERO),
             is_maker: true,
             trade_time_ms: 1_020_001,
         };
@@ -506,7 +506,7 @@ mod tests {
             raw_commission: fee,
             commission_cost: fee,
             commission_asset: "USDT".into(),
-            realized_profit: Decimal::ZERO,
+            realized_profit: Some(Decimal::ZERO),
             is_maker: true,
             trade_time_ms: 1_170,
         };
@@ -1232,6 +1232,384 @@ mod tests {
                 .price,
             Decimal::new(1014, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn optional_pnl_partial_rest_and_full_fill_remain_idempotent() {
+        let (mut machine, id) = accepted_grid_machine().await;
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        let mut partial = partial_cancel_execution_for(&machine, &id);
+        partial.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        let mut value = serde_json::to_value(&partial).unwrap();
+        value["trades"][0]["realized_profit"] = serde_json::json!("0.54026203");
+        partial = serde_json::from_value(value).unwrap();
+        service
+            .synchronize(&gateway(Ok(partial.clone())), &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let after_partial = machine.store().snapshot().clone();
+
+        let mut rest = serde_json::to_value(&partial).unwrap();
+        rest["trades"][0]["realized_profit"] = serde_json::Value::Null;
+        let rest: OrderExecutionSnapshot = serde_json::from_value(rest).unwrap();
+        let refresh = service
+            .synchronize(&gateway(Ok(rest.clone())), &mut machine, &id, 1_201)
+            .await
+            .unwrap();
+        assert_eq!(refresh.transition, StrategyTransition::NoChange);
+        assert_eq!(machine.store().snapshot(), &after_partial);
+
+        let saved = serde_json::to_vec(machine.store().snapshot()).unwrap();
+        let restored: StrategyState = serde_json::from_slice(&saved).unwrap();
+        let baseline = restored.baseline.clone();
+        machine = StrategyMachine::new(MemoryStrategyStateStore::new(restored));
+        let mut full = rest;
+        full.order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Filled);
+        let mut second = full.trades[0].clone();
+        second.trade_id = "partial-cancel-8".into();
+        second.trade_time_ms = 1_181;
+        full.trades.push(second);
+        full.cumulative_quantity = Decimal::new(2, 1);
+        full.cumulative_quote *= Decimal::TWO;
+        full.fees_by_asset.insert("USDT".into(), Decimal::new(2, 2));
+        full.update_time_ms = 1_182;
+        let complete = service
+            .synchronize(&gateway(Ok(full.clone())), &mut machine, &id, 1_300)
+            .await
+            .unwrap();
+        assert!(!matches!(
+            complete.transition,
+            StrategyTransition::Failed { .. }
+        ));
+        let state = machine.store().snapshot();
+        assert_ne!(state.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(state.baseline, baseline);
+        let audit = state.orders[&id].execution_audit.as_ref().unwrap();
+        assert_eq!(audit.snapshot.trades.len(), 2);
+        assert_eq!(audit.snapshot.cumulative_quantity, Decimal::new(2, 1));
+        assert_eq!(
+            serde_json::to_value(&audit.snapshot.trades[0]).unwrap()["realized_profit"],
+            "0.54026203"
+        );
+        assert_eq!(
+            state
+                .inventory_events
+                .values()
+                .filter(|event| event.source_client_order_id == id)
+                .count(),
+            2
+        );
+        assert_eq!(
+            state
+                .replacement_obligations
+                .values()
+                .filter(|row| row.source_client_order_id == id)
+                .map(|row| row.shape.quantity)
+                .sum::<Decimal>(),
+            Decimal::new(2, 1)
+        );
+        let before = state.clone();
+        let repeated = service
+            .synchronize(&gateway(Ok(full)), &mut machine, &id, 1_301)
+            .await
+            .unwrap();
+        assert_eq!(repeated.transition, StrategyTransition::NoChange);
+        assert_eq!(machine.store().snapshot(), &before);
+    }
+
+    #[tokio::test]
+    async fn optional_pnl_does_not_hide_explicit_zero_or_execution_conflicts() {
+        for (field, changed) in [
+            ("realized_profit", serde_json::json!("0.54026203")),
+            ("quantity", serde_json::json!("0.2")),
+            ("price", serde_json::json!("9999")),
+            ("commission_cost", serde_json::json!("0.02")),
+            ("trade_id", serde_json::json!("rewritten-trade-id")),
+        ] {
+            let (mut machine, id) = accepted_grid_machine().await;
+            let service = ExecutionSyncService::new("USDT").unwrap();
+            let mut partial = partial_cancel_execution_for(&machine, &id);
+            partial.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+            service
+                .synchronize(&gateway(Ok(partial.clone())), &mut machine, &id, 1_200)
+                .await
+                .unwrap();
+            let before = machine.store().snapshot().clone();
+            let mut changed_snapshot = serde_json::to_value(&partial).unwrap();
+            changed_snapshot["trades"][0][field] = changed;
+            let changed_snapshot = serde_json::from_value(changed_snapshot).unwrap();
+            let result = service
+                .synchronize(&gateway(Ok(changed_snapshot)), &mut machine, &id, 1_201)
+                .await;
+            assert!(
+                result.is_err()
+                    || matches!(
+                        result.unwrap().transition,
+                        StrategyTransition::Failed { .. }
+                    ),
+                "{field} must remain rejected"
+            );
+            assert_eq!(
+                machine.store().snapshot().inventory_events,
+                before.inventory_events
+            );
+            assert_eq!(
+                machine.store().snapshot().replacement_obligations,
+                before.replacement_obligations
+            );
+            assert_eq!(machine.store().snapshot().total_fee, before.total_fee);
+            assert_eq!(machine.store().snapshot().baseline, before.baseline);
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_real_500_q_partial_rest_replay_keeps_exact_210_and_290_obligations() {
+        let mut cfg = config();
+        cfg.exchange = Some(Exchange::Bybit);
+        cfg.symbol = "QUSDT".into();
+        cfg.lower_price = Decimal::new(1162, 4);
+        cfg.upper_price = Decimal::new(1462, 4);
+        cfg.grid_count = 50;
+        cfg.grid_order_qty = Some(Decimal::from(500));
+        cfg.initial_order_price = Some(Decimal::new(1168, 4));
+        let mut instrument = rules();
+        instrument.tick_size = Decimal::new(1, 6);
+        instrument.limit_quantity.max = Some(Decimal::from(100_000));
+        instrument.market_quantity.max = Some(Decimal::from(100_000));
+        let market = MarketSnapshot {
+            last_price: Decimal::new(1168, 4),
+            mark_price: Decimal::new(1168, 4),
+        };
+        let plan = build_grid_plan(&cfg, &market, &instrument).unwrap();
+        let baseline = PositionBaseline::from_authoritative_position(
+            Decimal::new(-5, 1),
+            Some(Decimal::new(12, 2)),
+        )
+        .unwrap();
+        let state = StrategyState::from_plan(
+            crate::engine::StrategyRunId::parse("qreplay1").unwrap(),
+            cfg,
+            instrument,
+            plan,
+            baseline.clone(),
+            1_000,
+        )
+        .unwrap();
+        let opening = state
+            .orders
+            .values()
+            .find(|row| row.purpose == StrategyOrderPurpose::Opening)
+            .unwrap()
+            .clone();
+        assert_eq!(opening.shape.quantity, Decimal::from(500));
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state));
+        machine
+            .synchronize_intent(
+                &OrderIntent {
+                    client_order_id: opening.client_order_id.clone(),
+                    exchange: Exchange::Bybit,
+                    shape: opening.shape.clone(),
+                    state: IntentState::Accepted {
+                        exchange_order_id: "opening-q".into(),
+                    },
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_100,
+                },
+                1_100,
+            )
+            .unwrap();
+        let opening_fill = TradeFill {
+            trade_id: "opening-trade-q".into(),
+            exchange_order_id: "opening-q".into(),
+            symbol: "QUSDT".into(),
+            side: OrderSide::Sell,
+            price: Decimal::new(1168, 4),
+            quantity: Decimal::from(500),
+            quote_quantity: Decimal::new(584, 1),
+            raw_commission: Decimal::new(2336, 5),
+            commission_cost: Decimal::new(2336, 5),
+            commission_asset: "USDT".into(),
+            realized_profit: Some(Decimal::ZERO),
+            is_maker: true,
+            trade_time_ms: 1_150,
+        };
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(
+                &gateway(Ok(OrderExecutionSnapshot {
+                    order: AuthoritativeOrder {
+                        client_order_id: opening.client_order_id.clone(),
+                        exchange_order_id: "opening-q".into(),
+                        exchange: Exchange::Bybit,
+                        shape: opening.shape,
+                        lifecycle: OrderLifecycle::Terminal(TerminalOrderStatus::Filled),
+                        executed_quantity: Some(Decimal::from(500)),
+                    },
+                    cumulative_quantity: Decimal::from(500),
+                    cumulative_quote: Decimal::new(584, 1),
+                    fees_by_asset: [("USDT".into(), Decimal::new(2336, 5))]
+                        .into_iter()
+                        .collect(),
+                    trades: vec![opening_fill],
+                    order_time_ms: 1_100,
+                    update_time_ms: 1_150,
+                })),
+                &mut machine,
+                &opening.client_order_id,
+                1_160,
+            )
+            .await
+            .unwrap();
+        let close = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|row| row.shape.reduce_only && row.shape.price == Some(Decimal::new(1162, 4)))
+            .unwrap()
+            .clone();
+        let oid = "f89eccf9-f3df-4021-b5bb-d69ce1fb3ab5";
+        machine
+            .synchronize_intent(
+                &OrderIntent {
+                    client_order_id: close.client_order_id.clone(),
+                    exchange: Exchange::Bybit,
+                    shape: close.shape.clone(),
+                    state: IntentState::Accepted {
+                        exchange_order_id: oid.into(),
+                    },
+                    created_at_ms: 1_160,
+                    updated_at_ms: 1_170,
+                },
+                1_170,
+            )
+            .unwrap();
+        let first = TradeFill {
+            trade_id: "fa4268e8-4994-541c-9709-18423acb3515".into(),
+            exchange_order_id: oid.into(),
+            symbol: "QUSDT".into(),
+            side: OrderSide::Buy,
+            price: Decimal::new(1162, 4),
+            quantity: Decimal::from(210),
+            quote_quantity: Decimal::new(24402, 3),
+            raw_commission: Decimal::new(97608, 7),
+            commission_cost: Decimal::new(97608, 7),
+            commission_asset: "USDT".into(),
+            realized_profit: Some(Decimal::new(54026203, 8)),
+            is_maker: true,
+            trade_time_ms: 1792336092619,
+        };
+        let partial = OrderExecutionSnapshot {
+            order: AuthoritativeOrder {
+                client_order_id: close.client_order_id.clone(),
+                exchange_order_id: oid.into(),
+                exchange: Exchange::Bybit,
+                shape: close.shape,
+                lifecycle: OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled),
+                executed_quantity: Some(Decimal::from(210)),
+            },
+            cumulative_quantity: Decimal::from(210),
+            cumulative_quote: Decimal::new(24402, 3),
+            fees_by_asset: [("USDT".into(), Decimal::new(97608, 7))]
+                .into_iter()
+                .collect(),
+            trades: vec![first],
+            order_time_ms: 1792335805436,
+            update_time_ms: 1792336092622,
+        };
+        service
+            .synchronize(
+                &gateway(Ok(partial.clone())),
+                &mut machine,
+                &close.client_order_id,
+                1792336092659,
+            )
+            .await
+            .unwrap();
+        let after_partial = machine.store().snapshot().clone();
+        assert_eq!(
+            after_partial.grid_position_net_quantity,
+            Decimal::from(-290)
+        );
+        let mut rest = partial;
+        rest.trades[0].realized_profit = None;
+        let refresh = service
+            .synchronize(
+                &gateway(Ok(rest.clone())),
+                &mut machine,
+                &close.client_order_id,
+                1792336093394,
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh.transition, StrategyTransition::NoChange);
+        assert_eq!(machine.store().snapshot(), &after_partial);
+        let restored: StrategyState =
+            serde_json::from_slice(&serde_json::to_vec(&after_partial).unwrap()).unwrap();
+        machine = StrategyMachine::new(MemoryStrategyStateStore::new(restored));
+        let mut second = rest.trades[0].clone();
+        second.trade_id = "79f30bc1-0684-50df-bc95-6e52a3f835f9".into();
+        second.quantity = Decimal::from(290);
+        second.quote_quantity = Decimal::new(33698, 3);
+        second.raw_commission = Decimal::new(134792, 7);
+        second.commission_cost = second.raw_commission;
+        second.trade_time_ms = 1792336094234;
+        rest.trades.push(second);
+        rest.order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Filled);
+        rest.order.executed_quantity = Some(Decimal::from(500));
+        rest.cumulative_quantity = Decimal::from(500);
+        rest.cumulative_quote = Decimal::new(581, 1);
+        rest.fees_by_asset
+            .insert("USDT".into(), Decimal::new(2324, 5));
+        rest.update_time_ms = 1792336094238;
+        let final_result = service
+            .synchronize(
+                &gateway(Ok(rest.clone())),
+                &mut machine,
+                &close.client_order_id,
+                1792336094272,
+            )
+            .await
+            .unwrap();
+        assert!(!matches!(
+            final_result.transition,
+            StrategyTransition::Failed { .. }
+        ));
+        let state = machine.store().snapshot();
+        assert_eq!(state.grid_position_net_quantity, Decimal::ZERO);
+        assert_eq!(state.baseline, baseline);
+        assert_eq!(state.total_fee, Decimal::new(466, 4));
+        assert_eq!(state.gross_realized_profit, Decimal::new(3, 1));
+        let mut quantities = state
+            .replacement_obligations
+            .values()
+            .filter(|row| row.source_client_order_id == close.client_order_id)
+            .map(|row| row.shape.quantity)
+            .collect::<Vec<_>>();
+        quantities.sort();
+        assert_eq!(quantities, vec![Decimal::from(210), Decimal::from(290)]);
+        assert_eq!(
+            state.orders[&close.client_order_id]
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .trades[0]
+                .realized_profit,
+            Some(Decimal::new(54026203, 8))
+        );
+        let before_repeat = state.clone();
+        let repeated = service
+            .synchronize(
+                &gateway(Ok(rest)),
+                &mut machine,
+                &close.client_order_id,
+                1792336094273,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.transition, StrategyTransition::NoChange);
+        assert_eq!(machine.store().snapshot(), &before_repeat);
     }
 
     #[tokio::test]
