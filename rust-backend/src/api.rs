@@ -1797,14 +1797,16 @@ fn strategy_trade_rows(
                 qty: trade.quantity.to_string(),
                 volume: trade.quote_quantity.to_string(),
                 fee: trade.commission_cost.to_string(),
-                fee_usdt: valuation.quote_value.to_string(),
+                fee_usdt: (valuation.source != FeeValuationSource::PendingHistoricalPrice)
+                    .then(|| valuation.quote_value.to_string()),
                 fee_asset: trade.commission_asset.clone(),
                 fee_quote_asset: valuation.quote_asset.clone(),
                 fee_source: fee_valuation_source_name(valuation.source),
                 liquidity: if trade.is_maker { "maker" } else { "taker" },
                 is_maker: trade.is_maker,
                 realized_pnl: trade.realized_profit.to_string(),
-                profit: profit.to_string(),
+                profit: (valuation.source != FeeValuationSource::PendingHistoricalPrice)
+                    .then(|| profit.to_string()),
                 reduce_only: order.shape.reduce_only,
                 level_idx,
                 time: trade.trade_time_ms,
@@ -1827,6 +1829,7 @@ fn fee_valuation_source_name(source: FeeValuationSource) -> &'static str {
         FeeValuationSource::ExchangeZero => "exchange_zero",
         FeeValuationSource::QuoteAsset => "quote_asset",
         FeeValuationSource::HistoricalMinuteOpen => "historical_minute_open",
+        FeeValuationSource::PendingHistoricalPrice => "pending_historical_price",
     }
 }
 
@@ -1864,6 +1867,9 @@ fn strategy_history_row(snapshot: &StrategyCatalogSnapshot) -> Result<Value, Box
                         "The durable strategy profit arithmetic overflowed",
                     ))
                 })?;
+            let pending_fee_count = state.pending_fee_valuation_count();
+            let net_profit = (pending_fee_count == 0).then(|| net_profit.to_string());
+            let total_fee = (pending_fee_count == 0).then(|| state.total_fee.to_string());
             Ok(json!({
                 "run_id": state.run_id.as_str(),
                 "started_at": state.created_at_ms,
@@ -1880,9 +1886,10 @@ fn strategy_history_row(snapshot: &StrategyCatalogSnapshot) -> Result<Value, Box
                 "total_investment": state.config.total_investment.to_string(),
                 "status": state.lifecycle,
                 "gross_profit": state.gross_realized_profit.to_string(),
-                "realized_net_profit": net_profit.to_string(),
-                "net_profit": net_profit.to_string(),
-                "total_fee": state.total_fee.to_string(),
+                "realized_net_profit": net_profit,
+                "net_profit": net_profit,
+                "total_fee": total_fee,
+                "fee_valuation_pending_count": pending_fee_count,
                 "total_volume": state.total_volume.to_string(),
                 "completed_pairs": state.completed_pairs,
                 "baseline_position": state.baseline.signed_quantity.to_string(),
@@ -2161,7 +2168,10 @@ fn strategy_status_response(
             } else {
                 None
             };
-            Ok(json!({
+            let pending_fee_count = state.pending_fee_valuation_count();
+            let realized_net = (pending_fee_count == 0).then(|| realized_net.to_string());
+            let total_fee = (pending_fee_count == 0).then(|| state.total_fee.to_string());
+            let mut response = json!({
                 "run_id": state.run_id.as_str(),
                 "exchange": state.exchange,
                 "symbol": state.symbol,
@@ -2196,9 +2206,9 @@ fn strategy_status_response(
                 "grid_ready": state.initial_deployment_complete,
                 "completed_pairs": state.completed_pairs,
                 "gross_profit": state.gross_realized_profit.to_string(),
-                "total_fee": state.total_fee.to_string(),
-                "realized_net_profit": realized_net.to_string(),
-                "total_profit": realized_net.to_string(),
+                "total_fee": total_fee,
+                "realized_net_profit": realized_net,
+                "total_profit": realized_net,
                 "total_volume": state.total_volume.to_string(),
                 "baseline_position": {
                     "side": baseline_side,
@@ -2213,7 +2223,9 @@ fn strategy_status_response(
                 "failure": state.failure,
                 "created_at_ms": state.created_at_ms,
                 "updated_at_ms": state.updated_at_ms,
-            }))
+            });
+            response["fee_valuation_pending_count"] = json!(pending_fee_count);
+            Ok(response)
         }
     }
 }
@@ -2377,14 +2389,14 @@ struct StrategyTradeRow {
     qty: String,
     volume: String,
     fee: String,
-    fee_usdt: String,
+    fee_usdt: Option<String>,
     fee_asset: String,
     fee_quote_asset: String,
     fee_source: &'static str,
     liquidity: &'static str,
     is_maker: bool,
     realized_pnl: String,
-    profit: String,
+    profit: Option<String>,
     reduce_only: bool,
     level_idx: Option<u16>,
     time: u64,
@@ -3508,17 +3520,19 @@ async fn exchange_risk(
                 }
             };
             let profit_calculation_has_risk = profit_metrics.is_none();
+            let fees_settled = strategy.pending_fee_valuation_count() == 0;
             let profit_fields = json!({
                 "gross_profit": strategy.gross_realized_profit.to_string(),
-                "realized_net_profit": profit_metrics.map(|metrics| metrics.realized_net_profit.to_string()),
+                "realized_net_profit": profit_metrics.filter(|_| fees_settled).map(|metrics| metrics.realized_net_profit.to_string()),
                 "unrealised_pnl": profit_metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
                 "grid_unrealised_pnl": profit_metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
-                "total_equity_profit": profit_metrics.map(|metrics| metrics.total_equity_profit.to_string()),
-                "total_profit": profit_metrics.map(|metrics| metrics.total_equity_profit.to_string()),
+                "total_equity_profit": profit_metrics.filter(|_| fees_settled).map(|metrics| metrics.total_equity_profit.to_string()),
+                "total_profit": profit_metrics.filter(|_| fees_settled).map(|metrics| metrics.total_equity_profit.to_string()),
                 "profit_mark_price": profit_metrics.map(|metrics| metrics.mark_price.to_string()),
                 "profit_scope": "strategy_owned_inventory",
                 "profit_calculation_error": profit_calculation_has_risk.then_some("strategy_profit_unavailable"),
-                "total_fee": strategy.total_fee.to_string(),
+                "total_fee": fees_settled.then(|| strategy.total_fee.to_string()),
+                "fee_valuation_pending_count": strategy.pending_fee_valuation_count(),
                 "total_volume": strategy.total_volume.to_string(),
                 "completed_pairs": strategy.completed_pairs,
             });
@@ -5145,6 +5159,29 @@ mod tests {
     }
 
     #[test]
+    fn pending_fee_valuation_is_not_exposed_as_zero_fee_or_final_profit() {
+        let directory = tempdir().unwrap();
+        let mut strategy = strategy_with_trade_audit(directory.path());
+        let value = strategy
+            .orders
+            .values_mut()
+            .find_map(|order| order.execution_audit.as_mut())
+            .unwrap()
+            .fee_valuations
+            .first_mut()
+            .unwrap();
+        value.source = FeeValuationSource::PendingHistoricalPrice;
+        value.quote_value = Decimal::ZERO;
+        value.valuation_price = None;
+        let rows = strategy_trade_rows(&strategy, 100).unwrap();
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert!(row["fee_usdt"].is_null());
+        assert!(row["profit"].is_null());
+        assert_eq!(row["fee_source"], "pending_historical_price");
+        assert_eq!(row["fee"], "0.0277");
+    }
+
+    #[test]
     fn strategy_trade_rows_preserve_exchange_quantity_fee_and_liquidity_exactly() {
         let directory = tempdir().unwrap();
         let strategy = strategy_with_trade_audit(directory.path());
@@ -5157,12 +5194,12 @@ mod tests {
         assert_eq!(rows[0].qty, "3.14");
         assert_eq!(rows[0].volume, "50.083");
         assert_eq!(rows[0].fee, "0.0277");
-        assert_eq!(rows[0].fee_usdt, "0.12");
+        assert_eq!(rows[0].fee_usdt.as_deref(), Some("0.12"));
         assert_eq!(rows[0].fee_asset, "BNB");
         assert_eq!(rows[0].fee_quote_asset, "USDT");
         assert_eq!(rows[0].liquidity, "taker");
         assert_eq!(rows[0].realized_pnl, "1.5");
-        assert_eq!(rows[0].profit, "1.38");
+        assert_eq!(rows[0].profit.as_deref(), Some("1.38"));
     }
 
     #[test]

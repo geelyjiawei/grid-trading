@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod domain;
 pub mod engine;
@@ -50,6 +52,7 @@ const DEFAULT_WEB_ROOT: &str = "/app/web";
 const DEFAULT_CONFIG_FILE: &str = "/app/data/api_config.json";
 const DEFAULT_RUNTIME_TICK_MS: u64 = 1_000;
 const TRADE_XYZ_RUNTIME_AUDIT_TICK_MS: u64 = 5_000;
+const FEE_SETTLEMENT_TICK_MS: u64 = 5_000;
 const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
 const DEFAULT_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const DEFAULT_SUBMISSIONS_PER_TICK: usize = 100;
@@ -240,6 +243,9 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
         let mut trade_xyz_audit_ticker =
             tokio::time::interval(Duration::from_millis(TRADE_XYZ_RUNTIME_AUDIT_TICK_MS));
         trade_xyz_audit_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut fee_settlement_ticker =
+            tokio::time::interval(Duration::from_millis(FEE_SETTLEMENT_TICK_MS));
+        fee_settlement_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut execution_wakeups = subscribe_execution_wakeups();
         let (execution_completion_sender, mut execution_completions) =
             tokio::sync::mpsc::unbounded_channel();
@@ -328,6 +334,15 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                             log_runtime_advance(advance, false, None, None, 0);
                         }
                     });
+                }
+                _ = fee_settlement_ticker.tick() => {
+                    let Some(now_ms) = system_time_ms() else {
+                        tracing::error!("system clock is unavailable; fee settlement sweep skipped");
+                        continue;
+                    };
+                    // Only snapshots and per-run job admission happen here. Fee HTTP does
+                    // not own either trading tick lease, including during stop/recovery.
+                    runtime.spawn_fee_settlements(now_ms).await;
                 }
             }
         }

@@ -17,7 +17,9 @@ use crate::exchange::{
 
 use super::{
     GridOrderRole, GridPlan, GridPlanError, PlannedGridOrder,
-    execution_accounting::{ExecutionAuditRecord, FeeValuationSource, ValuedExecutionReport},
+    execution_accounting::{
+        ExecutionAuditRecord, FeeValuation, FeeValuationSource, ValuedExecutionReport,
+    },
 };
 
 const ASTER_TRADE_TIMESTAMP_ROUNDING_TOLERANCE_MS: u64 = 100;
@@ -316,6 +318,14 @@ pub(crate) struct TriggerActivation {
 }
 
 impl StrategyState {
+    pub fn pending_fee_valuation_count(&self) -> usize {
+        self.orders
+            .values()
+            .filter_map(|order| order.execution_audit.as_ref())
+            .flat_map(|audit| &audit.fee_valuations)
+            .filter(|valuation| valuation.source == FeeValuationSource::PendingHistoricalPrice)
+            .count()
+    }
     pub fn from_plan(
         run_id: StrategyRunId,
         config: GridConfig,
@@ -1989,6 +1999,17 @@ fn validate_execution_audit_payload(
                                 == Some(valuation.quote_value)
                     })
             }
+            FeeValuationSource::PendingHistoricalPrice => {
+                let expected_minute = trade.trade_time_ms - trade.trade_time_ms % 60_000;
+                let expected_symbol = format!("{}{}", valuation.fee_asset, valuation.quote_asset);
+                valuation.fee_amount > Decimal::ZERO
+                    && valuation.fee_asset != valuation.quote_asset
+                    && expected_minute > 0
+                    && valuation.quote_value.is_zero()
+                    && valuation.valuation_symbol.as_deref() == Some(&expected_symbol)
+                    && valuation.valuation_minute_start_ms == Some(expected_minute)
+                    && valuation.valuation_price.is_none()
+            }
         };
         if !source_is_valid {
             return Err(StrategyStateError::InvalidExecutionAudit);
@@ -2022,9 +2043,22 @@ fn validate_execution_audit_extension(
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
-    if !candidate
-        .fee_valuations
-        .starts_with(&previous.fee_valuations)
+    if candidate.fee_valuations.len() < previous.fee_valuations.len()
+        || previous
+            .fee_valuations
+            .iter()
+            .zip(&candidate.fee_valuations)
+            .any(|(old, new)| {
+                old != new
+                    && !(old.source == FeeValuationSource::PendingHistoricalPrice
+                        && new.source == FeeValuationSource::HistoricalMinuteOpen
+                        && old.trade_id == new.trade_id
+                        && old.fee_asset == new.fee_asset
+                        && old.fee_amount == new.fee_amount
+                        && old.quote_asset == new.quote_asset
+                        && old.valuation_symbol == new.valuation_symbol
+                        && old.valuation_minute_start_ms == new.valuation_minute_start_ms)
+            })
     {
         return Err(StrategyStateError::InvalidExecutionAudit);
     }
@@ -2288,6 +2322,92 @@ where
         let mut next = self.store.snapshot().clone();
         let transition = apply_valued_execution_to_state(&mut next, snapshot, valued, now_ms);
         self.finalize_and_store(next, now_ms, transition)
+    }
+
+    pub(crate) fn settle_fee_valuations(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        resolved: &[FeeValuation],
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
+        let state = self.store.snapshot();
+        let order = state
+            .orders
+            .get(client_order_id)
+            .ok_or(StrategyStateError::InvalidExecutionAudit)?;
+        let audit = order
+            .execution_audit
+            .as_ref()
+            .ok_or(StrategyStateError::InvalidExecutionAudit)?;
+        let mut candidate = audit.clone();
+        let mut seen = BTreeSet::new();
+        for valuation in resolved {
+            if !seen.insert(&valuation.trade_id) {
+                return Err(StrategyStateError::InvalidExecutionAudit.into());
+            }
+            let existing = candidate
+                .fee_valuations
+                .iter_mut()
+                .find(|current| current.trade_id == valuation.trade_id)
+                .ok_or(StrategyStateError::InvalidExecutionAudit)?;
+            if *existing != *valuation {
+                if existing.source != FeeValuationSource::PendingHistoricalPrice
+                    || valuation.source != FeeValuationSource::HistoricalMinuteOpen
+                {
+                    return Err(StrategyStateError::InvalidExecutionAudit.into());
+                }
+                *existing = valuation.clone();
+            }
+        }
+        let cumulative_fee =
+            candidate
+                .fee_valuations
+                .iter()
+                .try_fold(Decimal::ZERO, |total, value| {
+                    total
+                        .checked_add(value.quote_value)
+                        .ok_or(StrategyStateError::NumericOverflow("settled execution fee"))
+                })?;
+        validate_execution_audit_payload(
+            state.exchange,
+            order,
+            &candidate,
+            order.cumulative_quantity,
+            order.cumulative_quote,
+            cumulative_fee,
+            order.terminal_status,
+        )?;
+        validate_execution_audit_extension(audit, &candidate)?;
+        if candidate.fee_valuations == audit.fee_valuations {
+            return Ok(StrategyTransition::NoChange);
+        }
+        let delta_fee = cumulative_fee
+            .checked_sub(order.cumulative_fee)
+            .filter(|delta| *delta >= Decimal::ZERO)
+            .ok_or(StrategyStateError::InvalidExecutionAudit)?;
+        let total_fee = state
+            .total_fee
+            .checked_add(delta_fee)
+            .ok_or(StrategyStateError::NumericOverflow("settled strategy fee"))?;
+        let mut next = state.clone();
+        let order = next
+            .orders
+            .get_mut(client_order_id)
+            .ok_or(StrategyStateError::InvalidExecutionAudit)?;
+        candidate.synced_at_ms = now_ms;
+        order.cumulative_fee = cumulative_fee;
+        order.execution_audit = Some(candidate);
+        next.total_fee = total_fee;
+        // Fee settlement is not a new execution: never touch inventory,
+        // terminal reconciliation, replacement obligations or lifecycle here.
+        self.finalize_and_store(
+            next,
+            now_ms,
+            StrategyTransition::Updated {
+                new_obligation_ids: Vec::new(),
+            },
+        )
     }
 
     pub fn apply_valued_executions(

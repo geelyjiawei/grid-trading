@@ -41,6 +41,7 @@ pub use execution_accounting::{
     FeeValuationSource, ValuedExecutionReport,
 };
 pub use execution_sync::{ExecutionSyncError, ExecutionSyncResult, ExecutionSyncService};
+pub(crate) use execution_sync::{PendingFeeValuation, ResolvedFeeValuation};
 pub use fee_rates::{AuthoritativeFeeConfig, FeeRateConfigError, load_authoritative_fee_config};
 pub use grid_plan::{
     GridOrderRole, GridPlan, GridPlanError, MarketSnapshot, PlannedGridOrder, PlannedOpeningOrder,

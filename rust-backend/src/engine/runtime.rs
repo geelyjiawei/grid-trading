@@ -16,12 +16,13 @@ use crate::{
     },
     engine::{
         ArmedStrategyLifecycle, ArmedStrategyState, CancellationResult, CancellationServiceError,
-        ExecutionAccountingError, ExecutionSyncService, ReconciliationError, ReconciliationResult,
-        StrategyBootstrapError, StrategyLifecycle, StrategyMachine, StrategyMachineError,
-        StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking, StrategyRunId,
-        StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
-        StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
-        cancel_many_with, commit_submission_batch, intent_requires_lookup, load_strategy_inputs,
+        ExecutionAccountingError, ExecutionSyncService, FeeValuationSource, PendingFeeValuation,
+        ReconciliationError, ReconciliationResult, ResolvedFeeValuation, StrategyBootstrapError,
+        StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
+        StrategyOrderRecord, StrategyOrderTracking, StrategyRunId, StrategyState,
+        StrategyStateError, StrategyStateStore, StrategyStoreError, StrategyTransition,
+        SubmissionError, SubmissionResult, activate_armed_strategy, cancel_many_with,
+        commit_submission_batch, intent_requires_lookup, load_strategy_inputs,
         prepare_new_strategy, prepare_submission_batch, reconcile_lookup_with,
         resolve_cancellations_with, submit_many_with, submit_with,
     },
@@ -416,6 +417,62 @@ impl<G> PreparedLeasedFileStrategy<G> {
 
     pub fn is_terminal(&self) -> bool {
         self.lifecycle().is_terminal()
+    }
+
+    pub(crate) fn has_pending_fee_valuations(&self) -> bool {
+        self.active_runtime().is_some_and(|runtime| {
+            runtime
+                .runtime()
+                .machine()
+                .store()
+                .snapshot()
+                .pending_fee_valuation_count()
+                > 0
+        })
+    }
+
+    pub(crate) fn prepare_pending_fee_work(
+        &self,
+        maximum_orders: usize,
+    ) -> Vec<PendingFeeValuation<G>>
+    where
+        G: Clone,
+    {
+        self.active_runtime().map_or_else(Vec::new, |runtime| {
+            runtime.runtime().prepare_pending_fee_work(maximum_orders)
+        })
+    }
+
+    pub(crate) fn prepare_pending_fee_work_after(
+        &self,
+        maximum_orders: usize,
+        after: Option<&ClientOrderId>,
+    ) -> Vec<PendingFeeValuation<G>>
+    where
+        G: Clone,
+    {
+        match after {
+            None => self.prepare_pending_fee_work(maximum_orders),
+            Some(_) => self.active_runtime().map_or_else(Vec::new, |runtime| {
+                runtime
+                    .runtime()
+                    .prepare_pending_fee_work_after(maximum_orders, after)
+            }),
+        }
+    }
+
+    pub(crate) fn complete_fee_valuation(
+        &mut self,
+        resolved: ResolvedFeeValuation,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        match self.inner.as_mut() {
+            Some(PreparedLeasedFileStrategyInner::Active(runtime)) => runtime
+                .runtime_mut()
+                .machine_mut()
+                .settle_fee_valuations(&resolved.client_order_id, &resolved.fee_valuations, now_ms),
+            _ => Err(StrategyStateError::InvalidExecutionAudit.into()),
+        }
     }
 
     pub fn request_stop(
@@ -908,6 +965,14 @@ pub struct LeasedFileStrategyRecovery {
 }
 
 impl LeasedFileStrategyRecovery {
+    pub(crate) fn has_pending_fee_valuations(&self) -> bool {
+        match &self.inner {
+            LeasedFileStrategyRecoveryInner::Active { store, .. } => {
+                store.snapshot().pending_fee_valuation_count() > 0
+            }
+            LeasedFileStrategyRecoveryInner::Armed(_) => false,
+        }
+    }
     pub fn paths(&self) -> &StrategyFilePaths {
         &self.paths
     }
@@ -1443,6 +1508,50 @@ where
 
     pub fn gateway(&self) -> &G {
         &self.gateway
+    }
+
+    pub(crate) fn prepare_pending_fee_work(
+        &self,
+        maximum_orders: usize,
+    ) -> Vec<PendingFeeValuation<G>>
+    where
+        G: Clone,
+    {
+        self.prepare_pending_fee_work_after(maximum_orders, None)
+    }
+
+    pub(crate) fn prepare_pending_fee_work_after(
+        &self,
+        maximum_orders: usize,
+        after: Option<&ClientOrderId>,
+    ) -> Vec<PendingFeeValuation<G>>
+    where
+        G: Clone,
+    {
+        let orders = &self.machine.store().snapshot().orders;
+        orders
+            .iter()
+            .filter(|(id, _)| after.is_none_or(|after| *id > after))
+            .chain(
+                orders
+                    .iter()
+                    .filter(|(id, _)| after.is_some_and(|after| *id <= after)),
+            )
+            .filter_map(|(_, order)| order.execution_audit.as_ref())
+            .filter(|audit| {
+                audit
+                    .fee_valuations
+                    .iter()
+                    .any(|value| value.source == FeeValuationSource::PendingHistoricalPrice)
+            })
+            .take(maximum_orders)
+            .map(|audit| PendingFeeValuation {
+                gateway: self.gateway.clone(),
+                service: self.execution_sync.clone(),
+                snapshot: audit.snapshot.clone(),
+                fee_valuations: audit.fee_valuations.clone(),
+            })
+            .collect()
     }
 
     pub fn intent_store(&self) -> &I {
@@ -6553,6 +6662,57 @@ mod tests {
         assert!(stable.submissions.is_empty(), "{stable:?}");
         assert_eq!(gateway.placement_call_count(), placements_before_fill + 1);
         assert_eq!(gateway.cancellation_call_count(), cancellations_before_fill);
+    }
+
+    #[tokio::test]
+    async fn pending_fee_price_does_not_block_targeted_submission_or_duplicate_it() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+        let exchange_id = runtime.machine().store().snapshot().orders[&source_id]
+            .exchange_order_id
+            .clone()
+            .unwrap();
+        gateway.fill_order_with_quote_asset(
+            &source_id,
+            source_shape.price.unwrap(),
+            Decimal::new(1, 3),
+            "BNB",
+        );
+        {
+            let mut state = gateway.state.lock().unwrap();
+            let execution = state.executions.get_mut(&source_id).unwrap();
+            execution.trades[0].trade_time_ms += 1_020_000;
+            execution.update_time_ms = execution.trades[0].trade_time_ms;
+        }
+        let before = gateway.placement_call_count();
+        let report = runtime
+            .tick_execution_event(1_300, Some(&exchange_id))
+            .await
+            .unwrap();
+        assert!(!report.is_blocked(), "{report:?}");
+        assert_eq!(report.submissions.len(), 1);
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(state.pending_fee_valuation_count(), 1);
+        assert_eq!(
+            state.orders[&report.submissions[0].client_order_id]
+                .shape
+                .quantity,
+            source_shape.quantity
+        );
+        let duplicate = runtime
+            .tick_execution_event(1_301, Some(&exchange_id))
+            .await
+            .unwrap();
+        assert!(duplicate.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), before + 1);
+        assert_eq!(gateway.cancellation_call_count(), 0);
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 
 use crate::{
     domain::{ClientOrderId, Exchange, IntentState, OrderShape},
     engine::{
-        ExecutionAccountingError, ExecutionAccountingService, StrategyMachine,
+        ExecutionAccountingError, ExecutionAccountingService, FeeValuation, StrategyMachine,
         StrategyMachineError, StrategyOrderTracking, StrategyStateStore, StrategyTransition,
         ValuedExecutionReport,
     },
@@ -56,15 +58,42 @@ pub enum ExecutionSyncError {
     StateMachine(#[from] StrategyMachineError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionSyncService {
-    accounting: ExecutionAccountingService,
+    accounting: Arc<ExecutionAccountingService>,
+}
+
+pub(crate) struct PendingFeeValuation<G> {
+    pub(crate) gateway: G,
+    pub(crate) service: ExecutionSyncService,
+    pub(crate) snapshot: OrderExecutionSnapshot,
+    pub(crate) fee_valuations: Vec<FeeValuation>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedFeeValuation {
+    pub(crate) client_order_id: ClientOrderId,
+    pub(crate) fee_valuations: Vec<FeeValuation>,
+}
+
+impl<G: HistoricalPriceGateway> PendingFeeValuation<G> {
+    pub(crate) async fn resolve(self) -> Result<ResolvedFeeValuation, ExecutionSyncError> {
+        let valued = self
+            .service
+            .accounting
+            .resolve_pending_valuations(&self.gateway, &self.snapshot, &self.fee_valuations)
+            .await?;
+        Ok(ResolvedFeeValuation {
+            client_order_id: self.snapshot.order.client_order_id,
+            fee_valuations: valued.fee_valuations,
+        })
+    }
 }
 
 impl ExecutionSyncService {
     pub fn new(quote_asset: &str) -> Result<Self, ExecutionAccountingError> {
         Ok(Self {
-            accounting: ExecutionAccountingService::new(quote_asset)?,
+            accounting: Arc::new(ExecutionAccountingService::new(quote_asset)?),
         })
     }
 
@@ -160,7 +189,7 @@ impl ExecutionSyncService {
 
     pub(crate) async fn prepare_loaded_snapshot<G, S>(
         &self,
-        gateway: &G,
+        _gateway: &G,
         machine: &StrategyMachine<S>,
         loaded: LoadedExecutionSnapshot,
     ) -> Result<PreparedExecutionSync, ExecutionSyncError>
@@ -192,7 +221,13 @@ impl ExecutionSyncService {
             ));
         }
         let snapshot = loaded.snapshot;
-        let valued_report = self.accounting.value_snapshot(gateway, &snapshot).await?;
+        let previous = order
+            .execution_audit
+            .as_ref()
+            .map_or(&[][..], |audit| audit.fee_valuations.as_slice());
+        let valued_report = self
+            .accounting
+            .value_snapshot_deferred(&snapshot, previous)?;
         Ok(PreparedExecutionSync {
             snapshot,
             valued_report,
@@ -496,6 +531,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_fee_price_does_not_delay_exact_counter_obligation() {
+        let (mut machine, id) = accepted_grid_machine().await;
+        let mut snapshot = partial_cancel_execution_for(&machine, &id);
+        snapshot.trades[0].commission_asset = "BNB".into();
+        snapshot.fees_by_asset = [("BNB".into(), Decimal::new(1, 2))].into_iter().collect();
+        snapshot.order_time_ms = 1_165_000;
+        snapshot.update_time_ms = 1_180_000;
+        snapshot.trades[0].trade_time_ms = 1_170_000;
+        let gateway = gateway(Ok(snapshot.clone()));
+        let service = ExecutionSyncService::new("USDT").unwrap();
+
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_ne!(state.lifecycle, StrategyLifecycle::Failed);
+        let audit = state.orders[&id].execution_audit.as_ref().unwrap();
+        assert_eq!(audit.snapshot, snapshot);
+        assert_eq!(
+            serde_json::to_value(audit.fee_valuations[0].source).unwrap(),
+            "pending_historical_price"
+        );
+        assert_eq!(*gateway.price_calls.lock().unwrap(), 0);
+        let counter = state
+            .replacement_obligations
+            .values()
+            .find(|obligation| {
+                obligation.source_client_order_id == id
+                    && obligation.kind == ReplacementObligationKind::Counter
+            })
+            .unwrap();
+        assert_eq!(counter.shape.quantity, Decimal::new(1, 1));
+        state.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_fee_price_never_bypasses_trade_quantity_validation() {
+        let (mut machine, id) = accepted_grid_machine().await;
+        let mut snapshot = partial_cancel_execution_for(&machine, &id);
+        snapshot.trades[0].commission_asset = "BNB".into();
+        snapshot.fees_by_asset = [("BNB".into(), Decimal::new(1, 2))].into_iter().collect();
+        snapshot.order_time_ms = 1_165_000;
+        snapshot.update_time_ms = 1_180_000;
+        snapshot.trades[0].trade_time_ms = 1_170_000;
+        snapshot.cumulative_quantity += Decimal::new(1, 1);
+        let gateway = gateway(Ok(snapshot));
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        let before = machine.store().snapshot().clone();
+        assert!(
+            service
+                .synchronize(&gateway, &mut machine, &id, 1_200)
+                .await
+                .is_err()
+        );
+        assert_eq!(machine.store().snapshot(), &before);
+        assert_eq!(*gateway.price_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn exact_snapshot_and_fee_are_atomically_applied_once() {
         let (mut machine, id) = accepted_machine();
         let snapshot = execution_for(&machine, &id);
@@ -646,34 +742,339 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_non_quote_fee_price_blocks_all_state_and_obligation_changes() {
+    async fn unavailable_non_quote_fee_price_is_retried_without_rolling_back_execution() {
         let (mut machine, id) = accepted_machine();
         let mut snapshot = execution_for(&machine, &id);
         let fee = snapshot.trades[0].commission_cost;
         snapshot.trades[0].commission_asset = "BNB".into();
         snapshot.fees_by_asset = [("BNB".into(), fee)].into_iter().collect();
-        let gateway = gateway(Ok(snapshot));
+        let gateway = gateway(Ok(snapshot.clone()));
         let service = ExecutionSyncService::new("USDT").unwrap();
-        let before = machine.store().snapshot().clone();
-
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let before_retry = machine.store().snapshot().clone();
+        assert_eq!(before_retry.pending_fee_valuation_count(), 1);
+        assert_eq!(
+            before_retry.orders[&id].cumulative_quantity,
+            snapshot.cumulative_quantity
+        );
+        let pending = PendingFeeValuation {
+            gateway: gateway.clone(),
+            service,
+            snapshot,
+            fee_valuations: machine.store().snapshot().orders[&id]
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .fee_valuations
+                .clone(),
+        };
         assert!(matches!(
-            service
-                .synchronize(&gateway, &mut machine, &id, 1_200)
-                .await,
+            pending.resolve().await,
             Err(ExecutionSyncError::Accounting(
                 ExecutionAccountingError::HistoricalPriceUnavailable(_)
             ))
         ));
-        assert_eq!(machine.store().snapshot(), &before);
-        assert!(
-            machine
-                .store()
-                .snapshot()
-                .replacement_obligations
-                .is_empty()
-        );
+        assert_eq!(machine.store().snapshot(), &before_retry);
         assert_eq!(*gateway.execution_calls.lock().unwrap(), 1);
         assert_eq!(*gateway.price_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_fee_settlement_is_durable_idempotent_and_does_not_replay_inventory() {
+        let (mut machine, id) = accepted_grid_machine().await;
+        let mut snapshot = partial_cancel_execution_for(&machine, &id);
+        snapshot.trades[0].commission_asset = "BNB".into();
+        snapshot.fees_by_asset = [("BNB".into(), Decimal::new(1, 2))].into_iter().collect();
+        snapshot.order_time_ms = 1_165_000;
+        snapshot.update_time_ms = 1_180_000;
+        snapshot.trades[0].trade_time_ms = 1_170_000;
+        let mut gateway = gateway(Ok(snapshot.clone()));
+        gateway.historical_price = Ok(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_140_000,
+            open_price: Decimal::from(600),
+        });
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pending.json");
+        FileStrategyStateStore::create(&path, machine.store().snapshot().clone()).unwrap();
+        let mut reloaded = StrategyMachine::new(FileStrategyStateStore::load(&path).unwrap());
+        let before = reloaded.store().snapshot().clone();
+        let resolved = PendingFeeValuation {
+            gateway: gateway.clone(),
+            service: service.clone(),
+            snapshot,
+            fee_valuations: machine.store().snapshot().orders[&id]
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .fee_valuations
+                .clone(),
+        }
+        .resolve()
+        .await
+        .unwrap();
+        let mut forged = resolved.fee_valuations.clone();
+        forged[0].fee_amount += Decimal::ONE;
+        assert!(reloaded.settle_fee_valuations(&id, &forged, 1_300).is_err());
+        assert_eq!(reloaded.store().snapshot(), &before);
+        reloaded
+            .settle_fee_valuations(&id, &resolved.fee_valuations, 1_300)
+            .unwrap();
+        let after = reloaded.store().snapshot().clone();
+        assert_eq!(after.pending_fee_valuation_count(), 0);
+        assert_eq!(after.total_fee, before.total_fee + Decimal::from(6));
+        assert_eq!(after.inventory_events, before.inventory_events);
+        assert_eq!(
+            after.replacement_obligations,
+            before.replacement_obligations
+        );
+        assert_eq!(
+            after.grid_position_net_quantity,
+            before.grid_position_net_quantity
+        );
+        assert_eq!(after.completed_pairs, before.completed_pairs);
+        assert_eq!(
+            reloaded
+                .settle_fee_valuations(&id, &resolved.fee_valuations, 1_400)
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(reloaded.store().snapshot(), &after);
+        let duplicate = service
+            .synchronize(&gateway, &mut reloaded, &id, 1_500)
+            .await
+            .unwrap();
+        assert_eq!(duplicate.transition, StrategyTransition::NoChange);
+        assert_eq!(reloaded.store().snapshot(), &after);
+        assert_eq!(*gateway.price_calls.lock().unwrap(), 1);
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            &after
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_fee_resolution_does_not_reprice_a_settled_prefix_after_restart() {
+        let (mut machine, id) = accepted_machine();
+        let mut full = execution_for(&machine, &id);
+        let mut first_trade = full.trades[0].clone();
+        first_trade.quantity /= Decimal::from(2);
+        first_trade.quote_quantity /= Decimal::from(2);
+        first_trade.commission_asset = "BNB".into();
+        first_trade.commission_cost = Decimal::new(2, 2);
+        first_trade.raw_commission = first_trade.commission_cost;
+        let mut second_trade = first_trade.clone();
+        second_trade.trade_id = "8".into();
+        second_trade.trade_time_ms = 1_080_001;
+        second_trade.commission_cost = Decimal::new(3, 2);
+        second_trade.raw_commission = second_trade.commission_cost;
+        full.trades = vec![first_trade.clone(), second_trade];
+        full.update_time_ms = 1_140_000;
+        full.fees_by_asset = [("BNB".into(), Decimal::new(5, 2))].into_iter().collect();
+        let mut partial = full.clone();
+        partial.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        partial.cumulative_quantity = first_trade.quantity;
+        partial.cumulative_quote = first_trade.quote_quantity;
+        partial.trades = vec![first_trade];
+        partial.fees_by_asset = [("BNB".into(), Decimal::new(2, 2))].into_iter().collect();
+        partial.update_time_ms = 1_050_000;
+        let mut gateway = gateway(Ok(full.clone()));
+        gateway.historical_price = Ok(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_020_000,
+            open_price: Decimal::from(600),
+        });
+        let old_service = ExecutionSyncService::new("USDT").unwrap();
+        let valued = old_service
+            .accounting
+            .value_snapshot(&gateway, &partial)
+            .await
+            .unwrap();
+        machine
+            .apply_valued_execution(&partial, &valued, 1_200)
+            .unwrap();
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        gateway.historical_price = Ok(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_080_000,
+            open_price: Decimal::from(700),
+        });
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_300)
+            .await
+            .unwrap();
+        let work = PendingFeeValuation {
+            gateway: gateway.clone(),
+            service,
+            snapshot: full,
+            fee_valuations: machine.store().snapshot().orders[&id]
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .fee_valuations
+                .clone(),
+        };
+        let resolved = work.resolve().await.unwrap();
+        assert_eq!(resolved.fee_valuations[0], valued.fee_valuations[0]);
+        assert_eq!(resolved.fee_valuations[1].quote_value, Decimal::from(21));
+        machine
+            .settle_fee_valuations(&id, &resolved.fee_valuations, 1_400)
+            .unwrap();
+        assert_eq!(machine.store().snapshot().total_fee, Decimal::from(33));
+        assert_eq!(*gateway.price_calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn pending_fee_settlement_preserves_terminal_reconciliation_in_flight() {
+        let (mut machine, id) = accepted_grid_machine().await;
+        let mut snapshot = partial_cancel_execution_for(&machine, &id);
+        snapshot.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        snapshot.trades[0].commission_asset = "BNB".into();
+        snapshot.fees_by_asset = [("BNB".into(), Decimal::new(1, 2))].into_iter().collect();
+        snapshot.order_time_ms = 1_165_000;
+        snapshot.update_time_ms = 1_180_000;
+        snapshot.trades[0].trade_time_ms = 1_170_000;
+        let mut gateway = gateway(Ok(snapshot.clone()));
+        gateway.historical_price = Ok(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_140_000,
+            open_price: Decimal::from(600),
+        });
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let pending = PendingFeeValuation {
+            gateway,
+            service,
+            snapshot,
+            fee_valuations: machine.store().snapshot().orders[&id]
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .fee_valuations
+                .clone(),
+        };
+        let record = machine.store().snapshot().orders[&id].clone();
+        machine
+            .synchronize_intent(
+                &OrderIntent {
+                    client_order_id: id.clone(),
+                    exchange: Exchange::Binance,
+                    shape: record.shape,
+                    state: IntentState::Terminal {
+                        status: TerminalOrderStatus::Cancelled,
+                        exchange_order_id: record.exchange_order_id,
+                    },
+                    created_at_ms: 1_150,
+                    updated_at_ms: 1_250,
+                },
+                1_250,
+            )
+            .unwrap();
+        let before = machine.store().snapshot().clone();
+        let resolved = pending.resolve().await.unwrap();
+        let transition = machine
+            .settle_fee_valuations(&id, &resolved.fee_valuations, 1_300)
+            .unwrap();
+        assert!(!matches!(transition, StrategyTransition::Failed { .. }));
+        let after = machine.store().snapshot();
+        assert_eq!(after.lifecycle, before.lifecycle);
+        assert_eq!(after.orders[&id].tracking, before.orders[&id].tracking);
+        assert_eq!(
+            after.orders[&id].terminal_processed,
+            before.orders[&id].terminal_processed
+        );
+        assert_eq!(after.inventory_events, before.inventory_events);
+        assert_eq!(
+            after.replacement_obligations,
+            before.replacement_obligations
+        );
+        assert_eq!(after.total_fee, before.total_fee + Decimal::from(6));
+    }
+
+    #[tokio::test]
+    async fn pending_fee_settlement_merges_old_work_without_regressing_new_fills() {
+        let (mut machine, id) = accepted_machine();
+        let mut full = execution_for(&machine, &id);
+        let mut first_trade = full.trades[0].clone();
+        first_trade.quantity /= Decimal::from(2);
+        first_trade.quote_quantity /= Decimal::from(2);
+        first_trade.commission_asset = "BNB".into();
+        first_trade.commission_cost = Decimal::new(2, 2);
+        first_trade.raw_commission = first_trade.commission_cost;
+        let mut second_trade = first_trade.clone();
+        second_trade.trade_id = "8".into();
+        second_trade.trade_time_ms += 1;
+        second_trade.commission_cost = Decimal::new(3, 2);
+        second_trade.raw_commission = second_trade.commission_cost;
+        full.trades = vec![first_trade.clone(), second_trade];
+        full.fees_by_asset = [("BNB".into(), Decimal::new(5, 2))].into_iter().collect();
+        let mut partial = full.clone();
+        partial.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        partial.cumulative_quantity = first_trade.quantity;
+        partial.cumulative_quote = first_trade.quote_quantity;
+        partial.trades = vec![first_trade];
+        partial.fees_by_asset = [("BNB".into(), Decimal::new(2, 2))].into_iter().collect();
+        let mut gateway = gateway(Ok(partial.clone()));
+        gateway.historical_price = Ok(HistoricalMinutePrice {
+            exchange: Exchange::Binance,
+            symbol: "BNBUSDT".into(),
+            minute_start_ms: 1_020_000,
+            open_price: Decimal::from(600),
+        });
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let work = PendingFeeValuation {
+            gateway: gateway.clone(),
+            service: service.clone(),
+            snapshot: partial,
+            fee_valuations: machine.store().snapshot().orders[&id]
+                .execution_audit
+                .as_ref()
+                .unwrap()
+                .fee_valuations
+                .clone(),
+        };
+        gateway.execution = Ok(full);
+        service
+            .synchronize(&gateway, &mut machine, &id, 1_300)
+            .await
+            .unwrap();
+        let before = machine.store().snapshot().clone();
+        let resolved = work.resolve().await.unwrap();
+        machine
+            .settle_fee_valuations(&id, &resolved.fee_valuations, 1_400)
+            .unwrap();
+        let after = machine.store().snapshot();
+        assert_eq!(after.pending_fee_valuation_count(), 1);
+        assert_eq!(after.total_fee, Decimal::from(12));
+        assert_eq!(after.inventory_events, before.inventory_events);
+        assert_eq!(
+            after.replacement_obligations,
+            before.replacement_obligations
+        );
+        assert_eq!(
+            after.orders[&id].cumulative_quantity,
+            before.orders[&id].cumulative_quantity
+        );
+        after.validate().unwrap();
     }
 
     #[tokio::test]

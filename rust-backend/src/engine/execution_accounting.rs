@@ -21,6 +21,7 @@ pub enum FeeValuationSource {
     ExchangeZero,
     QuoteAsset,
     HistoricalMinuteOpen,
+    PendingHistoricalPrice,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +111,161 @@ impl ExecutionAccountingService {
             price_cache: Mutex::new(BTreeMap::new()),
             maximum_cache_items,
         })
+    }
+
+    /// Quantity evidence is complete even when a third-asset fee still needs pricing.
+    /// This path never performs network I/O and never discards an earlier valuation.
+    pub(crate) fn value_snapshot_deferred(
+        &self,
+        snapshot: &OrderExecutionSnapshot,
+        previous: &[FeeValuation],
+    ) -> Result<ValuedExecutionReport, ExecutionAccountingError> {
+        self.validate_snapshot(snapshot)?;
+        let previous = previous
+            .iter()
+            .map(|value| (value.trade_id.as_str(), value))
+            .collect::<BTreeMap<_, _>>();
+        let mut valuations = Vec::with_capacity(snapshot.trades.len());
+        for trade in &snapshot.trades {
+            let minute = trade.trade_time_ms - trade.trade_time_ms % 60_000;
+            let symbol = format!("{}{}", trade.commission_asset, self.quote_asset);
+            let retained = previous
+                .get(trade.trade_id.as_str())
+                .copied()
+                .filter(|valuation| {
+                    valuation.fee_asset == trade.commission_asset
+                        && valuation.fee_amount == trade.commission_cost
+                        && valuation.quote_asset == self.quote_asset
+                        && valuation.source != FeeValuationSource::PendingHistoricalPrice
+                });
+            let valuation = if let Some(retained) = retained {
+                retained.clone()
+            } else if trade.commission_cost.is_zero() {
+                FeeValuation {
+                    trade_id: trade.trade_id.clone(),
+                    fee_asset: trade.commission_asset.clone(),
+                    fee_amount: trade.commission_cost,
+                    quote_asset: self.quote_asset.clone(),
+                    quote_value: Decimal::ZERO,
+                    source: FeeValuationSource::ExchangeZero,
+                    valuation_symbol: None,
+                    valuation_minute_start_ms: None,
+                    valuation_price: None,
+                }
+            } else if trade.commission_asset == self.quote_asset {
+                FeeValuation {
+                    trade_id: trade.trade_id.clone(),
+                    fee_asset: trade.commission_asset.clone(),
+                    fee_amount: trade.commission_cost,
+                    quote_asset: self.quote_asset.clone(),
+                    quote_value: trade.commission_cost,
+                    source: FeeValuationSource::QuoteAsset,
+                    valuation_symbol: None,
+                    valuation_minute_start_ms: None,
+                    valuation_price: Some(Decimal::ONE),
+                }
+            } else {
+                if minute == 0 {
+                    return Err(ExecutionAccountingError::InvalidExecutionSnapshot);
+                }
+                let cached_price = self
+                    .price_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&PriceCacheKey {
+                        exchange_code: exchange_code(snapshot.order.exchange),
+                        symbol: symbol.clone(),
+                        minute_start_ms: minute,
+                    })
+                    .copied();
+                FeeValuation {
+                    trade_id: trade.trade_id.clone(),
+                    fee_asset: trade.commission_asset.clone(),
+                    fee_amount: trade.commission_cost,
+                    quote_asset: self.quote_asset.clone(),
+                    quote_value: match cached_price {
+                        Some(price) => trade
+                            .commission_cost
+                            .checked_mul(price)
+                            .ok_or(ExecutionAccountingError::ArithmeticOverflow)?,
+                        None => Decimal::ZERO,
+                    },
+                    source: if cached_price.is_some() {
+                        FeeValuationSource::HistoricalMinuteOpen
+                    } else {
+                        FeeValuationSource::PendingHistoricalPrice
+                    },
+                    valuation_symbol: Some(symbol),
+                    valuation_minute_start_ms: Some(minute),
+                    valuation_price: cached_price,
+                }
+            };
+            valuations.push(valuation);
+        }
+        let cumulative_fee = valuations
+            .iter()
+            .try_fold(Decimal::ZERO, |total, valuation| {
+                total
+                    .checked_add(valuation.quote_value)
+                    .ok_or(ExecutionAccountingError::ArithmeticOverflow)
+            })?;
+        Ok(ValuedExecutionReport {
+            report: ExecutionReport {
+                client_order_id: snapshot.order.client_order_id.clone(),
+                exchange_order_id: snapshot.order.exchange_order_id.clone(),
+                cumulative_quantity: snapshot.cumulative_quantity,
+                cumulative_quote: snapshot.cumulative_quote,
+                cumulative_fee,
+                terminal_status: match snapshot.order.lifecycle {
+                    OrderLifecycle::Active(_) => None,
+                    OrderLifecycle::Terminal(status) => Some(status),
+                },
+            },
+            fee_valuations: valuations,
+        })
+    }
+
+    pub(crate) async fn resolve_pending_valuations<G>(
+        &self,
+        gateway: &G,
+        snapshot: &OrderExecutionSnapshot,
+        previous: &[FeeValuation],
+    ) -> Result<ValuedExecutionReport, ExecutionAccountingError>
+    where
+        G: HistoricalPriceGateway,
+    {
+        let mut valued = self.value_snapshot_deferred(snapshot, previous)?;
+        for valuation in &mut valued.fee_valuations {
+            if valuation.source != FeeValuationSource::PendingHistoricalPrice {
+                continue;
+            }
+            let symbol = valuation
+                .valuation_symbol
+                .as_deref()
+                .ok_or(ExecutionAccountingError::InvalidExecutionSnapshot)?;
+            let minute = valuation
+                .valuation_minute_start_ms
+                .ok_or(ExecutionAccountingError::InvalidExecutionSnapshot)?;
+            let price = self
+                .historical_price(gateway, snapshot.order.exchange, symbol, minute)
+                .await?;
+            valuation.quote_value = valuation
+                .fee_amount
+                .checked_mul(price)
+                .ok_or(ExecutionAccountingError::ArithmeticOverflow)?;
+            valuation.valuation_price = Some(price);
+            valuation.source = FeeValuationSource::HistoricalMinuteOpen;
+        }
+        valued.report.cumulative_fee =
+            valued
+                .fee_valuations
+                .iter()
+                .try_fold(Decimal::ZERO, |total, value| {
+                    total
+                        .checked_add(value.quote_value)
+                        .ok_or(ExecutionAccountingError::ArithmeticOverflow)
+                })?;
+        Ok(valued)
     }
 
     pub async fn value_snapshot<G>(

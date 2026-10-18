@@ -128,11 +128,20 @@ impl<G> RuntimeCoordinator<G> {
     }
 
     pub async fn entries(&self) -> Vec<RuntimeRegistryEntry> {
-        self.registry.entries().await
+        self.registry.market_entries().await
     }
 
     pub fn recovery_completed(&self) -> bool {
         self.recovery_completed.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn spawn_fee_settlements(&self, now_ms: u64) -> usize
+    where
+        G: Clone + HistoricalPriceGateway + Send + Sync + 'static,
+    {
+        let spawned = self.registry.spawn_fee_settlements(now_ms).await;
+        self.registry.prune_terminal().await;
+        spawned
     }
 
     fn acquire_catalog_lease(&self) -> Result<StrategyRuntimeLease, RuntimeLeaseError> {
