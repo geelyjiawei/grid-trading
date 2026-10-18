@@ -5800,14 +5800,29 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn registry_pipelines_trade_xyz_replacements_and_preserves_stop_during_ack() {
+        assert_registry_pipelines_replacements(Exchange::TradeXyz, "MUUSDC", "USDC").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bybit_registry_pipelines_replacements_without_changing_manual_baseline() {
+        assert_registry_pipelines_replacements(Exchange::Bybit, "MUUSDT", "USDT").await;
+    }
+
+    async fn assert_registry_pipelines_replacements(
+        exchange: Exchange,
+        symbol: &str,
+        quote_asset: &str,
+    ) {
         let directory = tempdir().unwrap();
         let gateway = MockGateway::new(rules(), 1_100)
-            .with_exchange(Exchange::TradeXyz)
-            .with_symbol("MUUSDC");
+            .with_exchange(exchange)
+            .with_symbol(symbol);
+        let manual_quantity = Decimal::new(-5, 1);
+        gateway.set_position(manual_quantity, Some(Decimal::new(1014, 0)));
         let run_id = StrategyRunId::parse("pipe0001").unwrap();
         let mut trade_config = config(None);
-        trade_config.exchange = Some(Exchange::TradeXyz);
-        trade_config.symbol = "MUUSDC".into();
+        trade_config.exchange = Some(exchange);
+        trade_config.symbol = symbol.into();
         let prepared = prepare_leased_file_strategy(
             gateway.clone(),
             directory.path(),
@@ -5840,9 +5855,12 @@ mod tests {
             &opening_id,
             Decimal::new(1014, 0),
             Decimal::new(5, 2),
-            "USDC",
+            quote_asset,
         );
-        gateway.set_position(-opening_quantity, Some(Decimal::new(1014, 0)));
+        gateway.set_position(
+            manual_quantity - opening_quantity,
+            Some(Decimal::new(1014, 0)),
+        );
         let PreparedStrategyStep::Active(deployment) =
             registry.advance(&run_id, 1_200).await.unwrap()
         else {
@@ -5862,7 +5880,7 @@ mod tests {
                 &intent.client_order_id,
                 intent.shape.price.unwrap(),
                 Decimal::new(1, 2),
-                "USDC",
+                quote_asset,
             );
         }
         let added_quantity = source_intents
@@ -5870,7 +5888,7 @@ mod tests {
             .map(|intent| intent.shape.quantity)
             .sum::<Decimal>();
         gateway.set_position(
-            -(opening_quantity + added_quantity),
+            manual_quantity - opening_quantity - added_quantity,
             Some(Decimal::new(1014, 0)),
         );
         let first_target = vec![gateway.exchange_order_id(&source_intents[0].client_order_id)];
@@ -5879,14 +5897,16 @@ mod tests {
 
         let first_registry = Arc::clone(&registry);
         let second_registry = Arc::clone(&registry);
+        let first_symbol = symbol.to_owned();
+        let second_symbol = symbol.to_owned();
         let first = tokio::spawn(async move {
             first_registry
-                .advance_execution_events(Exchange::TradeXyz, "MUUSDC", Some(&first_target), 1_300)
+                .advance_execution_events(exchange, &first_symbol, Some(&first_target), 1_300)
                 .await
         });
         let second = tokio::spawn(async move {
             second_registry
-                .advance_execution_events(Exchange::TradeXyz, "MUUSDC", Some(&second_target), 1_301)
+                .advance_execution_events(exchange, &second_symbol, Some(&second_target), 1_301)
                 .await
         });
         for _ in 0..50 {
@@ -5899,12 +5919,7 @@ mod tests {
         let duplicate_target = vec![gateway.exchange_order_id(&source_intents[0].client_order_id)];
         let (_, duplicate) = tokio::time::timeout(
             Duration::from_millis(100),
-            registry.advance_execution_events(
-                Exchange::TradeXyz,
-                "MUUSDC",
-                Some(&duplicate_target),
-                1_302,
-            ),
+            registry.advance_execution_events(exchange, symbol, Some(&duplicate_target), 1_302),
         )
         .await
         .expect("a duplicate fill must not wait for another placement acknowledgement")
@@ -5947,6 +5962,13 @@ mod tests {
         assert_eq!(
             registry.entries().await[0].lifecycle,
             Some(PreparedStrategyLifecycle::Stopped)
+        );
+        let paths = StrategyFilePaths::new(directory.path(), run_id).unwrap();
+        let state = FileStrategyStateStore::load(paths.state()).unwrap();
+        assert_eq!(state.snapshot().baseline.signed_quantity, manual_quantity);
+        assert_eq!(
+            gateway.state.lock().unwrap().position_quantity,
+            manual_quantity - opening_quantity - added_quantity
         );
     }
 
@@ -6921,13 +6943,24 @@ mod tests {
 
     #[tokio::test]
     async fn idle_periodic_reads_yield_to_exact_fill_before_read_release() {
+        assert_idle_periodic_reads_yield_to_exact_fill(Exchange::Binance).await;
+    }
+
+    #[tokio::test]
+    async fn bybit_idle_periodic_reads_yield_to_exact_fill_before_read_release() {
+        assert_idle_periodic_reads_yield_to_exact_fill(Exchange::Bybit).await;
+    }
+
+    async fn assert_idle_periodic_reads_yield_to_exact_fill(exchange: Exchange) {
         for open_progress_read in [false, true] {
             let rules = rules();
-            let gateway = MockGateway::new(rules.clone(), 1_100);
+            let gateway = MockGateway::new(rules.clone(), 1_100).with_exchange(exchange);
+            let mut grid_config = config(None);
+            grid_config.exchange = Some(exchange);
             let mut runtime = runtime(
                 gateway.clone(),
                 MemoryOrderIntentStore::default(),
-                machine(config(None), &rules),
+                machine(grid_config, &rules),
             );
             let opening = deploy_running_short_grid(&mut runtime, &gateway).await;
             gateway.enable_open_progress();
@@ -6966,12 +6999,7 @@ mod tests {
             let event_registry = registry.clone();
             let mut event = tokio::spawn(async move {
                 event_registry
-                    .advance_execution_events(
-                        Exchange::Binance,
-                        "MUUSDT",
-                        Some(&[exchange_id]),
-                        1_400,
-                    )
+                    .advance_execution_events(exchange, "MUUSDT", Some(&[exchange_id]), 1_400)
                     .await
                     .unwrap()
                     .1
