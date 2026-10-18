@@ -1196,23 +1196,32 @@ mod tests {
 
     #[test]
     fn binance_child_fill_waits_for_the_parent_batch_acknowledgement() {
+        assert_child_fill_waits_for_parent_acknowledgement(Exchange::Binance);
+    }
+
+    #[test]
+    fn bybit_child_fill_waits_for_the_parent_batch_acknowledgement() {
+        assert_child_fill_waits_for_parent_acknowledgement(Exchange::Bybit);
+    }
+
+    fn assert_child_fill_waits_for_parent_acknowledgement(exchange: Exchange) {
         let mut dispatch = ExecutionDispatchState::default();
         let mut parent = execution_wakeup(Some("41"), Some(1_000), 1_010);
-        parent.exchange = Exchange::Binance;
+        parent.exchange = exchange;
         assert!(
             dispatch
                 .dispatch_or_queue(PendingExecutionWakeups::new(parent))
                 .is_some()
         );
         let mut child = execution_wakeup(Some("new_child"), Some(1_001), 1_011);
-        child.exchange = Exchange::Binance;
+        child.exchange = exchange;
         assert!(
             dispatch
                 .dispatch_or_queue(PendingExecutionWakeups::new(child))
                 .is_none()
         );
         let mut full = execution_wakeup(Some("new_child"), Some(1_002), 1_012);
-        full.exchange = Exchange::Binance;
+        full.exchange = exchange;
         assert!(
             dispatch
                 .dispatch_or_queue(PendingExecutionWakeups::new(full))

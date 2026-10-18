@@ -29,7 +29,9 @@ use crate::{
             AsterAdapter, AsterSignatureError, LocalEip712Signer, spawn_aster_execution_stream,
         },
         binance::{BinanceAdapter, HmacSha256Signer, SignatureError, spawn_binance_order_stream},
-        bybit::{BybitAdapter, BybitHmacSha256Signer, BybitSignatureError},
+        bybit::{
+            BybitAdapter, BybitHmacSha256Signer, BybitSignatureError, spawn_bybit_order_stream,
+        },
         protocol::{
             BinanceRequestGovernor, HyperliquidRequestGovernor, MonotonicMicrosecondNonce,
             MonotonicMillisecondNonce, ReqwestTransport, SystemClock, TransportBuildError,
@@ -401,7 +403,7 @@ impl ExchangeGatewayFactory {
                 let stream_api_key = Zeroizing::new(api_key.as_str().to_owned());
                 let stream_api_secret = Zeroizing::new(api_secret.as_str().to_owned());
                 let signer = BybitHmacSha256Signer::new(api_secret.as_bytes())?;
-                let adapter = match self.environment {
+                let mut adapter = match self.environment {
                     ExchangeEnvironment::Production => BybitAdapter::production(
                         self.transport.clone(),
                         signer,
@@ -415,6 +417,14 @@ impl ExchangeGatewayFactory {
                         api_key.as_str().to_owned(),
                     ),
                 };
+                if let Some(relay) = spawn_bybit_order_stream(
+                    self.environment == ExchangeEnvironment::Testnet,
+                    stream_api_key.clone(),
+                    stream_api_secret.clone(),
+                    adapter.realtime_lifetime(),
+                ) {
+                    adapter.set_websocket_order_relay(relay);
+                }
                 spawn_bybit_execution_stream(
                     self.environment == ExchangeEnvironment::Testnet,
                     stream_api_key,

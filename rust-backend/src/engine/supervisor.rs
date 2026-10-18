@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -39,6 +39,7 @@ struct RuntimeSlot<G> {
     exchange: Exchange,
     symbol: String,
     owns_market: AtomicBool,
+    unlocked_placements: AtomicUsize,
     execution_waiters: PeriodicPriority,
     fee_settlement: std::sync::Mutex<FeeSettlementSchedule>,
     strategy: Mutex<PreparedLeasedFileStrategy<G>>,
@@ -66,6 +67,21 @@ impl<G> Drop for FeeSettlementLease<G> {
 }
 
 type RuntimeSlotHandle<G> = Arc<RuntimeSlot<G>>;
+
+struct UnlockedPlacementReservation<'a>(&'a AtomicUsize);
+
+impl<'a> UnlockedPlacementReservation<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for UnlockedPlacementReservation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub struct RuntimeRegistry<G> {
     entries: RwLock<BTreeMap<StrategyRunId, RuntimeSlotHandle<G>>>,
@@ -183,6 +199,7 @@ impl<G> RuntimeRegistry<G> {
                 exchange,
                 symbol,
                 owns_market: AtomicBool::new(owns_market),
+                unlocked_placements: AtomicUsize::new(0),
                 execution_waiters: PeriodicPriority::default(),
                 fee_settlement: std::sync::Mutex::new(FeeSettlementSchedule::default()),
                 strategy: Mutex::new(strategy),
@@ -253,10 +270,20 @@ impl<G> RuntimeRegistry<G> {
         entries
             .into_iter()
             .map(|(run_id, slot)| {
-                // Bounded fairness is Binance-only, not an audit-completion deadline.
-                // Other exchanges retain admission reservations, including TradeXyz ACKs.
+                if slot.unlocked_placements.load(Ordering::Acquire) > 0 {
+                    return RuntimeRegistryEntry {
+                        run_id,
+                        exchange: slot.exchange,
+                        symbol: slot.symbol.clone(),
+                        kind: None,
+                        lifecycle: None,
+                        advancing: true,
+                    };
+                }
+                // Periodic reads may yield, but an unlocked write must finish before
+                // an overdue audit can inspect its durably prepared intents.
                 let audit_due = periodic
-                    && slot.exchange == Exchange::Binance
+                    && matches!(slot.exchange, Exchange::Binance | Exchange::Bybit)
                     && slot.owns_market.load(Ordering::Acquire)
                     && slot.execution_waiters.audit_due()
                     && !slot.execution_waiters.is_advancing();
@@ -390,7 +417,12 @@ impl<G> RuntimeRegistry<G> {
             .execution_waiters
             .begin()
             .ok_or_else(|| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?;
-        let bounded_priority = slot.exchange == Exchange::Binance;
+        if slot.unlocked_placements.load(Ordering::Acquire) > 0 {
+            return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
+                run_id.clone(),
+            ));
+        }
+        let bounded_priority = matches!(slot.exchange, Exchange::Binance | Exchange::Bybit);
         let protected = bounded_priority && priority.is_protected();
         if !protected && slot.execution_waiters.has_waiters() {
             return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
@@ -404,6 +436,11 @@ impl<G> RuntimeRegistry<G> {
                 .try_lock()
                 .map_err(|_| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?
         };
+        if slot.unlocked_placements.load(Ordering::Acquire) > 0 {
+            return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
+                run_id.clone(),
+            ));
+        }
         if !protected && slot.execution_waiters.has_waiters() {
             drop(strategy);
             return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
@@ -490,7 +527,7 @@ impl<G> RuntimeRegistry<G> {
             "execution event acquired strategy lock"
         );
         let effective_now_ms = now_ms.max(strategy.updated_at_ms());
-        if exchange == Exchange::TradeXyz
+        if matches!(exchange, Exchange::TradeXyz | Exchange::Bybit)
             && let Some(exchange_order_ids) = exchange_order_ids
         {
             let prepared = match strategy
@@ -508,6 +545,7 @@ impl<G> RuntimeRegistry<G> {
                 }
                 PreparedExecutionEventStep::Submit(prepared) => prepared,
             };
+            let _reservation = UnlockedPlacementReservation::new(&slot.unlocked_placements);
             drop(strategy);
             let placement_results = prepared.place().await;
             let completion_lock_started = Instant::now();
@@ -1149,9 +1187,18 @@ mod fee_settlement_tests {
 
     #[tokio::test]
     async fn trade_xyz_prepared_intent_reservation_blocks_an_overdue_periodic_audit() {
+        assert_prepared_intent_reservation_blocks_overdue_audit(Exchange::TradeXyz).await;
+    }
+
+    #[tokio::test]
+    async fn bybit_prepared_intent_reservation_blocks_an_overdue_periodic_audit() {
+        assert_prepared_intent_reservation_blocks_overdue_audit(Exchange::Bybit).await;
+    }
+
+    async fn assert_prepared_intent_reservation_blocks_overdue_audit(exchange: Exchange) {
         let directory = tempdir().unwrap();
         let mut gateway = FeeGateway::new();
-        gateway.exchange = Exchange::TradeXyz;
+        gateway.exchange = exchange;
         let strategy = pending_strategy(directory.path(), &gateway, "priority3", 0, false).await;
         let run = strategy.run_id().clone();
         let paths = strategy.paths().clone();
@@ -1182,8 +1229,9 @@ mod fee_settlement_tests {
         let registry = RuntimeRegistry::new();
         registry.register(strategy).await;
         let slot = registry.entries.read().await.get(&run).unwrap().clone();
-        // The real TradeXyz path keeps this reservation while placement/ACK is unlocked.
+        // Real split placement retains both reservations until the ACK is durable.
         let acknowledgement = ExecutionWaiter::register(&slot.execution_waiters);
+        let reservation = UnlockedPlacementReservation::new(&slot.unlocked_placements);
         for _ in 0..3 {
             let context = slot.execution_waiters.begin().unwrap();
             assert_eq!(context.read(std::future::ready(())).await, None);
@@ -1212,9 +1260,16 @@ mod fee_settlement_tests {
             assert_eq!(runtime.intent_store().snapshot(), &before.1);
         }
         drop(acknowledgement);
+        assert!(registry.periodic_entries().await[0].advancing);
+        drop(reservation);
         let entry = registry.periodic_entries().await.remove(0);
         assert!(!entry.advancing);
-        assert_eq!(entry.kind, Some(PreparedStrategyKind::Active));
+        // Bybit explicitly offers the overdue audit without waiting to inspect
+        // strategy metadata; TradeXyz retains its ordinary admission path.
+        assert_eq!(
+            entry.kind,
+            (exchange != Exchange::Bybit).then_some(PreparedStrategyKind::Active)
+        );
     }
 
     #[tokio::test]

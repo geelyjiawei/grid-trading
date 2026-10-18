@@ -2229,14 +2229,23 @@ where
                     .ok_or(RuntimeTickError::IntentLedgerMismatch)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut lookup_results =
-            stream::iter(lookup_intents.into_iter().map(|intent| async move {
-                let result = gateway.lookup_order_intent(&intent, now_ms).await;
-                (intent.client_order_id, result)
-            }))
-            .buffered(MAX_CONCURRENT_ORDER_LOOKUPS)
-            .collect::<BTreeMap<_, _>>()
-            .await;
+        let lookup_read = stream::iter(lookup_intents.into_iter().map(|intent| async move {
+            let result = gateway.lookup_order_intent(&intent, now_ms).await;
+            (intent.client_order_id, result)
+        }))
+        .buffered(MAX_CONCURRENT_ORDER_LOOKUPS)
+        .collect::<BTreeMap<_, _>>();
+        let mut lookup_results = if exchange == Exchange::Bybit
+            && idle_read
+            && let Some(priority) = priority
+        {
+            match priority.read(lookup_read).await {
+                Some(results) => results,
+                None => return Ok(report),
+            }
+        } else {
+            lookup_read.await
+        };
         let mut exact_open_progress = BTreeMap::new();
         for client_order_id in &reconciliation_ids {
             let current_intent = self
@@ -3581,6 +3590,7 @@ mod tests {
         active_order_lookups: usize,
         maximum_concurrent_order_lookups: usize,
         order_lookup_delay: Option<Duration>,
+        order_lookup_gate: Option<Arc<MarketGate>>,
         execution_snapshot_calls: usize,
         active_execution_snapshots: usize,
         maximum_concurrent_execution_snapshots: usize,
@@ -3655,6 +3665,7 @@ mod tests {
                     active_order_lookups: 0,
                     maximum_concurrent_order_lookups: 0,
                     order_lookup_delay: None,
+                    order_lookup_gate: None,
                     execution_snapshot_calls: 0,
                     active_execution_snapshots: 0,
                     maximum_concurrent_execution_snapshots: 0,
@@ -4196,7 +4207,7 @@ mod tests {
             _symbol: &str,
             client_order_id: &ClientOrderId,
         ) -> Result<OrderLookup, LookupError> {
-            let (delay, lookup) = {
+            let (delay, gate, lookup) = {
                 let mut state = self.state.lock().unwrap();
                 state.order_lookup_calls += 1;
                 state.active_order_lookups += 1;
@@ -4205,6 +4216,7 @@ mod tests {
                     .max(state.active_order_lookups);
                 (
                     state.order_lookup_delay,
+                    state.order_lookup_gate.take(),
                     if state.missing_exact_lookups {
                         OrderLookup::NotFound
                     } else {
@@ -4217,6 +4229,10 @@ mod tests {
                     },
                 )
             };
+            if let Some(gate) = gate {
+                gate.entered.wait().await;
+                gate.release.acquire().await.unwrap().forget();
+            }
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -6949,6 +6965,56 @@ mod tests {
     #[tokio::test]
     async fn bybit_idle_periodic_reads_yield_to_exact_fill_before_read_release() {
         assert_idle_periodic_reads_yield_to_exact_fill(Exchange::Bybit).await;
+    }
+
+    #[tokio::test]
+    async fn bybit_idle_exact_lookup_yields_without_changing_ledgers() {
+        use crate::engine::periodic_priority::{PeriodicPriority, PriorityWaiter};
+
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100).with_exchange(Exchange::Bybit);
+        let mut grid_config = config(None);
+        grid_config.exchange = Some(Exchange::Bybit);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(grid_config, &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+        let (source, shape, _) = accepted_add_order(runtime.machine());
+        gateway.fill_order(&source, shape.price.unwrap(), Decimal::new(1, 3));
+        let before_state = runtime.machine().store().snapshot().clone();
+        let before_intents = runtime.intent_store().snapshot().clone();
+        let placements = gateway.placement_call_count();
+        let gate = MarketGate::new();
+        gateway.state.lock().unwrap().order_lookup_gate = Some(gate.clone());
+        let priority = PeriodicPriority::default();
+        let context = priority.begin().unwrap();
+        let mut periodic = tokio::spawn(async move {
+            let report = runtime.tick_with_priority(1_300, &context).await.unwrap();
+            (runtime, report)
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("periodic exact GET must start");
+        let _waiter = PriorityWaiter::register(&priority);
+        let result = tokio::time::timeout(Duration::from_millis(500), &mut periodic).await;
+        let yielded = result.is_ok();
+        gate.release();
+        let (runtime, report) = match result {
+            Ok(result) => result.unwrap(),
+            Err(_) => periodic.await.unwrap(),
+        };
+        assert!(
+            yielded,
+            "read-only exact lookup must release the strategy for execution"
+        );
+        assert!(report.submissions.is_empty());
+        assert_eq!(runtime.machine().store().snapshot(), &before_state);
+        assert_eq!(runtime.intent_store().snapshot(), &before_intents);
+        assert_eq!(gateway.placement_call_count(), placements);
+        assert_eq!(gateway.cancellation_call_count(), 0);
     }
 
     async fn assert_idle_periodic_reads_yield_to_exact_fill(exchange: Exchange) {

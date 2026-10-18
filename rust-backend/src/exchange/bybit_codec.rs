@@ -174,39 +174,58 @@ pub(super) fn parse_account_balance_snapshot(
     Ok(snapshot)
 }
 
+#[derive(Debug, PartialEq)]
+pub(super) struct ExactOrderPage {
+    pub record: Option<OrderExecutionHeader>,
+    pub next_cursor: Option<String>,
+}
+
 pub(super) fn parse_exact_order_record(
     body: &str,
     expected_symbol: &str,
     expected_client_order_id: &ClientOrderId,
     expected_exchange_order_id: Option<&str>,
-) -> Result<Option<OrderExecutionHeader>, BybitCodecError> {
+) -> Result<ExactOrderPage, BybitCodecError> {
     let root = success_root(body)?;
     let result = result_object(&root)?;
     require_category(result)?;
+    if result.get("nextPageCursor") == Some(&Value::Null) {
+        return Err(BybitCodecError::InvalidField("nextPageCursor"));
+    }
     let cursor = optional_string(result, "nextPageCursor")?.unwrap_or_default();
-    if !cursor.is_empty() {
-        return Err(BybitCodecError::DuplicateRecord);
+    if cursor.len() > 4096
+        || cursor.chars().any(char::is_control)
+        || (!cursor.is_empty() && cursor.trim().is_empty())
+    {
+        return Err(BybitCodecError::InvalidField("nextPageCursor"));
     }
     let rows = required_array(result, "list")?;
     if rows.is_empty() {
-        return Ok(None);
+        return Ok(ExactOrderPage {
+            record: None,
+            next_cursor: (!cursor.is_empty()).then_some(cursor),
+        });
     }
     if rows.len() != 1 {
         return Err(BybitCodecError::DuplicateRecord);
     }
-    parse_order_row(
+    let record = parse_order_row(
         &rows[0],
         expected_symbol,
         expected_client_order_id,
         expected_exchange_order_id,
-    )
-    .map(Some)
+    )?;
+    Ok(ExactOrderPage {
+        record: Some(record),
+        next_cursor: (!cursor.is_empty()).then_some(cursor),
+    })
 }
 
 #[derive(Debug, PartialEq)]
 pub(super) struct OpenOrderPage {
     pub orders: Vec<AuthoritativeOrder>,
     pub progress: Vec<OpenOrderExecutionProgress>,
+    pub headers: Vec<OrderExecutionHeader>,
     pub next_cursor: Option<String>,
 }
 
@@ -231,6 +250,7 @@ pub(super) fn parse_open_order_page(
     let mut exchange_order_ids = BTreeSet::new();
     let mut orders = Vec::with_capacity(rows.len());
     let mut progress = Vec::with_capacity(rows.len());
+    let mut headers = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(raw_client_order_id) = row.get("orderLinkId").and_then(Value::as_str) else {
             continue;
@@ -251,12 +271,14 @@ pub(super) fn parse_open_order_page(
             order: header.order.clone(),
             cumulative_quantity: header.cumulative_quantity,
         });
-        orders.push(header.order);
+        orders.push(header.order.clone());
+        headers.push(header);
     }
     orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
     Ok(OpenOrderPage {
         orders,
         progress,
+        headers,
         next_cursor: (!cursor.is_empty()).then_some(cursor),
     })
 }
@@ -926,7 +948,7 @@ mod tests {
         let page = parse_open_order_page(
             r#"{"retCode":0,"result":{"category":"linear","nextPageCursor":"next%3A2","list":[
                 {"symbol":"MUUSDT","orderId":"2","orderLinkId":"g_RUN00001_2_S_2","side":"Sell","orderType":"Limit","qty":"100","price":"1012","timeInForce":"GTC","positionIdx":0,"orderStatus":"PartiallyFilled","cumExecQty":"30","cumExecValue":"30360","reduceOnly":false,"createdTime":"1000","updatedTime":"1100"},
-                {"symbol":"MUUSDT","orderId":"1","orderLinkId":"g_RUN00001_1_B_1","side":"Buy","orderType":"Limit","qty":"100","price":"1010","timeInForce":"PostOnly","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","reduceOnly":true,"createdTime":"1000","updatedTime":"1000"}
+                {"symbol":"MUUSDT","orderId":"1","orderLinkId":"g_RUN00001_1_B_1","side":"Buy","orderType":"Limit","qty":"100","price":"1010","timeInForce":"PostOnly","positionIdx":0,"orderStatus":"New","cumExecQty":"0","cumExecValue":"0","reduceOnly":true,"createdTime":"1000","updatedTime":"1010"}
             ]}}"#,
             "MUUSDT",
         )
@@ -936,6 +958,17 @@ mod tests {
         assert_eq!(page.orders[0].client_order_id.as_str(), "g_RUN00001_1_B_1");
         assert_eq!(page.orders[0].shape.time_in_force, TimeInForce::PostOnly);
         assert_eq!(page.orders[1].shape.quantity, Decimal::new(100, 0));
+        assert_eq!(page.headers.len(), 2);
+        let new_header = page
+            .headers
+            .iter()
+            .find(|header| header.order.exchange_order_id == "1")
+            .unwrap();
+        assert_eq!(new_header.order_time_ms, 1000);
+        assert_eq!(new_header.update_time_ms, 1010);
+        assert_eq!(new_header.order.shape, page.orders[0].shape);
+        assert_eq!(new_header.cumulative_quantity, Decimal::ZERO);
+        assert_eq!(new_header.cumulative_quote, Decimal::ZERO);
     }
 
     #[test]
@@ -1008,6 +1041,16 @@ mod tests {
     }
 
     #[test]
+    fn exact_lookup_null_cursor_cannot_certify_page_completeness() {
+        let mut body: Value = serde_json::from_str(&order_response("New", "0", "0")).unwrap();
+        body["result"]["nextPageCursor"] = Value::Null;
+        assert_eq!(
+            parse_exact_order_record(&body.to_string(), "MUUSDT", &client_id(), None),
+            Err(BybitCodecError::InvalidField("nextPageCursor"))
+        );
+    }
+
+    #[test]
     fn text_execution_identity_and_exact_order_shape_are_preserved() {
         let header = parse_exact_order_record(
             &order_response("Filled", "2.8", "2839.2"),
@@ -1016,6 +1059,7 @@ mod tests {
             Some("order-42"),
         )
         .unwrap()
+        .record
         .unwrap();
         assert_eq!(header.order.shape.quantity, Decimal::new(28, 1));
         assert_eq!(header.order.shape.price, Some(Decimal::new(1014, 0)));
@@ -1063,6 +1107,7 @@ mod tests {
             Some("order-42"),
         )
         .unwrap()
+        .record
         .unwrap();
 
         assert_eq!(

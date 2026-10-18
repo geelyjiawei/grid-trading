@@ -48,7 +48,11 @@ const OPEN_ORDER_PAGE_LIMIT: usize = 50;
 const MAX_OPEN_ORDER_PAGES: usize = 100;
 const ORDER_HISTORY_PAGE_LIMIT: usize = 50;
 const MAX_ORDER_HISTORY_PAGES: usize = 20;
+const MAX_EXACT_ORDER_PAGES: usize = 20;
 const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
+
+mod order_ws;
+pub(crate) use order_ws::{BybitOrderRelay, spawn_bybit_order_stream};
 
 pub trait BybitRequestSigner: Send + Sync {
     fn sign(&self, message: &str) -> Result<String, BybitSignatureError>;
@@ -112,6 +116,7 @@ pub struct BybitAdapter<T, S, C> {
     recv_window_ms: u64,
     realtime_lifetime: Arc<()>,
     realtime_execution_cache: BybitExecutionCache,
+    websocket_order_relay: Option<BybitOrderRelay>,
 }
 
 impl<T, S, C> BybitAdapter<T, S, C> {
@@ -139,6 +144,7 @@ impl<T, S, C> BybitAdapter<T, S, C> {
             recv_window_ms: 5_000,
             realtime_lifetime: crate::exchange::realtime::new_realtime_lifetime(),
             realtime_execution_cache: BybitExecutionCache::default(),
+            websocket_order_relay: None,
         }
     }
 
@@ -152,6 +158,37 @@ impl<T, S, C> BybitAdapter<T, S, C> {
 
     pub fn set_recv_window_ms(&mut self, recv_window_ms: u64) {
         self.recv_window_ms = recv_window_ms;
+    }
+
+    pub(crate) fn set_websocket_order_relay(&mut self, relay: BybitOrderRelay) {
+        self.websocket_order_relay = Some(relay);
+    }
+
+    fn seed_open_order_headers(
+        &self,
+        epoch: u64,
+        headers: Vec<crate::exchange::execution::OrderExecutionHeader>,
+    ) -> Result<(), SnapshotError> {
+        let mut snapshots = Vec::new();
+        for header in headers {
+            if matches!(
+                header.order.lifecycle,
+                crate::exchange::OrderLifecycle::Active(crate::exchange::ActiveOrderStatus::New)
+            ) && header.cumulative_quantity.is_zero()
+            {
+                let snapshot = assemble_execution_snapshot(header, vec![]).map_err(|error| {
+                    SnapshotError::new(format!("invalid Bybit New order snapshot: {error}"))
+                })?;
+                snapshots.push(snapshot);
+            }
+        }
+        // Bind only after the complete scan validates. These REST observations
+        // are already returned to the caller, not fresh fill notifications.
+        for snapshot in snapshots {
+            self.realtime_execution_cache
+                .seed_verified_snapshot(epoch, &snapshot);
+        }
+        Ok(())
     }
 
     fn public_request(&self, path: &str, query: Parameters) -> PreparedHttpRequest {
@@ -274,42 +311,75 @@ where
             ("/v5/order/realtime", "Bybit realtime order lookup"),
             ("/v5/order/history", "Bybit historical order lookup"),
         ] {
-            let request = self
-                .signed_get(
-                    path,
-                    vec![
-                        ("category".into(), CATEGORY.into()),
-                        ("symbol".into(), symbol.into()),
-                        ("orderLinkId".into(), client_order_id.as_str().into()),
-                        ("limit".into(), "1".into()),
-                    ],
+            let mut cursor: Option<String> = None;
+            let mut seen_cursors = BTreeSet::new();
+            let mut found = None;
+            for page_index in 0..MAX_EXACT_ORDER_PAGES {
+                let mut query = vec![
+                    ("category".into(), CATEGORY.into()),
+                    ("symbol".into(), symbol.into()),
+                    ("orderLinkId".into(), client_order_id.as_str().into()),
+                    ("limit".into(), "1".into()),
+                ];
+                if let Some(cursor) = &cursor {
+                    query.push(("cursor".into(), cursor.clone()));
+                }
+                let request = self
+                    .signed_get(path, query)
+                    .map_err(|error| lookup_error(error.to_string()))?;
+                let response = self
+                    .transport
+                    .execute(request)
+                    .await
+                    .map_err(|error| lookup_error(format!("{context}: {error}")))?;
+                let exchange_error = parse_error(&response.body);
+                if exchange_error.code.as_deref() == Some("110001") {
+                    if page_index == 0 && found.is_none() {
+                        break;
+                    }
+                    return Err(lookup_error("Bybit exact lookup continuation disappeared"));
+                }
+                if !(200..300).contains(&response.status)
+                    || exchange_error.code.as_deref() != Some("0")
+                {
+                    return Err(lookup_error(format!(
+                        "{context}: HTTP {}: {}",
+                        response.status, exchange_error.message
+                    )));
+                }
+                let page = parse_exact_order_record(
+                    &response.body,
+                    symbol,
+                    client_order_id,
+                    exchange_order_id,
                 )
-                .map_err(|error| lookup_error(error.to_string()))?;
-            let response = self
-                .transport
-                .execute(request)
-                .await
-                .map_err(|error| lookup_error(format!("{context}: {error}")))?;
-            let exchange_error = parse_error(&response.body);
-            if exchange_error.code.as_deref() == Some("110001") {
-                continue;
-            }
-            if !(200..300).contains(&response.status) || exchange_error.code.as_deref() != Some("0")
-            {
-                return Err(lookup_error(format!(
-                    "{context}: HTTP {}: {}",
-                    response.status, exchange_error.message
-                )));
-            }
-            let record = parse_exact_order_record(
-                &response.body,
-                symbol,
-                client_order_id,
-                exchange_order_id,
-            )
-            .map_err(|error| lookup_error(format!("invalid Bybit order snapshot: {error}")))?;
-            if record.is_some() {
-                return Ok(record);
+                .map_err(|error| lookup_error(format!("invalid Bybit order snapshot: {error}")))?;
+                if let Some(record) = page.record {
+                    if found.is_some() {
+                        return Err(lookup_error(
+                            "Bybit exact lookup contains duplicate records",
+                        ));
+                    }
+                    found = Some(record);
+                }
+                match page.next_cursor {
+                    None => {
+                        if found.is_some() {
+                            return Ok(found);
+                        }
+                        break;
+                    }
+                    Some(next) => {
+                        if !seen_cursors.insert(next.clone())
+                            || page_index + 1 == MAX_EXACT_ORDER_PAGES
+                        {
+                            return Err(lookup_error(
+                                "Bybit exact lookup pagination did not terminate",
+                            ));
+                        }
+                        cursor = Some(next);
+                    }
+                }
             }
         }
         Ok(None)
@@ -525,6 +595,74 @@ where
             order_link_id: intent.client_order_id.as_str(),
             reduce_only: shape.reduce_only,
         };
+        if let Some(relay) = &self.websocket_order_relay {
+            let payload = serde_json::to_value(&payload)
+                .map_err(|_| definitive_placement("Bybit order serialization failed"))?;
+            let started = std::time::Instant::now();
+            match relay.post(payload, self.recv_window_ms).await {
+                Ok(response) => {
+                    let roundtrip_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if let Some(ret_code) = parse_error(&response.body)
+                        .code
+                        .and_then(|code| code.parse::<i64>().ok())
+                    {
+                        tracing::info!(
+                            transport = "websocket",
+                            roundtrip_ms,
+                            ret_code,
+                            client_order_id = intent.client_order_id.as_str(),
+                            symbol = intent.shape.symbol.as_str(),
+                            "Bybit order placement response"
+                        );
+                    }
+                    let ack = match classify_placement_response(response, &intent.client_order_id) {
+                        Ok(ack) => ack,
+                        Err(error) => {
+                            tracing::warn!(
+                                transport = "websocket",
+                                roundtrip_ms,
+                                client_order_id = intent.client_order_id.as_str(),
+                                symbol = intent.shape.symbol.as_str(),
+                                "Bybit order acknowledgement is invalid, rejected, or uncertain"
+                            );
+                            return Err(error);
+                        }
+                    };
+                    self.realtime_execution_cache.register_placement(
+                        intent,
+                        &ack,
+                        self.clock.now_millis(),
+                    );
+                    return Ok(ack);
+                }
+                Err(order_ws::BybitOrderError::NotSent) => {
+                    tracing::info!(
+                        transport = "rest",
+                        fallback_reason = "websocket_not_sent",
+                        client_order_id = intent.client_order_id.as_str(),
+                        symbol = intent.shape.symbol.as_str(),
+                        "Bybit order placement REST fallback"
+                    );
+                }
+                Err(order_ws::BybitOrderError::Unknown) => {
+                    tracing::warn!(
+                        transport = "websocket",
+                        outcome = "unknown",
+                        roundtrip_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        client_order_id = intent.client_order_id.as_str(),
+                        symbol = intent.shape.symbol.as_str(),
+                        "Bybit order placement needs exact reconciliation; no REST fallback"
+                    );
+                    return Err(PlacementError::Unknown {
+                        message:
+                            "Bybit order WebSocket outcome is unknown; reconcile exact identity"
+                                .into(),
+                    });
+                }
+            }
+        }
         let request = self
             .signed_post("/v5/order/create", &payload)
             .map_err(|error| definitive_placement(error.to_string()))?;
@@ -535,7 +673,10 @@ where
                 .map_err(|error| PlacementError::Unknown {
                     message: error.to_string(),
                 })?;
-        classify_placement_response(response, &intent.client_order_id)
+        let ack = classify_placement_response(response, &intent.client_order_id)?;
+        self.realtime_execution_cache
+            .register_placement(intent, &ack, self.clock.now_millis());
+        Ok(ack)
     }
 }
 
@@ -637,6 +778,7 @@ where
         exchange: Exchange,
         symbol: &str,
     ) -> Result<Vec<crate::exchange::AuthoritativeOrder>, SnapshotError> {
+        let cache_epoch = self.realtime_execution_cache.session_epoch();
         validate_snapshot_request(exchange, Exchange::Bybit, symbol)?;
         let symbol = symbol.to_ascii_uppercase();
         let mut cursor: Option<String> = None;
@@ -644,6 +786,7 @@ where
         let mut client_order_ids = BTreeSet::new();
         let mut exchange_order_ids = BTreeSet::new();
         let mut orders = Vec::new();
+        let mut headers = Vec::new();
         for _ in 0..MAX_OPEN_ORDER_PAGES {
             let mut query = vec![
                 ("category".into(), CATEGORY.into()),
@@ -673,7 +816,9 @@ where
                 }
                 orders.push(order);
             }
+            headers.extend(page.headers);
             let Some(next_cursor) = page.next_cursor else {
+                self.seed_open_order_headers(cache_epoch, headers)?;
                 orders.sort_by(|left, right| left.client_order_id.cmp(&right.client_order_id));
                 return Ok(orders);
             };
@@ -788,6 +933,7 @@ where
         symbol: &str,
     ) -> Result<Option<Vec<crate::exchange::OpenOrderExecutionProgress>>, ExecutionSnapshotError>
     {
+        let cache_epoch = self.realtime_execution_cache.session_epoch();
         validate_snapshot_request(exchange, Exchange::Bybit, symbol)
             .map_err(|error| execution_error(error.to_string()))?;
         let symbol = symbol.to_ascii_uppercase();
@@ -796,6 +942,7 @@ where
         let mut client_order_ids = BTreeSet::new();
         let mut exchange_order_ids = BTreeSet::new();
         let mut progress = Vec::new();
+        let mut headers = Vec::new();
         for _ in 0..MAX_OPEN_ORDER_PAGES {
             let mut query = vec![
                 ("category".into(), CATEGORY.into()),
@@ -826,7 +973,10 @@ where
                 }
                 progress.push(item);
             }
+            headers.extend(page.headers);
             let Some(next_cursor) = page.next_cursor else {
+                self.seed_open_order_headers(cache_epoch, headers)
+                    .map_err(|error| execution_error(error.to_string()))?;
                 progress.sort_by(|left, right| {
                     left.order.client_order_id.cmp(&right.order.client_order_id)
                 });
@@ -851,6 +1001,7 @@ where
         client_order_id: &ClientOrderId,
         exchange_order_id: &str,
     ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
+        let cache_epoch = self.realtime_execution_cache.session_epoch();
         validate_snapshot_request(exchange, Exchange::Bybit, symbol)
             .map_err(|error| execution_error(error.to_string()))?;
         if exchange_order_id.trim().is_empty() {
@@ -883,8 +1034,11 @@ where
             .map_err(|error| execution_error(error.to_string()))?
             .ok_or_else(|| execution_error("Bybit order snapshot is not available"))?;
         if header.cumulative_quantity.is_zero() {
-            return assemble_execution_snapshot(header, vec![])
-                .map_err(|error| execution_error(error.to_string()));
+            let snapshot = assemble_execution_snapshot(header, vec![])
+                .map_err(|error| execution_error(error.to_string()))?;
+            self.realtime_execution_cache
+                .seed_verified_snapshot(cache_epoch, &snapshot);
+            return Ok(snapshot);
         }
 
         let mut cursor: Option<String> = None;
@@ -932,8 +1086,11 @@ where
                 "Bybit execution history exceeded bounded pagination",
             ));
         }
-        assemble_execution_snapshot(header, trades)
-            .map_err(|error| execution_error(format!("incomplete Bybit execution: {error}")))
+        let snapshot = assemble_execution_snapshot(header, trades)
+            .map_err(|error| execution_error(format!("incomplete Bybit execution: {error}")))?;
+        self.realtime_execution_cache
+            .seed_verified_snapshot(cache_epoch, &snapshot);
+        Ok(snapshot)
     }
 }
 
@@ -1114,7 +1271,18 @@ fn classify_placement_response(
 fn bybit_write_outcome_is_unknown(code: &str) -> bool {
     matches!(
         code,
-        "429" | "10000" | "10006" | "10014" | "10016" | "110072" | "110079" | "3400214"
+        "429"
+            | "10000"
+            | "10006"
+            | "10014"
+            | "10016"
+            | "10403"
+            | "10429"
+            | "10019"
+            | "20006"
+            | "110072"
+            | "110079"
+            | "3400214"
     )
 }
 
@@ -1175,6 +1343,7 @@ mod tests {
     struct MockTransport {
         requests: Arc<Mutex<Vec<PreparedHttpRequest>>>,
         responses: Arc<Mutex<VecDeque<Result<HttpResponse, TransportError>>>>,
+        reset_cache: Option<BybitExecutionCache>,
     }
 
     impl MockTransport {
@@ -1200,6 +1369,9 @@ mod tests {
             request: PreparedHttpRequest,
         ) -> Result<HttpResponse, TransportError> {
             self.requests.lock().unwrap().push(request);
+            if let Some(cache) = &self.reset_cache {
+                cache.begin_session();
+            }
             self.responses
                 .lock()
                 .unwrap()
@@ -1260,6 +1432,454 @@ mod tests {
             status: 200,
             body: body.into(),
         })
+    }
+
+    #[tokio::test]
+    async fn exact_lookup_exhausts_cursor_before_accepting_filled_500() {
+        let transport = MockTransport::default();
+        let mut page: serde_json::Value =
+            serde_json::from_str(&order_result("Filled", "500", "505500")).unwrap();
+        page["result"]["list"][0]["qty"] = serde_json::json!("500");
+        page["result"]["nextPageCursor"] = serde_json::json!("opaque%3A500");
+        transport.push(ok(page.to_string()));
+        transport.push(ok(empty_order_result()));
+        let result = adapter(transport.clone())
+            .lookup_order_by_client_id(Exchange::Bybit, "MUUSDT", &intent().client_order_id)
+            .await
+            .unwrap();
+        let OrderLookup::Found(order) = result else {
+            panic!("exact filled order missing")
+        };
+        assert_eq!(order.shape.quantity, Decimal::from(500));
+        assert_eq!(order.executed_quantity, Some(Decimal::from(500)));
+        assert_eq!(
+            order.lifecycle,
+            OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+        );
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].path, "/v5/order/realtime");
+        assert!(
+            requests[1]
+                .query
+                .contains(&("cursor".into(), "opaque%3A500".into()))
+        );
+        assert!(requests.iter().all(|r| r.method == HttpMethod::Get));
+    }
+
+    #[tokio::test]
+    async fn exact_lookup_never_accepts_duplicate_foreign_malformed_or_unbounded_pages() {
+        let row: serde_json::Value = serde_json::from_str(&order_result("New", "0", "0")).unwrap();
+        let mut first = row.clone();
+        first["result"]["nextPageCursor"] = serde_json::json!("page-2");
+        let mut foreign = row.clone();
+        foreign["result"]["list"][0]["orderLinkId"] = serde_json::json!("g_8_S_foreign");
+        let mut malformed = row.clone();
+        malformed["result"]["list"][0]["qty"] = serde_json::json!("broken");
+        let mut bad_cursor =
+            serde_json::from_str::<serde_json::Value>(&empty_order_result()).unwrap();
+        bad_cursor["result"]["nextPageCursor"] = serde_json::json!({"cursor":"bad"});
+        let mut repeated =
+            serde_json::from_str::<serde_json::Value>(&empty_order_result()).unwrap();
+        repeated["result"]["nextPageCursor"] = serde_json::json!("page-2");
+        for second in [row, foreign, malformed, bad_cursor, repeated] {
+            let transport = MockTransport::default();
+            transport.push(ok(first.to_string()));
+            transport.push(ok(second.to_string()));
+            assert!(adapter(transport.clone()).lookup_order_by_client_id(
+                Exchange::Bybit, "MUUSDT", &intent().client_order_id,
+            ).await.is_err());
+            assert_eq!(
+                transport.requests().len(),
+                2,
+                "must validate the continuation, not reject every cursor"
+            );
+            assert!(
+                transport
+                    .requests()
+                    .iter()
+                    .all(|r| r.method == HttpMethod::Get)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_lookup_cursor_bound_and_malformed_continuations_fail_closed() {
+        let mut page = serde_json::from_str::<serde_json::Value>(&empty_order_result()).unwrap();
+        let transport = MockTransport::default();
+        for index in 0..20 {
+            page["result"]["nextPageCursor"] = serde_json::json!(format!("page-{index}"));
+            transport.push(ok(page.to_string()));
+        }
+        assert!(
+            adapter(transport.clone())
+                .lookup_order_by_client_id(Exchange::Bybit, "MUUSDT", &intent().client_order_id,)
+                .await
+                .is_err()
+        );
+        assert_eq!(transport.requests().len(), 20);
+        for cursor in [
+            serde_json::json!(17),
+            serde_json::json!(["bad"]),
+            serde_json::json!("\n"),
+            serde_json::json!(" "),
+            serde_json::json!("x".repeat(4097)),
+        ] {
+            let transport = MockTransport::default();
+            page["result"]["nextPageCursor"] = cursor;
+            transport.push(ok(page.to_string()));
+            assert!(adapter(transport.clone()).lookup_order_by_client_id(
+                Exchange::Bybit, "MUUSDT", &intent().client_order_id,
+            ).await.is_err());
+            assert_eq!(transport.requests().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_verified_snapshot_seeds_current_session_without_inventing_fills() {
+        for (status, quantity, quote) in [("New", "0", "0"), ("Filled", "0.2", "202.2")] {
+            let transport = MockTransport::default();
+            transport.push(ok(order_result(status, quantity, quote)));
+            if status == "Filled" {
+                transport.push(ok(execution_result(
+                    "seed-fill",
+                    "0.2",
+                    "202.2",
+                    1_700_000_000_500,
+                    "",
+                )));
+            }
+            let gateway = adapter(transport.clone());
+            let snapshot = gateway
+                .execution_snapshot(
+                    Exchange::Bybit,
+                    "MUUSDT",
+                    &intent().client_order_id,
+                    "order-91",
+                )
+                .await
+                .unwrap();
+            let cached = gateway
+                .realtime_execution_cache()
+                .wait_snapshot(
+                    "MUUSDT",
+                    &intent().client_order_id,
+                    "order-91",
+                    Duration::ZERO,
+                )
+                .await;
+            assert!(
+                gateway
+                    .realtime_execution_cache()
+                    .knows_order("MUUSDT", "order-91"),
+                "verified REST evidence must bind the same live session"
+            );
+            assert_eq!(
+                cached, None,
+                "REST evidence already returned to its caller must not become a second fresh WS read"
+            );
+            assert_eq!(
+                snapshot.trades.len(),
+                if status == "Filled" { 1 } else { 0 }
+            );
+            assert_eq!(
+                transport.requests().len(),
+                if status == "Filled" { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_snapshot_started_before_reconnect_never_seeds_new_epoch() {
+        let cache = BybitExecutionCache::default();
+        let transport = MockTransport {
+            reset_cache: Some(cache.clone()),
+            ..MockTransport::default()
+        };
+        transport.push(ok(order_result("New", "0", "0")));
+        let mut gateway = adapter(transport.clone());
+        gateway.realtime_execution_cache = cache.clone();
+        let snapshot = gateway
+            .execution_snapshot(
+                Exchange::Bybit,
+                "MUUSDT",
+                &intent().client_order_id,
+                "order-91",
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.cumulative_quantity, Decimal::ZERO);
+        assert!(!cache.knows_order("MUUSDT", "order-91"));
+        assert!(
+            cache
+                .wait_snapshot(
+                    "MUUSDT",
+                    &intent().client_order_id,
+                    "order-91",
+                    Duration::ZERO
+                )
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_ws_real_transport_auth_frame_ack_preserves_qty_and_reduce_only() {
+        use order_ws::test_support::{Reply, mock_relay};
+        let fixture = mock_relay(Reply::Ack).await;
+        fixture.ready().await;
+        let transport = MockTransport::default();
+        let mut gateway = adapter(transport.clone());
+        gateway.set_recv_window_ms(8000);
+        gateway.set_websocket_order_relay(fixture.relay.clone());
+        let mut order = intent();
+        order.shape.quantity = Decimal::from(500);
+        order.shape.reduce_only = true;
+        let ack = gateway.place_order(&order).await.unwrap();
+        assert_eq!(ack.exchange_order_id, "ws-order-91");
+        assert_eq!(ack.client_order_id, order.client_order_id);
+        assert!(
+            gateway
+                .realtime_execution_cache()
+                .knows_order("MUUSDT", "ws-order-91")
+        );
+        assert!(
+            transport.requests().is_empty(),
+            "accepted WS order must never reach REST"
+        );
+        // An acceptance acknowledgement must not fabricate a fill.
+        if let Some(snapshot) = gateway
+            .realtime_execution_cache()
+            .wait_snapshot(
+                "MUUSDT",
+                &order.client_order_id,
+                "ws-order-91",
+                Duration::ZERO,
+            )
+            .await
+        {
+            assert_eq!(snapshot.cumulative_quantity, Decimal::ZERO);
+            assert!(snapshot.trades.is_empty());
+        }
+        gateway.place_order(&order).await.unwrap();
+        let frames = fixture.orders.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        let request = &frames[0];
+        let id = request["reqId"].as_str().unwrap();
+        assert!(!id.is_empty() && id.len() <= 36);
+        assert_ne!(request["reqId"], frames[1]["reqId"]);
+        assert!(
+            request["header"]["X-BAPI-TIMESTAMP"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(request["header"]["X-BAPI-RECV-WINDOW"], "8000");
+        assert_eq!(
+            request["args"],
+            serde_json::json!([{
+                "category":"linear", "symbol":"MUUSDT", "side":"Sell", "orderType":"Limit",
+                "qty":"500", "price":"1011", "timeInForce":"PostOnly", "positionIdx":0,
+                "orderLinkId":"g_7_S_fixed", "reduceOnly":true
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_ws_real_transport_unknown_never_resends_or_falls_back() {
+        use order_ws::test_support::{Reply, mock_relay};
+        for reply in [
+            Reply::Disconnect,
+            Reply::Silence,
+            Reply::ForeignClient,
+            Reply::ForeignRequest,
+            Reply::WrongOp,
+            Reply::Malformed,
+        ] {
+            let fixture = mock_relay(reply).await;
+            fixture.ready().await;
+            let transport = MockTransport::default();
+            let mut gateway = adapter(transport.clone());
+            gateway.set_websocket_order_relay(fixture.relay.clone());
+            assert!(matches!(
+                gateway.place_order(&intent()).await,
+                Err(PlacementError::Unknown { .. })
+            ));
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(transport.requests().is_empty());
+            assert_eq!(fixture.orders.lock().unwrap().len(), 1);
+            if matches!(reply, Reply::Disconnect | Reply::Malformed) {
+                assert!(
+                    fixture
+                        .connections
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        >= 2,
+                    "must verify no replay on a reauthenticated connection"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_ws_real_transport_auth_failure_is_not_sent_rest_fallback() {
+        use order_ws::test_support::{Reply, mock_relay};
+        let fixture = mock_relay(Reply::AuthRejected).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let transport = MockTransport::with_response(ok(
+            r#"{"retCode":0,"result":{"orderId":"rest-91","orderLinkId":"g_7_S_fixed"}}"#,
+        ));
+        let mut gateway = adapter(transport.clone());
+        gateway.set_websocket_order_relay(fixture.relay.clone());
+        assert_eq!(
+            gateway
+                .place_order(&intent())
+                .await
+                .unwrap()
+                .exchange_order_id,
+            "rest-91"
+        );
+        assert_eq!(transport.requests().len(), 1);
+        assert!(fixture.orders.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bybit_ws_real_transport_definitive_rejection_does_not_fallback() {
+        use order_ws::test_support::{Reply, mock_relay};
+        let fixture = mock_relay(Reply::Reject).await;
+        fixture.ready().await;
+        let transport = MockTransport::default();
+        let mut gateway = adapter(transport.clone());
+        gateway.set_websocket_order_relay(fixture.relay.clone());
+        assert!(matches!(
+            gateway.place_order(&intent()).await,
+            Err(PlacementError::Definitive { .. })
+        ));
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bybit_ws_real_transport_weak_lifetime_stops_writer_and_market_omits_price() {
+        use order_ws::test_support::{Reply, mock_relay};
+        let mut fixture = mock_relay(Reply::Ack).await;
+        fixture.ready().await;
+        let transport = MockTransport::default();
+        let mut gateway = adapter(transport.clone());
+        gateway.set_websocket_order_relay(fixture.relay.clone());
+        let mut order = intent();
+        order.shape.kind = OrderKind::Market;
+        order.shape.price = None;
+        order.shape.time_in_force = TimeInForce::Gtc;
+        order.shape.reduce_only = true;
+        gateway.place_order(&order).await.unwrap();
+        let payload = fixture.orders.lock().unwrap()[0]["args"][0].clone();
+        assert_eq!(payload["orderType"], "Market");
+        assert_eq!(payload["qty"], "0.2");
+        assert_eq!(payload["reduceOnly"], true);
+        assert!(payload.get("price").is_none());
+        assert!(payload.get("timeInForce").is_none());
+        fixture.stop().await;
+        assert!(transport.requests().is_empty());
+        assert_eq!(fixture.orders.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bybit_ws_real_transport_heartbeat_keeps_authenticated_session_reusable() {
+        use order_ws::test_support::{Reply, mock_relay};
+        let mut fixture = mock_relay(Reply::Ack).await;
+        fixture.ready().await;
+        tokio::time::timeout(Duration::from_secs(25), async {
+            while fixture.pings.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("persistent authenticated socket must emit an application heartbeat");
+        let transport = MockTransport::default();
+        let mut gateway = adapter(transport.clone());
+        gateway.set_websocket_order_relay(fixture.relay.clone());
+        gateway.place_order(&intent()).await.unwrap();
+        assert_eq!(
+            fixture
+                .connections
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(transport.requests().is_empty());
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn bybit_ws_real_transport_logs_sanitized_transport_latency_and_failure_code() {
+        use order_ws::test_support::{Reply, mock_relay};
+        #[derive(Clone)]
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let output = logs.clone();
+        // Avoid tracing's single-dispatch callsite fast path while parallel
+        // tests register the same callsites without a thread-local subscriber.
+        let _parallel_dispatch =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || LogWriter(output.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for reply in [Reply::Ack, Reply::Reject, Reply::AuthRejected] {
+            let fixture = mock_relay(reply).await;
+            if matches!(reply, Reply::AuthRejected) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            fixture.ready().await;
+            let transport = MockTransport::default();
+            let mut gateway = adapter(transport.clone());
+            gateway.set_websocket_order_relay(fixture.relay.clone());
+            let result = gateway.place_order(&intent()).await;
+            assert!(result.is_ok() || matches!(result, Err(PlacementError::Definitive { .. })));
+            assert!(transport.requests().is_empty());
+        }
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("authenticated Bybit trading WebSocket connected"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("transport=\"websocket\"") && logs.contains("roundtrip_ms="),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("g_7_S_fixed") && logs.contains("MUUSDT"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("ret_code=10001") && logs.contains("ret_code=10004"),
+            "{logs}"
+        );
+        for secret in [
+            "test-key",
+            "test-secret",
+            "GET/realtime",
+            "\"args\"",
+            "X-BAPI-SIGN",
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "secret or raw frame appeared in logs"
+            );
+        }
     }
 
     #[test]
@@ -1350,6 +1970,131 @@ mod tests {
         assert_eq!(progress.len(), 1);
         assert_eq!(progress[0].cumulative_quantity, Decimal::new(7, 2));
         assert_eq!(progress[0].order.shape.quantity, Decimal::new(2, 1));
+    }
+
+    #[tokio::test]
+    async fn bybit_open_pages_cold_seed_only_real_zero_new_orders() {
+        for progress_only in [false, true] {
+            let transport = MockTransport::default();
+            let mut page: serde_json::Value =
+                serde_json::from_str(&order_result("New", "0", "0")).unwrap();
+            let mut partial: serde_json::Value =
+                serde_json::from_str(&order_result("PartiallyFilled", "0.07", "70.77")).unwrap();
+            partial["result"]["list"][0]["orderId"] = serde_json::json!("partial-92");
+            partial["result"]["list"][0]["orderLinkId"] = serde_json::json!("g_8_S_partial");
+            let mut manual = page["result"]["list"][0].clone();
+            manual["orderId"] = serde_json::json!("manual-93");
+            manual["orderLinkId"] = serde_json::json!("m_manual");
+            page["result"]["list"]
+                .as_array_mut()
+                .unwrap()
+                .extend([partial["result"]["list"][0].clone(), manual]);
+            transport.push(ok(page.to_string()));
+            let gateway = adapter(transport.clone());
+            let cache = gateway.realtime_execution_cache();
+            assert!(!cache.knows_order("MUUSDT", "order-91"));
+            let orders = if progress_only {
+                gateway
+                    .open_order_execution_progress_snapshot(Exchange::Bybit, "MUUSDT")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .map(|progress| progress.order)
+                    .collect::<Vec<_>>()
+            } else {
+                gateway
+                    .open_orders_snapshot(Exchange::Bybit, "MUUSDT")
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(orders.len(), 2, "manual namespace must remain excluded");
+            assert!(
+                cache.knows_order("MUUSDT", "order-91"),
+                "complete zero New REST evidence must warm owned identity"
+            );
+            assert!(
+                !cache.knows_order("MUUSDT", "partial-92"),
+                "partial header without exact trades and fees must remain cold"
+            );
+            assert!(!cache.knows_order("MUUSDT", "manual-93"));
+            assert!(
+                cache
+                    .wait_snapshot(
+                        "MUUSDT",
+                        &ClientOrderId::parse("g_8_S_partial").unwrap(),
+                        "partial-92",
+                        Duration::ZERO
+                    )
+                    .await
+                    .is_none(),
+                "partial REST headers cannot synthesize fills or fees"
+            );
+            assert!(
+                cache
+                    .wait_snapshot(
+                        "MUUSDT",
+                        &intent().client_order_id,
+                        "order-91",
+                        Duration::ZERO
+                    )
+                    .await
+                    .is_none(),
+                "returned REST evidence is already consumed"
+            );
+            assert_eq!(transport.requests().len(), 1);
+            assert!(transport.requests()[0].raw_body.is_none());
+            assert!(
+                transport.requests()[0]
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "X-BAPI-SIGN")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_open_pages_never_seed_across_reconnect_or_incomplete_pagination() {
+        for progress_only in [false, true] {
+            for reset_session in [false, true] {
+                let cache = BybitExecutionCache::default();
+                let transport = MockTransport {
+                    reset_cache: reset_session.then(|| cache.clone()),
+                    ..MockTransport::default()
+                };
+                if reset_session {
+                    transport.push(ok(order_result("New", "0", "0")));
+                } else {
+                    let mut page: serde_json::Value =
+                        serde_json::from_str(&order_result("New", "0", "0")).unwrap();
+                    page["result"]["nextPageCursor"] = serde_json::json!("page-2");
+                    transport.push(ok(page.to_string()));
+                    transport.push(ok(page.to_string()));
+                }
+                let mut gateway = adapter(transport.clone());
+                gateway.realtime_execution_cache = cache.clone();
+                let succeeded = if progress_only {
+                    gateway
+                        .open_order_execution_progress_snapshot(Exchange::Bybit, "MUUSDT")
+                        .await
+                        .is_ok()
+                } else {
+                    gateway
+                        .open_orders_snapshot(Exchange::Bybit, "MUUSDT")
+                        .await
+                        .is_ok()
+                };
+                assert_eq!(succeeded, reset_session);
+                assert!(
+                    !cache.knows_order("MUUSDT", "order-91"),
+                    "only a complete same-epoch scan may warm identity"
+                );
+                assert_eq!(
+                    transport.requests().len(),
+                    if reset_session { 1 } else { 2 }
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1445,14 +2190,17 @@ mod tests {
         let transport = MockTransport::with_response(ok(
             r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"order-91","orderLinkId":"g_7_S_fixed"},"time":1700000000124}"#,
         ));
-        let acknowledgement = adapter(transport.clone())
-            .place_order(&intent())
-            .await
-            .unwrap();
+        let gateway = adapter(transport.clone());
+        let acknowledgement = gateway.place_order(&intent()).await.unwrap();
         let request = &transport.requests()[0];
         let exact_body = r#"{"category":"linear","symbol":"MUUSDT","side":"Sell","orderType":"Limit","qty":"0.2","price":"1011","timeInForce":"PostOnly","positionIdx":0,"orderLinkId":"g_7_S_fixed","reduceOnly":false}"#;
 
         assert_eq!(acknowledgement.exchange_order_id, "order-91");
+        assert!(
+            gateway
+                .realtime_execution_cache()
+                .knows_order("MUUSDT", "order-91")
+        );
         assert_eq!(request.path, "/v5/order/create");
         assert_eq!(request.body_string(), exact_body);
         assert!(request.query.is_empty());

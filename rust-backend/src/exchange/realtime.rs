@@ -787,17 +787,27 @@ fn prune_futures_execution_cache(state: &mut FuturesExecutionCacheState) {
 
 #[derive(Debug, Clone)]
 struct BybitObservedOrder {
-    initial_shape: OrderShape,
+    initial_shape: Option<OrderShape>,
     client_order_id: ClientOrderId,
-    header: OrderExecutionHeader,
+    // An ACK binds identity, not lifecycle, exchange timestamps, or execution totals.
+    identity_bound: bool,
+    header: Option<OrderExecutionHeader>,
     trades: BTreeMap<String, TradeFill>,
+    pending_fast_trades: BTreeSet<String>,
+    conflicted: bool,
+    stream_generation: u64,
+    consumed_stream_generation: u64,
+    published_stream_generation: u64,
     snapshot: Option<OrderExecutionSnapshot>,
 }
 
 #[derive(Debug, Default)]
 struct BybitExecutionCacheState {
+    session: u64,
     entries: BTreeMap<(String, String), BybitObservedOrder>,
     order: VecDeque<(String, String)>,
+    recent_fast: BTreeSet<(String, String, String)>,
+    fast_order: VecDeque<(String, String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -807,12 +817,178 @@ pub(crate) struct BybitExecutionCache {
 }
 
 impl BybitExecutionCache {
+    pub(crate) fn session_epoch(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session
+    }
+
+    /// The caller must first exact-match signed REST evidence to its owned order request.
+    pub(crate) fn seed_verified_snapshot(
+        &self,
+        epoch: u64,
+        snapshot: &OrderExecutionSnapshot,
+    ) -> bool {
+        let Some(header) = verified_bybit_seed_header(snapshot) else {
+            return false;
+        };
+        let key = (
+            snapshot.order.shape.symbol.clone(),
+            snapshot.order.exchange_order_id.clone(),
+        );
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.session != epoch {
+            return false;
+        }
+        let trades = snapshot
+            .trades
+            .iter()
+            .map(|trade| (trade.trade_id.as_str(), trade))
+            .collect::<BTreeMap<_, _>>();
+        let mut replace_header = true;
+        let mut covers_stream = true;
+        if let Some(observed) = state.entries.get(&key) {
+            if observed.conflicted
+                || observed.client_order_id != snapshot.order.client_order_id
+                || observed
+                    .initial_shape
+                    .as_ref()
+                    .is_some_and(|shape| *shape != snapshot.order.shape)
+                || observed
+                    .header
+                    .as_ref()
+                    .is_some_and(|previous| previous.order_time_ms != snapshot.order_time_ms)
+            {
+                return false;
+            }
+            let conflicting = observed.trades.values().any(|trade| {
+                trade.side != snapshot.order.shape.side
+                    || trade.trade_time_ms < snapshot.order_time_ms
+                    || trades
+                        .get(trade.trade_id.as_str())
+                        .is_some_and(|rest| *rest != trade)
+            }) || observed.header.as_ref().is_some_and(|previous| {
+                previous.cumulative_quantity == snapshot.cumulative_quantity
+                    && previous.cumulative_quote != snapshot.cumulative_quote
+            });
+            let merged_quantity = observed
+                .trades
+                .values()
+                .filter(|trade| !trades.contains_key(trade.trade_id.as_str()))
+                .try_fold(snapshot.cumulative_quantity, |quantity, trade| {
+                    quantity.checked_add(trade.quantity)
+                });
+            if conflicting
+                || merged_quantity.is_none_or(|quantity| quantity > snapshot.order.shape.quantity)
+            {
+                let observed = state.entries.get_mut(&key).unwrap();
+                observed.conflicted = true;
+                observed.snapshot = None;
+                drop(state);
+                self.changed.notify_waiters();
+                return false;
+            }
+            let additional_trades = snapshot
+                .trades
+                .iter()
+                .filter(|trade| !observed.trades.contains_key(&trade.trade_id))
+                .count();
+            if observed.trades.len() + additional_trades > FUTURES_EXECUTION_CACHE_CAPACITY {
+                return false;
+            }
+            if let Some(previous) = &observed.header {
+                replace_header = snapshot.update_time_ms >= previous.update_time_ms
+                    && snapshot.cumulative_quantity >= previous.cumulative_quantity
+                    && !(matches!(previous.order.lifecycle, OrderLifecycle::Terminal(_))
+                        && matches!(snapshot.order.lifecycle, OrderLifecycle::Active(_)));
+            }
+            covers_stream = replace_header
+                && observed
+                    .trades
+                    .keys()
+                    .all(|id| trades.contains_key(id.as_str()))
+                && observed
+                    .pending_fast_trades
+                    .iter()
+                    .all(|id| trades.contains_key(id.as_str()));
+        }
+        let observed = bybit_observed_order(&mut state, &key, &snapshot.order.client_order_id);
+        observed.initial_shape = Some(snapshot.order.shape.clone());
+        observed.identity_bound = true;
+        if replace_header {
+            observed.header = Some(header);
+        }
+        for trade in &snapshot.trades {
+            observed.pending_fast_trades.remove(&trade.trade_id);
+            observed
+                .trades
+                .entry(trade.trade_id.clone())
+                .or_insert_with(|| trade.clone());
+        }
+        // REST is already returned to its caller. Do not consume newer, uncovered WS evidence.
+        if covers_stream {
+            observed.consumed_stream_generation = observed.stream_generation;
+            observed.published_stream_generation = observed.stream_generation;
+        }
+        refresh_bybit_snapshot(observed);
+        drop(state);
+        self.changed.notify_waiters();
+        true
+    }
+
+    pub(crate) fn register_placement(
+        &self,
+        intent: &crate::domain::OrderIntent,
+        ack: &crate::exchange::PlacementAcknowledgement,
+        observed_at_ms: u64,
+    ) {
+        if intent.exchange != Exchange::Bybit
+            || intent.validate().is_err()
+            || intent.client_order_id != ack.client_order_id
+            || ack.exchange_order_id.trim().is_empty()
+            || observed_at_ms < intent.created_at_ms
+        {
+            return;
+        }
+        let key = (intent.shape.symbol.clone(), ack.exchange_order_id.clone());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let observed = bybit_observed_order(&mut state, &key, &intent.client_order_id);
+        if observed.client_order_id != intent.client_order_id
+            || observed
+                .initial_shape
+                .as_ref()
+                .is_some_and(|shape| *shape != intent.shape)
+            || observed
+                .trades
+                .values()
+                .any(|trade| trade.side != intent.shape.side)
+        {
+            observed.conflicted = true;
+        } else {
+            observed.initial_shape = Some(intent.shape.clone());
+            observed.identity_bound = true;
+        }
+        refresh_bybit_snapshot(observed);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
     pub(crate) fn begin_session(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *state = BybitExecutionCacheState::default();
+        *state = BybitExecutionCacheState {
+            session: state.session.wrapping_add(1),
+            ..BybitExecutionCacheState::default()
+        };
         self.changed.notify_waiters();
     }
 
@@ -822,10 +998,14 @@ impl BybitExecutionCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entries
-            .contains_key(&key)
+            .get(&key)
+            .is_some_and(|observed| observed.identity_bound && !observed.conflicted)
     }
 
     fn apply_order(&self, header: OrderExecutionHeader) {
+        if header.order.exchange != Exchange::Bybit {
+            return;
+        }
         let key = (
             header.order.shape.symbol.clone(),
             header.order.exchange_order_id.clone(),
@@ -834,47 +1014,59 @@ impl BybitExecutionCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(
+        let is_new = matches!(
             header.order.lifecycle,
             OrderLifecycle::Active(ActiveOrderStatus::New)
-        ) && header.cumulative_quantity.is_zero()
-        {
-            if !state.entries.contains_key(&key) {
-                state.order.push_back(key.clone());
-            }
-            state.entries.insert(
-                key,
-                BybitObservedOrder {
-                    initial_shape: header.order.shape.clone(),
-                    client_order_id: header.order.client_order_id.clone(),
-                    header,
-                    trades: BTreeMap::new(),
-                    snapshot: None,
-                },
-            );
-            prune_bybit_execution_cache(&mut state);
-            drop(state);
-            self.changed.notify_waiters();
-            return;
-        }
-        let Some(observed) = state.entries.get_mut(&key) else {
-            return;
-        };
+        ) && header.cumulative_quantity.is_zero();
+        let observed = bybit_observed_order(&mut state, &key, &header.order.client_order_id);
         if observed.client_order_id != header.order.client_order_id
-            || observed.initial_shape != header.order.shape
+            || observed
+                .initial_shape
+                .as_ref()
+                .is_some_and(|shape| *shape != header.order.shape)
+            || observed
+                .trades
+                .values()
+                .any(|trade| trade.side != header.order.shape.side)
+            || observed
+                .header
+                .as_ref()
+                .is_some_and(|previous| previous.order_time_ms != header.order_time_ms)
         {
-            state.entries.remove(&key);
+            observed.conflicted = true;
+            observed.snapshot = None;
             drop(state);
             self.changed.notify_waiters();
             return;
         }
-        if header.update_time_ms < observed.header.update_time_ms
-            || (header.update_time_ms == observed.header.update_time_ms
-                && header.cumulative_quantity < observed.header.cumulative_quantity)
-        {
-            return;
+        observed.initial_shape = Some(header.order.shape.clone());
+        // Preserve the legacy stream anchor without requiring it after an exact ACK.
+        observed.identity_bound |= is_new;
+        if let Some(previous) = &observed.header {
+            if header.update_time_ms < previous.update_time_ms
+                || header.cumulative_quantity < previous.cumulative_quantity
+                || (matches!(previous.order.lifecycle, OrderLifecycle::Terminal(_))
+                    && matches!(header.order.lifecycle, OrderLifecycle::Active(_)))
+            {
+                refresh_bybit_snapshot(observed);
+                drop(state);
+                self.changed.notify_waiters();
+                return;
+            }
+            if header.cumulative_quantity == previous.cumulative_quantity
+                && header.cumulative_quote != previous.cumulative_quote
+            {
+                observed.conflicted = true;
+            }
+            if previous == &header {
+                refresh_bybit_snapshot(observed);
+                drop(state);
+                self.changed.notify_waiters();
+                return;
+            }
         }
-        observed.header = header;
+        observed.header = Some(header);
+        observed.stream_generation = observed.stream_generation.wrapping_add(1);
         refresh_bybit_snapshot(observed);
         drop(state);
         self.changed.notify_waiters();
@@ -886,25 +1078,77 @@ impl BybitExecutionCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(observed) = state.entries.get_mut(&key) else {
-            return;
-        };
+        let observed = bybit_observed_order(&mut state, &key, client_order_id);
         if observed.client_order_id != *client_order_id
-            || observed.initial_shape.symbol != trade.symbol
-            || observed.initial_shape.side != trade.side
+            || observed
+                .initial_shape
+                .as_ref()
+                .is_some_and(|shape| shape.symbol != trade.symbol || shape.side != trade.side)
+            || observed
+                .trades
+                .get(&trade.trade_id)
+                .is_some_and(|previous| previous != &trade)
         {
-            state.entries.remove(&key);
+            observed.conflicted = true;
+            observed.snapshot = None;
             drop(state);
             self.changed.notify_waiters();
             return;
         }
-        observed
-            .trades
-            .entry(trade.trade_id.clone())
-            .or_insert(trade);
+        if observed.trades.contains_key(&trade.trade_id) {
+            return;
+        }
+        // Bound pre-ACK evidence as well as very large orders; REST remains authoritative.
+        let capacity = if observed.identity_bound {
+            FUTURES_EXECUTION_CACHE_CAPACITY
+        } else {
+            64
+        };
+        if observed.trades.len() >= capacity {
+            observed.conflicted = true;
+            observed.snapshot = None;
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
+        observed.pending_fast_trades.remove(&trade.trade_id);
+        observed.trades.insert(trade.trade_id.clone(), trade);
+        observed.stream_generation = observed.stream_generation.wrapping_add(1);
         refresh_bybit_snapshot(observed);
         drop(state);
         self.changed.notify_waiters();
+    }
+
+    fn apply_fast(&self, symbol: &str, order_id: &str, trade_id: &str) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (symbol.to_ascii_uppercase(), order_id.to_owned());
+        let fast_key = (key.0.clone(), key.1.clone(), trade_id.to_owned());
+        if !state.recent_fast.insert(fast_key.clone()) {
+            return false;
+        }
+        state.fast_order.push_back(fast_key);
+        while state.fast_order.len() > FUTURES_EXECUTION_CACHE_CAPACITY {
+            if let Some(expired) = state.fast_order.pop_front() {
+                state.recent_fast.remove(&expired);
+            }
+        }
+        if let Some(observed) = state.entries.get_mut(&key) {
+            if observed.conflicted || observed.trades.contains_key(trade_id) {
+                return false;
+            }
+            if observed.pending_fast_trades.len() >= FUTURES_EXECUTION_CACHE_CAPACITY {
+                observed.conflicted = true;
+            } else {
+                observed.pending_fast_trades.insert(trade_id.to_owned());
+            }
+            observed.snapshot = None;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        true
     }
 
     pub(crate) async fn wait_snapshot(
@@ -915,23 +1159,40 @@ impl BybitExecutionCache {
         maximum_wait: Duration,
     ) -> Option<OrderExecutionSnapshot> {
         let key = (symbol.to_ascii_uppercase(), exchange_order_id.to_owned());
+        let session = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session;
         let snapshot = || {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let observed = state.entries.get(&key)?;
-            (observed.client_order_id == *client_order_id)
-                .then(|| observed.snapshot.clone())
-                .flatten()
+            if state.session != session {
+                return Err(());
+            }
+            let Some(observed) = state.entries.get_mut(&key) else {
+                return Ok(None);
+            };
+            if observed.client_order_id != *client_order_id
+                || observed.conflicted
+                || observed.stream_generation == observed.consumed_stream_generation
+            {
+                return Ok(None);
+            }
+            let snapshot = observed.snapshot.clone();
+            if snapshot.is_some() {
+                observed.consumed_stream_generation = observed.stream_generation;
+            }
+            Ok(snapshot)
         };
-        if let Some(snapshot) = snapshot() {
-            return Some(snapshot);
-        }
         let deadline = tokio::time::Instant::now() + maximum_wait;
         loop {
             let changed = self.changed.notified();
-            if let Some(snapshot) = snapshot() {
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(snapshot) = snapshot().ok()? {
                 return Some(snapshot);
             }
             let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
@@ -940,12 +1201,131 @@ impl BybitExecutionCache {
     }
 }
 
+fn verified_bybit_seed_header(snapshot: &OrderExecutionSnapshot) -> Option<OrderExecutionHeader> {
+    let order = &snapshot.order;
+    let quantity = snapshot.cumulative_quantity;
+    if order.exchange != Exchange::Bybit
+        || order.shape.validate().is_err()
+        || !is_valid_symbol_for_exchange(Exchange::Bybit, &order.shape.symbol)
+        || order.exchange_order_id.is_empty()
+        || order.exchange_order_id.len() > 128
+        || !order
+            .exchange_order_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+        || order.executed_quantity != Some(quantity)
+        || quantity < Decimal::ZERO
+        || quantity > order.shape.quantity
+        || snapshot.cumulative_quote < Decimal::ZERO
+        || (quantity.is_zero() && !snapshot.cumulative_quote.is_zero())
+        || (quantity > Decimal::ZERO && snapshot.cumulative_quote <= Decimal::ZERO)
+        || snapshot.order_time_ms == 0
+        || snapshot.update_time_ms < snapshot.order_time_ms
+        || snapshot.trades.len() > FUTURES_EXECUTION_CACHE_CAPACITY
+    {
+        return None;
+    }
+    match order.lifecycle {
+        OrderLifecycle::Active(ActiveOrderStatus::New) if !quantity.is_zero() => return None,
+        OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled)
+            if quantity <= Decimal::ZERO || quantity >= order.shape.quantity =>
+        {
+            return None;
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+            if quantity != order.shape.quantity =>
+        {
+            return None;
+        }
+        OrderLifecycle::Terminal(TerminalOrderStatus::Rejected) if !quantity.is_zero() => {
+            return None;
+        }
+        _ => {}
+    }
+    if snapshot.trades.iter().any(|trade| {
+        !crate::exchange::is_valid_trade_id(&trade.trade_id)
+            || trade.price <= Decimal::ZERO
+            || trade.quantity <= Decimal::ZERO
+            || trade.quote_quantity <= Decimal::ZERO
+            || trade.raw_commission != trade.commission_cost
+            || trade.commission_asset.is_empty()
+            || !trade
+                .commission_asset
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            || trade.trade_time_ms < snapshot.order_time_ms
+            || trade.trade_time_ms > snapshot.update_time_ms
+    }) {
+        return None;
+    }
+    let header = OrderExecutionHeader {
+        order: order.clone(),
+        cumulative_quantity: quantity,
+        cumulative_quote: snapshot.cumulative_quote,
+        order_time_ms: snapshot.order_time_ms,
+        update_time_ms: snapshot.update_time_ms,
+    };
+    let assembled = assemble_execution_snapshot(header.clone(), snapshot.trades.clone()).ok()?;
+    (assembled == *snapshot).then_some(header)
+}
+
+fn bybit_observed_order<'a>(
+    state: &'a mut BybitExecutionCacheState,
+    key: &(String, String),
+    client_order_id: &ClientOrderId,
+) -> &'a mut BybitObservedOrder {
+    if !state.entries.contains_key(key) {
+        state.order.push_back(key.clone());
+        state.entries.insert(
+            key.clone(),
+            BybitObservedOrder {
+                initial_shape: None,
+                client_order_id: client_order_id.clone(),
+                identity_bound: false,
+                header: None,
+                trades: BTreeMap::new(),
+                pending_fast_trades: BTreeSet::new(),
+                conflicted: false,
+                stream_generation: 0,
+                consumed_stream_generation: 0,
+                published_stream_generation: 0,
+                snapshot: None,
+            },
+        );
+        prune_bybit_execution_cache(state);
+    }
+    state.entries.get_mut(key).expect("inserted Bybit order")
+}
+
 fn refresh_bybit_snapshot(observed: &mut BybitObservedOrder) {
-    observed.snapshot = assemble_execution_snapshot(
-        observed.header.clone(),
-        observed.trades.values().cloned().collect(),
-    )
-    .ok();
+    observed.snapshot = None;
+    if observed.conflicted || !observed.identity_bound || !observed.pending_fast_trades.is_empty() {
+        return;
+    }
+    let Some(header) = &observed.header else {
+        return;
+    };
+    if observed.trades.values().any(|trade| {
+        trade.trade_time_ms < header.order_time_ms || trade.trade_time_ms > header.update_time_ms
+    }) {
+        return;
+    }
+    observed.snapshot =
+        assemble_execution_snapshot(header.clone(), observed.trades.values().cloned().collect())
+            .ok();
+    if let Some(snapshot) = &observed.snapshot
+        && observed.stream_generation != observed.published_stream_generation
+        && (snapshot.cumulative_quantity > Decimal::ZERO
+            || matches!(snapshot.order.lifecycle, OrderLifecycle::Terminal(_)))
+    {
+        observed.published_stream_generation = observed.stream_generation;
+        publish_execution_wakeup(
+            Exchange::Bybit,
+            &snapshot.order.shape.symbol,
+            Some(snapshot.order.exchange_order_id.clone()),
+            Some(snapshot.update_time_ms),
+        );
+    }
 }
 
 fn prune_bybit_execution_cache(state: &mut BybitExecutionCacheState) {
@@ -974,7 +1354,6 @@ pub fn subscribe_execution_wakeups() -> broadcast::Receiver<ExecutionWakeup> {
     execution_wakeup_sender().subscribe()
 }
 
-#[cfg(not(test))]
 pub(crate) fn publish_execution_wakeup(
     exchange: Exchange,
     symbol: &str,
@@ -985,8 +1364,8 @@ pub(crate) fn publish_execution_wakeup(
     if !is_valid_symbol_for_exchange(exchange, &symbol) {
         return;
     }
-    let observed_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let observed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or_default();
@@ -1616,7 +1995,6 @@ where
     .unwrap_or(false)
 }
 
-#[cfg(not(test))]
 fn publish_bybit_message(text: &str, execution_cache: &BybitExecutionCache) {
     if let Ok(message) = serde_json::from_str::<Value>(text) {
         for header in parse_bybit_order_updates(&message) {
@@ -1625,9 +2003,26 @@ fn publish_bybit_message(text: &str, execution_cache: &BybitExecutionCache) {
         for (client_order_id, trade) in parse_bybit_trade_updates(&message) {
             execution_cache.apply_trade(&client_order_id, trade);
         }
-    }
-    for (symbol, order_id, event_time) in parse_bybit_execution_events(text) {
-        publish_execution_wakeup(Exchange::Bybit, &symbol, Some(order_id), event_time);
+        for (symbol, order_id, event_time) in parse_bybit_execution_events(text) {
+            let mut fresh = false;
+            for row in message
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if row.get("category").and_then(Value::as_str) == Some("linear")
+                    && row.get("symbol").and_then(Value::as_str) == Some(symbol.as_str())
+                    && value_identifier(row.get("orderId")).as_deref() == Some(order_id.as_str())
+                    && let Some(trade_id) = value_identifier(row.get("execId"))
+                {
+                    fresh |= execution_cache.apply_fast(&symbol, &order_id, &trade_id);
+                }
+            }
+            if fresh {
+                publish_execution_wakeup(Exchange::Bybit, &symbol, Some(order_id), event_time);
+            }
+        }
     }
 }
 
@@ -2445,5 +2840,704 @@ mod tests {
             "0.00999776".parse().unwrap()
         );
         assert_eq!(snapshot.trades.len(), 1);
+    }
+
+    fn bybit_header(id: &str, status: &str, quantity: &str, time: u64) -> OrderExecutionHeader {
+        let quantity: Decimal = quantity.parse().unwrap();
+        parse_bybit_order_updates(&json!({
+            "topic": "order.linear", "data": [{
+                "category": "linear", "symbol": "MUUSDT", "orderId": id,
+                "orderLinkId": "r_run_0_B_1", "positionIdx": 0,
+                "side": "Buy", "orderType": "Limit", "qty": "500",
+                "price": "2", "timeInForce": "GTC", "reduceOnly": true,
+                "orderStatus": status, "cumExecQty": quantity.to_string(),
+                "cumExecValue": (quantity * Decimal::TWO).to_string(),
+                "createdTime": "1000", "updatedTime": time.to_string()
+            }]
+        }))
+        .remove(0)
+    }
+
+    fn bybit_trade(id: &str, trade_id: &str, quantity: &str, time: u64) -> TradeFill {
+        let quantity: Decimal = quantity.parse().unwrap();
+        parse_bybit_trade_updates(&json!({
+            "topic": "execution.linear", "data": [{
+                "category": "linear", "symbol": "MUUSDT", "orderId": id,
+                "orderLinkId": "r_run_0_B_1", "execType": "Trade",
+                "execId": trade_id, "execPrice": "2", "execQty": quantity.to_string(),
+                "execValue": (quantity * Decimal::TWO).to_string(),
+                "execFee": (quantity / Decimal::from(500)).to_string(),
+                "execTime": time.to_string(), "feeCurrency": "USDT", "execPnl": "0",
+                "side": "Buy", "isMaker": false
+            }]
+        }))
+        .remove(0)
+        .1
+    }
+
+    async fn bybit_read(cache: &BybitExecutionCache, id: &str) -> Option<OrderExecutionSnapshot> {
+        cache
+            .wait_snapshot(
+                "MUUSDT",
+                &ClientOrderId::parse("r_run_0_B_1").unwrap(),
+                id,
+                Duration::ZERO,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn bybit_late_new_does_not_erase_earlier_terminal_or_full_trades() {
+        let cache = BybitExecutionCache::default();
+        let client = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        cache.apply_trade(&client, bybit_trade("88101", "first", "460", 1010));
+        cache.apply_order(bybit_header("88101", "Filled", "500", 1020));
+        cache.apply_trade(&client, bybit_trade("88101", "second", "40", 1020));
+        cache.apply_order(bybit_header("88101", "New", "0", 1000));
+        let snapshot = bybit_read(&cache, "88101")
+            .await
+            .expect("late New must not erase fills");
+        assert_eq!(snapshot.cumulative_quantity, Decimal::from(500));
+        assert_eq!(snapshot.cumulative_quote, Decimal::from(1000));
+        assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::ONE);
+        assert_eq!(snapshot.trades.len(), 2);
+        assert_eq!(
+            snapshot.order.lifecycle,
+            OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_snapshot_is_consumed_and_duplicates_do_not_grant_another_read() {
+        let cache = BybitExecutionCache::default();
+        let client = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        cache.apply_order(bybit_header("88102", "New", "0", 1000));
+        let trade = bybit_trade("88102", "first", "460", 1010);
+        let partial = bybit_header("88102", "PartiallyFilled", "460", 1010);
+        cache.apply_trade(&client, trade.clone());
+        cache.apply_order(partial.clone());
+        assert_eq!(
+            bybit_read(&cache, "88102")
+                .await
+                .unwrap()
+                .cumulative_quantity,
+            Decimal::from(460)
+        );
+        cache.apply_trade(&client, trade);
+        cache.apply_order(partial);
+        assert!(
+            bybit_read(&cache, "88102").await.is_none(),
+            "duplicates must not refresh consumed evidence"
+        );
+        cache.apply_order(bybit_header("88102", "Filled", "500", 1020));
+        assert!(
+            bybit_read(&cache, "88102").await.is_none(),
+            "missing final trade must not return stale partial"
+        );
+        cache.apply_trade(&client, bybit_trade("88102", "second", "40", 1020));
+        assert_eq!(
+            bybit_read(&cache, "88102")
+                .await
+                .unwrap()
+                .cumulative_quantity,
+            Decimal::from(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_late_full_evidence_publishes_one_wakeup_without_fast_stream() {
+        let cache = BybitExecutionCache::default();
+        let mut wakeups = subscribe_execution_wakeups();
+        let client = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        cache.apply_order(bybit_header("88103", "New", "0", 1000));
+        cache.apply_order(bybit_header("88103", "Filled", "500", 1020));
+        cache.apply_trade(&client, bybit_trade("88103", "first", "490", 1010));
+        let final_trade = bybit_trade("88103", "second", "10", 1020);
+        cache.apply_trade(&client, final_trade.clone());
+        cache.apply_trade(&client, final_trade);
+        let mut matching = Vec::new();
+        while let Ok(wakeup) = wakeups.try_recv() {
+            if wakeup.exchange_order_id.as_deref() == Some("88103") {
+                matching.push(wakeup);
+            }
+        }
+        assert_eq!(
+            matching.len(),
+            1,
+            "complete full evidence must wake once, even after an earlier fast wake"
+        );
+        assert_eq!(matching[0].exchange_event_time_ms, Some(1020));
+        assert_eq!(bybit_read(&cache, "88103").await.unwrap().trades.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bybit_conflicting_duplicate_trade_cannot_be_silently_accepted() {
+        let cache = BybitExecutionCache::default();
+        let client = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        cache.apply_order(bybit_header("88104", "New", "0", 1000));
+        cache.apply_order(bybit_header("88104", "Filled", "500", 1020));
+        cache.apply_trade(&client, bybit_trade("88104", "first", "500", 1020));
+        let mut conflict = bybit_trade("88104", "first", "500", 1020);
+        conflict.commission_cost = Decimal::from(99);
+        cache.apply_trade(&client, conflict);
+        cache.apply_order(bybit_header("88104", "New", "0", 1000));
+        cache.apply_order(bybit_header("88104", "Filled", "500", 1020));
+        cache.apply_trade(&client, bybit_trade("88104", "first", "500", 1020));
+        assert!(
+            bybit_read(&cache, "88104").await.is_none(),
+            "conflict must stay quarantined for this session"
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_reconnect_ends_old_waiter_instead_of_consuming_new_session() {
+        let cache = BybitExecutionCache::default();
+        let client = ClientOrderId::parse("r_run_0_B_1").unwrap();
+        let old_wait = cache.wait_snapshot("MUUSDT", &client, "88105", Duration::from_secs(1));
+        tokio::pin!(old_wait);
+        assert!(matches!(
+            futures::poll!(old_wait.as_mut()),
+            std::task::Poll::Pending
+        ));
+        cache.begin_session();
+        cache.apply_order(bybit_header("88105", "New", "0", 1000));
+        cache.apply_order(bybit_header("88105", "Filled", "500", 1020));
+        cache.apply_trade(&client, bybit_trade("88105", "first", "500", 1020));
+        assert!(
+            old_wait.await.is_none(),
+            "old waiter must not cross reconnect boundary"
+        );
+        assert_eq!(
+            bybit_read(&cache, "88105")
+                .await
+                .unwrap()
+                .cumulative_quantity,
+            Decimal::from(500)
+        );
+    }
+
+    fn bybit_placement(
+        id: &str,
+    ) -> (
+        crate::domain::OrderIntent,
+        crate::exchange::PlacementAcknowledgement,
+    ) {
+        let header = bybit_header(id, "New", "0", 1000);
+        let intent = crate::domain::OrderIntent::prepare(
+            header.order.client_order_id.clone(),
+            Exchange::Bybit,
+            header.order.shape,
+            990,
+        )
+        .unwrap();
+        let ack = crate::exchange::PlacementAcknowledgement {
+            client_order_id: intent.client_order_id.clone(),
+            exchange_order_id: id.to_owned(),
+        };
+        (intent, ack)
+    }
+
+    #[tokio::test]
+    async fn bybit_placement_ack_recovers_immediate_fill_before_ack_without_new() {
+        for (id, first, second) in [("88106", "460", "40"), ("88107", "490", "10")] {
+            let cache = BybitExecutionCache::default();
+            let (intent, ack) = bybit_placement(id);
+            cache.apply_trade(
+                &intent.client_order_id,
+                bybit_trade(id, "second", second, 1020),
+            );
+            cache.apply_order(bybit_header(id, "Filled", "500", 1020));
+            cache.apply_trade(
+                &intent.client_order_id,
+                bybit_trade(id, "first", first, 1010),
+            );
+            assert!(
+                bybit_read(&cache, id).await.is_none(),
+                "unbound evidence is not ownership"
+            );
+            cache.register_placement(&intent, &ack, 1030);
+            let snapshot = bybit_read(&cache, id)
+                .await
+                .expect("ACK must bind earlier exact evidence");
+            assert_eq!(snapshot.cumulative_quantity, Decimal::from(500));
+            assert_eq!(snapshot.cumulative_quote, Decimal::from(1000));
+            assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::ONE);
+            assert_eq!(snapshot.trades.len(), 2);
+            cache.register_placement(&intent, &ack, 1040);
+            assert!(
+                bybit_read(&cache, id).await.is_none(),
+                "duplicate ACK is not fresh evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_placement_ack_alone_never_fabricates_new_zero_snapshot() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88108");
+        cache.register_placement(&intent, &ack, 1005);
+        assert!(cache.knows_order("MUUSDT", "88108"));
+        assert!(bybit_read(&cache, "88108").await.is_none());
+        cache.apply_order(bybit_header("88108", "Filled", "500", 1020));
+        assert!(
+            bybit_read(&cache, "88108").await.is_none(),
+            "order totals alone cannot fabricate fees"
+        );
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88108", "first", "500", 1020),
+        );
+        assert_eq!(
+            bybit_read(&cache, "88108")
+                .await
+                .unwrap()
+                .cumulative_quantity,
+            Decimal::from(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_foreign_ack_and_immutable_shape_conflicts_do_not_bind_fills() {
+        let cache = BybitExecutionCache::default();
+        let (mut intent, mut ack) = bybit_placement("88109");
+        ack.client_order_id = ClientOrderId::parse("manual_order").unwrap();
+        cache.register_placement(&intent, &ack, 1005);
+        assert!(!cache.knows_order("MUUSDT", "88109"));
+        ack.client_order_id = intent.client_order_id.clone();
+        intent.shape.reduce_only = false;
+        cache.register_placement(&intent, &ack, 1005);
+        cache.apply_order(bybit_header("88109", "Filled", "500", 1020));
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88109", "first", "500", 1020),
+        );
+        assert!(bybit_read(&cache, "88109").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bybit_fast_progress_invalidates_unconsumed_partial_until_full_evidence() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88110");
+        cache.register_placement(&intent, &ack, 1005);
+        cache.apply_order(bybit_header("88110", "New", "0", 1000));
+        cache.apply_order(bybit_header("88110", "PartiallyFilled", "460", 1010));
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88110", "first", "460", 1010),
+        );
+        publish_bybit_message(&json!({"topic":"execution.fast.linear","creationTime":1020,
+            "data":[{"category":"linear","symbol":"MUUSDT","orderId":"88110",
+                "orderLinkId":"", "execId":"second","execQty":"40","execPrice":"2","execTime":"1020"}]
+        }).to_string(), &cache);
+        assert!(
+            bybit_read(&cache, "88110").await.is_none(),
+            "new fast execution forbids cached partial reuse"
+        );
+        cache.apply_order(bybit_header("88110", "Filled", "500", 1020));
+        assert!(
+            bybit_read(&cache, "88110").await.is_none(),
+            "fast has no fee evidence"
+        );
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88110", "second", "40", 1020),
+        );
+        let snapshot = bybit_read(&cache, "88110").await.unwrap();
+        assert_eq!(snapshot.cumulative_quantity, Decimal::from(500));
+        assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::ONE);
+    }
+
+    #[tokio::test]
+    async fn bybit_all_ack_order_and_full_trade_arrival_orders_preserve_exact_totals() {
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let events = [a, b, c, d];
+                        if events.into_iter().collect::<BTreeSet<_>>().len() != 4 {
+                            continue;
+                        }
+                        let cache = BybitExecutionCache::default();
+                        let (intent, ack) = bybit_placement("88111");
+                        for event in events {
+                            match event {
+                                0 => cache.register_placement(&intent, &ack, 1030),
+                                1 => {
+                                    cache.apply_order(bybit_header("88111", "Filled", "500", 1020))
+                                }
+                                2 => cache.apply_trade(
+                                    &intent.client_order_id,
+                                    bybit_trade("88111", "first", "460", 1010),
+                                ),
+                                3 => cache.apply_trade(
+                                    &intent.client_order_id,
+                                    bybit_trade("88111", "second", "40", 1020),
+                                ),
+                                _ => unreachable!(),
+                            }
+                        }
+                        let snapshot = bybit_read(&cache, "88111")
+                            .await
+                            .expect("all 24 permutations must complete");
+                        assert_eq!(snapshot.cumulative_quantity, Decimal::from(500));
+                        assert_eq!(snapshot.cumulative_quote, Decimal::from(1000));
+                        assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::ONE);
+                        assert_eq!(snapshot.trades.len(), 2);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_full_completion_wakes_again_after_deduplicated_fast_hint() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88112");
+        cache.register_placement(&intent, &ack, 1005);
+        let mut wakeups = subscribe_execution_wakeups();
+        let fast = json!({"topic":"execution.fast.linear","creationTime":1020,
+            "data":[{"category":"linear","symbol":"MUUSDT","orderId":"88112",
+                "orderLinkId":"", "execId":"first","execQty":"500","execPrice":"2","execTime":"1020"}]
+        }).to_string();
+        publish_bybit_message(&fast, &cache);
+        publish_bybit_message(&fast, &cache);
+        let count = |receiver: &mut broadcast::Receiver<ExecutionWakeup>| {
+            let mut count = 0;
+            while let Ok(wakeup) = receiver.try_recv() {
+                if wakeup.exchange_order_id.as_deref() == Some("88112") {
+                    count += 1;
+                }
+            }
+            count
+        };
+        assert_eq!(
+            count(&mut wakeups),
+            1,
+            "duplicate fast execution must not flood wakeups"
+        );
+        assert!(bybit_read(&cache, "88112").await.is_none());
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88112", "first", "500", 1020),
+        );
+        assert_eq!(
+            count(&mut wakeups),
+            0,
+            "still missing authoritative order header"
+        );
+        let filled = bybit_header("88112", "Filled", "500", 1020);
+        cache.apply_order(filled.clone());
+        cache.apply_order(filled);
+        publish_bybit_message(&fast, &cache);
+        assert_eq!(
+            count(&mut wakeups),
+            1,
+            "full evidence must wake after the earlier insufficient fast hint"
+        );
+        assert_eq!(
+            bybit_read(&cache, "88112").await.unwrap().fees_by_asset["USDT"],
+            Decimal::ONE
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_reconnect_discards_pending_and_complete_previous_session_evidence() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88113");
+        cache.register_placement(&intent, &ack, 1005);
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88113", "first", "460", 1010),
+        );
+        cache.begin_session();
+        assert!(!cache.knows_order("MUUSDT", "88113"));
+        cache.register_placement(&intent, &ack, 1030);
+        cache.apply_order(bybit_header("88113", "Filled", "500", 1020));
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88113", "second", "40", 1020),
+        );
+        assert!(
+            bybit_read(&cache, "88113").await.is_none(),
+            "must not mix fills across the disconnected gap"
+        );
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88113", "first", "460", 1010),
+        );
+        assert!(bybit_read(&cache, "88113").await.is_some());
+        cache.begin_session();
+        assert!(
+            bybit_read(&cache, "88113").await.is_none(),
+            "old complete snapshot must also be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_newer_timestamp_cannot_regress_cumulative_quantity_or_terminal_state() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88114");
+        cache.register_placement(&intent, &ack, 1005);
+        cache.apply_order(bybit_header("88114", "Filled", "500", 1020));
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88114", "first", "500", 1020),
+        );
+        assert!(bybit_read(&cache, "88114").await.is_some());
+        cache.apply_order(bybit_header("88114", "PartiallyFilled", "460", 1030));
+        cache.apply_order(bybit_header("88114", "New", "0", 1040));
+        assert!(
+            bybit_read(&cache, "88114").await.is_none(),
+            "regressive headers must not grant a fresh generation"
+        );
+    }
+
+    fn bybit_rest_partial(id: &str) -> OrderExecutionSnapshot {
+        OrderExecutionSnapshot {
+            order: bybit_header(id, "PartiallyFilled", "460", 1010).order,
+            cumulative_quantity: Decimal::from(460),
+            cumulative_quote: Decimal::from(920),
+            fees_by_asset: BTreeMap::from([("USDT".to_owned(), "0.92".parse().unwrap())]),
+            trades: vec![bybit_trade(id, "first", "460", 1010)],
+            order_time_ms: 1000,
+            update_time_ms: 1010,
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_seed_restores_reconnected_order_for_next_fresh_full_fill() {
+        let cache = BybitExecutionCache::default();
+        cache.begin_session();
+        let epoch = cache.session_epoch();
+        let snapshot = bybit_rest_partial("88201");
+        assert!(cache.seed_verified_snapshot(epoch, &snapshot));
+        assert!(cache.knows_order("MUUSDT", "88201"));
+        assert!(
+            bybit_read(&cache, "88201").await.is_none(),
+            "REST seed is already consumed, not stream progress"
+        );
+        cache.apply_order(bybit_header("88201", "Filled", "500", 1020));
+        assert!(bybit_read(&cache, "88201").await.is_none());
+        cache.apply_trade(
+            &snapshot.order.client_order_id,
+            bybit_trade("88201", "second", "40", 1020),
+        );
+        let filled = bybit_read(&cache, "88201")
+            .await
+            .expect("REST prefix plus fresh full trade must complete");
+        assert_eq!(filled.cumulative_quantity, Decimal::from(500));
+        assert_eq!(filled.cumulative_quote, Decimal::from(1000));
+        assert_eq!(filled.fees_by_asset["USDT"], Decimal::ONE);
+        assert_eq!(filled.order_time_ms, 1000);
+        assert_eq!(
+            filled
+                .trades
+                .iter()
+                .map(|trade| trade.trade_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_seed_rejects_previous_epoch_without_mixing_new_session_evidence() {
+        let cache = BybitExecutionCache::default();
+        let old_epoch = cache.session_epoch();
+        let mut old = bybit_rest_partial("88202");
+        old.trades[0].trade_id = "old-session-only".to_owned();
+        cache.begin_session();
+        assert!(!cache.seed_verified_snapshot(old_epoch, &old));
+        assert!(!cache.knows_order("MUUSDT", "88202"));
+        let current = bybit_rest_partial("88202");
+        assert!(cache.seed_verified_snapshot(cache.session_epoch(), &current));
+        assert!(!cache.seed_verified_snapshot(old_epoch, &old));
+        cache.apply_trade(
+            &current.order.client_order_id,
+            bybit_trade("88202", "second", "40", 1020),
+        );
+        cache.apply_order(bybit_header("88202", "Filled", "500", 1020));
+        let filled = bybit_read(&cache, "88202").await.unwrap();
+        assert_eq!(filled.cumulative_quantity, Decimal::from(500));
+        assert_eq!(filled.trades.len(), 2);
+        assert!(
+            filled
+                .trades
+                .iter()
+                .all(|trade| trade.trade_id != "old-session-only")
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_seed_older_prefix_completes_but_never_consumes_newer_ws_progress() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88203");
+        cache.register_placement(&intent, &ack, 1005);
+        cache.apply_order(bybit_header("88203", "Filled", "500", 1020));
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88203", "second", "40", 1020),
+        );
+        let prefix = bybit_rest_partial("88203");
+        let epoch = cache.session_epoch();
+        assert!(cache.seed_verified_snapshot(epoch, &prefix));
+        assert!(cache.seed_verified_snapshot(epoch, &prefix));
+        let filled = bybit_read(&cache, "88203")
+            .await
+            .expect("older REST must preserve the fresh WS generation");
+        assert_eq!(filled.cumulative_quantity, Decimal::from(500));
+        assert_eq!(filled.update_time_ms, 1020);
+        assert_eq!(filled.fees_by_asset["USDT"], Decimal::ONE);
+        assert_eq!(filled.trades.len(), 2);
+        assert_eq!(
+            filled.order.lifecycle,
+            OrderLifecycle::Terminal(TerminalOrderStatus::Filled)
+        );
+        assert!(cache.seed_verified_snapshot(epoch, &prefix));
+        assert!(
+            bybit_read(&cache, "88203").await.is_none(),
+            "older REST cannot regrant consumed WS progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_seed_does_not_erase_already_complete_unconsumed_ws_snapshot() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88204");
+        cache.register_placement(&intent, &ack, 1005);
+        cache.apply_order(bybit_header("88204", "Filled", "500", 1020));
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88204", "first", "460", 1010),
+        );
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88204", "second", "40", 1020),
+        );
+        assert!(cache.seed_verified_snapshot(cache.session_epoch(), &bybit_rest_partial("88204")));
+        let filled = bybit_read(&cache, "88204").await.unwrap();
+        assert_eq!(filled.cumulative_quantity, Decimal::from(500));
+        assert_eq!(filled.trades.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_seed_repeated_snapshot_never_republishes_wakeup_or_refreshes_read() {
+        let cache = BybitExecutionCache::default();
+        let mut wakeups = subscribe_execution_wakeups();
+        let epoch = cache.session_epoch();
+        let prefix = bybit_rest_partial("88205");
+        assert!(cache.seed_verified_snapshot(epoch, &prefix));
+        assert!(cache.seed_verified_snapshot(epoch, &prefix));
+        assert!(bybit_read(&cache, "88205").await.is_none());
+        let count = |receiver: &mut broadcast::Receiver<ExecutionWakeup>| {
+            let mut count = 0;
+            while let Ok(wakeup) = receiver.try_recv() {
+                if wakeup.exchange_order_id.as_deref() == Some("88205") {
+                    count += 1;
+                }
+            }
+            count
+        };
+        assert_eq!(
+            count(&mut wakeups),
+            0,
+            "REST does not publish execution stream wakeups"
+        );
+        cache.apply_trade(
+            &prefix.order.client_order_id,
+            bybit_trade("88205", "second", "40", 1020),
+        );
+        cache.apply_order(bybit_header("88205", "Filled", "500", 1020));
+        assert_eq!(count(&mut wakeups), 1);
+        let filled = bybit_read(&cache, "88205").await.unwrap();
+        assert!(cache.seed_verified_snapshot(epoch, &filled));
+        assert!(cache.seed_verified_snapshot(epoch, &filled));
+        assert!(bybit_read(&cache, "88205").await.is_none());
+        assert_eq!(
+            count(&mut wakeups),
+            0,
+            "repeated REST cannot duplicate the full-fill wakeup"
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_seed_rejects_quarantine_foreign_identity_and_inconsistent_evidence() {
+        for mutation in 0..14 {
+            let cache = BybitExecutionCache::default();
+            let (intent, ack) = bybit_placement("88206");
+            cache.register_placement(&intent, &ack, 1005);
+            let mut snapshot = bybit_rest_partial("88206");
+            match mutation {
+                0 => snapshot.order.exchange = Exchange::Binance,
+                1 => snapshot.order.client_order_id = ClientOrderId::parse("manual_order").unwrap(),
+                2 => snapshot.order.shape.reduce_only = false,
+                3 => snapshot.trades[0].exchange_order_id = "foreign".to_owned(),
+                4 => snapshot.cumulative_quantity = Decimal::from(459),
+                5 => snapshot.cumulative_quote = Decimal::from(919),
+                6 => {
+                    snapshot
+                        .fees_by_asset
+                        .insert("USDT".to_owned(), Decimal::ZERO);
+                }
+                7 => snapshot.order.executed_quantity = Some(Decimal::ZERO),
+                8 => snapshot.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::New),
+                9 => snapshot.order_time_ms = 1011,
+                10 => snapshot.trades.push(snapshot.trades[0].clone()),
+                11 => {
+                    cache.apply_trade(&intent.client_order_id, snapshot.trades[0].clone());
+                    snapshot.trades[0].commission_cost = Decimal::from(2);
+                    snapshot.trades[0].raw_commission = Decimal::from(2);
+                    snapshot
+                        .fees_by_asset
+                        .insert("USDT".to_owned(), Decimal::from(2));
+                }
+                12 => {
+                    cache.apply_trade(&intent.client_order_id, snapshot.trades[0].clone());
+                    let mut conflicting = snapshot.trades[0].clone();
+                    conflicting.quantity = Decimal::from(1);
+                    cache.apply_trade(&intent.client_order_id, conflicting);
+                }
+                13 => {
+                    cache.apply_order(bybit_header("88206", "PartiallyFilled", "460", 1010));
+                    snapshot.order_time_ms = 999;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !cache.seed_verified_snapshot(cache.session_epoch(), &snapshot),
+                "must reject mutation {mutation}"
+            );
+            assert!(bybit_read(&cache, "88206").await.is_none());
+        }
+        let cache = BybitExecutionCache::default();
+        assert!(
+            cache.seed_verified_snapshot(cache.session_epoch(), &bybit_rest_partial("88207")),
+            "rejecting bad evidence must not mean rejecting every seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn bybit_rest_seed_keeps_uncovered_fast_evidence_pending() {
+        let cache = BybitExecutionCache::default();
+        let (intent, ack) = bybit_placement("88208");
+        cache.register_placement(&intent, &ack, 1005);
+        cache.apply_fast("MUUSDT", "88208", "second");
+        let prefix = bybit_rest_partial("88208");
+        assert!(cache.seed_verified_snapshot(cache.session_epoch(), &prefix));
+        cache.apply_order(bybit_header("88208", "Filled", "500", 1020));
+        assert!(
+            bybit_read(&cache, "88208").await.is_none(),
+            "REST prefix cannot clear an uncovered fast execution"
+        );
+        cache.apply_trade(
+            &intent.client_order_id,
+            bybit_trade("88208", "second", "40", 1020),
+        );
+        assert_eq!(
+            bybit_read(&cache, "88208")
+                .await
+                .unwrap()
+                .cumulative_quantity,
+            Decimal::from(500)
+        );
     }
 }
