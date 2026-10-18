@@ -354,6 +354,18 @@ impl<T, S, N> AsterAdapter<T, S, N> {
         self.realtime_execution_cache.clone()
     }
 
+    fn bind_execution_snapshot(
+        &self,
+        snapshot: OrderExecutionSnapshot,
+        session: u64,
+    ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
+        self.realtime_execution_cache
+            .bind_authoritative_snapshot_for_session(&snapshot, session)
+            .ok_or_else(|| {
+                execution_error("conflicting Aster REST and realtime execution evidence")
+            })
+    }
+
     fn public_request(&self, path: &str, parameters: Parameters) -> PreparedHttpRequest {
         PreparedHttpRequest {
             method: HttpMethod::Get,
@@ -1288,18 +1300,38 @@ where
             return Err(execution_error("exchange order ID is required"));
         }
         let symbol = symbol.to_ascii_uppercase();
-        if self
+        let cache_session = self.realtime_execution_cache.current_session();
+        if let Some(snapshot) = self.realtime_execution_cache.take_fresh_snapshot(
+            &symbol,
+            client_order_id,
+            exchange_order_id,
+        ) {
+            tracing::info!(
+                symbol = symbol.as_str(),
+                exchange_order_id,
+                "using Aster realtime execution snapshot"
+            );
+            return Ok(snapshot);
+        }
+        if self.realtime_execution_cache.has_pending_stream_evidence(
+            &symbol,
+            client_order_id,
+            exchange_order_id,
+        ) && self
             .realtime_execution_cache
-            .knows_order(&symbol, exchange_order_id)
-            && let Some(snapshot) = self
-                .realtime_execution_cache
-                .wait_snapshot(
-                    &symbol,
-                    client_order_id,
-                    exchange_order_id,
-                    REALTIME_EXECUTION_SNAPSHOT_WAIT,
-                )
-                .await
+            .wait_snapshot(
+                &symbol,
+                client_order_id,
+                exchange_order_id,
+                REALTIME_EXECUTION_SNAPSHOT_WAIT,
+            )
+            .await
+            .is_some()
+            && let Some(snapshot) = self.realtime_execution_cache.take_fresh_snapshot(
+                &symbol,
+                client_order_id,
+                exchange_order_id,
+            )
         {
             tracing::info!(
                 symbol = symbol.as_str(),
@@ -1363,18 +1395,14 @@ where
                     trade_count = snapshot.trades.len(),
                     "reconstructed Aster execution from order-scoped official trades"
                 );
-                self.realtime_execution_cache
-                    .bind_authoritative_snapshot(&snapshot);
-                return Ok(snapshot);
+                return self.bind_execution_snapshot(snapshot, cache_session);
             }
         };
         let mut header = parsed_header.header;
         if header.cumulative_quantity.is_zero() {
             let snapshot = assemble_execution_snapshot(header, vec![])
                 .map_err(|error| execution_error(error.to_string()))?;
-            self.realtime_execution_cache
-                .bind_authoritative_snapshot(&snapshot);
-            return Ok(snapshot);
+            return self.bind_execution_snapshot(snapshot, cache_session);
         }
 
         let final_end = header
@@ -1513,9 +1541,7 @@ where
         }
         let snapshot = assemble_execution_snapshot(header, trades)
             .map_err(|error| execution_error(format!("incomplete Aster execution: {error}")))?;
-        self.realtime_execution_cache
-            .bind_authoritative_snapshot(&snapshot);
-        Ok(snapshot)
+        self.bind_execution_snapshot(snapshot, cache_session)
     }
 }
 
@@ -2335,6 +2361,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, OrderLookup::NotFound);
+    }
+
+    #[tokio::test]
+    async fn release_blocker_aster_partial_cache_requires_new_stream_progress_or_rest() {
+        for warm in [false, true] {
+            let transport = MockTransport::default();
+            let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+            let gateway = adapter(transport.clone(), signer);
+            if warm {
+                transport
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .push_back(Ok(HttpResponse {
+                        status: 200,
+                        body: execution_order_detail("0", "0", "NEW", 1_000_000, 1_000_000),
+                    }));
+            } else {
+                transport.responses.lock().unwrap().extend([
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: execution_order_detail(
+                            "40",
+                            "15.2",
+                            "PARTIALLY_FILLED",
+                            1_000_000,
+                            1_050_000,
+                        ),
+                    }),
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: format!("[{}]", aster_trade(7, "40", "15.2", 1_050_000)),
+                    }),
+                ]);
+            }
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("100", "38", "FILLED", 1_000_000, 1_100_000),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(
+                        "[{},{}]",
+                        aster_trade(7, "40", "15.2", 1_050_000),
+                        aster_trade(8, "60", "22.8", 1_100_000)
+                    ),
+                }),
+            ]);
+            let client = ClientOrderId::parse("g_0_B_fixed").unwrap();
+            let initial = gateway
+                .execution_snapshot(Exchange::Aster, "ANSEMUSDT", &client, "4770039")
+                .await
+                .unwrap();
+            if warm {
+                assert!(initial.cumulative_quantity.is_zero());
+                let partial = serde_json::json!({
+                    "e": "ORDER_TRADE_UPDATE", "T": 1050000,
+                    "o": {"s":"ANSEMUSDT","c":"g_0_B_fixed","S":"BUY","o":"LIMIT",
+                        "f":"GTC","q":"100","p":"0.38","x":"TRADE","X":"PARTIALLY_FILLED","i":4770039,
+                        "l":"40","z":"40","L":"0.38","N":"USDT","n":"-0.001",
+                        "R":true,"T":1050000,"t":7,"m":true,"rp":"0"}
+                });
+                gateway.realtime_execution_cache.apply(
+                    crate::exchange::realtime::parse_futures_order_update(
+                        &partial,
+                        Exchange::Aster,
+                    )
+                    .unwrap(),
+                );
+                let accepted = gateway
+                    .execution_snapshot(Exchange::Aster, "ANSEMUSDT", &client, "4770039")
+                    .await
+                    .unwrap();
+                assert_eq!(accepted.cumulative_quantity, Decimal::from(40));
+                assert_eq!(
+                    transport.all_requests().len(),
+                    1,
+                    "new stream evidence keeps the warm fast path"
+                );
+            } else {
+                assert_eq!(initial.cumulative_quantity, Decimal::from(40));
+            }
+            let caught_up = gateway
+                .execution_snapshot(Exchange::Aster, "ANSEMUSDT", &client, "4770039")
+                .await
+                .unwrap();
+            assert_eq!(
+                caught_up.cumulative_quantity,
+                Decimal::from(100),
+                "warm={warm}: missing stream events must not make a partial cache perpetual"
+            );
+            assert_eq!(caught_up.cumulative_quote, Decimal::from(38));
+            assert_eq!(caught_up.trades.len(), 2);
+            assert_eq!(transport.all_requests().len(), if warm { 3 } else { 4 });
+        }
     }
 
     #[tokio::test]

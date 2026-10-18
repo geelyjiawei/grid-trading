@@ -206,6 +206,13 @@ impl ExecutionSyncService {
             .orders
             .get(&loaded.request.client_order_id)
             .ok_or(ExecutionSyncError::UnknownStrategyOrder)?;
+        if loaded.snapshot.cumulative_quantity < order.cumulative_quantity
+            || loaded.snapshot.cumulative_quote < order.cumulative_quote
+        {
+            return Err(ExecutionSyncError::SnapshotInconclusive(
+                "execution snapshot totals are below the durable execution totals".into(),
+            ));
+        }
         if matches!(
             (&order.tracking, &loaded.snapshot.order.lifecycle),
             (
@@ -860,6 +867,81 @@ mod tests {
             FileStrategyStateStore::load(&path).unwrap().snapshot(),
             &after
         );
+    }
+
+    #[tokio::test]
+    async fn stale_execution_totals_are_inconclusive_without_failing_or_replaying_inventory() {
+        let (mut machine, id) = accepted_grid_machine().await;
+        let mut partial = partial_cancel_execution_for(&machine, &id);
+        partial.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway(Ok(partial.clone())), &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let before = machine.store().snapshot().clone();
+        let mut stale = partial.clone();
+        stale.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::New);
+        stale.cumulative_quantity = Decimal::ZERO;
+        stale.cumulative_quote = Decimal::ZERO;
+        stale.trades.clear();
+        stale.fees_by_asset.clear();
+        let result = service
+            .synchronize(&gateway(Ok(stale)), &mut machine, &id, 1_300)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExecutionSyncError::SnapshotInconclusive(_))
+        ));
+        assert_eq!(machine.store().snapshot(), &before);
+        let mut fresh = partial;
+        let mut next_trade = fresh.trades[0].clone();
+        next_trade.trade_id = "9".into();
+        next_trade.trade_time_ms += 1;
+        fresh.trades.push(next_trade);
+        fresh.cumulative_quantity *= Decimal::from(2);
+        fresh.cumulative_quote *= Decimal::from(2);
+        for fee in fresh.fees_by_asset.values_mut() {
+            *fee *= Decimal::from(2);
+        }
+        fresh.order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Filled);
+        service
+            .synchronize(&gateway(Ok(fresh.clone())), &mut machine, &id, 1_400)
+            .await
+            .unwrap();
+        assert_eq!(
+            machine.store().snapshot().orders[&id].cumulative_quantity,
+            fresh.cumulative_quantity
+        );
+        assert_ne!(machine.store().snapshot(), &before);
+    }
+
+    #[tokio::test]
+    async fn stale_execution_quote_is_inconclusive_without_rewriting_known_fills() {
+        let (mut machine, id) = accepted_grid_machine().await;
+        let mut current = partial_cancel_execution_for(&machine, &id);
+        current.order.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        current.trades[0].price += Decimal::ONE;
+        current.trades[0].quote_quantity += current.cumulative_quantity;
+        current.cumulative_quote = current.trades[0].quote_quantity;
+        let service = ExecutionSyncService::new("USDT").unwrap();
+        service
+            .synchronize(&gateway(Ok(current.clone())), &mut machine, &id, 1_200)
+            .await
+            .unwrap();
+        let before = machine.store().snapshot().clone();
+        let mut stale = current;
+        stale.trades[0].price -= Decimal::ONE;
+        stale.trades[0].quote_quantity -= stale.cumulative_quantity;
+        stale.cumulative_quote = stale.trades[0].quote_quantity;
+        let result = service
+            .synchronize(&gateway(Ok(stale)), &mut machine, &id, 1_300)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExecutionSyncError::SnapshotInconclusive(_))
+        ));
+        assert_eq!(machine.store().snapshot(), &before);
     }
 
     #[tokio::test]

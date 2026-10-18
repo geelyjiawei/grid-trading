@@ -812,33 +812,13 @@ impl<T, S, C> BinanceAdapter<T, S, C> {
     fn bind_execution_snapshot(
         &self,
         snapshot: OrderExecutionSnapshot,
+        session: u64,
     ) -> Result<OrderExecutionSnapshot, ExecutionSnapshotError> {
-        if !self
-            .realtime_execution_cache
-            .bind_authoritative_snapshot(&snapshot)
-        {
-            return Err(execution_error(
-                "conflicting Binance REST and realtime execution evidence",
-            ));
-        }
-        // A REST read can complete after the full stream update it was meant to resolve.
-        Ok(self
-            .realtime_execution_cache
-            .snapshot(
-                &snapshot.order.shape.symbol,
-                &snapshot.order.client_order_id,
-                &snapshot.order.exchange_order_id,
-            )
-            .filter(|cached| {
-                cached.order.exchange == snapshot.order.exchange
-                    && cached.order.shape == snapshot.order.shape
-                    && cached.order_time_ms == snapshot.order_time_ms
-                    && (cached.cumulative_quantity > snapshot.cumulative_quantity
-                        || (cached.cumulative_quantity == snapshot.cumulative_quantity
-                            && cached.cumulative_quote == snapshot.cumulative_quote
-                            && cached.update_time_ms >= snapshot.update_time_ms))
+        self.realtime_execution_cache
+            .bind_authoritative_snapshot_for_session(&snapshot, session)
+            .ok_or_else(|| {
+                execution_error("conflicting Binance REST and realtime execution evidence")
             })
-            .unwrap_or(snapshot))
     }
 
     pub fn set_recv_window_ms(&mut self, recv_window_ms: u64) {
@@ -1544,18 +1524,38 @@ where
             return Err(execution_error("exchange order ID is required"));
         }
         let symbol = symbol.to_ascii_uppercase();
-        if self
+        let cache_session = self.realtime_execution_cache.current_session();
+        if let Some(snapshot) = self.realtime_execution_cache.take_fresh_snapshot(
+            &symbol,
+            client_order_id,
+            exchange_order_id,
+        ) {
+            tracing::info!(
+                symbol = symbol.as_str(),
+                exchange_order_id,
+                "using Binance realtime execution snapshot"
+            );
+            return Ok(snapshot);
+        }
+        if self.realtime_execution_cache.has_pending_stream_evidence(
+            &symbol,
+            client_order_id,
+            exchange_order_id,
+        ) && self
             .realtime_execution_cache
-            .knows_order(&symbol, exchange_order_id)
-            && let Some(snapshot) = self
-                .realtime_execution_cache
-                .wait_snapshot(
-                    &symbol,
-                    client_order_id,
-                    exchange_order_id,
-                    REALTIME_EXECUTION_SNAPSHOT_WAIT,
-                )
-                .await
+            .wait_snapshot(
+                &symbol,
+                client_order_id,
+                exchange_order_id,
+                REALTIME_EXECUTION_SNAPSHOT_WAIT,
+            )
+            .await
+            .is_some()
+            && let Some(snapshot) = self.realtime_execution_cache.take_fresh_snapshot(
+                &symbol,
+                client_order_id,
+                exchange_order_id,
+            )
         {
             tracing::info!(
                 symbol = symbol.as_str(),
@@ -1589,7 +1589,7 @@ where
         if header.cumulative_quantity.is_zero() {
             let snapshot = assemble_execution_snapshot(header, vec![])
                 .map_err(|error| execution_error(error.to_string()))?;
-            return self.bind_execution_snapshot(snapshot);
+            return self.bind_execution_snapshot(snapshot, cache_session);
         }
 
         let mut trades = Vec::new();
@@ -1661,14 +1661,14 @@ where
         }
         let snapshot = match self
             .realtime_execution_cache
-            .supplement_authoritative_trades(&header, &trades)?
+            .supplement_authoritative_trades(&header, &trades, cache_session)?
         {
             Some(snapshot) => snapshot,
             None => assemble_execution_snapshot(header, trades).map_err(|error| {
                 execution_error(format!("incomplete Binance execution: {error}"))
             })?,
         };
-        self.bind_execution_snapshot(snapshot)
+        self.bind_execution_snapshot(snapshot, cache_session)
     }
 }
 
@@ -1735,6 +1735,7 @@ mod tests {
         requests: Arc<Mutex<Vec<PreparedHttpRequest>>>,
         responses: Arc<Mutex<VecDeque<Result<HttpResponse, TransportError>>>>,
         stream_updates: Arc<Mutex<PendingStreamUpdates>>,
+        restart_execution_cache: Arc<Mutex<Option<FuturesExecutionCache>>>,
     }
 
     impl MockTransport {
@@ -1760,16 +1761,20 @@ mod tests {
             request: PreparedHttpRequest,
         ) -> Result<HttpResponse, TransportError> {
             if request.path == "/fapi/v1/userTrades"
+                && let Some(cache) = self.restart_execution_cache.lock().unwrap().take()
+            {
+                cache.begin_session();
+            }
+            if request.path == "/fapi/v1/userTrades"
                 && let Some((cache, messages)) = self.stream_updates.lock().unwrap().take()
             {
                 for message in messages {
-                    cache.apply(
-                        crate::exchange::realtime::parse_futures_order_update(
-                            &message,
-                            Exchange::Binance,
-                        )
-                        .unwrap(),
-                    );
+                    if let Some(update) = crate::exchange::realtime::parse_futures_order_update(
+                        &message,
+                        Exchange::Binance,
+                    ) {
+                        cache.apply(update);
+                    }
                 }
             }
             self.requests.lock().unwrap().push(request);
@@ -2977,6 +2982,659 @@ mod tests {
         assert_eq!(result, OrderLookup::NotFound);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_blocker_concurrent_readers_consume_one_warm_generation() {
+        let transport = MockTransport::default();
+        let adapter = Arc::new(adapter(transport.clone()));
+        let cache = adapter.realtime_execution_cache();
+        let mut new: Value =
+            serde_json::from_str(&execution_order_detail("3.14", "0", "0", "NEW")).unwrap();
+        new["updateTime"] = json!(1000000);
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: new.to_string(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!(
+                    "[{},{}]",
+                    binance_trade(7, "2", "2"),
+                    binance_trade(8, "1.14", "1.14")
+                ),
+            }),
+        ]);
+        let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+        adapter
+            .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+            .await
+            .unwrap();
+        cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(
+                &execution_stream_message(Some(7), "2", "2", 1050000),
+                Exchange::Binance,
+            )
+            .unwrap(),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            let client = client.clone();
+            readers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                adapter
+                    .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                    .await
+                    .unwrap()
+                    .cumulative_quantity
+            }));
+        }
+        barrier.wait().await;
+        let mut quantities = Vec::new();
+        for reader in readers {
+            quantities.push(reader.await.unwrap());
+        }
+        quantities.sort();
+        assert_eq!(
+            quantities,
+            vec![Decimal::from(2), Decimal::new(314, 2)],
+            "only one reader may spend the accepted warm generation"
+        );
+        assert_eq!(transport.all_requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn release_blocker_rest_anchor_does_not_mask_later_rest_execution() {
+        for event in ["none", "lite", "missing_commission", "rest_union"] {
+            let transport = MockTransport::default();
+            let adapter = adapter(transport.clone());
+            let cache = adapter.realtime_execution_cache();
+            if event == "rest_union" {
+                *transport.stream_updates.lock().unwrap() = Some((
+                    cache.clone(),
+                    vec![execution_stream_message(Some(7), "2", "2", 1050000)],
+                ));
+            }
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "2", "2", "PARTIALLY_FILLED"),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!("[{}]", binance_trade(7, "2", "2")),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(
+                        "[{},{}]",
+                        binance_trade(7, "2", "2"),
+                        binance_trade(8, "1.14", "1.14")
+                    ),
+                }),
+            ]);
+            let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+            assert_eq!(
+                adapter
+                    .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                    .await
+                    .unwrap()
+                    .cumulative_quantity,
+                Decimal::from(2)
+            );
+            let mut message = execution_stream_message(Some(8), "1.14", "3.14", 1060000);
+            if event == "lite" {
+                message["e"] = json!("TRADE_LITE");
+            } else {
+                message["o"]["n"] = Value::Null;
+            }
+            assert!(
+                crate::exchange::realtime::parse_futures_order_update(&message, Exchange::Binance)
+                    .is_none()
+            );
+            let snapshot = adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.cumulative_quantity,
+                Decimal::new(314, 2),
+                "{event}: a REST anchor is not perpetual freshness"
+            );
+            assert_eq!(snapshot.trades.len(), 2);
+            assert_eq!(
+                cache
+                    .snapshot("MUUSDT", &client, "91")
+                    .unwrap()
+                    .cumulative_quote,
+                Decimal::new(314, 2)
+            );
+            assert_eq!(transport.all_requests().len(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_blocker_consumed_warm_progress_requires_new_progress_or_rest() {
+        for event in [
+            "none",
+            "lite",
+            "missing_commission",
+            "duplicate_partial",
+            "timestamp_only",
+        ] {
+            let transport = MockTransport::default();
+            let adapter = adapter(transport.clone());
+            let cache = adapter.realtime_execution_cache();
+            let mut new: Value =
+                serde_json::from_str(&execution_order_detail("3.14", "0", "0", "NEW")).unwrap();
+            new["updateTime"] = json!(1000000);
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: new.to_string(),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(
+                        "[{},{}]",
+                        binance_trade(7, "2", "2"),
+                        binance_trade(8, "1.14", "1.14")
+                    ),
+                }),
+            ]);
+            let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+            adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .unwrap();
+            let partial = execution_stream_message(Some(7), "2", "2", 1050000);
+            cache.apply(
+                crate::exchange::realtime::parse_futures_order_update(&partial, Exchange::Binance)
+                    .unwrap(),
+            );
+            let warm = adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .unwrap();
+            assert_eq!(warm.cumulative_quantity, Decimal::from(2));
+            assert_eq!(
+                transport.all_requests().len(),
+                1,
+                "a fresh full stream update must preserve the warm fast path"
+            );
+            let mut message = execution_stream_message(Some(8), "1.14", "3.14", 1060000);
+            match event {
+                "lite" => message["e"] = json!("TRADE_LITE"),
+                "missing_commission" => message["o"]["n"] = Value::Null,
+                "timestamp_only" => {
+                    message = partial;
+                    message["o"]["x"] = json!("AMENDMENT");
+                    message["o"]["l"] = json!("0");
+                    message["o"]["T"] = json!(1050100);
+                }
+                "none" => message["e"] = json!("IGNORED"),
+                _ => message = partial,
+            }
+            if let Some(update) =
+                crate::exchange::realtime::parse_futures_order_update(&message, Exchange::Binance)
+            {
+                cache.apply(update);
+            }
+            let snapshot = adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.cumulative_quantity,
+                Decimal::new(314, 2),
+                "{event}: already consumed warm evidence cannot hide later REST progress"
+            );
+            assert_eq!(transport.all_requests().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_blocker_older_new_rest_cannot_clear_a_trade_quarantine() {
+        let transport = MockTransport::default();
+        let adapter = adapter(transport.clone());
+        let cache = adapter.realtime_execution_cache();
+        let full = execution_stream_message(Some(7), "3.14", "3.14", 1050000);
+        *transport.stream_updates.lock().unwrap() = Some((cache.clone(), vec![full.clone()]));
+        let mut trade: Value = serde_json::from_str(&binance_trade(7, "3.14", "3.14")).unwrap();
+        trade["commission"] = json!("0.001");
+        let mut old_new: Value =
+            serde_json::from_str(&execution_order_detail("3.14", "0", "0", "NEW")).unwrap();
+        old_new["updateTime"] = json!(1000000);
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: json!([trade.clone()]).to_string(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: old_new.to_string(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: json!([trade]).to_string(),
+            }),
+        ]);
+        let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+        assert!(
+            adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .is_err()
+        );
+        assert!(
+            adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .is_err(),
+            "an older empty NEW is not a covering resolution of disputed trade 7"
+        );
+        cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(&full, Exchange::Binance)
+                .unwrap(),
+        );
+        assert!(!cache.knows_order("MUUSDT", "91"));
+        assert!(
+            cache.snapshot("MUUSDT", &client, "91").is_none(),
+            "replaying the disputed zero-fee trade must remain quarantined"
+        );
+        let resolved = adapter
+            .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+            .await
+            .unwrap();
+        assert_eq!(resolved.trades[0].trade_id, "7");
+        assert_eq!(resolved.fees_by_asset["USDT"], Decimal::new(1, 3));
+        assert_eq!(transport.all_requests().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn cold_tail_fill_cannot_impersonate_an_earlier_rest_prefix() {
+        for body in [
+            "[]".to_owned(),
+            format!("[{}]", binance_trade(8, "1.14", "1.14")),
+        ] {
+            let transport = MockTransport::default();
+            let adapter = adapter(transport.clone());
+            let cache = adapter.realtime_execution_cache();
+            *transport.stream_updates.lock().unwrap() = Some((
+                cache.clone(),
+                vec![execution_stream_message(Some(8), "1.14", "3.14", 1050000)],
+            ));
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "1.14", "1.14", "PARTIALLY_FILLED"),
+                }),
+                Ok(HttpResponse { status: 200, body }),
+            ]);
+            let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+            assert!(
+                adapter
+                    .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                    .await
+                    .is_err(),
+                "the fill ending at cumulative 3.14 cannot prove a historical prefix ending at 1.14"
+            );
+            assert!(cache.snapshot("MUUSDT", &client, "91").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_inflight_rest_cannot_restore_an_anchor_after_reconnect() {
+        for body in [
+            "[]".to_owned(),
+            format!("[{}]", binance_trade(7, "3.14", "3.14")),
+        ] {
+            let transport = MockTransport::default();
+            let adapter = adapter(transport.clone());
+            let cache = adapter.realtime_execution_cache();
+            *transport.restart_execution_cache.lock().unwrap() = Some(cache.clone());
+            *transport.stream_updates.lock().unwrap() = Some((
+                cache.clone(),
+                vec![execution_stream_message(Some(7), "3.14", "3.14", 1050000)],
+            ));
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+                }),
+                Ok(HttpResponse { status: 200, body }),
+            ]);
+            let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+            assert!(
+                adapter
+                    .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                    .await
+                    .is_err(),
+                "an old-session REST result must not resurrect a creation-time anchor"
+            );
+            assert!(!cache.knows_order("MUUSDT", "91"));
+            assert!(cache.snapshot("MUUSDT", &client, "91").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_full_reconciliation_preserves_identity_time_and_fee_validation() {
+        for case in [
+            "client",
+            "shape",
+            "symbol",
+            "order_id",
+            "quote",
+            "quantity_gap",
+            "canonical_id",
+            "missing_commission",
+            "negative_commission",
+            "fee_asset",
+            "before_creation",
+            "after_header",
+        ] {
+            let transport = MockTransport::default();
+            let adapter = adapter(transport.clone());
+            let cache = adapter.realtime_execution_cache();
+            let mut full = execution_stream_message(Some(7), "3.14", "3.14", 1060000);
+            match case {
+                "client" => full["o"]["c"] = json!("another_client"),
+                "shape" => full["o"]["p"] = json!("2"),
+                "symbol" => full["o"]["s"] = json!("BTCUSDT"),
+                "order_id" => full["o"]["i"] = json!(92),
+                "quantity_gap" => full["o"]["l"] = json!("1.14"),
+                "canonical_id" => full["o"]["t"] = json!("07"),
+                "missing_commission" => full["o"]["n"] = Value::Null,
+                "negative_commission" => full["o"]["n"] = json!("-0.001"),
+                "fee_asset" => full["o"]["N"] = json!(""),
+                "before_creation" => full["o"]["T"] = json!(999999),
+                "after_header" => full["o"]["T"] = json!(1110000),
+                _ => {}
+            }
+            *transport.stream_updates.lock().unwrap() = Some((cache.clone(), vec![full]));
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail(
+                        "3.14",
+                        "3.14",
+                        if case == "quote" { "4" } else { "3.14" },
+                        "FILLED",
+                    ),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "[]".into(),
+                }),
+            ]);
+            let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+            assert!(
+                adapter
+                    .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                    .await
+                    .is_err(),
+                "{case} cannot establish cold execution authority"
+            );
+            assert!(
+                cache.snapshot("MUUSDT", &client, "91").is_none(),
+                "{case} must not expose an unproved cached snapshot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_full_without_new_reconciles_empty_rest_trade_history() {
+        let transport = MockTransport::default();
+        let adapter = adapter(transport.clone());
+        let cache = adapter.realtime_execution_cache();
+        let mut full = execution_stream_message(Some(7), "3.14", "3.14", 1060000);
+        full["o"]["n"] = json!("0.000628");
+        cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(&full, Exchange::Binance)
+                .unwrap(),
+        );
+        let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+        assert!(!cache.knows_order("MUUSDT", "91"));
+        assert!(cache.snapshot("MUUSDT", &client, "91").is_none());
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: "[]".into(),
+            }),
+        ]);
+        let snapshot = adapter.execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91").await
+            .expect("a real full stream fill plus signed REST totals does not require NEW or REST trade visibility");
+        assert_eq!(snapshot.order_time_ms, 1000000);
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(314, 2));
+        assert_eq!(snapshot.cumulative_quote, Decimal::new(314, 2));
+        assert_eq!(snapshot.trades[0].trade_id, "7");
+        assert_eq!(snapshot.fees_by_asset["USDT"], Decimal::new(628, 6));
+        assert_eq!(transport.all_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cold_rest_prefix_anchors_later_stream_without_new() {
+        let transport = MockTransport::default();
+        let adapter = adapter(transport.clone());
+        let cache = adapter.realtime_execution_cache();
+        let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "2", "2", "PARTIALLY_FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: format!("[{}]", binance_trade(7, "2", "2")),
+            }),
+        ]);
+        let prefix = adapter
+            .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+            .await
+            .unwrap();
+        assert_eq!(prefix.cumulative_quantity, Decimal::from(2));
+        cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(
+                &execution_stream_message(Some(8), "1.14", "3.14", 1110000),
+                Exchange::Binance,
+            )
+            .unwrap(),
+        );
+        let cached = cache
+            .snapshot("MUUSDT", &client, "91")
+            .expect("complete REST history anchors subsequent session-local fills without NEW");
+        assert_eq!(cached.cumulative_quantity, Decimal::new(314, 2));
+        assert_eq!(cached.trades.len(), 2);
+        let snapshot = adapter
+            .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.cumulative_quote, Decimal::new(314, 2));
+        assert_eq!(
+            transport.all_requests().len(),
+            2,
+            "the later full update must not require another REST tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_pending_rest_header_accepts_late_full_only_at_exact_quote() {
+        for quote in ["3.14", "4"] {
+            let transport = MockTransport::default();
+            let adapter = adapter(transport.clone());
+            let cache = adapter.realtime_execution_cache();
+            let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "3.14", quote, "FILLED"),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "[]".into(),
+                }),
+            ]);
+            assert!(
+                adapter
+                    .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                    .await
+                    .is_err()
+            );
+            assert!(cache.snapshot("MUUSDT", &client, "91").is_none());
+            let waiting = cache.wait_snapshot("MUUSDT", &client, "91", Duration::from_secs(1));
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            cache.apply(
+                crate::exchange::realtime::parse_futures_order_update(
+                    &execution_stream_message(Some(7), "3.14", "3.14", 1060000),
+                    Exchange::Binance,
+                )
+                .unwrap(),
+            );
+            if quote == "3.14" {
+                let std::task::Poll::Ready(Some(snapshot)) = futures::poll!(&mut waiting) else {
+                    panic!(
+                        "a late exact full update must wake the pending signed-header waiter without a periodic tick"
+                    );
+                };
+                assert_eq!(snapshot.order_time_ms, 1000000);
+                assert_eq!(snapshot.cumulative_quote, Decimal::new(314, 2));
+            } else {
+                assert!(
+                    futures::poll!(&mut waiting).is_pending(),
+                    "equal quantity cannot prove a different REST quote"
+                );
+                assert!(cache.snapshot("MUUSDT", &client, "91").is_none());
+            }
+            assert_eq!(transport.all_requests().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_partial_history_gap_requires_the_real_missing_prefix() {
+        let transport = MockTransport::default();
+        let adapter = adapter(transport.clone());
+        let cache = adapter.realtime_execution_cache();
+        let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+        cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(
+                &execution_stream_message(Some(8), "1.14", "3.14", 1060000),
+                Exchange::Binance,
+            )
+            .unwrap(),
+        );
+        for body in ["[]".to_owned(), format!("[{}]", binance_trade(7, "2", "2"))] {
+            transport.responses.lock().unwrap().extend([
+                Ok(HttpResponse {
+                    status: 200,
+                    body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+                }),
+                Ok(HttpResponse { status: 200, body }),
+            ]);
+        }
+        assert!(
+            adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .is_err()
+        );
+        assert!(cache.snapshot("MUUSDT", &client, "91").is_none());
+        let snapshot = adapter
+            .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+            .await
+            .expect("the real REST prefix closes the gap; no synthetic missing trade is needed");
+        assert_eq!(snapshot.cumulative_quantity, Decimal::new(314, 2));
+        assert_eq!(snapshot.cumulative_quote, Decimal::new(314, 2));
+        assert_eq!(
+            snapshot
+                .trades
+                .iter()
+                .map(|trade| trade.trade_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["7", "8"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_common_trade_conflict_is_inconclusive_without_new() {
+        let transport = MockTransport::default();
+        let adapter = adapter(transport.clone());
+        let cache = adapter.realtime_execution_cache();
+        *transport.stream_updates.lock().unwrap() = Some((
+            cache.clone(),
+            vec![execution_stream_message(Some(7), "3.14", "3.14", 1050000)],
+        ));
+        let mut trade: Value = serde_json::from_str(&binance_trade(7, "3.14", "3.14")).unwrap();
+        trade["commission"] = json!("0.001");
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: json!([trade]).to_string(),
+            }),
+        ]);
+        let client = ClientOrderId::parse("g_7_S_fixed").unwrap();
+        let error = adapter
+            .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+            .await
+            .expect_err("cold order IDs cannot bypass common-trade conflict checks");
+        assert!(error.to_string().contains("conflicting"));
+        cache.apply(
+            crate::exchange::realtime::parse_futures_order_update(
+                &execution_stream_message(Some(7), "3.14", "3.14", 1050000),
+                Exchange::Binance,
+            )
+            .unwrap(),
+        );
+        transport.responses.lock().unwrap().extend([
+            Ok(HttpResponse {
+                status: 200,
+                body: execution_order_detail("3.14", "3.14", "3.14", "FILLED"),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: "[]".into(),
+            }),
+        ]);
+        assert!(
+            adapter
+                .execution_snapshot(Exchange::Binance, "MUUSDT", &client, "91")
+                .await
+                .is_err(),
+            "a repeated stream event cannot erase an unresolved REST conflict"
+        );
+        assert!(cache.snapshot("MUUSDT", &client, "91").is_none());
+    }
+
     #[tokio::test]
     async fn execution_snapshot_rejects_conflicting_rest_commission_and_allows_clean_retry() {
         let transport = MockTransport::default();
@@ -3175,7 +3833,7 @@ mod tests {
             "wrong_shape",
             "wrong_order_time",
             "noncanonical_trade_id",
-            "missing_new",
+            "cold_history_gap",
         ] {
             let transport = MockTransport::default();
             let adapter = adapter(transport.clone());
@@ -3185,7 +3843,7 @@ mod tests {
                 Exchange::Binance,
             )
             .unwrap();
-            if case != "missing_new" {
+            if case != "cold_history_gap" {
                 cache.apply(new.clone());
             }
             if case == "wrong_order_time" {
@@ -3214,7 +3872,9 @@ mod tests {
             }
             *transport.stream_updates.lock().unwrap() = Some((cache.clone(), vec![full]));
             let trade = binance_trade(7, "2", "2");
-            let trade_body = if case == "duplicate_rest" {
+            let trade_body = if case == "cold_history_gap" {
+                "[]".to_owned()
+            } else if case == "duplicate_rest" {
                 format!("[{trade},{trade}]")
             } else {
                 format!("[{trade}]")

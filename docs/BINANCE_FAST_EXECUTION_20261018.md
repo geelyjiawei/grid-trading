@@ -83,6 +83,63 @@ exact source trade timestamps and unique corresponding exchange order creation
 timestamps. Report outstanding/unmatched fills separately. Do not create test
 trades to manufacture a favorable production latency sample.
 
+## Follow-up: orders created before a process restart
+
+The first production release of fee decoupling exposed a separate existing
+cold-cache path. On 2026-10-18, its first two post-restart QUSDT replacements
+took 720 ms and 432 ms, despite complete user-stream updates arriving around
+2 ms after exchange execution. The stream cache required a NEW event from the
+current connection, so it dropped updates for orders created before restart.
+An immediately read REST trade page was still lagging, leaving the next
+one-second reconciliation tick to complete the counter.
+
+By 09:19:58 Asia/Shanghai, 15 post-release samples had median 131 ms, mean
+344.6 ms and maximum 1109 ms. New orders created after restart took 84-146 ms
+in that window; the long waits were on pre-restart orders. This is not a claim
+that either cold or warm end-to-end latency is the 3-5 ms WebSocket request
+round trip. Durable validation and write-ahead commits remain on the hot path.
+
+Cold recovery must retain real full-order stream evidence without inventing a
+NEW event or creation timestamp. An authenticated, order-specific REST anchor
+can supply identity and creation time; missing history remains untrusted until
+the complete, nonconflicting trade set agrees with unchanged authoritative
+quantity and quote totals. A later full update must be able to finish this
+proof without waiting for the periodic tick. Session reset must invalidate the
+anchor. TRADE_LITE alone remains a wakeup, never executable fill evidence.
+
+The follow-up keeps unbound full updates for pre-restart orders, then checks
+their real trades against signed REST identity, creation time, quantity and
+quote totals. A pending header survives an incomplete history page, so a later
+complete update can wake its waiter immediately. Session generations prevent
+in-flight REST responses from restoring an anchor after a reconnect. Conflicting
+trade identities or fees remain inconclusive until clean REST reconciliation.
+
+Fast cache reads atomically consume a stream-evidence generation. REST binding,
+identical replays and timestamp-only updates do not replenish it. A consumed
+generation goes straight to REST on the next execution read, rather than
+waiting merely because an anchor exists. This prevents cached partial fills
+from permanently hiding subsequent fills when full stream messages are absent.
+Conflict quarantine records the disputed quantity, update time and trade IDs;
+only non-regressing, complete REST evidence covering those IDs can clear it.
+Older NEW/zero-fill responses cannot erase the dispute.
+Because Aster shares the futures cache, its adapter must use the same consuming
+read/session-fenced binding APIs. An Aster partial-to-filled REST catch-up
+regression guards against introducing permanent cached-prefix reuse there.
+
+Execution synchronization also rejects totals below the durable quantity or
+quote as inconclusive, without applying them or failing the strategy. This does
+not assert that every inconsistent response is merely stale. Identity checks
+still run first; equal-total trade rewrites still fail validation. Regression
+tests first reproduced both failures, then verified unchanged state and normal
+progress after fresh evidence arrives.
+
+At 09:27:49 Asia/Shanghai, the first release had 150 matched production samples:
+128 current-process sources had median 110 ms, mean 128.02 ms and maximum
+303 ms; 22 pre-restart sources had median 471 ms and maximum 1109 ms. This
+diagnostic window motivates the cold-cache follow-up, not a final performance
+claim for that follow-up. All 40 cells had 500 Q remaining, no overallocated
+levels, and no order-shape mismatch in that observation.
+
 ### Local Windows validation caveat
 
 The first complete Windows GNU run returned 755 passing and 23 failing tests.
