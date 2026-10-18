@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -21,6 +21,7 @@ use crate::exchange::{
 use crate::persistence::{StrategyDiscoveryAnomaly, StrategyDiscoveryReport, StrategyFilePaths};
 
 use super::exchange_inputs::advance_reference_time_ms;
+use super::periodic_priority::{PeriodicPriority, PriorityWaiter as ExecutionWaiter};
 use super::runtime::PreparedExecutionEventStep;
 use super::{
     FileStrategyRecoveryError, PendingFeeValuation, PreparedLeasedFileStrategy,
@@ -38,7 +39,7 @@ struct RuntimeSlot<G> {
     exchange: Exchange,
     symbol: String,
     owns_market: AtomicBool,
-    execution_waiters: AtomicUsize,
+    execution_waiters: PeriodicPriority,
     fee_settlement: std::sync::Mutex<FeeSettlementSchedule>,
     strategy: Mutex<PreparedLeasedFileStrategy<G>>,
 }
@@ -61,21 +62,6 @@ impl<G> Drop for FeeSettlementLease<G> {
             .unwrap_or_else(|error| error.into_inner());
         schedule.in_flight = false;
         schedule.not_before = Some(Instant::now() + FEE_SETTLEMENT_RETRY_DELAY);
-    }
-}
-
-struct ExecutionWaiter<'a>(&'a AtomicUsize);
-
-impl<'a> ExecutionWaiter<'a> {
-    fn register(waiters: &'a AtomicUsize) -> Self {
-        waiters.fetch_add(1, Ordering::AcqRel);
-        Self(waiters)
-    }
-}
-
-impl Drop for ExecutionWaiter<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -197,7 +183,7 @@ impl<G> RuntimeRegistry<G> {
                 exchange,
                 symbol,
                 owns_market: AtomicBool::new(owns_market),
-                execution_waiters: AtomicUsize::new(0),
+                execution_waiters: PeriodicPriority::default(),
                 fee_settlement: std::sync::Mutex::new(FeeSettlementSchedule::default()),
                 strategy: Mutex::new(strategy),
             }),
@@ -240,14 +226,22 @@ impl<G> RuntimeRegistry<G> {
     }
 
     pub async fn entries(&self) -> Vec<RuntimeRegistryEntry> {
-        self.registry_entries(false).await
+        self.registry_entries(false, false).await
+    }
+
+    pub(crate) async fn periodic_entries(&self) -> Vec<RuntimeRegistryEntry> {
+        self.registry_entries(false, true).await
     }
 
     pub(crate) async fn market_entries(&self) -> Vec<RuntimeRegistryEntry> {
-        self.registry_entries(true).await
+        self.registry_entries(true, false).await
     }
 
-    async fn registry_entries(&self, owners_only: bool) -> Vec<RuntimeRegistryEntry> {
+    async fn registry_entries(
+        &self,
+        owners_only: bool,
+        periodic: bool,
+    ) -> Vec<RuntimeRegistryEntry> {
         let entries = self
             .entries
             .read()
@@ -259,7 +253,24 @@ impl<G> RuntimeRegistry<G> {
         entries
             .into_iter()
             .map(|(run_id, slot)| {
-                if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+                // Bounded fairness is Binance-only, not an audit-completion deadline.
+                // Other exchanges retain admission reservations, including TradeXyz ACKs.
+                let audit_due = periodic
+                    && slot.exchange == Exchange::Binance
+                    && slot.owns_market.load(Ordering::Acquire)
+                    && slot.execution_waiters.audit_due()
+                    && !slot.execution_waiters.is_advancing();
+                if audit_due {
+                    return RuntimeRegistryEntry {
+                        run_id,
+                        exchange: slot.exchange,
+                        symbol: slot.symbol.clone(),
+                        kind: None,
+                        lifecycle: None,
+                        advancing: false,
+                    };
+                }
+                if slot.execution_waiters.has_waiters() {
                     return RuntimeRegistryEntry {
                         run_id,
                         exchange: slot.exchange,
@@ -304,7 +315,7 @@ impl<G> RuntimeRegistry<G> {
             .collect::<Vec<_>>();
         let mut spawned = 0;
         for (run_id, slot) in slots {
-            if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+            if slot.execution_waiters.has_waiters() {
                 continue;
             }
             let work = {
@@ -322,7 +333,7 @@ impl<G> RuntimeRegistry<G> {
                 let Ok(strategy) = slot.strategy.try_lock() else {
                     continue;
                 };
-                if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+                if slot.execution_waiters.has_waiters() {
                     continue;
                 }
                 let work = strategy.prepare_pending_fee_work_after(
@@ -367,6 +378,7 @@ impl<G> RuntimeRegistry<G> {
             + ExecutionSnapshotGateway
             + HistoricalPriceGateway,
     {
+        let started = Instant::now();
         let slot = self
             .entries
             .read()
@@ -374,16 +386,25 @@ impl<G> RuntimeRegistry<G> {
             .get(run_id)
             .cloned()
             .ok_or_else(|| RuntimeRegistryAdvanceError::NotFound(run_id.clone()))?;
-        if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+        let priority = slot
+            .execution_waiters
+            .begin()
+            .ok_or_else(|| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?;
+        let bounded_priority = slot.exchange == Exchange::Binance;
+        let protected = bounded_priority && priority.is_protected();
+        if !protected && slot.execution_waiters.has_waiters() {
             return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
                 run_id.clone(),
             ));
         }
-        let mut strategy = slot
-            .strategy
-            .try_lock()
-            .map_err(|_| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?;
-        if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+        let mut strategy = if protected {
+            slot.strategy.lock().await
+        } else {
+            slot.strategy
+                .try_lock()
+                .map_err(|_| RuntimeRegistryAdvanceError::AlreadyAdvancing(run_id.clone()))?
+        };
+        if !protected && slot.execution_waiters.has_waiters() {
             drop(strategy);
             return Err(RuntimeRegistryAdvanceError::AlreadyAdvancing(
                 run_id.clone(),
@@ -399,7 +420,20 @@ impl<G> RuntimeRegistry<G> {
                 blockers: Vec::new(),
             }));
         }
-        let result = strategy.advance(now_ms).await.map_err(Into::into);
+        let effective_now_ms =
+            advance_reference_time_ms(now_ms, started.elapsed()).max(strategy.updated_at_ms());
+        let result = if bounded_priority {
+            strategy
+                .advance_with_priority(effective_now_ms, &priority)
+                .await
+        } else {
+            strategy.advance(effective_now_ms).await
+        }
+        .map_err(Into::into);
+        priority.complete(matches!(
+            &result,
+            Ok(PreparedStrategyStep::Active(report)) if !report.is_blocked()
+        ));
         slot.owns_market
             .store(!strategy.is_terminal(), Ordering::Release);
         result
@@ -520,6 +554,7 @@ impl<G> RuntimeRegistry<G> {
             .ok_or_else(|| RuntimeRegistryStopError::NotFound(run_id.clone()))?;
         // A stop request is safety-critical: wait for the current atomic tick instead of
         // returning a transient busy error that would force the caller to guess or retry.
+        let _waiter = ExecutionWaiter::register_stop(&slot.execution_waiters);
         let mut strategy = slot.strategy.lock().await;
         let effective_now_ms = now_ms.max(strategy.updated_at_ms());
         let result = strategy.request_stop(effective_now_ms).map_err(Into::into);
@@ -560,13 +595,13 @@ async fn settle_fee_batch<G>(
         };
         // Never queue behind trading work or execution waiters. The current audit
         // remains pending if the short state-only commit cannot run right now.
-        if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+        if slot.execution_waiters.has_waiters() {
             continue;
         }
         let Ok(mut strategy) = slot.strategy.try_lock() else {
             continue;
         };
-        if slot.execution_waiters.load(Ordering::Acquire) > 0 {
+        if slot.execution_waiters.has_waiters() {
             continue;
         }
         let effective_now_ms =
@@ -718,7 +753,7 @@ mod fee_settlement_tests {
     use super::*;
     use async_trait::async_trait;
     use rust_decimal::Decimal;
-    use std::time::Duration;
+    use std::{sync::atomic::AtomicUsize, time::Duration};
     use tempfile::tempdir;
     use tokio::sync::Semaphore;
 
@@ -741,6 +776,7 @@ mod fee_settlement_tests {
 
     #[derive(Clone)]
     struct FeeGateway {
+        exchange: Exchange,
         prices: Arc<PriceGate>,
         snapshot: Option<OrderExecutionSnapshot>,
     }
@@ -757,6 +793,7 @@ mod fee_settlement_tests {
     impl FeeGateway {
         fn new() -> Self {
             Self {
+                exchange: Exchange::Binance,
                 prices: Arc::new(PriceGate {
                     permits: Semaphore::new(0),
                     calls: AtomicUsize::new(0),
@@ -782,7 +819,7 @@ mod fee_settlement_tests {
 
     impl ExchangeIdentityGateway for FeeGateway {
         fn exchange(&self) -> Exchange {
-            Exchange::Binance
+            self.exchange
         }
     }
 
@@ -847,8 +884,12 @@ mod fee_settlement_tests {
         stopped: bool,
     ) -> PreparedLeasedFileStrategy<FeeGateway> {
         let config = GridConfig {
-            exchange: Some(Exchange::Binance),
-            symbol: "MUUSDT".into(),
+            exchange: Some(gateway.exchange()),
+            symbol: if gateway.exchange() == Exchange::TradeXyz {
+                "MUUSDC".into()
+            } else {
+                "MUUSDT".into()
+            },
             direction: Direction::Neutral,
             upper_price: Decimal::new(1020, 0),
             lower_price: Decimal::new(1000, 0),
@@ -1041,6 +1082,139 @@ mod fee_settlement_tests {
             .store()
             .snapshot()
             .total_fee
+    }
+
+    #[tokio::test]
+    async fn queued_stop_announces_priority_and_cancellation_cleans_it_up() {
+        let directory = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = pending_strategy(directory.path(), &gateway, "priority1", 1, false).await;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        let slot = registry.entries.read().await.get(&run).unwrap().clone();
+        let strategy = slot.strategy.lock().await;
+        let before = strategy
+            .active_runtime()
+            .unwrap()
+            .runtime()
+            .machine()
+            .store()
+            .snapshot()
+            .clone();
+        let mut stop = Box::pin(registry.request_stop(&run, 1_300));
+        std::future::poll_fn(|cx| {
+            assert!(stop.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(slot.execution_waiters.has_waiters());
+        drop(stop);
+        assert!(!slot.execution_waiters.has_waiters());
+        assert_eq!(
+            strategy
+                .active_runtime()
+                .unwrap()
+                .runtime()
+                .machine()
+                .store()
+                .snapshot(),
+            &before
+        );
+    }
+
+    #[tokio::test]
+    async fn overdue_audit_is_offered_once_even_with_execution_queued() {
+        let directory = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = pending_strategy(directory.path(), &gateway, "priority2", 1, false).await;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        let slot = registry.entries.read().await.get(&run).unwrap().clone();
+        let _waiter = ExecutionWaiter::register(&slot.execution_waiters);
+        for _ in 0..3 {
+            let context = slot.execution_waiters.begin().unwrap();
+            assert_eq!(context.read(std::future::ready(())).await, None);
+        }
+        let _strategy = slot.strategy.lock().await;
+        assert!(registry.entries().await[0].advancing);
+        assert!(!registry.periodic_entries().await[0].advancing);
+        let audit = slot.execution_waiters.begin().unwrap();
+        assert!(audit.is_protected());
+        assert!(registry.periodic_entries().await[0].advancing);
+        drop(audit);
+        assert!(!registry.periodic_entries().await[0].advancing);
+    }
+
+    #[tokio::test]
+    async fn trade_xyz_prepared_intent_reservation_blocks_an_overdue_periodic_audit() {
+        let directory = tempdir().unwrap();
+        let mut gateway = FeeGateway::new();
+        gateway.exchange = Exchange::TradeXyz;
+        let strategy = pending_strategy(directory.path(), &gateway, "priority3", 0, false).await;
+        let run = strategy.run_id().clone();
+        let paths = strategy.paths().clone();
+        let intent = strategy
+            .active_runtime()
+            .unwrap()
+            .runtime()
+            .machine()
+            .store()
+            .snapshot()
+            .ready_intents(1_200)
+            .unwrap()
+            .remove(0);
+        drop(strategy);
+        let mut intents = FileOrderIntentStore::load(paths.intents()).unwrap();
+        intents.insert_prepared(intent.clone()).unwrap();
+        let mut machine =
+            StrategyMachine::new(FileStrategyStateStore::load(paths.state()).unwrap());
+        machine.synchronize_intent(&intent, 1_200).unwrap();
+        drop(machine);
+        drop(intents);
+        let strategy = recover_leased_file_strategy(
+            gateway,
+            paths,
+            RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap(),
+        )
+        .unwrap();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        let slot = registry.entries.read().await.get(&run).unwrap().clone();
+        // The real TradeXyz path keeps this reservation while placement/ACK is unlocked.
+        let acknowledgement = ExecutionWaiter::register(&slot.execution_waiters);
+        for _ in 0..3 {
+            let context = slot.execution_waiters.begin().unwrap();
+            assert_eq!(context.read(std::future::ready(())).await, None);
+        }
+        assert!(slot.execution_waiters.audit_due());
+        let before = {
+            let strategy = slot
+                .strategy
+                .try_lock()
+                .expect("ACK must not hold the mutex");
+            let runtime = strategy.active_runtime().unwrap().runtime();
+            assert!(matches!(
+                runtime.intent_store().snapshot().intents[&intent.client_order_id].state,
+                IntentState::Prepared
+            ));
+            (
+                runtime.machine().store().snapshot().clone(),
+                runtime.intent_store().snapshot().clone(),
+            )
+        };
+        assert!(registry.periodic_entries().await[0].advancing);
+        {
+            let strategy = slot.strategy.try_lock().unwrap();
+            let runtime = strategy.active_runtime().unwrap().runtime();
+            assert_eq!(runtime.machine().store().snapshot(), &before.0);
+            assert_eq!(runtime.intent_store().snapshot(), &before.1);
+        }
+        drop(acknowledgement);
+        let entry = registry.periodic_entries().await.remove(0);
+        assert!(!entry.advancing);
+        assert_eq!(entry.kind, Some(PreparedStrategyKind::Active));
     }
 
     #[tokio::test]

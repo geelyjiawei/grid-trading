@@ -321,7 +321,7 @@ where
         now_ms: u64,
         include: impl Fn(&RuntimeRegistryEntry) -> bool,
     ) -> Vec<RuntimeAdvanceResult> {
-        let entries = self.registry.entries().await;
+        let entries = self.registry.periodic_entries().await;
         let advances = entries.into_iter().filter_map(|entry| {
             if !include(&entry)
                 || entry.advancing

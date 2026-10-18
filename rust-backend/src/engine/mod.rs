@@ -8,6 +8,7 @@ mod execution_sync;
 mod fee_rates;
 mod grid_plan;
 mod leverage;
+mod periodic_priority;
 mod preview;
 mod reconciliation;
 mod runtime;
@@ -48,6 +49,7 @@ pub use grid_plan::{
     build_grid_plan, replay_legacy_grid_plan,
 };
 pub use leverage::{LeveragePreflightError, LeveragePreflightResult, ensure_symbol_leverage};
+pub(crate) use periodic_priority::PeriodicReadPriority;
 pub use preview::{GridCycleEstimate, GridPreviewError, GridPreviewMetrics, build_grid_preview};
 pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,

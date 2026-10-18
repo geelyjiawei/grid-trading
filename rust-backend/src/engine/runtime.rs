@@ -17,12 +17,12 @@ use crate::{
     engine::{
         ArmedStrategyLifecycle, ArmedStrategyState, CancellationResult, CancellationServiceError,
         ExecutionAccountingError, ExecutionSyncService, FeeValuationSource, PendingFeeValuation,
-        ReconciliationError, ReconciliationResult, ResolvedFeeValuation, StrategyBootstrapError,
-        StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
-        StrategyOrderRecord, StrategyOrderTracking, StrategyRunId, StrategyState,
-        StrategyStateError, StrategyStateStore, StrategyStoreError, StrategyTransition,
-        SubmissionError, SubmissionResult, activate_armed_strategy, cancel_many_with,
-        commit_submission_batch, intent_requires_lookup, load_strategy_inputs,
+        PeriodicReadPriority, ReconciliationError, ReconciliationResult, ResolvedFeeValuation,
+        StrategyBootstrapError, StrategyLifecycle, StrategyMachine, StrategyMachineError,
+        StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking, StrategyRunId,
+        StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
+        StrategyTransition, SubmissionError, SubmissionResult, activate_armed_strategy,
+        cancel_many_with, commit_submission_batch, intent_requires_lookup, load_strategy_inputs,
         prepare_new_strategy, prepare_submission_batch, reconcile_lookup_with,
         resolve_cancellations_with, submit_many_with, submit_with,
     },
@@ -508,6 +508,36 @@ impl<G> PreparedLeasedFileStrategy<G> {
             Some(PreparedLeasedFileStrategyInner::Active(runtime)) => Some(runtime),
             Some(PreparedLeasedFileStrategyInner::Armed { .. }) | None => None,
         }
+    }
+
+    pub(crate) async fn advance_with_priority(
+        &mut self,
+        now_ms: u64,
+        priority: &PeriodicReadPriority,
+    ) -> Result<PreparedStrategyStep, PreparedStrategyStepError>
+    where
+        G: ExchangeIdentityGateway
+            + TradingFeeRateGateway
+            + AccountBalanceSnapshotGateway
+            + LeverageGateway
+            + PositionSnapshotGateway
+            + MarketSnapshotGateway
+            + InstrumentRulesGateway
+            + OrderPlacementGateway
+            + OrderCancellationGateway
+            + OrderLookupGateway
+            + ExecutionSnapshotGateway
+            + HistoricalPriceGateway,
+    {
+        if let Some(PreparedLeasedFileStrategyInner::Active(runtime)) = self.inner.as_mut() {
+            return runtime
+                .runtime_mut()
+                .tick_with_priority(now_ms, priority)
+                .await
+                .map(PreparedStrategyStep::Active)
+                .map_err(PreparedStrategyStepError::from);
+        }
+        self.advance(now_ms).await
     }
 
     pub async fn advance(
@@ -1817,6 +1847,15 @@ where
         self.tick_with_mode(now_ms, RuntimeTickMode::Full).await
     }
 
+    pub(crate) async fn tick_with_priority(
+        &mut self,
+        now_ms: u64,
+        priority: &PeriodicReadPriority,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        self.tick_with_mode_and_priority(now_ms, RuntimeTickMode::Full, Some(priority))
+            .await
+    }
+
     pub async fn tick_execution_event(
         &mut self,
         now_ms: u64,
@@ -1972,14 +2011,16 @@ where
             .iter()
             .map(|(_, prepared)| (prepared.snapshot.clone(), prepared.valued_report.clone()))
             .collect::<Vec<_>>();
-        let transitions = if prepared_reports.is_empty() {
-            Vec::new()
+        let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
+        let (transitions, replacement_transition) = if prepared_reports.is_empty() {
+            (Vec::new(), StrategyTransition::NoChange)
         } else {
-            match self
-                .machine
-                .apply_valued_executions(&prepared_reports, now_ms)
-            {
-                Ok(transitions) => transitions,
+            match self.machine.apply_valued_executions_and_materialize(
+                &prepared_reports,
+                &persisted_rules,
+                now_ms,
+            ) {
+                Ok(result) => result,
                 Err(error) => {
                     for (client_order_id, _) in &prepared_execution_syncs {
                         report.blockers.push(RuntimeBlocker {
@@ -1988,7 +2029,7 @@ where
                             message: error.to_string(),
                         });
                     }
-                    Vec::new()
+                    (Vec::new(), StrategyTransition::NoChange)
                 }
             }
         };
@@ -2003,6 +2044,13 @@ where
                     message: "execution accounting failed the strategy".into(),
                 });
             }
+        }
+        if matches!(replacement_transition, StrategyTransition::Failed { .. }) {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::StrategyFailed,
+                client_order_id: None,
+                message: "replacement planning failed before targeted order submission".into(),
+            });
         }
         let accounting_ms =
             u64::try_from(accounting_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2033,29 +2081,8 @@ where
         {
             return Ok(TargetedExecutionPreparation::Complete(report));
         }
-        let persisted_rules = self.machine.store().snapshot().instrument_rules.clone();
-        let materialization_started = Instant::now();
-        let replacement_transition = self
-            .machine
-            .materialize_replacements(&persisted_rules, now_ms)?;
-        let materialization_ms =
-            u64::try_from(materialization_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if matches!(replacement_transition, StrategyTransition::Failed { .. }) {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::StrategyFailed,
-                client_order_id: None,
-                message: "replacement planning failed before targeted order submission".into(),
-            });
-            self.validate_ledger_ownership()?;
-            let report = self
-                .drive_exit(
-                    report,
-                    StrategyLifecycle::Failed,
-                    advance_reference_time_ms(now_ms, tick_started.elapsed()),
-                )
-                .await?;
-            return Ok(TargetedExecutionPreparation::Complete(report));
-        }
+        // Materialization is part of the atomic accounting commit above.
+        let materialization_ms = 0;
         let submission_started = Instant::now();
         let intents = self.prepare_ready_replacement_submissions(&report, now_ms)?;
         self.validate_ledger_ownership()?;
@@ -2089,7 +2116,20 @@ where
         now_ms: u64,
         mode: RuntimeTickMode,
     ) -> Result<RuntimeTickReport, RuntimeTickError> {
+        self.tick_with_mode_and_priority(now_ms, mode, None).await
+    }
+
+    async fn tick_with_mode_and_priority(
+        &mut self,
+        now_ms: u64,
+        mode: RuntimeTickMode,
+        priority: Option<&PeriodicReadPriority>,
+    ) -> Result<RuntimeTickReport, RuntimeTickError> {
         let tick_started = Instant::now();
+        let initial_revisions = (
+            self.machine.store().snapshot().revision,
+            self.intent_store.snapshot().revision,
+        );
         self.validate_ledger_ownership()?;
         self.converge_accounted_terminal_intents(now_ms)?;
         self.validate_ledger_ownership()?;
@@ -2098,11 +2138,25 @@ where
             let state = self.machine.store().snapshot();
             (state.exchange, state.symbol.clone())
         };
-        let open_progress = match self
+        let idle_read = mode == RuntimeTickMode::Full
+            && self.machine.store().snapshot().lifecycle == StrategyLifecycle::Running
+            && initial_revisions
+                == (
+                    self.machine.store().snapshot().revision,
+                    self.intent_store.snapshot().revision,
+                );
+        let progress_read = self
             .gateway
-            .open_order_execution_progress_snapshot(exchange, &symbol)
-            .await
-        {
+            .open_order_execution_progress_snapshot(exchange, &symbol);
+        let progress_result = if idle_read && let Some(priority) = priority {
+            match priority.read(progress_read).await {
+                Some(result) => result,
+                None => return Ok(report),
+            }
+        } else {
+            progress_read.await
+        };
+        let open_progress = match progress_result {
             Ok(Some(progress)) => index_open_order_progress(progress),
             Ok(None) => None,
             Err(error) => {
@@ -2510,16 +2564,33 @@ where
                 .await;
         }
 
-        let inputs = match load_strategy_inputs(
+        let input_read = load_strategy_inputs(
             &self.gateway,
             exchange,
             &symbol,
             advance_reference_time_ms(now_ms, tick_started.elapsed()),
             self.maximum_market_age_ms,
             self.maximum_future_skew_ms,
-        )
-        .await
-        {
+        );
+        let idle_audit = idle_read
+            && initial_revisions
+                == (
+                    self.machine.store().snapshot().revision,
+                    self.intent_store.snapshot().revision,
+                )
+            && report.ledger_reconciliations == 0
+            && report.execution_syncs == 0
+            && report.submissions.is_empty()
+            && report.cancellations.is_empty();
+        let input_result = if idle_audit && let Some(priority) = priority {
+            match priority.read(input_read).await {
+                Some(result) => result,
+                None => return Ok(report),
+            }
+        } else {
+            input_read.await
+        };
+        let inputs = match input_result {
             Ok(inputs) => inputs,
             Err(error) => {
                 report.blockers.push(RuntimeBlocker {
@@ -2566,6 +2637,9 @@ where
         let risk_transition = self
             .machine
             .evaluate_risk_price(inputs.market.mark_price, now_ms)?;
+        if let Some(priority) = priority {
+            priority.audit_read_completed();
+        }
         if matches!(
             risk_transition,
             StrategyTransition::RiskExitRequested { .. }
@@ -2652,6 +2726,7 @@ where
             .collect::<Vec<_>>();
         if !ready.is_empty() {
             prepare_submission_batch(&mut self.intent_store, &ready, now_ms)?;
+            let mut prepared_intents = Vec::with_capacity(ready.len());
             for intent in &ready {
                 let prepared = self
                     .intent_store
@@ -2663,8 +2738,10 @@ where
                 if !matches!(prepared.state, IntentState::Prepared) {
                     return Err(RuntimeTickError::IntentLedgerMismatch);
                 }
-                self.machine.synchronize_intent(&prepared, now_ms)?;
+                prepared_intents.push(prepared);
             }
+            self.machine
+                .synchronize_intents(&prepared_intents, now_ms)?;
         }
         Ok(ready)
     }
@@ -2683,15 +2760,19 @@ where
         } = prepared;
         let submissions =
             commit_submission_batch(&mut self.intent_store, intents, placement_results, now_ms)?;
-        for (client_order_id, result) in submissions {
-            let persisted = self
-                .intent_store
-                .snapshot()
-                .intents
-                .get(&client_order_id)
-                .cloned()
-                .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
-            let transition = self.machine.synchronize_intent(&persisted, now_ms)?;
+        let persisted = submissions
+            .iter()
+            .map(|(client_order_id, _)| {
+                self.intent_store
+                    .snapshot()
+                    .intents
+                    .get(client_order_id)
+                    .cloned()
+                    .ok_or(RuntimeTickError::IntentLedgerMismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transitions = self.machine.synchronize_intents(&persisted, now_ms)?;
+        for ((client_order_id, result), transition) in submissions.into_iter().zip(transitions) {
             report.submissions.push(RuntimeSubmission {
                 client_order_id: client_order_id.clone(),
                 result: result.clone(),
@@ -2804,15 +2885,20 @@ where
                 MAX_CONCURRENT_REPLACEMENT_SUBMISSIONS,
             )
             .await?;
-            for (client_order_id, result) in submissions {
-                let persisted = self
-                    .intent_store
-                    .snapshot()
-                    .intents
-                    .get(&client_order_id)
-                    .cloned()
-                    .ok_or(RuntimeTickError::IntentLedgerMismatch)?;
-                let transition = self.machine.synchronize_intent(&persisted, now_ms)?;
+            let persisted = submissions
+                .iter()
+                .map(|(client_order_id, _)| {
+                    self.intent_store
+                        .snapshot()
+                        .intents
+                        .get(client_order_id)
+                        .cloned()
+                        .ok_or(RuntimeTickError::IntentLedgerMismatch)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let transitions = self.machine.synchronize_intents(&persisted, now_ms)?;
+            for ((client_order_id, result), transition) in submissions.into_iter().zip(transitions)
+            {
                 report.submissions.push(RuntimeSubmission {
                     client_order_id: client_order_id.clone(),
                     result: result.clone(),
@@ -3328,6 +3414,7 @@ where
         preflight_ms = timing.preflight_ms,
         snapshot_ms = timing.snapshot_ms,
         accounting_ms = timing.accounting_ms,
+        accounting_includes_materialization = true,
         convergence_ms = timing.convergence_ms,
         materialization_ms = timing.materialization_ms,
         submission_ms =
@@ -3505,6 +3592,7 @@ mod tests {
         balance_snapshot_calls: usize,
         leverage_write_calls: usize,
         market_gate: Option<Arc<MarketGate>>,
+        open_progress_gate: Option<Arc<MarketGate>>,
     }
 
     struct MarketGate {
@@ -3578,6 +3666,7 @@ mod tests {
                     balance_snapshot_calls: 0,
                     leverage_write_calls: 0,
                     market_gate: None,
+                    open_progress_gate: None,
                 })),
             }
         }
@@ -4143,6 +4232,11 @@ mod tests {
             _exchange: Exchange,
             _symbol: &str,
         ) -> Result<Option<Vec<OpenOrderExecutionProgress>>, ExecutionSnapshotError> {
+            let gate = self.state.lock().unwrap().open_progress_gate.take();
+            if let Some(gate) = gate {
+                gate.entered.wait().await;
+                gate.release.acquire().await.unwrap().forget();
+            }
             let mut state = self.state.lock().unwrap();
             if let Some(error) = state.next_open_progress_error.take() {
                 state.open_progress_calls += 1;
@@ -6801,6 +6895,362 @@ mod tests {
         assert_eq!(gateway.all_bootstrap_call_count(), slow_reads_before);
         assert_eq!(gateway.open_progress_call_count(), open_progress_before);
         assert_eq!(gateway.placement_call_count(), placements_before + 1);
+    }
+
+    async fn registry_from_running_fixture(
+        root: &std::path::Path,
+        runtime: &StrategyRuntime<MockGateway, MemoryOrderIntentStore, MemoryStrategyStateStore>,
+        gateway: MockGateway,
+    ) -> Arc<RuntimeRegistry<MockGateway>> {
+        let state = runtime.machine().store().snapshot().clone();
+        let paths = StrategyFilePaths::new(root, state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(paths.state(), state).unwrap();
+        std::fs::write(
+            paths.intents(),
+            serde_json::to_vec(runtime.intent_store().snapshot()).unwrap(),
+        )
+        .unwrap();
+        let strategy = recover_leased_file_strategy(gateway, paths, runtime_settings()).unwrap();
+        let registry = Arc::new(RuntimeRegistry::default());
+        assert!(matches!(
+            registry.register(strategy).await,
+            RuntimeRegistration::Registered
+        ));
+        registry
+    }
+
+    #[tokio::test]
+    async fn idle_periodic_reads_yield_to_exact_fill_before_read_release() {
+        for open_progress_read in [false, true] {
+            let rules = rules();
+            let gateway = MockGateway::new(rules.clone(), 1_100);
+            let mut runtime = runtime(
+                gateway.clone(),
+                MemoryOrderIntentStore::default(),
+                machine(config(None), &rules),
+            );
+            let opening = deploy_running_short_grid(&mut runtime, &gateway).await;
+            gateway.enable_open_progress();
+            let (source_id, source_shape, _) = accepted_add_order(runtime.machine());
+            let exchange_id = runtime.machine().store().snapshot().orders[&source_id]
+                .exchange_order_id
+                .clone()
+                .unwrap();
+            let run = runtime.machine().store().snapshot().run_id.clone();
+            let root = tempdir().unwrap();
+            let registry =
+                registry_from_running_fixture(root.path(), &runtime, gateway.clone()).await;
+            let gate = MarketGate::new();
+            {
+                let mut observed = gateway.state.lock().unwrap();
+                if open_progress_read {
+                    observed.open_progress_gate = Some(gate.clone());
+                } else {
+                    observed.market_gate = Some(gate.clone());
+                }
+            }
+            let periodic_registry = registry.clone();
+            let periodic_run = run.clone();
+            let periodic =
+                tokio::spawn(async move { periodic_registry.advance(&periodic_run, 1_300).await });
+            tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+                .await
+                .unwrap();
+            gateway.state.lock().unwrap().market_gate = None;
+            gateway.fill_order(&source_id, source_shape.price.unwrap(), Decimal::new(1, 3));
+            gateway.set_position(
+                -(opening + source_shape.quantity),
+                Some(Decimal::new(1014, 0)),
+            );
+            let placements_before = gateway.placement_call_count();
+            let event_registry = registry.clone();
+            let mut event = tokio::spawn(async move {
+                event_registry
+                    .advance_execution_events(
+                        Exchange::Binance,
+                        "MUUSDT",
+                        Some(&[exchange_id]),
+                        1_400,
+                    )
+                    .await
+                    .unwrap()
+                    .1
+                    .unwrap()
+            });
+            let finished_before_release =
+                tokio::time::timeout(Duration::from_secs(2), &mut event).await;
+            let read_yielded = finished_before_release.is_ok();
+            gate.release();
+            let event_result = match finished_before_release {
+                Ok(result) => result.unwrap(),
+                Err(_) => event.await.unwrap(),
+            };
+            periodic.await.unwrap().unwrap();
+            let PreparedStrategyStep::Active(report) = event_result else {
+                panic!("active event required")
+            };
+            assert!(!report.is_blocked(), "{report:?}");
+            assert_eq!(report.submissions.len(), 1);
+            assert_eq!(gateway.placement_call_count(), placements_before + 1);
+            assert_eq!(gateway.cancellation_call_count(), 0);
+            assert!(
+                read_yielded,
+                "idle periodic read must yield without releasing its HTTP gate: progress={open_progress_read}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_periodic_read_yields_to_stop_and_a_later_fill_cannot_submit() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+        let (source, shape, _) = accepted_add_order(runtime.machine());
+        let state = runtime.machine().store().snapshot();
+        let exchange_id = state.orders[&source].exchange_order_id.clone().unwrap();
+        let run = state.run_id.clone();
+        let root = tempdir().unwrap();
+        let registry = registry_from_running_fixture(root.path(), &runtime, gateway.clone()).await;
+        let gate = MarketGate::new();
+        gateway.state.lock().unwrap().market_gate = Some(gate.clone());
+        let task_registry = registry.clone();
+        let task_run = run.clone();
+        let periodic = tokio::spawn(async move { task_registry.advance(&task_run, 1_300).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .unwrap();
+        gateway.state.lock().unwrap().market_gate = None;
+        let placements = gateway.placement_call_count();
+        let position = gateway.state.lock().unwrap().position_quantity;
+        let mut stop = Box::pin(registry.request_stop(&run, 1_400));
+        let stopped_before_release =
+            match tokio::time::timeout(Duration::from_secs(2), &mut stop).await {
+                Ok(result) => {
+                    result.unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+        gate.release();
+        if !stopped_before_release {
+            stop.as_mut().await.unwrap();
+        }
+        drop(stop);
+        periodic.await.unwrap().unwrap();
+        assert!(
+            stopped_before_release,
+            "stop must persist before the idle HTTP read is released"
+        );
+        gateway.fill_order(&source, shape.price.unwrap(), Decimal::new(1, 3));
+        let report = registry
+            .advance_execution_events(Exchange::Binance, "MUUSDT", Some(&[exchange_id]), 1_500)
+            .await
+            .unwrap()
+            .1
+            .unwrap();
+        let PreparedStrategyStep::Active(report) = report else {
+            panic!("active report required")
+        };
+        assert!(report.submissions.is_empty(), "{report:?}");
+        assert_eq!(gateway.placement_call_count(), placements);
+        assert_eq!(gateway.state.lock().unwrap().position_quantity, position);
+    }
+
+    #[tokio::test]
+    async fn stop_priority_never_abandons_an_in_flight_placement_acknowledgement() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening = deploy_running_short_grid(&mut runtime, &gateway).await;
+        gateway.enable_open_progress();
+        let (source, shape, _) = accepted_add_order(runtime.machine());
+        let run = runtime.machine().store().snapshot().run_id.clone();
+        let root = tempdir().unwrap();
+        let registry = registry_from_running_fixture(root.path(), &runtime, gateway.clone()).await;
+        gateway.fill_order(&source, shape.price.unwrap(), Decimal::new(1, 3));
+        gateway.set_position(-(opening + shape.quantity), Some(Decimal::new(1014, 0)));
+        gateway.measure_delayed_placements(Duration::from_millis(100));
+        let placements_before = gateway.placement_call_count();
+        let task_registry = registry.clone();
+        let task_run = run.clone();
+        let periodic = tokio::spawn(async move { task_registry.advance(&task_run, 1_300).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gateway.state.lock().unwrap().active_placements == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        registry.request_stop(&run, 1_400).await.unwrap();
+        periodic.await.unwrap().unwrap();
+        let paths = StrategyFilePaths::new(root.path(), run).unwrap();
+        let state = FileStrategyStateStore::load(paths.state()).unwrap();
+        assert_eq!(gateway.placement_call_count(), placements_before + 1);
+        assert_eq!(gateway.state.lock().unwrap().active_placements, 0);
+        assert_eq!(state.snapshot().lifecycle, StrategyLifecycle::StopRequested);
+        let counter = state
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| matches!(order.purpose, StrategyOrderPurpose::Replacement { .. }))
+            .unwrap();
+        assert!(matches!(
+            counter.tracking,
+            StrategyOrderTracking::Intent {
+                state: IntentState::Accepted { .. }
+            }
+        ));
+        assert_eq!(counter.shape.quantity, shape.quantity);
+        assert!(counter.exchange_order_id.is_some());
+        assert_eq!(gateway.cancellation_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn targeted_atomic_write_failure_never_submits_and_retry_keeps_exact_quantity() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        let (source, shape, _) = accepted_add_order(runtime.machine());
+        let exchange_id = runtime.machine().store().snapshot().orders[&source]
+            .exchange_order_id
+            .clone()
+            .unwrap();
+        gateway.fill_order(&source, shape.price.unwrap(), Decimal::new(1, 3));
+        let before = runtime.machine().store().snapshot().clone();
+        let placed = gateway.placement_call_count();
+        runtime.machine_mut().store_mut().fail_next_write();
+        let blocked = runtime
+            .tick_execution_event(1_300, Some(&exchange_id))
+            .await
+            .unwrap();
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::ExecutionAccounting)
+        );
+        assert!(blocked.submissions.is_empty());
+        assert_eq!(runtime.machine().store().snapshot(), &before);
+        assert_eq!(gateway.placement_call_count(), placed);
+        let retried = runtime
+            .tick_execution_event(1_301, Some(&exchange_id))
+            .await
+            .unwrap();
+        assert!(!retried.is_blocked(), "{retried:?}");
+        assert_eq!(retried.submissions.len(), 1);
+        let counter =
+            &runtime.machine().store().snapshot().orders[&retried.submissions[0].client_order_id];
+        assert_eq!(counter.shape.quantity, shape.quantity);
+        assert!(counter.shape.reduce_only);
+        assert_eq!(gateway.placement_call_count(), placed + 1);
+        let replay = runtime
+            .tick_execution_event(1_302, Some(&exchange_id))
+            .await
+            .unwrap();
+        assert!(replay.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), placed + 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_batch_uses_three_durable_strategy_writes_without_extra_quantity() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        let sources = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                matches!(
+                    order.purpose,
+                    StrategyOrderPurpose::InitialGrid {
+                        role: GridOrderRole::Add,
+                        ..
+                    }
+                ) && matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. }
+                    }
+                )
+            })
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2);
+        for source in &sources {
+            gateway.partially_fill_order(
+                &source.client_order_id,
+                Decimal::new(1, 1),
+                source.shape.price.unwrap(),
+                Decimal::new(1, 3),
+            );
+        }
+        let writes_before = runtime.machine().store().write_attempts();
+        let position_before = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .grid_position_net_quantity;
+        let placements_before = gateway.placement_call_count();
+        let ids = sources
+            .iter()
+            .map(|source| source.exchange_order_id.clone().unwrap())
+            .collect::<Vec<_>>();
+        let report = runtime
+            .tick_execution_events(1_300, Some(&ids))
+            .await
+            .unwrap();
+        assert!(!report.is_blocked(), "{report:?}");
+        assert_eq!(report.execution_syncs, 2);
+        assert_eq!(report.submissions.len(), 2);
+        assert_eq!(gateway.placement_call_count(), placements_before + 2);
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(
+            state.grid_position_net_quantity,
+            position_before - Decimal::new(2, 1)
+        );
+        for submission in &report.submissions {
+            let counter = &state.orders[&submission.client_order_id];
+            assert_eq!(counter.shape.quantity, Decimal::new(1, 1));
+            assert!(counter.shape.reduce_only);
+            assert_eq!(counter.shape.side, OrderSide::Buy);
+        }
+        assert_eq!(
+            runtime.machine().store().write_attempts() - writes_before,
+            3,
+            "one execution/plan commit, one prepared-intent mirror, one acknowledgement mirror"
+        );
+        let duplicate = runtime
+            .tick_execution_events(1_301, Some(&ids))
+            .await
+            .unwrap();
+        assert!(duplicate.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), placements_before + 2);
+        runtime.machine().store().snapshot().validate().unwrap();
+        runtime.verify_ledger_ownership().unwrap();
     }
 
     #[tokio::test]

@@ -2276,6 +2276,35 @@ where
         self.finalize_and_store(next, now_ms, transition)
     }
 
+    pub(crate) fn synchronize_intents(
+        &mut self,
+        intents: &[OrderIntent],
+        now_ms: u64,
+    ) -> Result<Vec<StrategyTransition>, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
+        if intents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut next = self.store.snapshot().clone();
+        let transitions = intents
+            .iter()
+            .map(|intent| synchronize_intent_state(&mut next, intent))
+            .collect::<Vec<_>>();
+        if transitions
+            .iter()
+            .any(|transition| transition != &StrategyTransition::NoChange)
+        {
+            self.finalize_and_store(
+                next,
+                now_ms,
+                StrategyTransition::Updated {
+                    new_obligation_ids: Vec::new(),
+                },
+            )?;
+        }
+        Ok(transitions)
+    }
+
     pub fn synchronize_intent_if_needed(
         &mut self,
         intent: &OrderIntent,
@@ -2442,6 +2471,51 @@ where
             )?;
         }
         Ok(transitions)
+    }
+
+    pub(crate) fn apply_valued_executions_and_materialize(
+        &mut self,
+        executions: &[(
+            crate::exchange::OrderExecutionSnapshot,
+            ValuedExecutionReport,
+        )],
+        fresh_rules: &InstrumentRules,
+        now_ms: u64,
+    ) -> Result<(Vec<StrategyTransition>, StrategyTransition), StrategyMachineError> {
+        fresh_rules
+            .validate()
+            .map_err(StrategyStateError::InvalidInstrument)?;
+        self.ensure_snapshot_validated()?;
+        if executions.is_empty() {
+            return Ok((Vec::new(), StrategyTransition::NoChange));
+        }
+        let mut next = self.store.snapshot().clone();
+        let transitions = executions
+            .iter()
+            .map(|(snapshot, valued)| {
+                apply_valued_execution_to_state(&mut next, snapshot, valued, now_ms)
+            })
+            .collect::<Vec<_>>();
+        let materialized = if next.lifecycle == StrategyLifecycle::Running {
+            materialize_replacement_orders(&mut next, fresh_rules)
+        } else {
+            StrategyTransition::NoChange
+        };
+        if materialized != StrategyTransition::NoChange
+            || transitions
+                .iter()
+                .any(|transition| transition != &StrategyTransition::NoChange)
+        {
+            // Publish fills and their children together, including fail-closed state.
+            self.finalize_and_store(
+                next,
+                now_ms,
+                StrategyTransition::Updated {
+                    new_obligation_ids: Vec::new(),
+                },
+            )?;
+        }
+        Ok((transitions, materialized))
     }
 
     pub fn materialize_replacements(
@@ -6317,6 +6391,472 @@ mod tests {
                 .execution_audit
                 .is_some()
         }));
+    }
+
+    fn bounded_batch_fixture() -> (
+        StrategyMachine<MemoryStrategyStateStore>,
+        Vec<(OrderExecutionSnapshot, ValuedExecutionReport)>,
+    ) {
+        let mut machine = small_neutral_machine();
+        complete_initial_deployment(&mut machine, 101);
+        let executions = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .enumerate()
+            .map(|(index, order)| {
+                let trade_id = format!("bounded-trade-{index}");
+                let (mut snapshot, mut valued) = single_valued_trade(
+                    &machine,
+                    order.client_order_id.clone(),
+                    ValuedTradeFixture {
+                        exchange_order_id: order.exchange_order_id.as_deref().unwrap(),
+                        trade_id: &trade_id,
+                        price: order.shape.price.unwrap(),
+                        quantity: decimal(20),
+                        trade_time_ms: 110 + index as u64,
+                        applied_at_ms: 120,
+                    },
+                );
+                snapshot.order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Filled);
+                valued.report.terminal_status = Some(TerminalOrderStatus::Filled);
+                (snapshot, valued)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(executions.len(), 2);
+        (machine, executions)
+    }
+
+    #[test]
+    fn bounded_batch_execution_matches_sequential_json_with_one_write_instead_of_two_or_three() {
+        for count in 1..=2 {
+            let (mut machine, executions) = bounded_batch_fixture();
+            let before = machine.store().snapshot().clone();
+            let rules = before.instrument_rules.clone();
+            let mut sequential =
+                StrategyMachine::new(MemoryStrategyStateStore::new(before.clone()));
+            let expected_transitions = executions[..count]
+                .iter()
+                .map(|(snapshot, valued)| {
+                    sequential
+                        .apply_valued_execution(snapshot, valued, 120)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let expected_materialized = sequential.materialize_replacements(&rules, 120).unwrap();
+            assert_eq!(sequential.store().write_attempts(), count as u64 + 1);
+            let writes = machine.store().write_attempts();
+
+            let result = machine
+                .apply_valued_executions_and_materialize(&executions[..count], &rules, 120)
+                .unwrap();
+
+            assert_eq!(result, (expected_transitions, expected_materialized));
+            assert_eq!(replacement_orders(machine.store().snapshot()).len(), count);
+            assert_eq!(machine.store().write_attempts(), writes + 1);
+            let mut expected = sequential.store().snapshot().clone();
+            expected.revision = before.revision + 1;
+            assert_eq!(
+                serde_json::to_value(machine.store().snapshot()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_batch_partial_fill_and_cancel_preserve_total_cell_quantity() {
+        let (mut machine, mut executions) = bounded_batch_fixture();
+        let (snapshot, valued) = &mut executions[1];
+        snapshot.order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled);
+        snapshot.cumulative_quantity = decimal(1);
+        snapshot.cumulative_quote = snapshot.trades[0].price;
+        snapshot.trades[0].quantity = decimal(1);
+        snapshot.trades[0].quote_quantity = snapshot.cumulative_quote;
+        valued.report.cumulative_quantity = snapshot.cumulative_quantity;
+        valued.report.cumulative_quote = snapshot.cumulative_quote;
+        valued.report.terminal_status = Some(TerminalOrderStatus::Cancelled);
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        let writes = machine.store().write_attempts();
+
+        machine
+            .apply_valued_executions_and_materialize(&executions, &rules, 120)
+            .unwrap();
+
+        let state = machine.store().snapshot();
+        assert_eq!(state.replacement_obligations.len(), 3);
+        assert_eq!(replacement_orders(state).len(), 2);
+        for planned in &state.plan.grid_orders {
+            let live = state
+                .orders
+                .values()
+                .filter(|order| {
+                    !order.terminal_processed
+                        && order.purpose.level_index() == Some(planned.level_index)
+                })
+                .map(|order| order.shape.quantity - order.cumulative_quantity)
+                .sum::<Decimal>();
+            let pending = state
+                .replacement_obligations
+                .values()
+                .filter(|obligation| {
+                    obligation.level_index == planned.level_index
+                        && obligation.assigned_client_order_id.is_none()
+                })
+                .map(|obligation| obligation.shape.quantity - obligation.retired_quantity)
+                .sum::<Decimal>();
+            assert_eq!(live + pending, decimal(20));
+            assert!(live + pending <= planned.quantity);
+        }
+        state.validate().unwrap();
+        assert_eq!(machine.store().write_attempts(), writes + 1);
+    }
+
+    #[test]
+    fn bounded_batch_duplicate_execution_does_not_write_or_replay_inventory() {
+        let (mut machine, executions) = bounded_batch_fixture();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        machine
+            .apply_valued_executions_and_materialize(&executions, &rules, 120)
+            .unwrap();
+        let before = machine.store().snapshot().clone();
+        let writes = machine.store().write_attempts();
+
+        let result = machine
+            .apply_valued_executions_and_materialize(&executions, &rules, 130)
+            .unwrap();
+
+        assert_eq!(
+            result,
+            (
+                vec![StrategyTransition::NoChange; 2],
+                StrategyTransition::NoChange
+            )
+        );
+        assert_eq!(machine.store().snapshot(), &before);
+        assert_eq!(machine.store().write_attempts(), writes);
+    }
+
+    #[test]
+    fn bounded_batch_stale_execution_fails_without_new_obligation_or_inventory_event() {
+        let (mut machine, executions) = bounded_batch_fixture();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        machine
+            .apply_valued_executions_and_materialize(&executions, &rules, 120)
+            .unwrap();
+        let before = machine.store().snapshot().clone();
+        let (mut stale, mut valued) = executions[0].clone();
+        stale.cumulative_quantity = Decimal::ZERO;
+        stale.cumulative_quote = Decimal::ZERO;
+        stale.trades.clear();
+        stale.fees_by_asset.clear();
+        stale.order.lifecycle = OrderLifecycle::Terminal(TerminalOrderStatus::Cancelled);
+        valued.report.cumulative_quantity = Decimal::ZERO;
+        valued.report.cumulative_quote = Decimal::ZERO;
+        valued.report.terminal_status = Some(TerminalOrderStatus::Cancelled);
+        valued.fee_valuations.clear();
+        let writes = machine.store().write_attempts();
+
+        let (transitions, materialized) = machine
+            .apply_valued_executions_and_materialize(&[(stale, valued)], &rules, 130)
+            .unwrap();
+
+        assert!(matches!(
+            transitions.as_slice(),
+            [StrategyTransition::Failed { .. }]
+        ));
+        assert_eq!(materialized, StrategyTransition::NoChange);
+        let after = machine.store().snapshot();
+        assert_eq!(after.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(after.orders, before.orders);
+        assert_eq!(
+            after.replacement_obligations,
+            before.replacement_obligations
+        );
+        assert_eq!(after.inventory_events, before.inventory_events);
+        assert_eq!(machine.store().write_attempts(), writes + 1);
+    }
+
+    #[test]
+    fn bounded_batch_write_failure_hides_both_fills_and_children() {
+        let (mut machine, executions) = bounded_batch_fixture();
+        let before = machine.store().snapshot().clone();
+        let rules = before.instrument_rules.clone();
+        let writes = machine.store().write_attempts();
+        machine.store_mut().fail_next_write();
+
+        let result = machine.apply_valued_executions_and_materialize(&executions, &rules, 120);
+
+        assert!(matches!(
+            result,
+            Err(StrategyMachineError::Persistence(
+                StrategyStoreError::InjectedWriteFailure
+            ))
+        ));
+        assert_eq!(machine.store().snapshot(), &before);
+        assert_eq!(machine.store().write_attempts(), writes + 1);
+        let retried = machine
+            .apply_valued_executions_and_materialize(&executions, &rules, 120)
+            .unwrap();
+        assert!(matches!(
+            retried.1,
+            StrategyTransition::ReplacementOrdersReady { .. }
+        ));
+        assert_eq!(machine.store().write_attempts(), writes + 2);
+        assert_eq!(machine.store().snapshot().inventory_events.len(), 2);
+    }
+
+    #[test]
+    fn bounded_batch_non_running_lifecycle_never_materializes() {
+        for lifecycle in [
+            StrategyLifecycle::StopRequested,
+            StrategyLifecycle::Stopped,
+            StrategyLifecycle::Failed,
+        ] {
+            let (machine, executions) = bounded_batch_fixture();
+            let mut before = machine.store().snapshot().clone();
+            before.lifecycle = lifecycle;
+            if lifecycle == StrategyLifecycle::Failed {
+                before.failure = Some("prior failure".into());
+            }
+            before.validate().unwrap();
+            let rules = before.instrument_rules.clone();
+            let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(before));
+
+            let (_, materialized) = machine
+                .apply_valued_executions_and_materialize(&executions, &rules, 120)
+                .unwrap();
+
+            assert_eq!(materialized, StrategyTransition::NoChange);
+            assert!(replacement_orders(machine.store().snapshot()).is_empty());
+            assert_ne!(
+                machine.store().snapshot().lifecycle,
+                StrategyLifecycle::Running
+            );
+            assert_eq!(machine.store().write_attempts(), 1);
+            machine.store().snapshot().validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn bounded_batch_empty_input_does_not_materialize_existing_obligations() {
+        let (mut machine, executions) = bounded_batch_fixture();
+        machine.apply_valued_executions(&executions, 120).unwrap();
+        let before = machine.store().snapshot().clone();
+        let writes = machine.store().write_attempts();
+
+        let result = machine
+            .apply_valued_executions_and_materialize(&[], &before.instrument_rules, 130)
+            .unwrap();
+
+        assert_eq!(result, (Vec::new(), StrategyTransition::NoChange));
+        assert_eq!(machine.store().snapshot(), &before);
+        assert_eq!(machine.store().write_attempts(), writes);
+    }
+
+    #[test]
+    fn bounded_batch_invalid_fresh_rules_reject_before_applying_any_execution() {
+        let (mut machine, executions) = bounded_batch_fixture();
+        let before = machine.store().snapshot().clone();
+        let mut rules = before.instrument_rules.clone();
+        rules.tick_size = Decimal::ZERO;
+        let writes = machine.store().write_attempts();
+
+        let result = machine.apply_valued_executions_and_materialize(&executions, &rules, 120);
+
+        assert!(matches!(
+            result,
+            Err(StrategyMachineError::InvalidState(
+                StrategyStateError::InvalidInstrument(_)
+            ))
+        ));
+        assert_eq!(machine.store().snapshot(), &before);
+        assert_eq!(machine.store().write_attempts(), writes);
+        assert!(
+            machine
+                .apply_valued_executions_and_materialize(&[], &rules, 120)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_batch_changed_fresh_rules_persists_failure_and_fill_without_children() {
+        let (mut machine, executions) = bounded_batch_fixture();
+        let mut rules = machine.store().snapshot().instrument_rules.clone();
+        rules.tick_size *= decimal(2);
+        let writes = machine.store().write_attempts();
+
+        let (_, materialized) = machine
+            .apply_valued_executions_and_materialize(&executions, &rules, 120)
+            .unwrap();
+
+        assert!(matches!(materialized, StrategyTransition::Failed { .. }));
+        let after = machine.store().snapshot();
+        assert_eq!(after.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(after.inventory_events.len(), 2);
+        assert_eq!(after.replacement_obligations.len(), 2);
+        assert!(replacement_orders(after).is_empty());
+        assert_eq!(machine.store().write_attempts(), writes + 1);
+    }
+
+    #[test]
+    fn bounded_batch_malformed_execution_identity_keeps_input_order_and_never_creates_children() {
+        for invalid_index in 0..2 {
+            let (mut machine, mut executions) = bounded_batch_fixture();
+            let rules = machine.store().snapshot().instrument_rules.clone();
+            executions[invalid_index].0.order.exchange_order_id = "wrong-identity".into();
+            let writes = machine.store().write_attempts();
+
+            let (transitions, materialized) = machine
+                .apply_valued_executions_and_materialize(&executions, &rules, 120)
+                .unwrap();
+
+            assert!(matches!(
+                transitions[invalid_index],
+                StrategyTransition::Failed { .. }
+            ));
+            assert!(matches!(
+                transitions[1 - invalid_index],
+                StrategyTransition::Updated { .. }
+            ));
+            assert_eq!(materialized, StrategyTransition::NoChange);
+            let after = machine.store().snapshot();
+            assert_eq!(after.lifecycle, StrategyLifecycle::Failed);
+            assert_eq!(after.inventory_events.len(), 1);
+            assert_eq!(
+                after.orders[&executions[invalid_index].1.report.client_order_id]
+                    .cumulative_quantity,
+                Decimal::ZERO
+            );
+            assert_eq!(
+                after.orders[&executions[1 - invalid_index].1.report.client_order_id]
+                    .cumulative_quantity,
+                decimal(20)
+            );
+            assert!(replacement_orders(after).is_empty());
+            assert_eq!(machine.store().write_attempts(), writes + 1);
+        }
+    }
+
+    #[test]
+    fn bounded_batch_intents_match_sequential_with_one_write_and_no_change_is_write_free() {
+        let mut machine = small_neutral_machine();
+        let before = machine.store().snapshot().clone();
+        let mut intents = before.ready_intents(101).unwrap();
+        for (index, intent) in intents.iter_mut().enumerate() {
+            intent.state = IntentState::Accepted {
+                exchange_order_id: format!("bounded-intent-{index}"),
+            };
+        }
+        assert_eq!(intents.len(), 2);
+        let mut sequential = StrategyMachine::new(MemoryStrategyStateStore::new(before.clone()));
+        let expected_transitions = intents
+            .iter()
+            .map(|intent| sequential.synchronize_intent(intent, 102).unwrap())
+            .collect::<Vec<_>>();
+
+        let transitions = machine.synchronize_intents(&intents, 102).unwrap();
+
+        assert_eq!(transitions, expected_transitions);
+        assert_eq!(
+            machine.store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
+        assert_eq!(machine.store().write_attempts(), 1);
+        let mut expected = sequential.store().snapshot().clone();
+        expected.revision = before.revision + 1;
+        assert_eq!(machine.store().snapshot(), &expected);
+        assert_eq!(machine.store().write_attempts(), 1);
+        assert_eq!(
+            machine.synchronize_intents(&intents, 103).unwrap(),
+            vec![StrategyTransition::NoChange; 2]
+        );
+        assert!(machine.synchronize_intents(&[], 103).unwrap().is_empty());
+        assert_eq!(machine.store().snapshot(), &expected);
+        assert_eq!(machine.store().write_attempts(), 1);
+    }
+
+    #[test]
+    fn bounded_batch_intent_write_failure_leaves_all_orders_unchanged() {
+        let mut machine = small_neutral_machine();
+        let before = machine.store().snapshot().clone();
+        let intents = before.ready_intents(101).unwrap();
+        machine.store_mut().fail_next_write();
+
+        let result = machine.synchronize_intents(&intents, 102);
+
+        assert!(matches!(
+            result,
+            Err(StrategyMachineError::Persistence(
+                StrategyStoreError::InjectedWriteFailure
+            ))
+        ));
+        assert_eq!(machine.store().snapshot(), &before);
+        assert_eq!(machine.store().write_attempts(), 1);
+        assert_eq!(machine.synchronize_intents(&intents, 102).unwrap().len(), 2);
+        assert_eq!(machine.store().write_attempts(), 2);
+        assert!(
+            machine
+                .store()
+                .snapshot()
+                .orders
+                .values()
+                .all(|order| matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Prepared
+                    }
+                ))
+        );
+    }
+
+    #[test]
+    fn bounded_batch_intent_identity_failure_keeps_input_order_and_persists_failure() {
+        let mut machine = small_neutral_machine();
+        let prepared = machine
+            .store()
+            .snapshot()
+            .ready_intents(101)
+            .unwrap()
+            .remove(0);
+        let mut accepted = prepared.clone();
+        accepted.state = IntentState::Accepted {
+            exchange_order_id: "original-identity".into(),
+        };
+        let mut malformed = accepted.clone();
+        malformed.state = IntentState::Accepted {
+            exchange_order_id: "changed-identity".into(),
+        };
+
+        let transitions = machine
+            .synchronize_intents(&[accepted.clone(), malformed, prepared], 102)
+            .unwrap();
+
+        assert!(matches!(
+            transitions.as_slice(),
+            [
+                StrategyTransition::Updated { .. },
+                StrategyTransition::Failed { .. },
+                StrategyTransition::Failed { .. }
+            ]
+        ));
+        let after = machine.store().snapshot();
+        assert_eq!(after.lifecycle, StrategyLifecycle::Failed);
+        assert_eq!(
+            after.orders[&accepted.client_order_id]
+                .exchange_order_id
+                .as_deref(),
+            Some("original-identity")
+        );
+        assert_eq!(
+            after.orders[&accepted.client_order_id].tracking,
+            StrategyOrderTracking::Intent {
+                state: accepted.state
+            }
+        );
+        assert!(after.failure.as_deref().unwrap().contains("regressed"));
+        after.validate().unwrap();
+        assert_eq!(machine.store().write_attempts(), 1);
     }
 
     fn replacement_orders(state: &StrategyState) -> Vec<&StrategyOrderRecord> {
