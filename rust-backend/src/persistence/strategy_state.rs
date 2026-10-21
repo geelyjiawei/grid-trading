@@ -2,10 +2,13 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
+
+use super::journal::{self, Journal};
 
 use crate::{
     domain::InstrumentRules,
@@ -24,6 +27,11 @@ pub enum PersistedStrategyState {
 
 fn read_persisted(path: &Path) -> Result<PersistedStrategyState, StrategyStoreError> {
     let bytes = fs::read(path).map_err(StrategyStoreError::Read)?;
+    if journal::is_checkpoint(&bytes).map_err(StrategyStoreError::InvalidJson)? {
+        let (state, _) =
+            Journal::read::<StrategyState>(&bytes, path).map_err(StrategyStoreError::Journal)?;
+        return Ok(PersistedStrategyState::Active(Box::new(state)));
+    }
     serde_json::from_slice(&bytes).map_err(StrategyStoreError::InvalidJson)
 }
 
@@ -99,7 +107,13 @@ impl FilePreparedStrategyStore {
 
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, StrategyStoreError> {
         let path = path.into();
-        match read_persisted(&path)? {
+        let bytes = fs::read(&path).map_err(StrategyStoreError::Read)?;
+        if journal::is_checkpoint(&bytes).map_err(StrategyStoreError::InvalidJson)? {
+            return FileStrategyStateStore::from_bytes(path, &bytes)
+                .map(Box::new)
+                .map(Self::Active);
+        }
+        match serde_json::from_slice(&bytes).map_err(StrategyStoreError::InvalidJson)? {
             PersistedStrategyState::Armed(snapshot) => {
                 let snapshot = *snapshot;
                 snapshot.validate()?;
@@ -109,14 +123,9 @@ impl FilePreparedStrategyStore {
                 })))
             }
             PersistedStrategyState::Active(snapshot) => {
-                let snapshot = *snapshot;
-                snapshot
-                    .validate()
-                    .map_err(StrategyStoreError::InvalidState)?;
-                Ok(Self::Active(Box::new(FileStrategyStateStore {
-                    path,
-                    snapshot,
-                })))
+                FileStrategyStateStore::from_legacy(path, *snapshot, &bytes)
+                    .map(Box::new)
+                    .map(Self::Active)
             }
         }
     }
@@ -132,7 +141,8 @@ impl FilePreparedStrategyStore {
 #[derive(Debug)]
 pub struct FileStrategyStateStore {
     path: PathBuf,
-    snapshot: StrategyState,
+    snapshot: Arc<StrategyState>,
+    journal: Journal,
 }
 
 impl FileStrategyStateStore {
@@ -144,24 +154,52 @@ impl FileStrategyStateStore {
         snapshot
             .validate()
             .map_err(StrategyStoreError::InvalidState)?;
-        let store = Self { path, snapshot };
-        create_persisted(
-            &store.path,
-            &PersistedStrategyState::Active(Box::new(store.snapshot.clone())),
-        )?;
-        Ok(store)
+        create_persisted(&path, &PersistedStrategyState::Active(Box::new(snapshot)))?;
+        Self::load(path)
     }
 
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, StrategyStoreError> {
         let path = path.into();
-        let PersistedStrategyState::Active(snapshot) = read_persisted(&path)? else {
-            return Err(StrategyStoreError::UnexpectedArmedState);
-        };
-        let snapshot = *snapshot;
+        let bytes = fs::read(&path).map_err(StrategyStoreError::Read)?;
+        Self::from_bytes(path, &bytes)
+    }
+
+    fn from_legacy(
+        path: PathBuf,
+        snapshot: StrategyState,
+        bytes: &[u8],
+    ) -> Result<Self, StrategyStoreError> {
         snapshot
             .validate()
             .map_err(StrategyStoreError::InvalidState)?;
-        Ok(Self { path, snapshot })
+        let journal = Journal::legacy(bytes, &path).map_err(StrategyStoreError::Journal)?;
+        Ok(Self {
+            path,
+            snapshot: Arc::new(snapshot),
+            journal,
+        })
+    }
+
+    fn from_bytes(path: PathBuf, bytes: &[u8]) -> Result<Self, StrategyStoreError> {
+        let (snapshot, journal) =
+            if journal::is_checkpoint(bytes).map_err(StrategyStoreError::InvalidJson)? {
+                Journal::read::<StrategyState>(bytes, &path).map_err(StrategyStoreError::Journal)?
+            } else {
+                let PersistedStrategyState::Active(snapshot) =
+                    serde_json::from_slice(bytes).map_err(StrategyStoreError::InvalidJson)?
+                else {
+                    return Err(StrategyStoreError::UnexpectedArmedState);
+                };
+                return Self::from_legacy(path, *snapshot, bytes);
+            };
+        snapshot
+            .validate()
+            .map_err(StrategyStoreError::InvalidState)?;
+        Ok(Self {
+            path,
+            snapshot: Arc::new(snapshot),
+            journal,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -172,11 +210,10 @@ impl FileStrategyStateStore {
         self.path = path.into();
     }
 
-    fn commit_snapshot(&self, snapshot: &StrategyState) -> Result<(), StrategyStoreError> {
-        commit_persisted(
-            &self.path,
-            &PersistedStrategyState::Active(Box::new(snapshot.clone())),
-        )
+    fn commit_snapshot(&mut self, snapshot: Arc<StrategyState>) -> Result<(), StrategyStoreError> {
+        self.journal
+            .append(&self.path, self.snapshot.as_ref(), snapshot)
+            .map_err(StrategyStoreError::Journal)
     }
 }
 
@@ -252,10 +289,7 @@ impl FileArmedStrategyStateStore {
             &self.path,
             &PersistedStrategyState::Active(Box::new(active.clone())),
         )?;
-        Ok(FileStrategyStateStore {
-            path: self.path.clone(),
-            snapshot: active.clone(),
-        })
+        FileStrategyStateStore::load(self.path.clone())
     }
 
     pub fn cancel(&mut self, now_ms: u64) -> Result<(), StrategyStoreError> {
@@ -286,7 +320,8 @@ impl StrategyStateStore for FileStrategyStateStore {
             return Err(StrategyStoreError::RevisionMismatch);
         }
         next.validate().map_err(StrategyStoreError::InvalidState)?;
-        self.commit_snapshot(&next)?;
+        let next = Arc::new(next);
+        self.commit_snapshot(next.clone())?;
         self.snapshot = next;
         Ok(())
     }
@@ -299,7 +334,8 @@ impl StrategyStateStore for FileStrategyStateStore {
         if self.snapshot.revision.checked_add(1) != Some(next.revision) {
             return Err(StrategyStoreError::RevisionMismatch);
         }
-        self.commit_snapshot(&next)?;
+        let next = Arc::new(next);
+        self.commit_snapshot(next.clone())?;
         self.snapshot = next;
         Ok(())
     }
@@ -421,6 +457,30 @@ mod tests {
     }
 
     #[test]
+    fn warm_strategy_commit_replays_without_rewriting_full_checkpoint() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut store = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut next = store.snapshot().clone();
+        next.revision += 1;
+        next.updated_at_ms += 1;
+        store.replace(next).unwrap();
+        let checkpoint = fs::read(&path).unwrap();
+        let mut next = store.snapshot().clone();
+        next.revision += 1;
+        next.updated_at_ms += 1;
+        store.replace(next.clone()).unwrap();
+        assert!(
+            fs::read(&path).unwrap() == checkpoint,
+            "warm commit rewrote the full checkpoint"
+        );
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            &next
+        );
+    }
+
+    #[test]
     fn atomic_file_store_round_trips_exact_strategy_state() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("strategy.json");
@@ -436,6 +496,334 @@ mod tests {
         let persisted = fs::read_to_string(&path).unwrap();
         assert!(persisted.ends_with('\n'));
         assert_eq!(persisted.lines().count(), 1);
+    }
+
+    #[test]
+    fn journal_readers_are_read_only_and_writer_is_exclusive() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut writer = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut next = writer.snapshot().clone();
+        next.revision += 1;
+        writer.replace(next).unwrap();
+        let wal = journal::sidecar(&path);
+        let before = fs::read(&wal).unwrap();
+        let mut reader = FileStrategyStateStore::load(&path).unwrap();
+        assert_eq!(reader.snapshot(), writer.snapshot());
+        assert!(fs::read(&wal).unwrap() == before);
+        let mut next = reader.snapshot().clone();
+        next.revision += 1;
+        assert!(reader.replace(next).is_err());
+        assert!(fs::read(&wal).unwrap() == before);
+    }
+
+    #[test]
+    fn journal_missing_during_live_write_must_not_publish_or_allow_another_write() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut writer = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut next = writer.snapshot().clone();
+        next.revision += 1;
+        writer.replace(next.clone()).unwrap();
+        let saved = writer.snapshot().clone();
+        fs::remove_file(journal::sidecar(&path)).unwrap();
+        next.revision += 1;
+        assert!(
+            writer.replace(next.clone()).is_err(),
+            "writer published into an unlinked WAL"
+        );
+        assert_eq!(writer.snapshot(), &saved);
+        assert!(
+            writer.replace(next).is_err(),
+            "ambiguous failure did not poison writer"
+        );
+    }
+
+    #[test]
+    fn journal_recovery_ignores_only_an_incomplete_eof_and_next_writer_repairs_it() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut store = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut next = store.snapshot().clone();
+        next.revision += 1;
+        store.replace(next.clone()).unwrap();
+        drop(store);
+        let wal = journal::sidecar(&path);
+        let committed = fs::read(&wal).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .unwrap()
+            .write_all(b"partial")
+            .unwrap();
+        let torn = fs::read(&wal).unwrap();
+        let mut restored = FileStrategyStateStore::load(&path).unwrap();
+        assert_eq!(restored.snapshot(), &next);
+        assert!(
+            fs::read(&wal).unwrap() == torn,
+            "read-only load repaired a file"
+        );
+        next.revision += 1;
+        restored.replace(next.clone()).unwrap();
+        let bytes = fs::read(&wal).unwrap();
+        assert!(bytes.starts_with(&committed));
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            &next
+        );
+    }
+
+    #[test]
+    fn journal_crash_at_each_frame_boundary_preserves_previous_complete_revision() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut writer = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut first = writer.snapshot().clone();
+        first.revision += 1;
+        writer.replace(first.clone()).unwrap();
+        let wal = journal::sidecar(&path);
+        let prefix = fs::read(&wal).unwrap();
+        let mut second = first.clone();
+        second.revision += 1;
+        writer.replace(second.clone()).unwrap();
+        let full = fs::read(&wal).unwrap();
+        drop(writer);
+        let frame_len = full.len() - prefix.len();
+        for cut in [0, 1, 8, 32, 56, 87, 88, 89, frame_len - 1, frame_len] {
+            let torn = &full[..prefix.len() + cut];
+            fs::write(&wal, torn).unwrap();
+            let recovered = FileStrategyStateStore::load(&path).unwrap();
+            assert_eq!(
+                recovered.snapshot(),
+                if cut == frame_len { &second } else { &first }
+            );
+            assert!(fs::read(&wal).unwrap() == torn);
+        }
+        let mut reordered = full[..32].to_vec();
+        reordered.extend_from_slice(&full[prefix.len()..]);
+        reordered.extend_from_slice(&full[32..prefix.len()]);
+        fs::write(&wal, reordered).unwrap();
+        assert!(
+            FileStrategyStateStore::load(&path).is_err(),
+            "out-of-order valid frames were accepted"
+        );
+    }
+
+    #[test]
+    fn journal_corruption_or_missing_wal_fails_closed_without_changing_evidence() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut store = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut next = store.snapshot().clone();
+        next.revision += 1;
+        store.replace(next).unwrap();
+        drop(store);
+        let wal = journal::sidecar(&path);
+        let committed = fs::read(&wal).unwrap();
+        for offset in [8, 32, 32 + 8, 32 + 24, 32 + 88] {
+            let mut corrupt = committed.clone();
+            corrupt[offset] ^= 1;
+            fs::write(&wal, &corrupt).unwrap();
+            assert!(
+                FileStrategyStateStore::load(&path).is_err(),
+                "corruption at {offset} was ignored"
+            );
+            assert!(fs::read(&wal).unwrap() == corrupt);
+        }
+        fs::remove_file(&wal).unwrap();
+        assert!(FileStrategyStateStore::load(&path).is_err());
+    }
+
+    #[test]
+    fn journal_format_rejects_legacy_readers_and_stale_legacy_writers() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut writer = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut stale = FileStrategyStateStore::load(&path).unwrap();
+        let mut next = writer.snapshot().clone();
+        next.revision += 1;
+        writer.replace(next.clone()).unwrap();
+        drop(writer);
+        let bytes = fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<PersistedStrategyState>(&bytes).is_err());
+        assert!(stale.replace(next).is_err());
+        assert!(fs::read(&path).unwrap() == bytes);
+    }
+
+    #[test]
+    fn journal_review_stale_torn_tail_cannot_erase_a_same_length_committed_successor() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut writer = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut first = writer.snapshot().clone();
+        first.revision += 1;
+        writer.replace(first.clone()).unwrap();
+        let mut long = first.clone();
+        long.revision += 1;
+        long.updated_at_ms = 1000;
+        writer.replace(long).unwrap();
+        drop(writer);
+        let wal = journal::sidecar(&path);
+        let full = fs::read(&wal).unwrap();
+        fs::write(&wal, &full[..full.len() - 1]).unwrap();
+        let old_length = fs::metadata(&wal).unwrap().len();
+        let mut stale = FileStrategyStateStore::load(&path).unwrap();
+        let mut winner = FileStrategyStateStore::load(&path).unwrap();
+        let mut next = first;
+        next.revision += 1;
+        next.updated_at_ms = 101;
+        winner.replace(next.clone()).unwrap();
+        drop(winner);
+        assert_eq!(
+            fs::metadata(&wal).unwrap().len(),
+            old_length,
+            "test must exercise the equal-length ABA case"
+        );
+        let committed = fs::read(&wal).unwrap();
+        let mut conflicting = next.clone();
+        conflicting.updated_at_ms = 102;
+        assert!(
+            stale.replace(conflicting).is_err(),
+            "stale recovery erased another writer's commit"
+        );
+        assert!(fs::read(&wal).unwrap() == committed);
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            &next
+        );
+    }
+
+    #[test]
+    fn journal_review_supported_state_version_upgrade_is_replayable() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut writer = FileStrategyStateStore::create(&path, state()).unwrap();
+        let mut next = writer.snapshot().clone();
+        next.revision += 1;
+        next.version = 2;
+        next.validate().unwrap();
+        writer.replace(next.clone()).unwrap();
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            &next
+        );
+    }
+
+    #[test]
+    fn journal_review_interrupted_header_creation_recovers_from_untouched_legacy_json() {
+        for length in [0, 1, 31, 32] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("strategy.json");
+            FileStrategyStateStore::create(&path, state()).unwrap();
+            let legacy = fs::read(&path).unwrap();
+            let wal = journal::sidecar(&path);
+            fs::write(&wal, vec![0; length]).unwrap();
+            let mut recovered = FileStrategyStateStore::load(&path).unwrap();
+            assert!(fs::read(&path).unwrap() == legacy);
+            assert_eq!(fs::metadata(&wal).unwrap().len(), length as u64);
+            let mut next = recovered.snapshot().clone();
+            next.revision += 1;
+            recovered.replace(next.clone()).unwrap();
+            assert_eq!(
+                FileStrategyStateStore::load(&path).unwrap().snapshot(),
+                &next
+            );
+        }
+    }
+
+    #[test]
+    fn periodic_background_checkpoint_and_later_records_recover_exactly() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let mut writer = FileStrategyStateStore::create(&path, state()).unwrap();
+        for _ in 0..80 {
+            let mut next = writer.snapshot().clone();
+            next.revision += 1;
+            next.updated_at_ms += 1;
+            writer.replace(next).unwrap();
+            assert_eq!(
+                FileStrategyStateStore::load(&path).unwrap().snapshot(),
+                writer.snapshot()
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if json["state"]["revision"].as_u64().unwrap() >= 64 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background checkpoint did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            writer.snapshot()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GRID_BENCH_STRATEGY_FILE; never runs against a production path"]
+    fn representative_journal_persistence_benchmark() {
+        use std::time::Instant;
+        let input =
+            std::env::var_os("GRID_BENCH_STRATEGY_FILE").expect("offline copied fixture required");
+        let original = FileStrategyStateStore::load(PathBuf::from(input))
+            .unwrap()
+            .snapshot()
+            .clone();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let legacy_path = directory.path().join("legacy.json");
+        let mut store = FileStrategyStateStore::create(&path, original.clone()).unwrap();
+        let mut next = original.clone();
+        next.revision += 1;
+        next.updated_at_ms += 1;
+        let cold = Instant::now();
+        store
+            .replace_validated(ValidatedStrategyState::new(next).unwrap())
+            .unwrap();
+        let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
+        let mut journal_ms = Vec::new();
+        let mut legacy_ms = Vec::new();
+        let wal_bytes_before = fs::metadata(journal::sidecar(&path)).unwrap().len();
+        let mut legacy_bytes = 0u64;
+        for _ in 0..20 {
+            let mut next = store.snapshot().clone();
+            next.revision += 1;
+            next.updated_at_ms += 1;
+            let validated = ValidatedStrategyState::new(next.clone()).unwrap();
+            let start = Instant::now();
+            commit_persisted(
+                &legacy_path,
+                &PersistedStrategyState::Active(Box::new(next)),
+            )
+            .unwrap();
+            legacy_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            legacy_bytes += fs::metadata(&legacy_path).unwrap().len();
+            let start = Instant::now();
+            store.replace_validated(validated).unwrap();
+            journal_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let wal_bytes = fs::metadata(journal::sidecar(&path)).unwrap().len() - wal_bytes_before;
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            store.snapshot()
+        );
+        assert!(
+            wal_bytes * 10 < legacy_bytes,
+            "incremental writes are not substantially smaller"
+        );
+        println!(
+            "{}",
+            serde_json::json!({"orders": original.orders.len(), "state_bytes": serde_json::to_vec(&original).unwrap().len(),
+            "cold_migration_and_validation_ms": cold_ms, "samples": 20,
+            "legacy_persistence_ms": legacy_ms, "journal_persistence_ms": journal_ms,
+            "legacy_bytes_written": legacy_bytes, "journal_bytes_written": wal_bytes})
+        );
     }
 
     #[test]

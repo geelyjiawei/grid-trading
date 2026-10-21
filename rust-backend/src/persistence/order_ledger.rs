@@ -1,13 +1,9 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
 
-use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::journal::{self, Journal};
 
 use crate::domain::{
     CancellationIntent, CancellationState, ClientOrderId, IntentState, OrderIntent,
@@ -76,39 +72,45 @@ pub trait IntentStore {
 #[derive(Debug)]
 pub struct FileOrderIntentStore {
     path: PathBuf,
-    snapshot: LedgerSnapshot,
+    snapshot: Arc<LedgerSnapshot>,
+    journal: Journal,
 }
 
 impl FileOrderIntentStore {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, LedgerError> {
         let path = path.into();
-        let snapshot = if path.exists() {
+        let (snapshot, journal) = if path.exists() {
             let bytes = fs::read(&path).map_err(LedgerError::Read)?;
-            serde_json::from_slice(&bytes).map_err(LedgerError::InvalidJson)?
+            if journal::is_checkpoint(&bytes).map_err(LedgerError::InvalidJson)? {
+                Journal::read::<LedgerSnapshot>(&bytes, &path).map_err(LedgerError::Journal)?
+            } else {
+                (
+                    serde_json::from_slice(&bytes).map_err(LedgerError::InvalidJson)?,
+                    Journal::legacy(&bytes, &path).map_err(LedgerError::Journal)?,
+                )
+            }
         } else {
-            LedgerSnapshot::default()
+            (
+                LedgerSnapshot::default(),
+                Journal::legacy(&[], &path).map_err(LedgerError::Journal)?,
+            )
         };
         validate_snapshot(&snapshot)?;
-        Ok(Self { path, snapshot })
+        Ok(Self {
+            path,
+            snapshot: Arc::new(snapshot),
+            journal,
+        })
     }
 
     pub(crate) fn relocate(&mut self, path: impl Into<PathBuf>) {
         self.path = path.into();
     }
 
-    fn commit_snapshot(&self, snapshot: &LedgerSnapshot) -> Result<(), LedgerError> {
-        let mut bytes = serde_json::to_vec(snapshot).map_err(LedgerError::Serialize)?;
-        bytes.push(b'\n');
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(LedgerError::CreateDirectory)?;
-        }
-        let mut file = AtomicWriteFile::options()
-            .open(&self.path)
-            .map_err(LedgerError::OpenAtomic)?;
-        file.write_all(&bytes).map_err(LedgerError::Write)?;
-        file.commit().map_err(LedgerError::Commit)?;
-        sync_parent(&self.path)?;
-        Ok(())
+    fn commit_snapshot(&mut self, snapshot: Arc<LedgerSnapshot>) -> Result<(), LedgerError> {
+        self.journal
+            .append(&self.path, self.snapshot.as_ref(), snapshot)
+            .map_err(LedgerError::Journal)
     }
 
     fn replace(&mut self, mut next: LedgerSnapshot) -> Result<(), LedgerError> {
@@ -118,7 +120,8 @@ impl FileOrderIntentStore {
             .checked_add(1)
             .ok_or(LedgerError::RevisionOverflow)?;
         validate_snapshot(&next)?;
-        self.commit_snapshot(&next)?;
+        let next = Arc::new(next);
+        self.commit_snapshot(next.clone())?;
         self.snapshot = next;
         Ok(())
     }
@@ -133,7 +136,7 @@ impl IntentStore for FileOrderIntentStore {
         if intent.state != IntentState::Prepared {
             return Err(LedgerError::NewIntentNotPrepared);
         }
-        let mut next = self.snapshot.clone();
+        let mut next = self.snapshot.as_ref().clone();
         if next.intents.contains_key(&intent.client_order_id) {
             return Err(LedgerError::DuplicateClientOrderId(
                 intent.client_order_id.as_str().to_owned(),
@@ -151,7 +154,7 @@ impl IntentStore for FileOrderIntentStore {
         if intents.is_empty() {
             return Ok(());
         }
-        let mut next = self.snapshot.clone();
+        let mut next = self.snapshot.as_ref().clone();
         apply_intent_preparations(&mut next, intents, now_ms)?;
         self.replace(next)
     }
@@ -173,7 +176,7 @@ impl IntentStore for FileOrderIntentStore {
         if transitions.is_empty() {
             return Ok(());
         }
-        let mut next = self.snapshot.clone();
+        let mut next = self.snapshot.as_ref().clone();
         let mut seen = std::collections::BTreeSet::new();
         for (client_order_id, next_state) in transitions {
             if !seen.insert(client_order_id.clone()) {
@@ -209,7 +212,7 @@ impl IntentStore for FileOrderIntentStore {
         if intents.is_empty() {
             return Ok(());
         }
-        let mut next = self.snapshot.clone();
+        let mut next = self.snapshot.as_ref().clone();
         for intent in intents {
             if intent.state != CancellationState::Prepared {
                 return Err(LedgerError::NewCancellationNotPrepared);
@@ -244,7 +247,7 @@ impl IntentStore for FileOrderIntentStore {
         if transitions.is_empty() {
             return Ok(());
         }
-        let mut next = self.snapshot.clone();
+        let mut next = self.snapshot.as_ref().clone();
         let mut seen = std::collections::BTreeSet::new();
         for (client_order_id, next_state) in transitions {
             if !seen.insert(client_order_id.clone()) {
@@ -637,23 +640,10 @@ fn validate_cancellation_transition(
     }
 }
 
-#[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), LedgerError> {
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(LedgerError::SyncDirectory)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_: &Path) -> Result<(), LedgerError> {
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 pub enum LedgerError {
+    #[error("durable intent journal failed: {0}")]
+    Journal(std::io::Error),
     #[error("failed to read ledger: {0}")]
     Read(std::io::Error),
     #[error("ledger contains invalid JSON: {0}")]
@@ -730,6 +720,24 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn warm_intent_commit_replays_without_rewriting_full_checkpoint() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("intents.json");
+        let mut store = FileOrderIntentStore::load(&path).unwrap();
+        store.insert_prepared(intent("g_1_S_first")).unwrap();
+        let checkpoint = fs::read(&path).unwrap();
+        store.insert_prepared(intent("g_2_S_second")).unwrap();
+        assert!(
+            fs::read(&path).unwrap() == checkpoint,
+            "warm commit rewrote the full checkpoint"
+        );
+        assert_eq!(
+            FileOrderIntentStore::load(&path).unwrap().snapshot(),
+            store.snapshot()
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::PathBuf,
+    sync::Mutex,
     time::Instant,
 };
 
@@ -193,6 +194,7 @@ pub struct StrategyRuntime<G, I, S> {
     gateway: G,
     intent_store: I,
     machine: StrategyMachine<S>,
+    ledger_validation_proof: Option<Mutex<Option<(u64, u64)>>>,
     execution_sync: ExecutionSyncService,
     maximum_market_age_ms: u64,
     maximum_future_skew_ms: u64,
@@ -776,13 +778,14 @@ where
                 settings.maximum_market_age_ms,
                 settings.maximum_future_skew_ms,
                 settings.maximum_submissions_per_tick,
-            )?;
+            )?
+            .with_ledger_validation_reuse();
             runtime
                 .verify_ledger_ownership()
                 .map_err(|_| FileStrategyStartError::IntentLedgerMismatch)?;
             let lease = reservation.publish(&paths)?;
-            runtime.intent_store.relocate(paths.intents());
-            runtime.machine.store_mut().relocate(paths.state());
+            runtime.intent_store_mut().relocate(paths.intents());
+            runtime.machine_mut().store_mut().relocate(paths.state());
             Ok(PreparedLeasedFileStrategy::active(
                 LeasedFileStrategyRuntime {
                     paths,
@@ -1067,7 +1070,8 @@ impl LeasedFileStrategyRecovery {
                     settings.maximum_market_age_ms,
                     settings.maximum_future_skew_ms,
                     settings.maximum_submissions_per_tick,
-                )?;
+                )?
+                .with_ledger_validation_reuse();
                 runtime
                     .verify_ledger_ownership()
                     .map_err(|_| FileStrategyRecoveryError::IntentLedgerMismatch)?;
@@ -1383,6 +1387,7 @@ impl LeasedFileArmedStrategy {
             gateway,
             intent_store: prepared.intent_store,
             machine: StrategyMachine::new(state_store),
+            ledger_validation_proof: Some(Mutex::new(None)),
             execution_sync: prepared.execution_sync,
             maximum_market_age_ms: settings.maximum_market_age_ms,
             maximum_future_skew_ms: settings.maximum_future_skew_ms,
@@ -1458,7 +1463,8 @@ impl<G> LeasedFileStrategyRuntime<G> {
             settings.maximum_market_age_ms,
             settings.maximum_future_skew_ms,
             settings.maximum_submissions_per_tick,
-        )?;
+        )?
+        .with_ledger_validation_reuse();
         runtime
             .verify_ledger_ownership()
             .map_err(|_| FileRuntimeLoadError::IntentLedgerMismatch)?;
@@ -1480,6 +1486,7 @@ impl<G> LeasedFileStrategyRuntime<G> {
     pub fn runtime_mut(
         &mut self,
     ) -> &mut StrategyRuntime<G, FileOrderIntentStore, FileStrategyStateStore> {
+        self.runtime.invalidate_ledger_validation_proof();
         &mut self.runtime
     }
 }
@@ -1529,6 +1536,8 @@ where
             gateway,
             intent_store,
             machine,
+            // Generic stores need not fence every mutation with a new revision.
+            ledger_validation_proof: None,
             execution_sync,
             maximum_market_age_ms,
             maximum_future_skew_ms,
@@ -1588,12 +1597,25 @@ where
         &self.intent_store
     }
 
+    pub fn intent_store_mut(&mut self) -> &mut I {
+        self.invalidate_ledger_validation_proof();
+        &mut self.intent_store
+    }
+
     pub fn machine(&self) -> &StrategyMachine<S> {
         &self.machine
     }
 
     pub fn machine_mut(&mut self) -> &mut StrategyMachine<S> {
+        self.invalidate_ledger_validation_proof();
         &mut self.machine
+    }
+
+    fn invalidate_ledger_validation_proof(&mut self) {
+        // Escaped references may replace a store without advancing its revision.
+        if let Some(proof) = &mut self.ledger_validation_proof {
+            *proof.get_mut().unwrap_or_else(|poison| poison.into_inner()) = None;
+        }
     }
 
     pub fn verify_ledger_ownership(&self) -> Result<(), RuntimeTickError> {
@@ -1601,10 +1623,23 @@ where
     }
 
     fn validate_ledger_ownership(&self) -> Result<(), RuntimeTickError> {
-        validate_cross_ledger_ownership(
-            self.machine.store().snapshot(),
-            self.intent_store.snapshot(),
-        )
+        let strategy = self.machine.store().snapshot();
+        let intents = self.intent_store.snapshot();
+        let Some(mut proof) = self
+            .ledger_validation_proof
+            .as_ref()
+            .and_then(|proof| proof.lock().ok())
+        else {
+            return validate_cross_ledger_ownership(strategy, intents);
+        };
+        let revisions = (strategy.revision, intents.revision);
+        if *proof == Some(revisions) {
+            return Ok(());
+        }
+        *proof = None;
+        validate_cross_ledger_ownership(strategy, intents)?;
+        *proof = Some(revisions);
+        Ok(())
     }
 
     fn converge_accounted_terminal_intents(
@@ -1668,10 +1703,21 @@ where
     }
 }
 
+impl<G> StrategyRuntime<G, FileOrderIntentStore, FileStrategyStateStore> {
+    fn with_ledger_validation_reuse(mut self) -> Self {
+        // Only these concrete stores guarantee immutable, revision-fenced snapshots.
+        self.ledger_validation_proof = Some(Mutex::new(None));
+        self
+    }
+}
+
 pub fn validate_cross_ledger_ownership(
     strategy: &StrategyState,
     ledger: &LedgerSnapshot,
 ) -> Result<(), RuntimeTickError> {
+    #[cfg(test)]
+    tests::CROSS_LEDGER_VALIDATIONS.with(|count| count.set(count.get() + 1));
+
     for (client_order_id, intent) in &ledger.intents {
         let Some(order) = strategy.orders.get(client_order_id) else {
             return Err(RuntimeTickError::IntentLedgerMismatch);
@@ -3449,10 +3495,18 @@ enum RuntimeTickMode {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         collections::BTreeMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
+
+    thread_local! {
+        pub(super) static CROSS_LEDGER_VALIDATIONS: Cell<usize> = const { Cell::new(0) };
+    }
 
     use async_trait::async_trait;
     use rust_decimal::Decimal;
@@ -4628,6 +4682,395 @@ mod tests {
 
     fn runtime_settings() -> RuntimeSettings {
         RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap()
+    }
+
+    fn validation_proof_file_runtime(
+        root: &std::path::Path,
+    ) -> LeasedFileStrategyRuntime<MockGateway> {
+        let state = file_state();
+        let paths = StrategyFilePaths::new(root, state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(paths.state(), state).unwrap();
+        LeasedFileStrategyRuntime::load(MockGateway::new(rules(), 1_100), paths, runtime_settings())
+            .unwrap()
+    }
+
+    #[test]
+    fn validation_proof_reuses_only_the_successful_revision_pair() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<
+            StrategyRuntime<MockGateway, FileOrderIntentStore, FileStrategyStateStore>,
+        >();
+        let directory = tempdir().unwrap();
+        let before_load = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+        let leased = validation_proof_file_runtime(directory.path());
+        assert_eq!(CROSS_LEDGER_VALIDATIONS.with(Cell::get), before_load + 1);
+        assert_eq!(validation_proof(leased.runtime()), Some((0, 0)));
+
+        leased.runtime().verify_ledger_ownership().unwrap();
+        leased.runtime().verify_ledger_ownership().unwrap();
+
+        assert_eq!(
+            CROSS_LEDGER_VALIDATIONS.with(Cell::get),
+            before_load + 1,
+            "the successful load proof must skip both repeated full scans",
+        );
+    }
+
+    #[test]
+    fn validation_proof_revalidates_each_changed_strategy_or_intent_revision() {
+        let directory = tempdir().unwrap();
+        let mut leased = validation_proof_file_runtime(directory.path());
+        let runtime = &mut leased.runtime;
+        let before = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+
+        // Bypass the public escape hatches: revision changes alone must invalidate.
+        runtime.machine.request_stop(1_100).unwrap();
+        runtime.verify_ledger_ownership().unwrap();
+        runtime.verify_ledger_ownership().unwrap();
+        assert_eq!(CROSS_LEDGER_VALIDATIONS.with(Cell::get), before + 1);
+        assert_eq!(validation_proof(runtime), Some((1, 0)));
+
+        let intent = validation_proof_intent(runtime.machine.store().snapshot());
+        runtime.intent_store.insert_prepared(intent).unwrap();
+        runtime.verify_ledger_ownership().unwrap();
+        runtime.verify_ledger_ownership().unwrap();
+        assert_eq!(CROSS_LEDGER_VALIDATIONS.with(Cell::get), before + 2);
+        assert_eq!(validation_proof(runtime), Some((1, 1)));
+    }
+
+    fn validation_proof(
+        runtime: &StrategyRuntime<MockGateway, FileOrderIntentStore, FileStrategyStateStore>,
+    ) -> Option<(u64, u64)> {
+        *runtime
+            .ledger_validation_proof
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+    }
+
+    fn validation_proof_intent(state: &StrategyState) -> OrderIntent {
+        let order = state
+            .orders
+            .values()
+            .find(|order| order.purpose == StrategyOrderPurpose::Opening)
+            .unwrap();
+        OrderIntent::prepare(
+            order.client_order_id.clone(),
+            state.exchange,
+            order.shape.clone(),
+            1_100,
+        )
+        .unwrap()
+    }
+
+    fn validation_proof_prepare_intent(
+        runtime: &mut StrategyRuntime<MockGateway, FileOrderIntentStore, FileStrategyStateStore>,
+    ) -> OrderIntent {
+        let intent = validation_proof_intent(runtime.machine().store().snapshot());
+        runtime
+            .intent_store
+            .insert_prepared(intent.clone())
+            .unwrap();
+        runtime.verify_ledger_ownership().unwrap();
+        intent
+    }
+
+    #[test]
+    fn validation_proof_is_cleared_before_each_mutable_escape() {
+        for escape in ["runtime", "machine", "intent_store"] {
+            let directory = tempdir().unwrap();
+            let mut leased = validation_proof_file_runtime(directory.path());
+            let before = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+            match escape {
+                "runtime" => {
+                    leased.runtime_mut();
+                }
+                "machine" => {
+                    leased.runtime.machine_mut();
+                }
+                "intent_store" => {
+                    leased.runtime.intent_store_mut();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(validation_proof(leased.runtime()), None, "{escape}");
+            leased.runtime().verify_ledger_ownership().unwrap();
+            leased.runtime().verify_ledger_ownership().unwrap();
+            assert_eq!(
+                CROSS_LEDGER_VALIDATIONS.with(Cell::get),
+                before + 1,
+                "{escape}"
+            );
+            assert_eq!(validation_proof(leased.runtime()), Some((0, 0)));
+        }
+    }
+
+    #[test]
+    fn validation_proof_machine_escape_rejects_same_revision_replacement() {
+        let directory = tempdir().unwrap();
+        let mut leased = validation_proof_file_runtime(directory.path());
+        let runtime = &mut leased.runtime;
+        validation_proof_prepare_intent(runtime);
+        let before = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+        let mut foreign = runtime.machine().store().snapshot().clone();
+        foreign.exchange = Exchange::Aster;
+        foreign.config.exchange = Some(Exchange::Aster);
+        let replacement =
+            FileStrategyStateStore::create(directory.path().join("foreign-state.json"), foreign)
+                .unwrap();
+
+        *runtime.machine_mut().store_mut() = replacement;
+
+        assert_eq!(runtime.machine().store().snapshot().revision, 0);
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime.verify_ledger_ownership(),
+                Err(RuntimeTickError::IntentLedgerMismatch)
+            ));
+        }
+        assert_eq!(CROSS_LEDGER_VALIDATIONS.with(Cell::get), before + 2);
+        assert_eq!(validation_proof(runtime), None);
+    }
+
+    #[test]
+    fn validation_proof_intent_escape_rejects_same_revision_replacement() {
+        let directory = tempdir().unwrap();
+        let mut leased = validation_proof_file_runtime(directory.path());
+        let runtime = &mut leased.runtime;
+        let mut foreign = validation_proof_prepare_intent(runtime);
+        let before = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+        foreign.exchange = Exchange::Aster;
+        let mut replacement =
+            FileOrderIntentStore::load(directory.path().join("foreign-intents.json")).unwrap();
+        replacement.insert_prepared(foreign).unwrap();
+
+        *runtime.intent_store_mut() = replacement;
+
+        assert_eq!(runtime.intent_store().snapshot().revision, 1);
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime.verify_ledger_ownership(),
+                Err(RuntimeTickError::IntentLedgerMismatch)
+            ));
+        }
+        assert_eq!(CROSS_LEDGER_VALIDATIONS.with(Cell::get), before + 2);
+        assert_eq!(validation_proof(runtime), None);
+    }
+
+    #[test]
+    fn validation_proof_rejects_bad_ownership_on_either_changed_revision() {
+        for changed in ["strategy", "intent"] {
+            let directory = tempdir().unwrap();
+            let mut leased = validation_proof_file_runtime(directory.path());
+            let runtime = &mut leased.runtime;
+            let mut intent = validation_proof_prepare_intent(runtime);
+            let before = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+            if changed == "strategy" {
+                let mut next = runtime.machine().store().snapshot().clone();
+                next.revision += 1;
+                next.exchange = Exchange::Aster;
+                next.config.exchange = Some(Exchange::Aster);
+                // Production WALs forbid changing a run's exchange in place.
+                // Inject a different, independently valid file store instead to
+                // test revision-based proof invalidation without weakening that fence.
+                *runtime.machine.store_mut() = FileStrategyStateStore::create(
+                    directory.path().join("foreign-strategy.json"),
+                    next,
+                )
+                .unwrap();
+            } else {
+                intent.client_order_id = ClientOrderId::parse("foreign_proof").unwrap();
+                runtime.intent_store.insert_prepared(intent).unwrap();
+            }
+
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        runtime.verify_ledger_ownership(),
+                        Err(RuntimeTickError::IntentLedgerMismatch)
+                    ),
+                    "{changed}"
+                );
+            }
+            assert_eq!(
+                CROSS_LEDGER_VALIDATIONS.with(Cell::get),
+                before + 2,
+                "{changed}"
+            );
+            assert_eq!(
+                validation_proof(runtime),
+                None,
+                "a failed scan cannot retain a proof"
+            );
+        }
+    }
+
+    struct SwitchingSnapshotStore<T> {
+        snapshots: [T; 2],
+        use_second: Arc<AtomicBool>,
+    }
+
+    impl<T> SwitchingSnapshotStore<T> {
+        fn current(&self) -> &T {
+            &self.snapshots[usize::from(self.use_second.load(Ordering::Relaxed))]
+        }
+    }
+
+    impl StrategyStateStore for SwitchingSnapshotStore<StrategyState> {
+        fn snapshot(&self) -> &StrategyState {
+            self.current()
+        }
+        fn snapshot_is_known_valid(&self) -> bool {
+            true
+        }
+        fn replace(&mut self, _next: StrategyState) -> Result<(), StrategyStoreError> {
+            Err(StrategyStoreError::InjectedWriteFailure)
+        }
+    }
+
+    impl IntentStore for SwitchingSnapshotStore<LedgerSnapshot> {
+        fn snapshot(&self) -> &LedgerSnapshot {
+            self.current()
+        }
+        fn insert_prepared(&mut self, _intent: OrderIntent) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+        fn prepare_intents(
+            &mut self,
+            _intents: Vec<OrderIntent>,
+            _now_ms: u64,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+        fn transition(
+            &mut self,
+            _id: &ClientOrderId,
+            _state: IntentState,
+            _now_ms: u64,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+        fn transition_intents(
+            &mut self,
+            _transitions: Vec<(ClientOrderId, IntentState)>,
+            _now_ms: u64,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+        fn insert_cancellation_prepared(
+            &mut self,
+            _intent: CancellationIntent,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+        fn insert_cancellations_prepared(
+            &mut self,
+            _intents: Vec<CancellationIntent>,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+        fn transition_cancellation(
+            &mut self,
+            _id: &ClientOrderId,
+            _state: CancellationState,
+            _now_ms: u64,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+        fn transition_cancellations(
+            &mut self,
+            _transitions: Vec<(ClientOrderId, CancellationState)>,
+            _now_ms: u64,
+        ) -> Result<(), LedgerError> {
+            Err(LedgerError::InjectedWriteFailure)
+        }
+    }
+
+    #[test]
+    fn validation_proof_never_trusts_a_known_valid_custom_strategy_store() {
+        let directory = tempdir().unwrap();
+        let state = file_state();
+        let mut foreign = state.clone();
+        foreign.exchange = Exchange::Aster;
+        foreign.config.exchange = Some(Exchange::Aster);
+        state.validate().unwrap();
+        foreign.validate().unwrap();
+        let mut intents =
+            FileOrderIntentStore::load(directory.path().join("intents.json")).unwrap();
+        intents
+            .insert_prepared(validation_proof_intent(&state))
+            .unwrap();
+        let switch = Arc::new(AtomicBool::new(false));
+        let store = SwitchingSnapshotStore {
+            snapshots: [state, foreign],
+            use_second: switch.clone(),
+        };
+        let runtime = StrategyRuntime::new(
+            (),
+            intents,
+            StrategyMachine::new(store),
+            "USDT",
+            10_000,
+            100,
+            100,
+        )
+        .unwrap();
+        let before = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+
+        runtime.verify_ledger_ownership().unwrap();
+        runtime.verify_ledger_ownership().unwrap();
+        assert_eq!(CROSS_LEDGER_VALIDATIONS.with(Cell::get), before + 2);
+        assert!(runtime.ledger_validation_proof.is_none());
+        switch.store(true, Ordering::Relaxed);
+        assert_eq!(runtime.machine().store().snapshot().revision, 0);
+        assert!(matches!(
+            runtime.verify_ledger_ownership(),
+            Err(RuntimeTickError::IntentLedgerMismatch)
+        ));
+    }
+
+    #[test]
+    fn validation_proof_never_trusts_an_arbitrary_custom_intent_store() {
+        let directory = tempdir().unwrap();
+        let state = file_state();
+        let mut intents = MemoryOrderIntentStore::default();
+        intents
+            .insert_prepared(validation_proof_intent(&state))
+            .unwrap();
+        let original = intents.snapshot().clone();
+        let mut foreign = original.clone();
+        foreign.intents.values_mut().next().unwrap().exchange = Exchange::Aster;
+        let switch = Arc::new(AtomicBool::new(false));
+        let intents = SwitchingSnapshotStore {
+            snapshots: [original, foreign],
+            use_second: switch.clone(),
+        };
+        let store =
+            FileStrategyStateStore::create(directory.path().join("state.json"), state).unwrap();
+        assert!(store.snapshot_is_known_valid());
+        let runtime = StrategyRuntime::new(
+            (),
+            intents,
+            StrategyMachine::new(store),
+            "USDT",
+            10_000,
+            100,
+            100,
+        )
+        .unwrap();
+        let before = CROSS_LEDGER_VALIDATIONS.with(Cell::get);
+
+        runtime.verify_ledger_ownership().unwrap();
+        runtime.verify_ledger_ownership().unwrap();
+        assert_eq!(CROSS_LEDGER_VALIDATIONS.with(Cell::get), before + 2);
+        assert!(runtime.ledger_validation_proof.is_none());
+        switch.store(true, Ordering::Relaxed);
+        assert_eq!(runtime.intent_store().snapshot().revision, 1);
+        assert!(matches!(
+            runtime.verify_ledger_ownership(),
+            Err(RuntimeTickError::IntentLedgerMismatch)
+        ));
     }
 
     #[tokio::test]

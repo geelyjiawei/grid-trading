@@ -44,15 +44,51 @@ fn validate_strategy_file(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn export_ledger_file(command: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    use grid_trading_server::{
+        engine::StrategyStateStore,
+        persistence::{
+            FileOrderIntentStore, FilePreparedStrategyStore, IntentStore, PersistedStrategyState,
+        },
+    };
+    use std::io::Write;
+
+    anyhow::ensure!(path.is_file(), "ledger file is missing");
+    let mut output = std::io::stdout().lock();
+    match command {
+        "--export-strategy-file" => {
+            let state = match FilePreparedStrategyStore::load(path)? {
+                FilePreparedStrategyStore::Active(store) => {
+                    PersistedStrategyState::Active(Box::new(store.snapshot().clone()))
+                }
+                FilePreparedStrategyStore::Armed(store) => {
+                    PersistedStrategyState::Armed(Box::new(store.snapshot().clone()))
+                }
+            };
+            serde_json::to_writer(&mut output, &state)?;
+        }
+        "--export-intent-file" => {
+            let store = FileOrderIntentStore::load(path)?;
+            serde_json::to_writer(&mut output, store.snapshot())?;
+        }
+        _ => anyhow::bail!("unsupported export command"),
+    }
+    writeln!(output)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if !args.is_empty() {
-        anyhow::ensure!(
-            args.len() == 2 && args[0] == "--validate-strategy-file",
-            "unsupported command"
-        );
-        return validate_strategy_file(std::path::Path::new(&args[1]));
+        anyhow::ensure!(args.len() == 2, "unsupported command");
+        let command = args[0].to_str().context("invalid command")?;
+        let path = std::path::Path::new(&args[1]);
+        return match command {
+            "--validate-strategy-file" => validate_strategy_file(path),
+            "--export-strategy-file" | "--export-intent-file" => export_ledger_file(command, path),
+            _ => anyhow::bail!("unsupported command"),
+        };
     }
     tracing_subscriber::registry()
         .with(

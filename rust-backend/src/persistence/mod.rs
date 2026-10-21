@@ -1,5 +1,7 @@
 mod exchange_config;
 mod idempotency;
+mod journal;
+mod journal_delta;
 mod order_ledger;
 mod runtime_files;
 mod runtime_lease;

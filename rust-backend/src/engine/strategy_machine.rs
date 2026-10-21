@@ -4999,6 +4999,8 @@ pub enum StrategyStateError {
 
 #[derive(Debug, Error)]
 pub enum StrategyStoreError {
+    #[error("durable strategy journal failed: {0}")]
+    Journal(std::io::Error),
     #[error("strategy state failed validation: {0}")]
     InvalidState(StrategyStateError),
     #[error("armed strategy state failed validation or activation: {0}")]
