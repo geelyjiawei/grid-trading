@@ -158,6 +158,7 @@ const BINANCE_DEFAULT_ORDER_LIMIT_10S: u32 = 300;
 const BINANCE_DEFAULT_ORDER_LIMIT: u32 = 1_200;
 const BINANCE_BUDGET_NUMERATOR: u32 = 3;
 const BINANCE_BUDGET_DENOMINATOR: u32 = 4;
+const BINANCE_CRITICAL_WEIGHT_RESERVE: u32 = 150;
 const BINANCE_DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 const BINANCE_DEFAULT_IP_BAN_COOLDOWN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_WAF_COOLDOWN: Duration = Duration::from_secs(15 * 60);
@@ -418,7 +419,12 @@ impl BinanceWebsocketOrderBudget {
         }
 
         prune_binance_usage(&mut state, now);
-        if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
+        if let Some(limit) = binance_budget_cooldown(
+            &state,
+            request_cost,
+            BinanceRequestPriority::TradingCritical,
+            now,
+        ) {
             let cooldown = match limit {
                 BinanceBudgetCooldown::RequestWeight(cooldown) => cooldown,
                 BinanceBudgetCooldown::Orders(cooldown) => {
@@ -552,7 +558,7 @@ where
                 }
             }
             prune_binance_usage(&mut state, now);
-            if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
+            if let Some(limit) = binance_budget_cooldown(&state, request_cost, priority, now) {
                 let cooldown = match limit {
                     BinanceBudgetCooldown::RequestWeight(cooldown) => cooldown,
                     BinanceBudgetCooldown::Orders(cooldown) => {
@@ -971,6 +977,7 @@ enum BinanceBudgetCooldown {
 fn binance_budget_cooldown(
     state: &BinanceRequestState,
     request_cost: BinanceRequestCost,
+    priority: BinanceRequestPriority,
     now: Instant,
 ) -> Option<BinanceBudgetCooldown> {
     let (used_weight, used_orders) = state.usage.iter().fold((0_u32, 0_u32), |used, event| {
@@ -984,8 +991,14 @@ fn binance_budget_cooldown(
         .iter()
         .filter(|event| now.saturating_duration_since(event.at) < BINANCE_ORDER_LIMIT_SHORT_WINDOW)
         .fold(0_u32, |used, event| used.saturating_add(event.cost.orders));
-    let exceeds_weight = used_weight.saturating_add(request_cost.weight)
-        > binance_budget(state.request_weight_limit);
+    let total_weight_budget = binance_budget(state.request_weight_limit);
+    let weight_budget = match priority {
+        BinanceRequestPriority::TradingCritical => total_weight_budget,
+        BinanceRequestPriority::Normal => {
+            total_weight_budget.saturating_sub(BINANCE_CRITICAL_WEIGHT_RESERVE)
+        }
+    };
+    let exceeds_weight = used_weight.saturating_add(request_cost.weight) > weight_budget;
     let exceeds_orders = request_cost.orders > 0
         && used_orders.saturating_add(request_cost.orders) > binance_budget(state.order_limit);
     let exceeds_orders_10s = request_cost.orders > 0
@@ -2164,13 +2177,13 @@ mod tests {
 
         for _ in 0..3 {
             let response = governor
-                .execute(symbol_request(HttpMethod::Get, "/fapi/v1/openOrders"))
+                .execute(symbol_request(HttpMethod::Get, "/fapi/v1/order"))
                 .await
                 .unwrap();
             assert_eq!(response.status, 200);
         }
         let blocked = governor
-            .execute(symbol_request(HttpMethod::Get, "/fapi/v1/openOrders"))
+            .execute(symbol_request(HttpMethod::Get, "/fapi/v1/order"))
             .await
             .unwrap();
 
@@ -2240,7 +2253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binance_income_weight_is_reserved_and_rechecked_until_window_expiry() {
+    async fn binance_income_cannot_spend_critical_reserve_and_window_still_expires() {
         let transport = ScriptedTransport::new((0..2).map(|_| HttpResponse {
             status: 200,
             body: "[]".into(),
@@ -2263,13 +2276,12 @@ mod tests {
             .execute(symbol_request(HttpMethod::Get, "/fapi/v1/income"))
             .await
             .unwrap();
-        assert_eq!(income.status, 200);
-        for _ in 0..2 {
-            assert_eq!(
-                governor.execute(execution_request()).await.unwrap().status,
-                429
-            );
-        }
+        assert_eq!(income.status, 429);
+        assert_eq!(transport.call_count(), 0);
+        assert_eq!(
+            governor.execute(execution_request()).await.unwrap().status,
+            200
+        );
         assert_eq!(transport.call_count(), 1);
         assert!(governor.websocket_order_budget().reserve().await.is_ok());
         {
@@ -2280,7 +2292,7 @@ mod tests {
                     .iter()
                     .map(|event| event.cost.weight)
                     .sum::<u32>(),
-                1_800
+                1_775
             );
             let expired_at = Instant::now() - Duration::from_secs(61);
             for event in &mut state.usage {
@@ -2301,6 +2313,114 @@ mod tests {
                 .sum::<u32>(),
             5
         );
+    }
+
+    #[tokio::test]
+    async fn binance_normal_history_preserves_all_150_critical_weight() {
+        let transport = ScriptedTransport::new((0..32).map(|_| HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }));
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+        governor
+            .state
+            .lock()
+            .await
+            .usage
+            .push_back(BinanceUsageEvent {
+                at: Instant::now(),
+                cost: BinanceRequestCost {
+                    weight: 1_620,
+                    orders: 0,
+                },
+            });
+
+        let income = governor
+            .execute(symbol_request(HttpMethod::Get, "/fapi/v1/income"))
+            .await
+            .unwrap();
+        assert_eq!(
+            income.status, 200,
+            "normal income may fill the normal 1650-weight budget"
+        );
+        for path in ["/fapi/v1/income", "/fapi/v1/userTrades"] {
+            assert_eq!(
+                governor
+                    .execute(symbol_request(HttpMethod::Get, path))
+                    .await
+                    .unwrap()
+                    .status,
+                429,
+                "normal history must leave all 150 reserved weight available"
+            );
+        }
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "rejected normal reads must not spend weight"
+        );
+        assert!(governor.state.lock().await.cooldown_until.is_none());
+
+        for _ in 0..30 {
+            assert_eq!(
+                governor.execute(execution_request()).await.unwrap().status,
+                200
+            );
+        }
+        assert_eq!(
+            governor.execute(execution_request()).await.unwrap().status,
+            429
+        );
+        assert!(governor.websocket_order_budget().reserve().await.is_ok());
+        let order = governor
+            .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+            .await
+            .unwrap();
+        assert_eq!(order.status, 200);
+        assert_eq!(transport.call_count(), 32);
+        let state = governor.state.lock().await;
+        assert!(state.cooldown_until.is_none());
+        assert_eq!(
+            state
+                .usage
+                .iter()
+                .map(|event| event.cost.weight)
+                .sum::<u32>(),
+            1_800
+        );
+    }
+
+    #[tokio::test]
+    async fn binance_critical_reads_still_respect_the_full_1800_weight_budget() {
+        let transport = ScriptedTransport::new([HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }]);
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+        governor
+            .state
+            .lock()
+            .await
+            .usage
+            .push_back(BinanceUsageEvent {
+                at: Instant::now(),
+                cost: BinanceRequestCost {
+                    weight: 1_800,
+                    orders: 0,
+                },
+            });
+
+        let critical = governor.execute(execution_request()).await.unwrap();
+        assert_eq!(critical.status, 429);
+        assert_eq!(transport.call_count(), 0);
+        assert!(governor.state.lock().await.cooldown_until.is_none());
+        assert!(governor.websocket_order_budget().reserve().await.is_ok());
+        let order = governor
+            .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+            .await
+            .unwrap();
+        assert_eq!(order.status, 200);
+        assert_eq!(transport.call_count(), 1);
     }
 
     #[tokio::test]
@@ -2393,9 +2513,13 @@ mod tests {
             });
         }
 
-        let BinanceBudgetCooldown::Orders(cooldown) =
-            binance_budget_cooldown(&state, order_cost, now).unwrap()
-        else {
+        let BinanceBudgetCooldown::Orders(cooldown) = binance_budget_cooldown(
+            &state,
+            order_cost,
+            BinanceRequestPriority::TradingCritical,
+            now,
+        )
+        .unwrap() else {
             panic!("the order window must not pause read requests");
         };
 
