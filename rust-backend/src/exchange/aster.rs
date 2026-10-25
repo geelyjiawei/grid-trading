@@ -189,6 +189,286 @@ where
     }
 }
 
+mod funding_history_reader {
+    use super::*;
+    use crate::exchange::funding::{FundingAccountFill, FundingHistorySnapshot, FundingPayment};
+    use rust_decimal::Decimal;
+    use std::{collections::BTreeMap, future::Future};
+
+    const HISTORY_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+    const WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+    const MAX_QUERIES: usize = 256;
+
+    pub(super) async fn load<F, Fut>(
+        exchange: Exchange,
+        symbol: String,
+        from_ms: u64,
+        through_ms: u64,
+        now_ms: u64,
+        fetch: F,
+    ) -> Result<FundingHistorySnapshot, SnapshotError>
+    where
+        F: Fn(&'static str, Parameters) -> Fut + Sync,
+        Fut: Future<Output = Result<String, SnapshotError>> + Send,
+    {
+        if from_ms > through_ms
+            || through_ms > now_ms
+            || now_ms.saturating_sub(from_ms) > HISTORY_MS
+            || through_ms - from_ms > HISTORY_MS
+        {
+            return Err(SnapshotError::new(
+                "funding history window is invalid or exceeds 90 days",
+            ));
+        }
+        let mut payments = collect(
+            "/fapi/v3/income",
+            &symbol,
+            from_ms,
+            through_ms,
+            true,
+            &fetch,
+            payment,
+        )
+        .await?;
+        payments.sort_by_key(|entry| entry.at_ms);
+        let account_fills = if payments.is_empty() {
+            None
+        } else {
+            let mut fills = collect(
+                "/fapi/v3/userTrades",
+                &symbol,
+                from_ms,
+                through_ms,
+                false,
+                &fetch,
+                account_fill,
+            )
+            .await?;
+            fills.sort_by_key(|entry| entry.at_ms);
+            Some(fills)
+        };
+        Ok(FundingHistorySnapshot {
+            exchange,
+            symbol,
+            from_ms,
+            through_ms,
+            payments,
+            account_fills,
+        })
+    }
+
+    async fn collect<R, F, Fut, P>(
+        path: &'static str,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+        income: bool,
+        fetch: &F,
+        parse: P,
+    ) -> Result<Vec<R>, SnapshotError>
+    where
+        R: Clone + PartialEq + Send,
+        F: Fn(&'static str, Parameters) -> Fut + Sync,
+        Fut: Future<Output = Result<String, SnapshotError>> + Send,
+        P: Fn(&Value, &str, u64, u64) -> Result<Option<(u64, R)>, SnapshotError> + Send + Sync,
+    {
+        let mut windows = Vec::new();
+        let mut start = from_ms;
+        loop {
+            let end = start.saturating_add(WINDOW_MS - 1).min(through_ms);
+            windows.push((start, end));
+            if end == through_ms {
+                break;
+            }
+            start = end + 1;
+        }
+        windows.reverse();
+        let mut queries = 0;
+        let mut seen = BTreeMap::new();
+        let mut complete = BTreeMap::new();
+        while let Some((start, end)) = windows.pop() {
+            if queries >= MAX_QUERIES {
+                return Err(SnapshotError::new("funding history query budget exhausted"));
+            }
+            queries += 1;
+            let mut params = vec![
+                ("symbol".into(), symbol.into()),
+                ("startTime".into(), start.to_string()),
+                ("endTime".into(), end.to_string()),
+                ("limit".into(), TRADE_PAGE_LIMIT.to_string()),
+            ];
+            if income {
+                params.push(("incomeType".into(), "FUNDING_FEE".into()));
+            }
+            let body = fetch(path, params).await?;
+            let page: Value = serde_json::from_str(&body)
+                .map_err(|_| SnapshotError::new("funding history response is not valid JSON"))?;
+            let rows = page
+                .as_array()
+                .ok_or_else(|| SnapshotError::new("funding history response is not an array"))?;
+            if rows.len() > TRADE_PAGE_LIMIT {
+                return Err(SnapshotError::new(
+                    "funding history page exceeds requested limit",
+                ));
+            }
+            let full = rows.len() == TRADE_PAGE_LIMIT;
+            for row in rows {
+                if let Some((id, record)) = parse(row, symbol, start, end)? {
+                    if seen.get(&id).is_some_and(|previous| previous != &record) {
+                        return Err(SnapshotError::new("conflicting funding history duplicate"));
+                    }
+                    seen.insert(id, record.clone());
+                    if !full {
+                        complete.insert(id, record);
+                    }
+                }
+            }
+            if full {
+                // Neither endpoint supports fromId with time bounds, and income has no page.
+                // Split inclusive windows rather than advancing past equal-millisecond rows.
+                if start == end {
+                    return Err(SnapshotError::new(
+                        "funding history is truncated within one millisecond",
+                    ));
+                }
+                let midpoint = start + (end - start) / 2;
+                windows.push((midpoint + 1, end));
+                windows.push((start, midpoint));
+            }
+        }
+        if seen != complete {
+            return Err(SnapshotError::new(
+                "funding history changed during pagination",
+            ));
+        }
+        Ok(complete.into_values().collect())
+    }
+
+    fn text<'a>(row: &'a Value, key: &str) -> Result<&'a str, SnapshotError> {
+        row.get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| SnapshotError::new(format!("funding history missing or invalid {key}")))
+    }
+
+    fn number(row: &Value, key: &str) -> Result<u64, SnapshotError> {
+        let value = row
+            .get(key)
+            .ok_or_else(|| SnapshotError::new(format!("funding history missing {key}")))?;
+        if let Some(number) = value.as_u64() {
+            return Ok(number);
+        }
+        if let Some(raw) = value.as_str()
+            && !raw.is_empty()
+            && raw.bytes().all(|byte| byte.is_ascii_digit())
+            && let Ok(number) = raw.parse::<u64>()
+        {
+            return Ok(number);
+        }
+        Err(SnapshotError::new(format!("funding history invalid {key}")))
+    }
+
+    fn decimal(row: &Value, key: &str) -> Result<Decimal, SnapshotError> {
+        let raw = text(row, key)?;
+        let unsigned = raw.strip_prefix('-').unwrap_or(raw);
+        let digits =
+            |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        let valid = match unsigned.split_once('.') {
+            Some((integer, fraction)) => digits(integer) && digits(fraction),
+            None => digits(unsigned),
+        };
+        if !valid {
+            return Err(SnapshotError::new(format!("funding history invalid {key}")));
+        }
+        Decimal::from_str_exact(raw)
+            .map_err(|_| SnapshotError::new(format!("funding history invalid {key}")))
+    }
+
+    fn timestamp(row: &Value, from: u64, through: u64) -> Result<u64, SnapshotError> {
+        let at = number(row, "time")?;
+        if !(from..=through).contains(&at) {
+            return Err(SnapshotError::new(
+                "funding history row is outside requested window",
+            ));
+        }
+        Ok(at)
+    }
+
+    fn payment(
+        row: &Value,
+        symbol: &str,
+        from: u64,
+        through: u64,
+    ) -> Result<Option<(u64, FundingPayment)>, SnapshotError> {
+        let actual_symbol = text(row, "symbol")?;
+        let income_type = text(row, "incomeType")?;
+        if actual_symbol != symbol || income_type != "FUNDING_FEE" {
+            return Ok(None);
+        }
+        let id = number(row, "tranId")?;
+        let at_ms = timestamp(row, from, through)?;
+        let amount = decimal(row, "income")?;
+        let asset = text(row, "asset")?;
+        if asset.is_empty()
+            || !asset
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return Err(SnapshotError::new("funding history invalid asset"));
+        }
+        Ok(Some((
+            id,
+            FundingPayment {
+                id: id.to_string(),
+                at_ms,
+                amount,
+                asset: asset.into(),
+                position_quantity: None,
+            },
+        )))
+    }
+
+    fn account_fill(
+        row: &Value,
+        symbol: &str,
+        from: u64,
+        through: u64,
+    ) -> Result<Option<(u64, FundingAccountFill)>, SnapshotError> {
+        if text(row, "symbol")? != symbol {
+            return Ok(None);
+        }
+        let id = number(row, "id")?;
+        let order_id = number(row, "orderId")?;
+        let at_ms = timestamp(row, from, through)?;
+        let quantity = decimal(row, "qty")?;
+        if quantity < Decimal::ZERO {
+            return Err(SnapshotError::new(
+                "funding account fill quantity is negative",
+            ));
+        }
+        let buy = match text(row, "side")? {
+            "BUY" => true,
+            "SELL" => false,
+            _ => return Err(SnapshotError::new("funding account fill side is invalid")),
+        };
+        if let Some(buyer) = row.get("buyer")
+            && buyer.as_bool() != Some(buy)
+        {
+            return Err(SnapshotError::new(
+                "funding account fill side conflicts with buyer",
+            ));
+        }
+        Ok(Some((
+            id,
+            FundingAccountFill {
+                trade_id: id.to_string(),
+                exchange_order_id: order_id.to_string(),
+                at_ms,
+                signed_quantity: if buy { quantity } else { -quantity },
+            },
+        )))
+    }
+}
+
 #[async_trait]
 impl<T, S, N> AccountBalanceSnapshotGateway for AsterAdapter<T, S, N>
 where
@@ -214,6 +494,31 @@ where
         parse_account_balance_snapshot(&body, Exchange::Aster).map_err(|error| {
             SnapshotError::new(format!("invalid Aster account balance snapshot: {error}"))
         })
+    }
+
+    async fn funding_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        funding_history_reader::load(
+            exchange,
+            symbol.trim().to_ascii_uppercase(),
+            from_ms,
+            through_ms,
+            self.nonce_source.next_nonce() / 1000,
+            |path, parameters| async move {
+                let request = self
+                    .signed_request(HttpMethod::Get, path, parameters)
+                    .map_err(|error| SnapshotError::new(error.to_string()))?;
+                self.execute_snapshot(request, "Aster funding history")
+                    .await
+            },
+        )
+        .await
     }
 }
 
@@ -1648,6 +1953,539 @@ mod tests {
             protocol::{HttpResponse, TransportError},
         },
     };
+
+    mod funding_history_tests {
+        use super::*;
+        use serde_json::json;
+
+        const BASE: u64 = 1_700_000_000_000;
+
+        fn payment(id: u64, at: u64, amount: &str) -> Value {
+            json!({"symbol": "MUUSDT", "incomeType": "FUNDING_FEE",
+                "income": amount, "asset": "USDT", "info": "", "time": at,
+                "tranId": id.to_string(), "tradeId": ""})
+        }
+
+        fn fill(id: u64, at: u64, side: &str) -> Value {
+            json!({"symbol": "MUUSDT", "id": id, "orderId": id + 9000,
+                "time": at, "side": side, "buyer": side == "BUY", "qty": "2.5",
+                "price": "1", "quoteQty": "2.5", "commission": "0",
+                "commissionAsset": "USDT", "realizedPnl": "0", "maker": false,
+                "positionSide": "BOTH"})
+        }
+
+        fn queued(pages: Vec<Value>) -> MockTransport {
+            let transport = MockTransport::default();
+            for page in pages {
+                transport
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .push_back(Ok(HttpResponse {
+                        status: 200,
+                        body: page.to_string(),
+                    }));
+            }
+            transport
+        }
+
+        fn subject(
+            transport: MockTransport,
+        ) -> AsterAdapter<MockTransport, RecordingSigner, FixedNonce> {
+            adapter(
+                transport,
+                RecordingSigner::new("0x2222222222222222222222222222222222222222"),
+            )
+        }
+
+        fn param(request: &PreparedHttpRequest, name: &str) -> String {
+            request
+                .query
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap_or_else(|| panic!("missing query parameter {name}"))
+                .1
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn funding_history_signs_exact_read_only_scope_and_preserves_settlement_signs() {
+            let transport = queued(vec![
+                json!([
+                    payment(0, BASE, "0"),
+                    payment(1, BASE + 50, "-0.125"),
+                    payment(2, BASE + 100, "0.25")
+                ]),
+                json!([fill(0, BASE, "BUY"), fill(1, BASE + 90, "SELL")]),
+            ]);
+            let result = subject(transport.clone())
+                .funding_history(Exchange::Aster, "muusdt", BASE, BASE + 100)
+                .await
+                .unwrap();
+            assert_eq!(result.exchange, Exchange::Aster);
+            assert_eq!(result.symbol, "MUUSDT");
+            assert_eq!((result.from_ms, result.through_ms), (BASE, BASE + 100));
+            assert_eq!(
+                result.payments.iter().map(|p| p.amount).collect::<Vec<_>>(),
+                vec![Decimal::ZERO, Decimal::new(-125, 3), Decimal::new(25, 2)]
+            );
+            assert_eq!(result.payments[1].at_ms, BASE + 50);
+            assert!(
+                result
+                    .payments
+                    .iter()
+                    .all(|p| p.position_quantity.is_none())
+            );
+            let fills = result.account_fills.unwrap();
+            assert_eq!(fills.len(), 2);
+            assert_eq!(fills[0].signed_quantity, Decimal::new(25, 1));
+            assert_eq!(fills[1].signed_quantity, Decimal::new(-25, 1));
+            assert_eq!(fills[1].exchange_order_id, "9001");
+            let requests = transport.all_requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].path, "/fapi/v3/income");
+            assert_eq!(requests[1].path, "/fapi/v3/userTrades");
+            assert_eq!(param(&requests[0], "incomeType"), "FUNDING_FEE");
+            for request in &requests {
+                assert_eq!(request.method, HttpMethod::Get);
+                assert_eq!(param(request, "symbol"), "MUUSDT");
+                assert_eq!(param(request, "startTime"), BASE.to_string());
+                assert_eq!(param(request, "endTime"), (BASE + 100).to_string());
+                assert_eq!(param(request, "limit"), "1000");
+                assert!(request.body.is_empty());
+                assert!(
+                    !request
+                        .query
+                        .iter()
+                        .any(|(key, _)| key == "orderId" || key == "fromId")
+                );
+                assert_eq!(param(request, "nonce"), "1700000000123456");
+                assert_eq!(
+                    param(request, "user"),
+                    "0x1111111111111111111111111111111111111111"
+                );
+                assert_eq!(
+                    param(request, "signer"),
+                    "0x2222222222222222222222222222222222222222"
+                );
+                assert_eq!(param(request, "signature"), "0xfixed-signature");
+            }
+        }
+
+        #[tokio::test]
+        async fn funding_history_empty_payments_do_not_query_account_trades() {
+            let transport = queued(vec![json!([])]);
+            let result = subject(transport.clone())
+                .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                .await
+                .unwrap();
+            assert!(result.payments.is_empty());
+            assert!(result.account_fills.is_none());
+            assert_eq!(transport.all_requests().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn funding_history_filters_other_symbols_and_income_types_before_attribution() {
+            let mut other = payment(1, BASE + 50, "10");
+            other["symbol"] = json!("BTCUSDT");
+            let mut commission = payment(2, BASE + 50, "-10");
+            commission["incomeType"] = json!("COMMISSION");
+            let mut unrelated_fill = fill(1, BASE + 20, "BUY");
+            unrelated_fill["symbol"] = json!("BTCUSDT");
+            let transport = queued(vec![
+                json!([other, commission, payment(3, BASE + 50, "1")]),
+                json!([unrelated_fill, fill(2, BASE + 30, "SELL")]),
+            ]);
+            let result = subject(transport)
+                .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                .await
+                .unwrap();
+            assert_eq!(result.payments.len(), 1);
+            assert_eq!(result.payments[0].id, "3");
+            assert_eq!(result.account_fills.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn funding_history_completes_full_income_pages_without_skipping_equal_timestamps() {
+            let rows: Vec<_> = (0..1000)
+                .map(|id| payment(id, if id < 500 { BASE - 750 } else { BASE - 250 }, "-1"))
+                .collect();
+            let transport = queued(vec![
+                json!(rows),
+                json!(&rows[..500]),
+                json!(&rows[500..]),
+                json!([]),
+            ]);
+            let result = subject(transport.clone())
+                .funding_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                .await
+                .unwrap();
+            assert_eq!(result.payments.len(), 1000);
+            assert_eq!(result.payments[999].at_ms, BASE - 250);
+            assert_eq!(transport.all_requests().len(), 4);
+            let requests = transport.all_requests();
+            assert_eq!(param(&requests[1], "endTime"), (BASE - 501).to_string());
+            assert_eq!(param(&requests[2], "startTime"), (BASE - 500).to_string());
+        }
+
+        #[tokio::test]
+        async fn funding_history_completes_all_account_trade_pages_and_preserves_both_sides() {
+            let rows: Vec<_> = (0..1000)
+                .map(|id| {
+                    fill(
+                        id,
+                        BASE - 1000 + id,
+                        if id % 2 == 0 { "BUY" } else { "SELL" },
+                    )
+                })
+                .collect();
+            let transport = queued(vec![
+                json!([payment(1, BASE - 1, "-1")]),
+                json!(rows),
+                json!(&rows[..500]),
+                json!(&rows[500..]),
+            ]);
+            let result = subject(transport.clone())
+                .funding_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                .await
+                .unwrap();
+            let fills = result.account_fills.unwrap();
+            assert_eq!(fills.len(), 1000);
+            assert_eq!(fills[0].signed_quantity, Decimal::new(25, 1));
+            assert_eq!(fills[999].signed_quantity, Decimal::new(-25, 1));
+            assert_eq!(transport.all_requests().len(), 4);
+        }
+
+        #[tokio::test]
+        async fn funding_history_uses_disjoint_seven_day_windows_for_income_and_account_trades() {
+            let from = BASE - 8 * 24 * 60 * 60 * 1000;
+            let transport = queued(vec![
+                json!([payment(1, from + 1, "-1")]),
+                json!([]),
+                json!([]),
+                json!([]),
+            ]);
+            subject(transport.clone())
+                .funding_history(Exchange::Aster, "MUUSDT", from, BASE)
+                .await
+                .unwrap();
+            let requests = transport.all_requests();
+            assert_eq!(requests.len(), 4);
+            for pair in [&requests[0..2], &requests[2..4]] {
+                let first_end = param(&pair[0], "endTime").parse::<u64>().unwrap();
+                assert_eq!(first_end - from, 7 * 24 * 60 * 60 * 1000 - 1);
+                assert_eq!(
+                    param(&pair[1], "startTime").parse::<u64>().unwrap(),
+                    first_end + 1
+                );
+                assert_eq!(param(&pair[1], "endTime"), BASE.to_string());
+            }
+        }
+
+        #[tokio::test]
+        async fn funding_history_rejects_missing_or_malformed_payment_fields() {
+            for field in ["tranId", "time", "income", "asset", "symbol", "incomeType"] {
+                let mut row = payment(1, BASE + 50, "0");
+                row.as_object_mut().unwrap().remove(field);
+                let transport = queued(vec![json!([row])]);
+                assert!(
+                    subject(transport)
+                        .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err(),
+                    "missing {field}"
+                );
+            }
+            for (field, value) in [
+                ("tranId", json!("")),
+                ("tranId", json!("-1")),
+                ("tranId", json!("1.5")),
+                ("time", json!(-1)),
+                ("income", json!("NaN")),
+                ("income", json!("")),
+                ("income", json!("1_000")),
+                ("income", json!("+1")),
+                ("income", json!(".1")),
+                ("income", json!("1.")),
+                ("income", json!("0.123456789012345678901234567890")),
+                ("asset", json!("")),
+                ("income", json!(0)),
+            ] {
+                let mut row = payment(1, BASE + 50, "0");
+                row[field] = value;
+                let transport = queued(vec![json!([row])]);
+                assert!(
+                    subject(transport)
+                        .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err(),
+                    "invalid {field}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn funding_history_rejects_missing_or_malformed_account_fills() {
+            for field in ["id", "orderId", "time", "qty", "side", "symbol"] {
+                let mut row = fill(1, BASE + 50, "BUY");
+                row.as_object_mut().unwrap().remove(field);
+                let transport = queued(vec![json!([payment(1, BASE + 100, "-1")]), json!([row])]);
+                assert!(
+                    subject(transport)
+                        .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err(),
+                    "missing {field}"
+                );
+            }
+            for (field, value) in [
+                ("id", json!("bad")),
+                ("orderId", json!("")),
+                ("qty", json!("-1")),
+                ("qty", json!("NaN")),
+                ("side", json!("LONG")),
+                ("buyer", json!(false)),
+                ("time", json!(BASE + 101)),
+                ("qty", json!("0.123456789012345678901234567890")),
+            ] {
+                let mut row = fill(1, BASE + 50, "BUY");
+                row[field] = value;
+                let transport = queued(vec![json!([payment(1, BASE + 100, "-1")]), json!([row])]);
+                assert!(
+                    subject(transport)
+                        .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err(),
+                    "invalid {field}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn funding_history_zero_quantity_is_not_a_missing_field() {
+            let mut row = fill(0, BASE, "BUY");
+            row["qty"] = json!("0");
+            let result = subject(queued(vec![json!([payment(0, BASE, "0")]), json!([row])]))
+                .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.account_fills.unwrap()[0].signed_quantity,
+                Decimal::ZERO
+            );
+        }
+
+        #[tokio::test]
+        async fn funding_history_fails_closed_on_conflicting_duplicates_and_wrong_windows() {
+            let mut conflict = payment(1, BASE + 50, "1");
+            conflict["income"] = json!("2");
+            for rows in [
+                json!([payment(1, BASE + 50, "1"), conflict]),
+                json!([payment(1, BASE - 1, "1")]),
+                json!([payment(1, BASE + 101, "1")]),
+            ] {
+                assert!(
+                    subject(queued(vec![rows]))
+                        .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err()
+                );
+            }
+            let mut conflict = fill(1, BASE + 50, "BUY");
+            conflict["qty"] = json!("3");
+            assert!(
+                subject(queued(vec![
+                    json!([payment(1, BASE + 100, "1")]),
+                    json!([fill(1, BASE + 50, "BUY"), conflict])
+                ]))
+                .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                .await
+                .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn funding_history_fails_closed_when_one_millisecond_is_saturated() {
+            let income_rows: Vec<_> = (0..1000).map(|id| payment(id, BASE, "-1")).collect();
+            assert!(
+                subject(queued(vec![json!(income_rows)]))
+                    .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                    .await
+                    .is_err()
+            );
+            let trade_rows: Vec<_> = (0..1000).map(|id| fill(id, BASE, "BUY")).collect();
+            assert!(
+                subject(queued(vec![
+                    json!([payment(1, BASE, "-1")]),
+                    json!(trade_rows)
+                ]))
+                .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                .await
+                .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn funding_history_rejects_invalid_or_unavailable_history_before_network() {
+            let transport = MockTransport::default();
+            let adapter = subject(transport.clone());
+            for (exchange, symbol, from, through) in [
+                (Exchange::Binance, "MUUSDT", BASE, BASE + 100),
+                (Exchange::Aster, "", BASE, BASE + 100),
+                (Exchange::Aster, "MUUSDT", BASE + 100, BASE),
+                (
+                    Exchange::Aster,
+                    "MUUSDT",
+                    BASE - 91 * 24 * 60 * 60 * 1000,
+                    BASE,
+                ),
+                (
+                    Exchange::Aster,
+                    "MUUSDT",
+                    BASE - 90 * 24 * 60 * 60 * 1000,
+                    BASE - 1,
+                ),
+                (Exchange::Aster, "MUUSDT", BASE, BASE + 124),
+            ] {
+                assert!(
+                    adapter
+                        .funding_history(exchange, symbol, from, through)
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(transport.all_requests().is_empty());
+        }
+
+        #[tokio::test]
+        async fn funding_history_deduplicates_identical_rows_without_double_counting() {
+            let result = subject(queued(vec![
+                json!([payment(1, BASE + 50, "1"), payment(1, BASE + 50, "1")]),
+                json!([fill(1, BASE + 20, "BUY"), fill(1, BASE + 20, "BUY")]),
+            ]))
+            .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+            .await
+            .unwrap();
+            assert_eq!(result.payments.len(), 1);
+            assert_eq!(result.account_fills.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn funding_history_rejects_conflicts_between_parent_and_subdivided_pages() {
+            let rows: Vec<_> = (0..1000)
+                .map(|id| payment(id, BASE - 1000 + id, "-1"))
+                .collect();
+            let mut changed = rows[..500].to_vec();
+            changed[0]["income"] = json!("-2");
+            assert!(
+                subject(queued(vec![json!(rows), json!(changed)]))
+                    .funding_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn funding_history_rejects_oversized_pages_and_interrupted_pagination() {
+            let rows: Vec<_> = (0..1001).map(|id| payment(id, BASE + 50, "1")).collect();
+            assert!(
+                subject(queued(vec![json!(rows)]))
+                    .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                    .await
+                    .is_err()
+            );
+            let rows: Vec<_> = (0..1000)
+                .map(|id| payment(id, BASE - 1000 + id, "-1"))
+                .collect();
+            let transport = queued(vec![json!(rows)]);
+            transport
+                .responses
+                .lock()
+                .unwrap()
+                .push_back(Err(TransportError::Timeout("interrupted".into())));
+            assert!(
+                subject(transport)
+                    .funding_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[derive(Clone, Default)]
+        struct SaturatedHistoryTransport(Arc<std::sync::atomic::AtomicUsize>);
+
+        #[async_trait]
+        impl HttpTransport for SaturatedHistoryTransport {
+            async fn execute(
+                &self,
+                request: PreparedHttpRequest,
+            ) -> Result<HttpResponse, TransportError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(request.path, "/fapi/v3/income");
+                let from = param(&request, "startTime").parse::<u64>().unwrap();
+                let through = param(&request, "endTime").parse::<u64>().unwrap();
+                let rows: Vec<_> = if through - from >= 1000 {
+                    (0..1000)
+                        .map(|index| {
+                            let at = from + index * (through - from) / 1000;
+                            payment(at, at, "1")
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    body: json!(rows).to_string(),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn funding_history_query_budget_is_an_error_not_an_incomplete_snapshot() {
+            let transport = SaturatedHistoryTransport::default();
+            let adapter = AsterAdapter::with_base_url(
+                transport.clone(),
+                RecordingSigner::new("0x2222222222222222222222222222222222222222"),
+                FixedNonce(1_700_000_000_123_456),
+                "0x1111111111111111111111111111111111111111",
+                "https://example.test",
+            );
+            let error = adapter
+                .funding_history(
+                    Exchange::Aster,
+                    "MUUSDT",
+                    BASE - 8 * 24 * 60 * 60 * 1000,
+                    BASE,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("query budget"), "{error}");
+            assert!(transport.0.load(std::sync::atomic::Ordering::Relaxed) <= 256);
+        }
+
+        #[tokio::test]
+        async fn funding_history_does_not_turn_transport_or_http_errors_into_zero() {
+            for response in [
+                Err(TransportError::Timeout("offline".into())),
+                Ok(HttpResponse {
+                    status: 429,
+                    body: r#"{"code":-1003,"msg":"rate limited"}"#.into(),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "{}".into(),
+                }),
+            ] {
+                assert!(
+                    subject(MockTransport::with_response(response))
+                        .funding_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct FixedNonce(u64);

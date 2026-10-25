@@ -247,6 +247,11 @@ export interface RiskSnapshot {
   realized_net_profit?: DecimalValue | null;
   unrealised_pnl?: DecimalValue | null;
   grid_unrealised_pnl?: DecimalValue | null;
+  funding_status?: "verified" | "unavailable";
+  funding_net_income?: string | null;
+  funding_payment_count?: number | null;
+  funding_observed_through_ms?: number | null;
+  trading_net_equity_profit?: string | null;
   total_equity_profit?: DecimalValue | null;
   total_profit?: DecimalValue | null;
   total_fee?: DecimalValue;
@@ -254,6 +259,7 @@ export interface RiskSnapshot {
   completed_pairs?: number;
   profit_scope?: "strategy_owned_inventory" | string;
   profit_calculation_error?: string | null;
+  fee_valuation_pending_count?: number;
   [key: string]: unknown;
 }
 
@@ -262,6 +268,8 @@ export interface GridHistoryResponse {
 }
 
 export interface GridHistoryRun {
+  run_id?: string;
+  grid_count?: number;
   started_at?: string | number;
   symbol?: string;
   exchange?: Exchange;

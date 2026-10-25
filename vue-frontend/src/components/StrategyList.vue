@@ -1,17 +1,31 @@
 <script setup lang="ts">
-import type { Exchange, GridStatus } from "../api/types";
-import { directionName, exchangeName, formatNumber, strategyStatusLabel } from "../format";
+import type { Exchange, GridStatus, RiskSnapshot } from "../api/types";
+import { directionName, exchangeName, formatNumber, quoteAsset, strategyStatusLabel } from "../format";
+import { matchingStrategyRisk, profitTone, strategyNetProfit } from "../strategy-profit";
 
-defineProps<{
+const props = withDefaults(defineProps<{
   grids: GridStatus[];
   activeExchange: Exchange;
   activeSymbol: string;
   loading: boolean;
-}>();
+  currentRisk?: RiskSnapshot | null;
+  risks?: RiskSnapshot[];
+}>(), { currentRisk: null, risks: () => [] });
 
 const emit = defineEmits<{
   select: [grid: GridStatus];
 }>();
+
+function riskFor(grid: GridStatus): RiskSnapshot | null {
+  if (grid.exchange === props.activeExchange && grid.symbol === props.activeSymbol) {
+    return matchingStrategyRisk(grid, props.currentRisk);
+  }
+  return props.risks.find(risk => matchingStrategyRisk(grid, risk)) ?? null;
+}
+
+function netProfit(grid: GridStatus) {
+  return strategyNetProfit(grid, riskFor(grid));
+}
 </script>
 
 <template>
@@ -42,10 +56,10 @@ const emit = defineEmits<{
         <small>{{ exchangeName(grid.exchange) }} · {{ directionName(grid.direction) }} · {{ grid.grid_mode === "geometric" ? "等比" : "等差" }} · {{ strategyStatusLabel(grid) }}</small>
       </span>
       <span class="strategy-profit">
-        <strong :class="Number(grid.realized_net_profit ?? grid.total_profit ?? 0) >= 0 ? 'positive' : 'negative'">
-          {{ formatNumber(grid.realized_net_profit ?? grid.total_profit, 4) }}
+        <strong :class="profitTone(netProfit(grid))" title="本轮已实现盈亏＋本轮浮动盈亏－成交手续费＋已结算资金费；资金费核对最多延迟60秒；未来平仓手续费尚未发生，未计入">
+          {{ netProfit(grid) == null ? "待核对" : `${formatNumber(netProfit(grid), 4)} ${quoteAsset(grid.exchange)}` }}
         </strong>
-        <small>已实现净利润 · 完成 {{ grid.completed_pairs ?? 0 }} 次</small>
+        <small>净收益（含浮盈亏及资金费） · 完成 {{ riskFor(grid)?.completed_pairs ?? grid.completed_pairs ?? 0 }} 次</small>
       </span>
     </button>
   </section>

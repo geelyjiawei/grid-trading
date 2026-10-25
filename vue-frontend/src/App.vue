@@ -24,14 +24,16 @@ import ExchangeSettingsDialog from "./components/ExchangeSettingsDialog.vue";
 import GridConfigurationPanel from "./components/GridConfigurationPanel.vue";
 import MarketOverview from "./components/MarketOverview.vue";
 import StrategyList from "./components/StrategyList.vue";
-import StrategyDetailsPanel from "./components/StrategyDetailsPanel.vue";
 import StrategyOverview from "./components/StrategyOverview.vue";
+import ExchangeRecordsPanel from "./components/ExchangeRecordsPanel.vue";
 import { exchangeName, quoteAsset, strategyCanStop } from "./format";
+import { matchingStrategyRisk } from "./strategy-profit";
 
 const exchanges: Exchange[] = ["binance", "aster", "bybit", "trade_xyz"];
 const SYMBOL_REFRESH_DELAY_MS = 450;
 const PRICE_POLL_INTERVAL_MS = 5_000;
 const SLOW_MARKET_POLL_INTERVAL_MS = 30_000;
+const PROFIT_SNAPSHOT_MAX_AGE_MS = 60_000;
 type ColorTheme = "dark" | "light";
 interface MarketRefreshOptions {
   price: boolean;
@@ -67,6 +69,9 @@ const grids = ref<GridStatus[]>([]);
 const tradingEnabled = ref(false);
 const selectedStatus = ref<GridStatus | null>(null);
 const risk = ref<RiskSnapshot | null>(null);
+const riskReceivedAt = ref(0);
+const profitClock = ref(Date.now());
+const profitSnapshots = ref<Record<string, { risk: RiskSnapshot; receivedAt: number }>>({});
 const positions = ref<PositionSnapshot[]>([]);
 const openOrders = ref<GridOrder[]>([]);
 const trades = ref<GridTrade[]>([]);
@@ -106,6 +111,75 @@ let marketContext = "";
 let balanceContext = "";
 let detailsContext = "";
 const riskRequestsInFlight = new Map<string, Promise<RiskSnapshot>>();
+const profitAttempts = new Map<string, number>();
+let profitRefreshRunning = false;
+let disposed = false;
+
+const visibleRisk = computed(() =>
+  profitClock.value - riskReceivedAt.value < PROFIT_SNAPSHOT_MAX_AGE_MS ? risk.value : null,
+);
+const strategyRisks = computed(() => Object.values(profitSnapshots.value)
+  .filter(snapshot => profitClock.value - snapshot.receivedAt < PROFIT_SNAPSHOT_MAX_AGE_MS)
+  .map(snapshot => snapshot.risk));
+
+function profitKey(grid: GridStatus): string | null {
+  return grid.run_id ? `${grid.exchange}:${grid.symbol}:${grid.run_id}` : null;
+}
+
+function requestRisk(exchange: Exchange, requestedSymbol: string): Promise<RiskSnapshot> {
+  const context = `${exchange}:${requestedSymbol}`;
+  const existing = riskRequestsInFlight.get(context);
+  if (existing) return existing;
+  const requestedGrid = grids.value.find(grid => grid.exchange === exchange && grid.symbol === requestedSymbol);
+  const requestedKey = requestedGrid ? profitKey(requestedGrid) : null;
+  const request = api.risk(exchange, requestedSymbol);
+  riskRequestsInFlight.set(context, request);
+  const finish = () => {
+    if (riskRequestsInFlight.get(context) === request) riskRequestsInFlight.delete(context);
+    if (requestedKey) profitAttempts.set(requestedKey, Date.now());
+  };
+  const invalidate = () => {
+    if (!requestedKey) return;
+    const next = { ...profitSnapshots.value };
+    delete next[requestedKey];
+    profitSnapshots.value = next;
+  };
+  void request.then(value => {
+    finish();
+    if (disposed || !authenticated.value) return;
+    const grid = grids.value.find(grid => grid.exchange === exchange && grid.symbol === requestedSymbol
+      && matchingStrategyRisk(grid, value));
+    const key = grid ? profitKey(grid) : null;
+    if (key) {
+      profitSnapshots.value = { ...profitSnapshots.value, [key]: { risk: value, receivedAt: Date.now() } };
+      profitClock.value = Date.now();
+    } else {
+      invalidate();
+    }
+  }, () => {
+    finish();
+    invalidate();
+  });
+  return request;
+}
+
+async function refreshStrategyProfits(): Promise<void> {
+  if (disposed || profitRefreshRunning || !authenticated.value || riskRequestsInFlight.size > 0) return;
+  profitRefreshRunning = true;
+  try {
+    // Reuse the selected strategy's request; serialize only background reads.
+    for (const grid of grids.value) {
+      if (disposed || !authenticated.value || riskRequestsInFlight.size > 0) break;
+      const key = profitKey(grid);
+      if (!key || !config.value?.configs[grid.exchange]?.configured
+        || (grid.exchange === activeExchange.value && grid.symbol === symbol.value)
+        || Date.now() - (profitAttempts.get(key) ?? 0) < SLOW_MARKET_POLL_INTERVAL_MS) continue;
+      await requestRisk(grid.exchange, grid.symbol).catch(() => undefined);
+    }
+  } finally {
+    profitRefreshRunning = false;
+  }
+}
 
 function applyTheme(nextTheme: ColorTheme): void {
   theme.value = nextTheme;
@@ -240,6 +314,12 @@ async function refreshStrategies(): Promise<void> {
     const response = await api.gridStatus();
     tradingEnabled.value = response.trading_enabled === true;
     grids.value = response.grids ?? [];
+    const liveKeys = new Set(grids.value.map(profitKey));
+    profitSnapshots.value = Object.fromEntries(Object.entries(profitSnapshots.value)
+      .filter(([key]) => liveKeys.has(key)));
+    for (const key of profitAttempts.keys()) {
+      if (!liveKeys.has(key)) profitAttempts.delete(key);
+    }
     selectedStatus.value =
       grids.value.find(
         (grid) => grid.exchange === activeExchange.value && grid.symbol === symbol.value,
@@ -249,6 +329,7 @@ async function refreshStrategies(): Promise<void> {
     tradingEnabled.value = false;
     strategyError.value = messageFrom(reason, "无法读取运行策略");
   } finally {
+    profitClock.value = Date.now();
     statusRefreshRunning = false;
     loading.value = false;
   }
@@ -269,7 +350,6 @@ async function refreshMarket(options: MarketRefreshOptions = fullMarketRefresh):
   }
   const exchange = activeExchange.value;
   const requestedSymbol = symbol.value;
-  const requestContext = `${exchange}:${requestedSymbol}`;
   const requestSequence = ++marketRequestSequence;
   const failures: string[] = [];
   const requestIsCurrent = () => (
@@ -316,30 +396,9 @@ async function refreshMarket(options: MarketRefreshOptions = fullMarketRefresh):
       ));
     }
     if (options.risk) {
-      let riskRequest: Promise<RiskSnapshot>;
-      const existingRiskRequest = riskRequestsInFlight.get(requestContext);
-      if (existingRiskRequest) {
-        riskRequest = existingRiskRequest;
-      } else {
-        const nextRiskRequest = api.risk(exchange, requestedSymbol);
-        riskRequestsInFlight.set(requestContext, nextRiskRequest);
-        void nextRiskRequest.then(
-          () => {
-            if (riskRequestsInFlight.get(requestContext) === nextRiskRequest) {
-              riskRequestsInFlight.delete(requestContext);
-            }
-          },
-          () => {
-            if (riskRequestsInFlight.get(requestContext) === nextRiskRequest) {
-              riskRequestsInFlight.delete(requestContext);
-            }
-          },
-        );
-        riskRequest = nextRiskRequest;
-      }
       requests.push(settle(
-        riskRequest,
-        (value) => { risk.value = value; },
+        requestRisk(exchange, requestedSymbol),
+        (value) => { risk.value = value; riskReceivedAt.value = Date.now(); },
         () => { risk.value = null; },
       ));
     }
@@ -372,6 +431,7 @@ async function refreshWorkspace(): Promise<void> {
   } finally {
     loading.value = false;
   }
+  void refreshStrategyProfits();
 }
 
 async function refreshSymbolWorkspace(): Promise<void> {
@@ -541,7 +601,7 @@ function startPolling(): void {
   window.clearInterval(statusTimer);
   window.clearInterval(priceTimer);
   window.clearInterval(slowMarketTimer);
-  statusTimer = window.setInterval(() => void refreshStrategies(), 3000);
+  statusTimer = window.setInterval(() => void refreshStrategies().then(refreshStrategyProfits), 3000);
   priceTimer = window.setInterval(
     () => void refreshMarket({ price: true, balance: false, fees: false, risk: false }),
     PRICE_POLL_INTERVAL_MS,
@@ -638,6 +698,7 @@ async function selectStrategy(grid: GridStatus): Promise<void> {
 
 onMounted(() => void checkAuth());
 onUnmounted(() => {
+  disposed = true;
   window.clearInterval(statusTimer);
   window.clearInterval(priceTimer);
   window.clearInterval(slowMarketTimer);
@@ -748,15 +809,18 @@ onUnmounted(() => {
       />
       <StrategyList
         :grids="grids"
+        :risks="strategyRisks"
+        :current-risk="visibleRisk"
         :active-exchange="activeExchange"
         :active-symbol="symbol"
         :loading="loading"
         @select="selectStrategy"
       />
       <StrategyOverview
-        class="dashboard-span"
+        :key="`${activeExchange}:${symbol}:${selectedStatus?.run_id ?? ''}`"
+        class="dashboard-span bot-workspace"
         :status="selectedStatus"
-        :risk="risk"
+        :risk="visibleRisk"
         :stop-busy="stopBusy"
         :stop-error="stopError"
         @stop="stopStrategy"
@@ -778,7 +842,7 @@ onUnmounted(() => {
         @preview="requestPreview"
         @start="startStrategy"
       />
-      <StrategyDetailsPanel
+      <ExchangeRecordsPanel
         :exchange="activeExchange"
         :symbol="symbol"
         :configured="configured"

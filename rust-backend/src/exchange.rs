@@ -35,6 +35,7 @@ mod bybit_codec;
 mod codec;
 pub mod configured;
 mod execution;
+pub mod funding;
 pub mod protocol;
 pub mod realtime;
 pub mod registry;
@@ -541,6 +542,16 @@ pub trait AccountBalanceSnapshotGateway: Send + Sync {
         &self,
         exchange: Exchange,
     ) -> Result<AccountBalanceSnapshot, SnapshotError>;
+
+    async fn funding_history(
+        &self,
+        _exchange: Exchange,
+        _symbol: &str,
+        _from_ms: u64,
+        _through_ms: u64,
+    ) -> Result<funding::FundingHistorySnapshot, SnapshotError> {
+        Err(SnapshotError::new("settled funding history is unavailable"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

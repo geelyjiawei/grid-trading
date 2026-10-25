@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { GridStatus, RiskSnapshot } from "../api/types";
+import { matchingStrategyRisk, profitTone, strategyFundingIncome, strategyNetProfit } from "../strategy-profit";
 import {
   directionName,
   formatExactDecimal,
@@ -23,21 +24,12 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{ stop: [] }>();
 const stopConfirmation = ref(false);
-const currentRisk = computed(() => {
-  if (!props.status?.run_id || !props.risk) return null;
-  if (
-    props.risk.run_id !== props.status.run_id
-    || props.risk.exchange !== props.status.exchange
-    || props.risk.symbol !== props.status.symbol
-  ) {
-    return null;
-  }
-  return props.risk;
-});
+const currentRisk = computed(() => matchingStrategyRisk(props.status, props.risk));
 const realizedNetProfit = computed(
   () => currentRisk.value?.realized_net_profit ?? props.status?.realized_net_profit ?? props.status?.total_profit,
 );
-const totalEquityProfit = computed(() => currentRisk.value?.total_equity_profit ?? null);
+const totalEquityProfit = computed(() => strategyNetProfit(props.status, currentRisk.value));
+const fundingNetIncome = computed(() => strategyFundingIncome(props.status, currentRisk.value));
 const gridUnrealizedProfit = computed(
   () => currentRisk.value?.grid_unrealised_pnl ?? currentRisk.value?.unrealised_pnl ?? null,
 );
@@ -255,16 +247,19 @@ function positionLabel(value: unknown): string {
         </dl>
       </section>
       <div class="metric-grid strategy-metrics">
-        <div class="metric-primary"><span>总权益利润</span><strong :class="Number(totalEquityProfit ?? 0) >= 0 ? 'positive' : 'negative'">{{ formatNumber(totalEquityProfit, 4) }} {{ settlementAsset }}</strong></div>
+        <div class="metric-primary"><span>总权益利润</span><strong :class="profitTone(totalEquityProfit)">{{ totalEquityProfit == null ? "待核对" : `${formatNumber(totalEquityProfit, 4)} ${settlementAsset}` }}</strong></div>
         <div><span>已实现净利润</span><strong>{{ formatNumber(realizedNetProfit, 4) }} {{ settlementAsset }}</strong></div>
         <div><span>网格未实现盈亏</span><strong>{{ formatNumber(gridUnrealizedProfit, 4) }} {{ settlementAsset }}</strong></div>
         <div><span>手续费</span><strong>{{ formatNumber(totalFee, 4) }} {{ settlementAsset }}</strong></div>
+        <div data-testid="settled-funding" title="已结算资金费：正数收入，负数支出"><span>已结算资金费</span><strong :class="profitTone(fundingNetIncome)">{{ fundingNetIncome == null ? "待核对" : `${formatNumber(fundingNetIncome, 4)} ${settlementAsset}` }}</strong></div>
         <div><span>总交易量</span><strong>{{ formatNumber(totalVolume, 2) }} {{ settlementAsset }}</strong></div>
         <div><span>网格净持仓</span><strong>{{ formatNumber(status.grid_position_net_qty, 8) }}</strong></div>
         <div><span>完成配对</span><strong>{{ completedPairs }}</strong></div>
         <div><span>方向 / 模式</span><strong>{{ directionName(status.direction) }} · {{ status.grid_mode === "geometric" ? "等比" : "等差" }}</strong></div>
       </div>
-      <p v-if="!currentRisk" class="form-hint">总权益利润等待当前策略的交易所权威风险快照，不使用旧数据或账户整仓盈亏代替。</p>
+      <p class="form-hint">总权益利润＝本轮已实现盈亏＋本轮浮动盈亏－成交手续费＋已结算资金费。已实现净利润仅扣成交手续费，不含资金费。不含旧仓和手动仓位盈亏；未来平仓手续费尚未发生，未计入。</p>
+      <p class="form-hint">已结算资金费：正数收入，负数支出。资金费核对最多延迟60秒，并非逐笔实时更新。</p>
+      <p v-if="totalEquityProfit == null" class="form-hint">总权益利润等待当前策略的交易所权威风险快照、手续费估值及已结算资金费核实，不使用旧数据或账户整仓盈亏代替。</p>
       <p v-if="status.trigger_message" class="form-hint">{{ status.trigger_message }}</p>
       <p v-if="stopError" class="form-error">{{ stopError }}</p>
     </template>

@@ -420,10 +420,7 @@ impl BinanceWebsocketOrderBudget {
         prune_binance_usage(&mut state, now);
         if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
             let cooldown = match limit {
-                BinanceBudgetCooldown::AllRequests(cooldown) => {
-                    state.cooldown_until = Some(now + cooldown);
-                    cooldown
-                }
+                BinanceBudgetCooldown::RequestWeight(cooldown) => cooldown,
                 BinanceBudgetCooldown::Orders(cooldown) => {
                     state.order_cooldown_until = Some(now + cooldown);
                     cooldown
@@ -557,10 +554,7 @@ where
             prune_binance_usage(&mut state, now);
             if let Some(limit) = binance_budget_cooldown(&state, request_cost, now) {
                 let cooldown = match limit {
-                    BinanceBudgetCooldown::AllRequests(cooldown) => {
-                        state.cooldown_until = Some(now + cooldown);
-                        cooldown
-                    }
+                    BinanceBudgetCooldown::RequestWeight(cooldown) => cooldown,
                     BinanceBudgetCooldown::Orders(cooldown) => {
                         state.order_cooldown_until = Some(now + cooldown);
                         cooldown
@@ -905,6 +899,7 @@ fn binance_request_cost(request: &PreparedHttpRequest) -> BinanceRequestCost {
         .chain(request.body.iter())
         .any(|(key, value)| key == "symbol" && !value.is_empty());
     let weight = match (request.method, request.path.as_str()) {
+        (_, "/fapi/v1/income") => 30,
         (_, "/fapi/v1/commissionRate") => 20,
         (_, "/fapi/v3/account")
         | (_, "/fapi/v2/positionRisk")
@@ -935,8 +930,16 @@ fn binance_request_priority(request: &PreparedHttpRequest) -> BinanceRequestPrio
     match (request.method, request.path.as_str()) {
         (HttpMethod::Post | HttpMethod::Delete, "/fapi/v1/order")
         | (HttpMethod::Post | HttpMethod::Delete, "/fapi/v1/batchOrders")
-        | (HttpMethod::Get, "/fapi/v1/order")
-        | (HttpMethod::Get, "/fapi/v1/userTrades") => BinanceRequestPriority::TradingCritical,
+        | (HttpMethod::Get, "/fapi/v1/order") => BinanceRequestPriority::TradingCritical,
+        (HttpMethod::Get, "/fapi/v1/userTrades")
+            if request
+                .query
+                .iter()
+                .chain(request.body.iter())
+                .any(|(key, value)| key == "orderId" && !value.trim().is_empty()) =>
+        {
+            BinanceRequestPriority::TradingCritical
+        }
         _ => BinanceRequestPriority::Normal,
     }
 }
@@ -960,7 +963,8 @@ fn binance_budget(limit: u32) -> u32 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinanceBudgetCooldown {
-    AllRequests(Duration),
+    // Local weight exhaustion rejects this request only; cheaper requests may still fit.
+    RequestWeight(Duration),
     Orders(Duration),
 }
 
@@ -1004,7 +1008,7 @@ fn binance_budget_cooldown(
     if exceeds_weight {
         let cooldown = remaining_for(BINANCE_RATE_LIMIT_WINDOW, |event| event.cost.weight > 0)
             .saturating_add(Duration::from_millis(1));
-        return Some(BinanceBudgetCooldown::AllRequests(cooldown));
+        return Some(BinanceBudgetCooldown::RequestWeight(cooldown));
     }
     let mut cooldown = Duration::ZERO;
     if exceeds_orders {
@@ -1566,13 +1570,19 @@ mod tests {
         }
     }
 
+    fn execution_request() -> PreparedHttpRequest {
+        let mut request = symbol_request(HttpMethod::Get, "/fapi/v1/userTrades");
+        request.query.push(("orderId".into(), "123".into()));
+        request
+    }
+
     #[test]
     fn binance_request_priority_is_limited_to_execution_critical_routes() {
         for request in [
             symbol_request(HttpMethod::Post, "/fapi/v1/order"),
             symbol_request(HttpMethod::Delete, "/fapi/v1/order"),
             symbol_request(HttpMethod::Get, "/fapi/v1/order"),
-            symbol_request(HttpMethod::Get, "/fapi/v1/userTrades"),
+            execution_request(),
         ] {
             assert_eq!(
                 binance_request_priority(&request),
@@ -1583,12 +1593,74 @@ mod tests {
             symbol_request(HttpMethod::Get, "/fapi/v1/premiumIndex"),
             symbol_request(HttpMethod::Get, "/fapi/v1/openOrders"),
             symbol_request(HttpMethod::Get, "/fapi/v3/account"),
+            symbol_request(HttpMethod::Get, "/fapi/v1/userTrades"),
+            symbol_request(HttpMethod::Get, "/fapi/v1/income"),
         ] {
             assert_eq!(
                 binance_request_priority(&request),
                 BinanceRequestPriority::Normal
             );
         }
+    }
+
+    #[test]
+    fn binance_user_trades_requires_a_nonempty_order_id_for_critical_priority() {
+        let mut request = symbol_request(HttpMethod::Get, "/fapi/v1/userTrades");
+        request.query.push(("orderId".into(), String::new()));
+        assert_eq!(
+            binance_request_priority(&request),
+            BinanceRequestPriority::Normal
+        );
+        request.query.pop();
+        request.body.push(("orderId".into(), "123".into()));
+        assert_eq!(
+            binance_request_priority(&request),
+            BinanceRequestPriority::TradingCritical
+        );
+    }
+
+    #[test]
+    fn binance_funding_and_trade_history_reserve_their_full_request_weights() {
+        for (request, weight) in [
+            (symbol_request(HttpMethod::Get, "/fapi/v1/income"), 30),
+            (symbol_request(HttpMethod::Get, "/fapi/v1/userTrades"), 5),
+            (execution_request(), 5),
+        ] {
+            assert_eq!(
+                binance_request_cost(&request),
+                BinanceRequestCost { weight, orders: 0 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn binance_bulk_history_waits_while_execution_bypasses_normal_spacing() {
+        let transport = ScriptedTransport::new([HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }]);
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::from_millis(60));
+        governor.state.lock().await.next_request_at = Some(Instant::now() + Duration::from_secs(5));
+        for path in ["/fapi/v1/userTrades", "/fapi/v1/income"] {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    governor.execute(symbol_request(HttpMethod::Get, path)),
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(transport.call_count(), 0);
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            governor.execute(execution_request()),
+        )
+        .await
+        .expect("order executions must not wait behind bulk history")
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(transport.call_count(), 1);
     }
 
     #[tokio::test]
@@ -1981,9 +2053,17 @@ mod tests {
 
         let first = governor.execute(test_request()).await.unwrap();
         let blocked = governor.execute(test_request()).await.unwrap();
+        let critical = governor.execute(execution_request()).await.unwrap();
+        let order = governor
+            .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+            .await
+            .unwrap();
 
         assert_eq!(first.status, 429);
         assert_eq!(blocked.status, 429);
+        assert_eq!(critical.status, 429);
+        assert_eq!(order.status, 429);
+        assert!(governor.websocket_order_budget().reserve().await.is_err());
         assert!(blocked.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
         assert_eq!(transport.call_count(), 1);
     }
@@ -2038,10 +2118,7 @@ mod tests {
         governor.state.lock().await.next_request_at = Some(normal_reserved_at);
         tokio::time::timeout(Duration::from_millis(200), async {
             for _ in 0..20 {
-                let response = governor
-                    .execute(symbol_request(HttpMethod::Get, "/fapi/v1/userTrades"))
-                    .await
-                    .unwrap();
+                let response = governor.execute(execution_request()).await.unwrap();
                 assert_eq!(response.status, 200);
             }
         })
@@ -2101,6 +2178,157 @@ mod tests {
         assert!(blocked.body.contains("cooldown is active"));
         assert!(blocked.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
         assert_eq!(transport.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn binance_local_weight_rejection_does_not_freeze_critical_or_websocket_orders() {
+        let transport = ScriptedTransport::new((0..2).map(|_| HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }));
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+        governor
+            .state
+            .lock()
+            .await
+            .usage
+            .push_back(BinanceUsageEvent {
+                at: Instant::now(),
+                cost: BinanceRequestCost {
+                    weight: 1_790,
+                    orders: 0,
+                },
+            });
+
+        let income = governor
+            .execute(symbol_request(HttpMethod::Get, "/fapi/v1/income"))
+            .await
+            .unwrap();
+        assert_eq!(income.status, 429);
+        assert!(income.body.contains(BINANCE_LOCAL_COOLDOWN_CODE));
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "rejected income must not hit the exchange"
+        );
+
+        let critical = governor.execute(execution_request()).await.unwrap();
+        assert_eq!(
+            critical.status, 200,
+            "five-weight execution must use the remaining ten weight"
+        );
+        assert!(governor.websocket_order_budget().reserve().await.is_ok());
+        let order = governor
+            .execute(symbol_request(HttpMethod::Post, "/fapi/v1/order"))
+            .await
+            .unwrap();
+        assert_eq!(
+            order.status, 200,
+            "zero-weight REST orders must remain available"
+        );
+        assert_eq!(transport.call_count(), 2);
+        let state = governor.state.lock().await;
+        assert!(state.cooldown_until.is_none());
+        assert_eq!(
+            state
+                .usage
+                .iter()
+                .map(|event| event.cost.weight)
+                .sum::<u32>(),
+            1_795
+        );
+    }
+
+    #[tokio::test]
+    async fn binance_income_weight_is_reserved_and_rechecked_until_window_expiry() {
+        let transport = ScriptedTransport::new((0..2).map(|_| HttpResponse {
+            status: 200,
+            body: "[]".into(),
+        }));
+        let governor = BinanceRequestGovernor::new(transport.clone(), Duration::ZERO);
+        governor
+            .state
+            .lock()
+            .await
+            .usage
+            .push_back(BinanceUsageEvent {
+                at: Instant::now(),
+                cost: BinanceRequestCost {
+                    weight: 1_770,
+                    orders: 0,
+                },
+            });
+
+        let income = governor
+            .execute(symbol_request(HttpMethod::Get, "/fapi/v1/income"))
+            .await
+            .unwrap();
+        assert_eq!(income.status, 200);
+        for _ in 0..2 {
+            assert_eq!(
+                governor.execute(execution_request()).await.unwrap().status,
+                429
+            );
+        }
+        assert_eq!(transport.call_count(), 1);
+        assert!(governor.websocket_order_budget().reserve().await.is_ok());
+        {
+            let mut state = governor.state.lock().await;
+            assert_eq!(
+                state
+                    .usage
+                    .iter()
+                    .map(|event| event.cost.weight)
+                    .sum::<u32>(),
+                1_800
+            );
+            let expired_at = Instant::now() - Duration::from_secs(61);
+            for event in &mut state.usage {
+                event.at = expired_at;
+            }
+        }
+        assert_eq!(
+            governor.execute(execution_request()).await.unwrap().status,
+            200
+        );
+        assert_eq!(transport.call_count(), 2);
+        let state = governor.state.lock().await;
+        assert_eq!(
+            state
+                .usage
+                .iter()
+                .map(|event| event.cost.weight)
+                .sum::<u32>(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn binance_websocket_local_weight_rejection_does_not_open_global_cooldown() {
+        let governor = BinanceRequestGovernor::new(ScriptedTransport::new([]), Duration::ZERO);
+        governor
+            .state
+            .lock()
+            .await
+            .usage
+            .push_back(BinanceUsageEvent {
+                at: Instant::now(),
+                cost: BinanceRequestCost {
+                    weight: 1_801,
+                    orders: 0,
+                },
+            });
+        let budget = governor.websocket_order_budget();
+        assert!(budget.reserve().await.is_err());
+        {
+            let mut state = governor.state.lock().await;
+            assert!(
+                state.cooldown_until.is_none(),
+                "local WS budget refusal must not become an IP cooldown"
+            );
+            state.usage.front_mut().unwrap().at = Instant::now() - Duration::from_secs(61);
+        }
+        assert!(budget.reserve().await.is_ok());
     }
 
     #[tokio::test]

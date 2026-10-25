@@ -1,6 +1,7 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App.vue";
+import "../test-support/dialog-mock";
 import { ApiError, api } from "./api/client";
 import type { GridStatus, PriceSnapshot, RiskSnapshot } from "./api/types";
 
@@ -82,6 +83,166 @@ describe("theme control", () => {
 });
 
 describe("workspace request isolation", () => {
+  it.each(["run", "exchange", "symbol"])("clears cached unselected profit after a mismatched %s response", async (field) => {
+    vi.useFakeTimers();
+    const grids: GridStatus[] = [
+      { run_id: "identity-current", exchange: "binance", symbol: "BTCUSDT", running: true },
+      { run_id: "identity-other", exchange: "aster", symbol: "ANSEMUSDT", running: true },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    let otherReads = 0;
+    vi.spyOn(api, "risk").mockImplementation(async (exchange, symbol) => {
+      const response: RiskSnapshot = {
+        run_id: grids.find(grid => grid.exchange === exchange && grid.symbol === symbol)?.run_id,
+        exchange, symbol, total_equity_profit: "-3",
+        funding_status: "verified", funding_net_income: "0",
+      };
+      if (exchange === "aster" && ++otherReads > 1) {
+        if (field === "run") response.run_id = "previous-run";
+        if (field === "exchange") response.exchange = "bybit";
+        if (field === "symbol") response.symbol = "OTHERUSDT";
+      }
+      return response;
+    });
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.findAll(".strategy-profit strong")[1]!.text()).toBe("-3 USDT");
+    await vi.advanceTimersByTimeAsync(33_000);
+    expect(otherReads).toBe(2);
+    expect(wrapper.findAll(".strategy-profit strong")[1]!.text()).toBe("待核对");
+    wrapper.unmount();
+  });
+
+  it("serializes background profit reads and reuses one when that strategy is selected", async () => {
+    const grids: GridStatus[] = [
+      { run_id: "serial-current", exchange: "binance", symbol: "BTCUSDT", running: true },
+      { run_id: "serial-aster", exchange: "aster", symbol: "ANSEMUSDT", running: true },
+      { run_id: "serial-bybit", exchange: "bybit", symbol: "QUSDT", running: true },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    const waiting = deferred<RiskSnapshot>();
+    const riskSpy = vi.spyOn(api, "risk").mockImplementation((exchange, symbol) => exchange === "aster"
+      ? waiting.promise : Promise.resolve({
+        run_id: grids.find(grid => grid.exchange === exchange && grid.symbol === symbol)?.run_id,
+        exchange, symbol, total_equity_profit: "-1",
+        funding_status: "verified", funding_net_income: "0",
+      }));
+    const wrapper = mount(App);
+    await vi.waitFor(() => expect(riskSpy).toHaveBeenCalledWith("aster", "ANSEMUSDT"));
+    expect(riskSpy).not.toHaveBeenCalledWith("bybit", "QUSDT");
+    await wrapper.findAll("button.strategy-row")[1]!.trigger("click");
+    expect(riskSpy.mock.calls.filter(([exchange]) => exchange === "aster")).toHaveLength(1);
+    waiting.resolve({ run_id: "serial-aster", exchange: "aster", symbol: "ANSEMUSDT", total_equity_profit: "-2", funding_status: "verified", funding_net_income: "0" });
+    await vi.waitFor(() => expect(riskSpy).toHaveBeenCalledWith("bybit", "QUSDT"));
+    expect(wrapper.get(".metric-primary strong").text()).toBe("-2 USDT");
+    expect(wrapper.findAll(".strategy-profit strong")[1]!.text()).toBe("-2 USDT");
+    wrapper.unmount();
+  });
+
+  it("expires both selected and unselected profits if subsequent risk reads never complete", async () => {
+    vi.useFakeTimers();
+    const grids: GridStatus[] = [
+      { run_id: "expiry-current", exchange: "binance", symbol: "BTCUSDT", running: true },
+      { run_id: "expiry-other", exchange: "aster", symbol: "ANSEMUSDT", running: true },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    const riskSpy = vi.spyOn(api, "risk").mockImplementation(async (exchange, symbol) => ({
+      run_id: grids.find(grid => grid.exchange === exchange && grid.symbol === symbol)?.run_id,
+      exchange, symbol, total_equity_profit: "-10",
+      funding_status: "verified", funding_net_income: "0",
+    }));
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["-10 USDT", "-10 USDT"]);
+    riskSpy.mockImplementation(() => new Promise(() => {}));
+    await vi.advanceTimersByTimeAsync(63_000);
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["待核对", "待核对"]);
+    expect(wrapper.get(".metric-primary strong").text()).toBe("待核对");
+    wrapper.unmount();
+  });
+
+  it("uses matching net-equity snapshots for every strategy and shares the selected overview value", async () => {
+    const grids: GridStatus[] = [
+      { run_id: "net-binance", exchange: "binance", symbol: "BTCUSDT", running: true, realized_net_profit: "95" },
+      { run_id: "net-xyz", exchange: "trade_xyz", symbol: "MUUSDC", running: true, realized_net_profit: "50" },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockImplementation(async (exchange, symbol) => ({
+      run_id: grids.find(grid => grid.exchange === exchange && grid.symbol === symbol)?.run_id,
+      exchange, symbol, total_equity_profit: exchange === "binance" ? "-25" : "-7",
+      funding_status: "verified", funding_net_income: "0",
+      total_fee: "5", realized_net_profit: "95", grid_unrealised_pnl: "-120",
+      profit_scope: "strategy_owned_inventory",
+    }));
+    const wrapper = mount(App);
+    await vi.waitFor(() => {
+      expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["-25 USDT", "-7 USDC"]);
+    });
+    expect(wrapper.get(".metric-primary strong").text()).toBe("-25 USDT");
+    expect(api.risk).toHaveBeenCalledTimes(2);
+    wrapper.unmount();
+  });
+
+  it.each(["unavailable", "missing"] as const)("withdraws selected and background profits when funding becomes %s", async (fundingStatus) => {
+    vi.useFakeTimers();
+    const grids: GridStatus[] = [
+      { run_id: "funding-current", exchange: "binance", symbol: "BTCUSDT", running: true },
+      { run_id: "funding-background", exchange: "trade_xyz", symbol: "MUUSDC", running: true },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    let fundingFailed = false;
+    vi.spyOn(api, "risk").mockImplementation(async (exchange, symbol) => ({
+      run_id: grids.find(grid => grid.exchange === exchange && grid.symbol === symbol)?.run_id,
+      exchange, symbol, total_equity_profit: "-22", total_fee: "5",
+      realized_net_profit: "95", grid_unrealised_pnl: "-120",
+      funding_status: fundingFailed ? fundingStatus === "missing" ? undefined : "unavailable" : "verified",
+      funding_net_income: fundingFailed ? null : "3",
+    }));
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["-22 USDT", "-22 USDC"]);
+    expect(wrapper.get(".metric-primary strong").text()).toBe("-22 USDT");
+    fundingFailed = true;
+    await vi.advanceTimersByTimeAsync(33_000);
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["待核对", "待核对"]);
+    expect(wrapper.get(".metric-primary strong").text()).toBe("待核对");
+    expect(wrapper.get('[data-testid="settled-funding"] strong').text()).toBe("待核对");
+    wrapper.unmount();
+  });
+
+  it("refreshes unselected profits at low frequency rather than with every status or price poll", async () => {
+    vi.useFakeTimers();
+    const grids: GridStatus[] = [
+      { run_id: "net-current", exchange: "binance", symbol: "BTCUSDT", running: true },
+      { run_id: "net-other", exchange: "aster", symbol: "ANSEMUSDT", running: true },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    const riskSpy = vi.spyOn(api, "risk").mockImplementation(async (exchange, symbol) => ({
+      run_id: grids.find(grid => grid.exchange === exchange && grid.symbol === symbol)?.run_id,
+      exchange, symbol, total_equity_profit: "-1", profit_scope: "strategy_owned_inventory",
+      funding_status: "verified", funding_net_income: "0",
+    }));
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(riskSpy.mock.calls.filter(([exchange]) => exchange === "aster")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(riskSpy.mock.calls.filter(([exchange]) => exchange === "aster")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(riskSpy.mock.calls.filter(([exchange]) => exchange === "aster")).toHaveLength(2);
+    expect(riskSpy.mock.calls.filter(([exchange]) => exchange === "binance")).toHaveLength(2);
+    wrapper.unmount();
+  });
+
   it("finishes exchange details before scanning global strategy history", async () => {
     installWorkspaceMocks([]);
     vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
@@ -458,6 +619,7 @@ describe("workspace request isolation", () => {
           realized_net_profit: "1",
           grid_unrealised_pnl: "2",
           total_equity_profit: "3",
+          funding_status: "verified", funding_net_income: "0",
           has_risk: false,
         })
     ));
@@ -483,6 +645,7 @@ describe("workspace request isolation", () => {
       exchange: "aster",
       symbol: "BTCUSDT",
       total_equity_profit: "999",
+      funding_status: "verified", funding_net_income: "0",
       grid_unrealised_pnl: "998",
       has_risk: true,
     });
@@ -512,6 +675,7 @@ describe("workspace request isolation", () => {
         realized_net_profit: "1",
         grid_unrealised_pnl: "986",
         total_equity_profit: "987",
+        funding_status: "verified", funding_net_income: "0",
         has_risk: false,
       })
       .mockRejectedValueOnce(new Error("risk snapshot unavailable"));
@@ -531,6 +695,7 @@ describe("workspace request isolation", () => {
       expect(wrapper.find(".strategy-overview").text()).toContain("总权益利润等待当前策略");
     });
     expect(wrapper.find(".strategy-overview").text()).not.toContain("987");
+    expect(wrapper.get(".strategy-profit strong").text()).toBe("待核对");
     wrapper.unmount();
   });
 
@@ -576,16 +741,21 @@ describe("workspace request isolation", () => {
 
     const wrapper = mount(App);
     await vi.waitFor(() => {
+      expect(api.history).toHaveBeenCalled();
+    });
+    await wrapper.get('[aria-label="查看持仓"]').trigger('click');
+    await vi.waitFor(() => {
       expect(wrapper.find(".detail-tabs").text()).toContain("持仓 1");
       expect(wrapper.find(".detail-tabs").text()).toContain("挂单 1");
     });
-    await wrapper.find(".detail-header button").trigger("click");
+    await wrapper.find(".records-toolbar > button").trigger("click");
     await flushPromises();
 
     expect(wrapper.find(".detail-tabs").text()).toContain("持仓 --");
     expect(wrapper.find(".detail-tabs").text()).toContain("挂单 --");
-    expect(wrapper.find(".detail-panel").text()).toContain("不能将持仓或挂单视为 0");
-    expect(wrapper.find(".detail-panel").text()).toContain("保留上次成功快照");
+    expect(wrapper.find(".bot-records").text()).toContain("不能将持仓或挂单视为 0");
+    expect(wrapper.find(".bot-records").text()).toContain("保留上次成功快照");
+    await wrapper.findAll('.detail-tabs button').find(button => button.text().startsWith('持仓'))!.trigger('click');
     expect(wrapper.find(".position-item").text()).toContain("125");
     wrapper.unmount();
   });

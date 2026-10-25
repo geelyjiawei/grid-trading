@@ -32,6 +32,7 @@ use crate::{
         bybit::{
             BybitAdapter, BybitHmacSha256Signer, BybitSignatureError, spawn_bybit_order_stream,
         },
+        funding::FundingHistorySnapshot,
         protocol::{
             BinanceRequestGovernor, HyperliquidRequestGovernor, MonotonicMicrosecondNonce,
             MonotonicMillisecondNonce, ReqwestTransport, SystemClock, TransportBuildError,
@@ -56,6 +57,10 @@ const TRADE_XYZ_ORDER_PLACEMENT_INTERVAL: Duration = Duration::from_millis(75);
 const BINANCE_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
 const INSTRUMENT_RULES_CACHE_TTL: Duration = Duration::from_secs(60);
 const TRADING_FEE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const FUNDING_HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
+const FUNDING_HISTORY_CACHE_CAPACITY: usize = 8;
+// Finish and cache failures before the API's outer fifteen-second deadline cancels this future.
+const FUNDING_HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 // Program-owned placements, cancellations, and execution events update this cache
 // immediately. REST remains a periodic authority check rather than a per-tick poll.
 const TRADE_XYZ_EXECUTION_PROGRESS_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -118,9 +123,102 @@ where
 }
 
 #[derive(Debug)]
+struct FundingHistoryCacheEntry {
+    cached_at: Instant,
+    through_ms: u64,
+    result: Result<FundingHistorySnapshot, SnapshotError>,
+}
+
+#[derive(Debug)]
+struct FundingHistoryCache {
+    values: Mutex<HashMap<String, FundingHistoryCacheEntry>>,
+}
+
+impl FundingHistoryCache {
+    fn new() -> Self {
+        Self {
+            values: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn get_or_fetch(
+        &self,
+        key: String,
+        through_ms: u64,
+        timeout: Duration,
+        request: impl std::future::Future<Output = Result<FundingHistorySnapshot, SnapshotError>>,
+    ) -> Result<FundingHistorySnapshot, SnapshotError> {
+        if let Some(cached) = self.get(&key, through_ms, Instant::now()) {
+            return cached;
+        }
+        let result = tokio::time::timeout(timeout, request)
+            .await
+            .unwrap_or_else(|_| Err(SnapshotError::new("funding history request timed out")));
+        self.insert(key, through_ms, result.clone(), Instant::now());
+        result
+    }
+
+    fn get(
+        &self,
+        key: &str,
+        through_ms: u64,
+        now: Instant,
+    ) -> Option<Result<FundingHistorySnapshot, SnapshotError>> {
+        let mut values = self
+            .values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = values.get(key)?;
+        if now.saturating_duration_since(entry.cached_at) >= FUNDING_HISTORY_CACHE_TTL {
+            values.remove(key);
+            return None;
+        }
+        (entry.through_ms <= through_ms).then(|| entry.result.clone())
+    }
+
+    fn insert(
+        &self,
+        key: String,
+        requested_through_ms: u64,
+        result: Result<FundingHistorySnapshot, SnapshotError>,
+        now: Instant,
+    ) {
+        let through_ms = result
+            .as_ref()
+            .map_or(requested_through_ms, |snapshot| snapshot.through_ms);
+        let mut values = self
+            .values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.retain(|_, entry| {
+            now.saturating_duration_since(entry.cached_at) < FUNDING_HISTORY_CACHE_TTL
+        });
+        if !values.contains_key(&key) && values.len() >= FUNDING_HISTORY_CACHE_CAPACITY {
+            let oldest = values
+                .iter()
+                .min_by_key(|(_, entry)| entry.cached_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                values.remove(&oldest);
+            }
+        }
+        // Keep failures as failures so repeated dashboard reads do not retry or invent zero income.
+        values.insert(
+            key,
+            FundingHistoryCacheEntry {
+                cached_at: now,
+                through_ms,
+                result,
+            },
+        );
+    }
+}
+
+#[derive(Debug)]
 struct GatewaySnapshotCaches {
     instrument_rules: TimedSnapshotCache<InstrumentRules>,
     trading_fees: TimedSnapshotCache<TradingFeeRates>,
+    funding_history: FundingHistoryCache,
     trade_xyz_execution_progress: TimedSnapshotCache<Option<Vec<OpenOrderExecutionProgress>>>,
 }
 
@@ -129,6 +227,7 @@ impl GatewaySnapshotCaches {
         Self {
             instrument_rules: TimedSnapshotCache::new(INSTRUMENT_RULES_CACHE_TTL),
             trading_fees: TimedSnapshotCache::new(TRADING_FEE_CACHE_TTL),
+            funding_history: FundingHistoryCache::new(),
             trade_xyz_execution_progress: TimedSnapshotCache::new(
                 TRADE_XYZ_EXECUTION_PROGRESS_CACHE_TTL,
             ),
@@ -138,6 +237,10 @@ impl GatewaySnapshotCaches {
 
 fn snapshot_cache_key(exchange: Exchange, symbol: &str) -> String {
     format!("{exchange:?}:{}", symbol.to_ascii_uppercase())
+}
+
+fn funding_history_cache_key(exchange: Exchange, symbol: &str, from_ms: u64) -> String {
+    format!("{}:{from_ms}", snapshot_cache_key(exchange, symbol))
 }
 
 #[derive(Debug)]
@@ -651,6 +754,37 @@ impl AccountBalanceSnapshotGateway for ConfiguredExchangeGateway {
             Self::TradeXyz(gateway) => gateway.account_balance_snapshot(exchange).await,
         }
     }
+
+    async fn funding_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<FundingHistorySnapshot, SnapshotError> {
+        match self {
+            Self::Binance(gateway) => {
+                gateway
+                    .funding_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+            Self::Aster(gateway) => {
+                gateway
+                    .funding_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+            Self::Bybit(gateway) => {
+                gateway
+                    .funding_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+            Self::TradeXyz(gateway) => {
+                gateway
+                    .funding_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1060,6 +1194,26 @@ impl AccountBalanceSnapshotGateway for SharedConfiguredExchangeGateway {
     ) -> Result<AccountBalanceSnapshot, SnapshotError> {
         self.inner.account_balance_snapshot(exchange).await
     }
+
+    async fn funding_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<FundingHistorySnapshot, SnapshotError> {
+        let key = funding_history_cache_key(exchange, symbol, from_ms);
+        self.snapshot_caches
+            .funding_history
+            .get_or_fetch(
+                key,
+                through_ms,
+                FUNDING_HISTORY_REQUEST_TIMEOUT,
+                self.inner
+                    .funding_history(exchange, symbol, from_ms, through_ms),
+            )
+            .await
+    }
 }
 
 #[async_trait]
@@ -1262,6 +1416,195 @@ impl PositionSnapshotGateway for SharedConfiguredExchangeGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn funding_snapshot(through_ms: u64) -> FundingHistorySnapshot {
+        FundingHistorySnapshot {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".into(),
+            from_ms: 100,
+            through_ms,
+            payments: vec![crate::exchange::funding::FundingPayment {
+                id: "funding-1".into(),
+                at_ms: 150,
+                amount: Decimal::from(-3),
+                asset: "USDT".into(),
+                position_quantity: None,
+            }],
+            account_fills: Some(vec![]),
+        }
+    }
+
+    #[tokio::test]
+    async fn funding_history_timeout_is_cached_before_the_outer_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = FundingHistoryCache::new();
+        let reads = AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            cache.get_or_fetch("key".into(), 200, Duration::from_millis(10), async {
+                reads.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    cache.values.try_lock().is_ok(),
+                    "the fetch must not hold the cache lock"
+                );
+                std::future::pending().await
+            }),
+        )
+        .await
+        .expect("the inner timeout must return an error before the outer deadline");
+        let error = result.expect_err("a timed-out history read must not become zero funding");
+        assert!(error.message.contains("timed out"));
+        let cached_at = cache.values.lock().unwrap().get("key").unwrap().cached_at;
+        assert_eq!(
+            cache.get("key", 300, cached_at + Duration::from_secs(59)),
+            Some(Err(error.clone()))
+        );
+        let cached = cache
+            .get_or_fetch("key".into(), 300, Duration::from_millis(10), async {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(funding_snapshot(300))
+            })
+            .await;
+        assert_eq!(cached, Err(error));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "a cached timeout must not retry the fetch"
+        );
+        assert_eq!(
+            cache.get("key", 300, cached_at + Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_history_cache_fetch_preserves_success_and_inner_errors() {
+        let cache = FundingHistoryCache::new();
+        let snapshot = funding_snapshot(200);
+        let success = cache
+            .get_or_fetch("success".into(), 200, Duration::from_secs(1), async {
+                Ok(snapshot.clone())
+            })
+            .await;
+        assert_eq!(success, Ok(snapshot.clone()));
+        assert_eq!(
+            cache.get("success", 300, Instant::now()),
+            Some(Ok(snapshot))
+        );
+
+        let error = SnapshotError::new("funding endpoint unavailable");
+        let failure = cache
+            .get_or_fetch("failure".into(), 200, Duration::from_secs(1), async {
+                Err(error.clone())
+            })
+            .await;
+        assert_eq!(failure, Err(error.clone()));
+        assert_eq!(cache.get("failure", 300, Instant::now()), Some(Err(error)));
+    }
+
+    #[test]
+    fn funding_history_cache_expires_success_at_sixty_seconds_without_sliding() {
+        let cache = FundingHistoryCache::new();
+        let now = Instant::now();
+        let key = funding_history_cache_key(Exchange::Binance, "BTCUSDT", 100);
+        let snapshot = funding_snapshot(200);
+        cache.insert(key.clone(), 200, Ok(snapshot.clone()), now);
+
+        assert_eq!(
+            cache.get(&key, 300, now + Duration::from_secs(59)),
+            Some(Ok(snapshot))
+        );
+        assert_eq!(cache.get(&key, 300, now + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn funding_history_cache_preserves_errors_for_sixty_seconds_instead_of_zero() {
+        let cache = FundingHistoryCache::new();
+        let now = Instant::now();
+        let error = SnapshotError::new("funding history rate limited");
+        cache.insert("key".into(), 200, Err(error.clone()), now);
+
+        assert_eq!(
+            cache.get("key", 300, now + Duration::from_secs(59)),
+            Some(Err(error))
+        );
+        assert_eq!(cache.get("key", 300, now + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn funding_history_cache_never_reuses_a_snapshot_beyond_the_requested_end() {
+        let cache = FundingHistoryCache::new();
+        let now = Instant::now();
+        let snapshot = funding_snapshot(200);
+        cache.insert("key".into(), 300, Ok(snapshot.clone()), now);
+
+        assert_eq!(cache.get("key", 199, now), None);
+        assert_eq!(cache.get("key", 200, now), Some(Ok(snapshot.clone())));
+        assert_eq!(cache.get("key", 400, now), Some(Ok(snapshot)));
+    }
+
+    #[test]
+    fn funding_history_cache_keys_isolate_exchange_symbol_and_start() {
+        let key = funding_history_cache_key(Exchange::Binance, "btcusdt", 100);
+        assert_eq!(
+            key,
+            funding_history_cache_key(Exchange::Binance, "BTCUSDT", 100)
+        );
+        assert_ne!(
+            key,
+            funding_history_cache_key(Exchange::Bybit, "BTCUSDT", 100)
+        );
+        assert_ne!(
+            key,
+            funding_history_cache_key(Exchange::Binance, "ETHUSDT", 100)
+        );
+        assert_ne!(
+            key,
+            funding_history_cache_key(Exchange::Binance, "BTCUSDT", 101)
+        );
+    }
+
+    #[test]
+    fn funding_history_cache_evicts_the_oldest_entry_at_eight_items() {
+        let cache = FundingHistoryCache::new();
+        let now = Instant::now();
+        for index in 0..8 {
+            cache.insert(
+                index.to_string(),
+                200,
+                Ok(funding_snapshot(200)),
+                now + Duration::from_millis(index),
+            );
+        }
+        cache.insert(
+            "7".into(),
+            200,
+            Ok(funding_snapshot(200)),
+            now + Duration::from_millis(8),
+        );
+        assert!(
+            cache
+                .get("0", 200, now + Duration::from_millis(8))
+                .is_some()
+        );
+        cache.insert(
+            "8".into(),
+            200,
+            Ok(funding_snapshot(200)),
+            now + Duration::from_millis(9),
+        );
+
+        assert_eq!(cache.values.lock().unwrap().len(), 8);
+        assert_eq!(cache.get("0", 200, now + Duration::from_millis(9)), None);
+        for index in 1..=8 {
+            assert!(
+                cache
+                    .get(&index.to_string(), 200, now + Duration::from_millis(9))
+                    .is_some()
+            );
+        }
+    }
 
     #[test]
     fn credential_debug_never_discloses_secret_material() {

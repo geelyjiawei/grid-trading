@@ -123,7 +123,7 @@ describe("Vue migration components", () => {
     expect(wrapper.emitted("select")?.[0]?.[0]).toEqual(grid);
   });
 
-  it("labels strategy-list profit as realized rather than total equity", () => {
+  it("does not label realized-only strategy status as net equity profit", () => {
     const wrapper = mount(StrategyList, {
       props: {
         grids: [{
@@ -141,9 +141,9 @@ describe("Vue migration components", () => {
       },
     });
 
-    expect(wrapper.find(".strategy-profit strong").text()).toBe("1.25");
+    expect(wrapper.find(".strategy-profit strong").text()).toBe("待核对");
     expect(wrapper.text()).not.toContain("9.75");
-    expect(wrapper.text()).toContain("已实现净利润 · 完成 3 次");
+    expect(wrapper.text()).toContain("净收益（含浮盈亏及资金费） · 完成 3 次");
   });
 
   it("keeps fixed per-grid quantity separate from investment sizing", async () => {
@@ -386,6 +386,8 @@ describe("Vue migration components", () => {
       realized_net_profit: "1.0",
       grid_unrealised_pnl: "2.0",
       total_equity_profit: "3.0",
+      funding_status: "verified",
+      funding_net_income: "0",
       profit_scope: "strategy_owned_inventory",
       has_risk: false,
     };
@@ -396,6 +398,73 @@ describe("Vue migration components", () => {
     expect(metrics).toContain("已实现净利润1 USDT");
     expect(metrics).toContain("网格未实现盈亏2 USDT");
     expect(wrapper.text()).not.toContain("等待当前策略");
+  });
+
+  it.each([
+    ["3", "-22", "3 USDT", "positive"],
+    ["-3", "-28", "-3 USDT", "negative"],
+    ["0", "-25", "0 USDT", "positive"],
+  ])("shares the funding-inclusive total with the overview for settled funding %s", (funding, total, fundingText, tone) => {
+    const status: GridStatus = {
+      run_id: "funding-ui", exchange: "binance", symbol: "BTCUSDT", running: true,
+      realized_net_profit: "95", total_fee: "5",
+    };
+    const risk: RiskSnapshot = {
+      run_id: "funding-ui", exchange: "binance", symbol: "BTCUSDT",
+      gross_profit: "100", realized_net_profit: "95", total_fee: "5",
+      grid_unrealised_pnl: "-120", trading_net_equity_profit: "-25",
+      funding_status: "verified", funding_net_income: funding,
+      funding_payment_count: funding === "0" ? null : 2, funding_observed_through_ms: 100,
+      total_equity_profit: total, profit_scope: "strategy_owned_inventory",
+    };
+    const overview = mount(StrategyOverview, { props: { status, risk } });
+    const list = mount(StrategyList, { props: {
+      grids: [status], activeExchange: "binance", activeSymbol: "BTCUSDT",
+      loading: false, currentRisk: risk,
+    } });
+    expect(overview.get(".metric-primary strong").text()).toBe(`${total} USDT`);
+    expect(list.get(".strategy-profit strong").text()).toBe(`${total} USDT`);
+    expect(overview.get('[data-testid="settled-funding"] strong').text()).toBe(fundingText);
+    expect(overview.get('[data-testid="settled-funding"] strong').classes()).toContain(tone);
+    expect(overview.text()).toContain("已实现净利润95 USDT");
+    expect(overview.text()).toContain("网格未实现盈亏-120 USDT");
+    expect(overview.text()).toContain("手续费5 USDT");
+    expect(overview.text()).toContain("＋已结算资金费");
+    expect(overview.text()).toContain("正数收入，负数支出");
+    expect(overview.text()).toContain("资金费核对最多延迟60秒");
+    expect(overview.text()).toContain("并非逐笔实时更新");
+    expect(overview.text()).toContain("未来平仓手续费尚未发生");
+    expect(overview.text()).not.toContain("不含资金费及未来平仓手续费");
+    expect(overview.text()).toContain("已实现净利润仅扣成交手续费，不含资金费");
+    expect(list.get(".strategy-profit strong").attributes("title")).toContain("已结算资金费");
+    expect(list.get(".strategy-profit strong").attributes("title")).toContain("最多延迟60秒");
+    overview.unmount();
+    list.unmount();
+  });
+
+  it.each([
+    { funding_status: "unavailable", funding_net_income: null },
+    { funding_status: undefined, funding_net_income: "0" },
+    { funding_status: "verified", funding_net_income: "" },
+    { funding_status: "verified", funding_net_income: "NaN" },
+    { funding_status: "verified", funding_net_income: null },
+  ])("marks both profits and the funding metric pending for %o", (funding) => {
+    const status: GridStatus = { run_id: "pending-funding", exchange: "trade_xyz", symbol: "MUUSDC", running: true };
+    const risk = {
+      run_id: "pending-funding", exchange: "trade_xyz", symbol: "MUUSDC",
+      total_equity_profit: "999", ...funding,
+    } as RiskSnapshot;
+    const overview = mount(StrategyOverview, { props: { status, risk } });
+    const list = mount(StrategyList, { props: {
+      grids: [status], activeExchange: "trade_xyz", activeSymbol: "MUUSDC",
+      loading: false, currentRisk: risk,
+    } });
+    expect(overview.get(".metric-primary strong").text()).toBe("待核对");
+    expect(list.get(".strategy-profit strong").text()).toBe("待核对");
+    expect(overview.get('[data-testid="settled-funding"] strong').text()).toBe("待核对");
+    expect(overview.text()).not.toContain("999");
+    overview.unmount();
+    list.unmount();
   });
 
   it("shows the persisted grid setup and separates baseline from grid inventory", () => {
@@ -578,8 +647,9 @@ describe("Vue migration components", () => {
 
     expect(wrapper.text()).toContain("0.380001234567");
     expect(wrapper.text()).toContain("70.000000001 / 100.000000001");
+    await wrapper.get('.record-expand').trigger('click');
     expect(wrapper.text()).toContain("g_7_B_exact");
-    expect(wrapper.text()).toContain("止盈/平仓");
+    expect(wrapper.text()).toContain("只减仓");
   });
 
   it("labels converted trade fees with the quote asset instead of the charged asset", async () => {
@@ -616,6 +686,7 @@ describe("Vue migration components", () => {
       .find((button) => button.text().startsWith("成交"));
     expect(tradeTab).toBeDefined();
     await tradeTab!.trigger("click");
+    await wrapper.get('.execution-summary').trigger('click');
 
     expect(wrapper.text()).toContain("0.12 USDT");
     expect(wrapper.text()).not.toContain("0.12 BNB");

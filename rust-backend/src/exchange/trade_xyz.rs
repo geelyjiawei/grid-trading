@@ -35,6 +35,7 @@ use crate::{
         PlacementAcknowledgement, PlacementError, PositionLeg, PositionSide, PositionSnapshot,
         PositionSnapshotGateway, SnapshotError, TradeFill, TradingFeeRateGateway, TradingFeeRates,
         compare_trade_chronology,
+        funding::{FundingHistorySnapshot, FundingPayment},
         protocol::{
             HttpMethod, HttpResponse, HttpTransport, NonceSource, PreparedHttpRequest,
             TransportError,
@@ -57,6 +58,9 @@ const TESTNET_BASE_URL: &str = "https://api.hyperliquid-testnet.xyz";
 const PRODUCTION_WEBSOCKET_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const TESTNET_WEBSOCKET_URL: &str = "wss://api.hyperliquid-testnet.xyz/ws";
 const DEX_NAME: &str = "xyz";
+const FUNDING_PAGE_LIMIT: usize = 500;
+const MAX_FUNDING_PAGES: usize = 256;
+const MAX_FUNDING_ROWS: usize = 50_000;
 // One default-weight Hyperliquid info request consumes about 1.2 seconds of our
 // conservative IP budget. Keep the same snapshot through a complete runtime
 // collection so position validation and the resulting limit order do not
@@ -1673,6 +1677,132 @@ where
     T: HttpTransport,
     N: NonceSource,
 {
+    async fn funding_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<FundingHistorySnapshot, SnapshotError> {
+        validate_request(exchange, symbol)?;
+        if from_ms > through_ms || through_ms > now_ms()? {
+            return Err(SnapshotError::new(
+                "TRADE.XYZ funding interval is invalid or in the future",
+            ));
+        }
+        self.verify_credentials().await?;
+        let symbol = symbol.to_ascii_uppercase();
+        let market = self.market_info(&symbol).await?;
+        let mut page_start = from_ms;
+        let mut seen = BTreeMap::<(String, u64, String), FundingPayment>::new();
+        let mut row_count = 0usize;
+        for _ in 0..MAX_FUNDING_PAGES {
+            let value = self
+                .post_info(
+                    json!({
+                        "type": "userFunding", "user": self.account_address,
+                        "startTime": page_start, "endTime": through_ms,
+                    }),
+                    "TRADE.XYZ settled funding history lookup failed",
+                )
+                .await?;
+            let rows = value
+                .as_array()
+                .ok_or_else(|| SnapshotError::new("TRADE.XYZ funding history is not an array"))?;
+            row_count = row_count
+                .checked_add(rows.len())
+                .filter(|count| *count <= MAX_FUNDING_ROWS)
+                .ok_or_else(|| {
+                    SnapshotError::new("TRADE.XYZ funding history row limit exceeded")
+                })?;
+            let mut last_ms = page_start;
+            for row in rows {
+                let at_ms = row
+                    .get("time")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| SnapshotError::new("TRADE.XYZ funding timestamp is invalid"))?;
+                if at_ms < page_start || at_ms > through_ms || at_ms < last_ms {
+                    return Err(SnapshotError::new(
+                        "TRADE.XYZ funding receipt is out of range or unordered",
+                    ));
+                }
+                last_ms = at_ms;
+                let hash = text_field(row, "hash")?;
+                if hash.len() != 66
+                    || !hash.starts_with("0x")
+                    || !hash[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(SnapshotError::new(
+                        "TRADE.XYZ funding receipt hash is invalid",
+                    ));
+                }
+                let delta = row
+                    .get("delta")
+                    .ok_or_else(|| SnapshotError::new("TRADE.XYZ funding delta is missing"))?;
+                if text_field(delta, "type")? != "funding" {
+                    return Err(SnapshotError::new(
+                        "TRADE.XYZ funding delta type is invalid",
+                    ));
+                }
+                let coin = text_field(delta, "coin")?;
+                if coin.trim() != coin {
+                    return Err(SnapshotError::new("TRADE.XYZ funding coin is invalid"));
+                }
+                // One block hash can contain funding for multiple coins. Keep their identities separate.
+                let payment = FundingPayment {
+                    id: format!("{}:{at_ms}:{coin}", hash.to_ascii_lowercase()),
+                    at_ms,
+                    amount: funding_decimal(delta, "usdc")?,
+                    asset: "USDC".into(),
+                    position_quantity: Some(funding_decimal(delta, "szi")?),
+                };
+                if payment.position_quantity == Some(Decimal::ZERO) && !payment.amount.is_zero() {
+                    return Err(SnapshotError::new(
+                        "TRADE.XYZ nonzero funding receipt has zero settlement position",
+                    ));
+                }
+                let identity = (hash.to_ascii_lowercase(), at_ms, coin.to_owned());
+                if let Some(previous) = seen.get(&identity) {
+                    if previous != &payment {
+                        return Err(SnapshotError::new(
+                            "TRADE.XYZ funding receipt identity conflict",
+                        ));
+                    }
+                } else {
+                    seen.insert(identity, payment);
+                }
+            }
+            if rows.len() < FUNDING_PAGE_LIMIT {
+                let mut payments = seen
+                    .into_iter()
+                    .filter(|((_, _, coin), _)| coin == &market.coin)
+                    .map(|(_, payment)| payment)
+                    .collect::<Vec<_>>();
+                payments
+                    .sort_by(|left, right| (left.at_ms, &left.id).cmp(&(right.at_ms, &right.id)));
+                return Ok(FundingHistorySnapshot {
+                    exchange,
+                    symbol,
+                    from_ms,
+                    through_ms,
+                    payments,
+                    account_fills: None,
+                });
+            }
+            // Official pagination is inclusive: +1 would silently lose other coins at the same ms.
+            // A capped page entirely at the boundary cannot prove completeness; fail closed.
+            if last_ms <= page_start {
+                return Err(SnapshotError::new(
+                    "TRADE.XYZ funding pagination cannot advance safely at the same millisecond",
+                ));
+            }
+            page_start = last_ms;
+        }
+        Err(SnapshotError::new(
+            "TRADE.XYZ funding history page limit exceeded",
+        ))
+    }
+
     async fn account_balance_snapshot(
         &self,
         exchange: Exchange,
@@ -1729,6 +1859,26 @@ where
         snapshot.validate()?;
         Ok(snapshot)
     }
+}
+
+fn funding_decimal(value: &Value, field: &str) -> Result<Decimal, SnapshotError> {
+    let text = text_field(value, field)?;
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let valid = match unsigned.split_once('.') {
+        Some((whole, fraction)) => digits(whole) && digits(fraction),
+        None => digits(unsigned),
+    };
+    if !valid {
+        return Err(SnapshotError::new(format!(
+            "TRADE.XYZ funding field {field} is invalid"
+        )));
+    }
+    Decimal::from_str_exact(text).map_err(|_| {
+        SnapshotError::new(format!(
+            "TRADE.XYZ funding field {field} is invalid or loses precision"
+        ))
+    })
 }
 
 fn parse_standard_account_balance(state: &Value) -> Result<AccountBalanceSnapshot, SnapshotError> {
@@ -3022,6 +3172,331 @@ mod tests {
             .address()
             .to_owned();
         TradeXyzAdapter::production_wallet(transport, FixedNonce, &account, &private_key).unwrap()
+    }
+
+    fn funding_row(index: u64, coin: &str, at_ms: u64, amount: &str, size: &str) -> Value {
+        json!({"hash": format!("0x{index:064x}"), "time": at_ms, "delta": {
+            "type": "funding", "coin": coin, "usdc": amount, "szi": size,
+            "fundingRate": "0.0001", "nSamples": null
+        }})
+    }
+
+    fn funding_transport(pages: Vec<Value>) -> ScriptedTransport {
+        ScriptedTransport::new(
+            [market_response(), dex_response()]
+                .into_iter()
+                .chain(pages.into_iter().map(response)),
+        )
+    }
+
+    #[tokio::test]
+    async fn funding_history_preserves_signed_settlement_and_exact_xyz_coin_scope() {
+        let transport = funding_transport(vec![json!([
+            funding_row(1, "xyz:MU", 100, "1.25", "-10"),
+            funding_row(1, "MU", 100, "99", "10"),
+            funding_row(1, "other:MU", 100, "99", "10"),
+            funding_row(2, "xyz:MU", 101, "-2.5", "20"),
+            funding_row(3, "xyz:MU", 102, "0", "0")
+        ])]);
+        let gateway = test_adapter(transport.clone());
+        let history = gateway
+            .funding_history(Exchange::TradeXyz, "muusdc", 100, 102)
+            .await
+            .unwrap();
+        assert_eq!(history.exchange, Exchange::TradeXyz);
+        assert_eq!(history.symbol, "MUUSDC");
+        assert_eq!((history.from_ms, history.through_ms), (100, 102));
+        assert!(history.account_fills.is_none());
+        assert_eq!(history.payments.len(), 3);
+        assert_eq!(history.payments[0].amount, Decimal::new(125, 2));
+        assert_eq!(
+            history.payments[0].position_quantity,
+            Some(Decimal::from(-10))
+        );
+        assert_eq!(history.payments[0].asset, "USDC");
+        assert_eq!(history.payments[1].amount, Decimal::new(-25, 1));
+        assert_eq!(
+            history.payments[1].position_quantity,
+            Some(Decimal::from(20))
+        );
+        assert_eq!(history.payments[2].amount, Decimal::ZERO);
+        assert_eq!(history.payments[2].position_quantity, Some(Decimal::ZERO));
+        let requests = transport.requests();
+        assert!(requests.iter().all(|request| request.path == "/info"));
+        let body: Value =
+            serde_json::from_str(requests.last().unwrap().raw_body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"type": "userFunding", "user": gateway.account_address(), "startTime":100, "endTime":102})
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_history_resolves_default_market_and_queries_master_not_agent() {
+        let owner = "0x1111111111111111111111111111111111111111";
+        let transport = ScriptedTransport::new([
+            response(json!({"role":"agent", "data":{"user":owner}})),
+            response(json!([{"universe":[]}, []])),
+            default_cashcat_market_response(),
+            response(json!([
+                funding_row(1, "CASHCAT", 100, "-1", "3"),
+                funding_row(2, "xyz:CASHCAT", 100, "9", "3")
+            ])),
+        ]);
+        let gateway = TradeXyzAdapter::production_wallet(
+            transport.clone(),
+            FixedNonce,
+            owner,
+            &official_public_test_vector_key(),
+        )
+        .unwrap();
+        let history = gateway
+            .funding_history(Exchange::TradeXyz, "CASHCATUSDC", 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(history.payments.len(), 1);
+        assert_eq!(history.payments[0].amount, Decimal::from(-1));
+        let requests = transport.requests();
+        let body: Value =
+            serde_json::from_str(requests.last().unwrap().raw_body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["user"], owner);
+        assert!(requests.iter().all(|request| request.path == "/info"));
+    }
+
+    #[tokio::test]
+    async fn funding_history_rejects_agent_for_another_master_before_fetching_history() {
+        let transport = ScriptedTransport::new([response(
+            json!({"role":"agent", "data":{"user":"0x2222222222222222222222222222222222222222"}}),
+        )]);
+        let gateway = TradeXyzAdapter::production_wallet(
+            transport.clone(),
+            FixedNonce,
+            "0x1111111111111111111111111111111111111111",
+            &official_public_test_vector_key(),
+        )
+        .unwrap();
+        assert!(
+            gateway
+                .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .unwrap_err()
+                .message
+                .contains("authorized")
+        );
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn funding_history_paginates_all_account_rows_with_inclusive_same_ms_overlap() {
+        let first = (0..500)
+            .map(|index| funding_row(index, "ETH", 100 + index, "1", "2"))
+            .collect::<Vec<_>>();
+        let transport = funding_transport(vec![
+            json!(first),
+            json!([
+                funding_row(499, "ETH", 599, "1", "2"),
+                funding_row(500, "xyz:MU", 599, "3", "-4"),
+                funding_row(501, "xyz:MU", 600, "5", "6")
+            ]),
+        ]);
+        let result = test_adapter(transport.clone())
+            .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 600)
+            .await
+            .unwrap();
+        assert_eq!(result.payments.len(), 2);
+        assert_eq!(result.payments[0].at_ms, 599);
+        let requests = transport.requests();
+        let body: Value = serde_json::from_str(requests[3].raw_body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["startTime"], 599);
+        assert_eq!(body["endTime"], 600);
+    }
+
+    #[tokio::test]
+    async fn funding_history_fails_closed_when_full_same_ms_page_cannot_advance() {
+        let rows = (0..500)
+            .map(|index| funding_row(index, "ETH", 100, "1", "2"))
+            .collect::<Vec<_>>();
+        let transport = funding_transport(vec![json!(rows)]);
+        let error = test_adapter(transport.clone())
+            .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("pagination"));
+        assert_eq!(transport.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn funding_history_rejects_missing_malformed_and_out_of_bounds_receipts() {
+        for (path, field, value) in [
+            ("delta", "szi", Value::Null),
+            ("delta", "szi", json!("")),
+            ("delta", "szi", json!("0")),
+            ("delta", "usdc", Value::Null),
+            ("delta", "usdc", json!("NaN")),
+            ("delta", "usdc", json!("1_000")),
+            ("delta", "usdc", json!("1.")),
+            ("delta", "usdc", json!(1.25)),
+            ("delta", "usdc", json!("0.123456789012345678901234567890")),
+            ("delta", "type", json!("deposit")),
+            ("delta", "coin", json!("")),
+            ("", "hash", json!("")),
+            ("", "hash", json!("not-a-hash")),
+            ("", "time", json!(99)),
+            ("", "time", json!(101)),
+            ("", "time", json!(u64::MAX)),
+        ] {
+            let mut row = funding_row(1, "xyz:MU", 100, "1", "2");
+            if path.is_empty() {
+                row[field] = value;
+            } else {
+                row[path][field] = value;
+            }
+            let transport = funding_transport(vec![json!([row])]);
+            assert!(
+                test_adapter(transport)
+                    .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                    .await
+                    .is_err(),
+                "accepted {field}"
+            );
+        }
+        for field in ["szi", "usdc", "coin", "type"] {
+            let mut row = funding_row(1, "xyz:MU", 100, "1", "2");
+            row["delta"].as_object_mut().unwrap().remove(field);
+            let transport = funding_transport(vec![json!([row])]);
+            assert!(
+                test_adapter(transport)
+                    .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                    .await
+                    .is_err(),
+                "accepted missing {field}"
+            );
+        }
+        for payload in [Value::Null, json!({}), json!({"error":"unavailable"})] {
+            let transport = funding_transport(vec![payload]);
+            assert!(
+                test_adapter(transport)
+                    .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn funding_history_deduplicates_receipts_but_rejects_conflicting_amounts_or_sizes() {
+        for (amount, size) in [("1", "2"), ("9", "2"), ("1", "-2")] {
+            let transport = funding_transport(vec![json!([
+                funding_row(1, "xyz:MU", 100, "1", "2"),
+                funding_row(1, "xyz:MU", 100, amount, size)
+            ])]);
+            let result = test_adapter(transport)
+                .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await;
+            if (amount, size) == ("1", "2") {
+                assert_eq!(result.unwrap().payments.len(), 1);
+            } else {
+                assert!(result.unwrap_err().message.contains("conflict"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn funding_history_uses_resolved_alias_not_local_symbol_base() {
+        let transport = ScriptedTransport::new([
+            skhx_market_response(),
+            dex_response(),
+            response(json!([
+                funding_row(1, "xyz:SKHYNIX", 100, "9", "3"),
+                funding_row(2, "xyz:SKHX", 100, "1", "-2")
+            ])),
+        ]);
+        let result = test_adapter(transport)
+            .funding_history(Exchange::TradeXyz, "SKHYNIXUSDC", 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(result.payments.len(), 1);
+        assert_eq!(result.payments[0].amount, Decimal::ONE);
+    }
+
+    #[tokio::test]
+    async fn funding_history_accepts_empty_history_and_rejects_http_errors_or_unordered_rows() {
+        let transport = funding_transport(vec![json!([])]);
+        assert!(
+            test_adapter(transport)
+                .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .unwrap()
+                .payments
+                .is_empty()
+        );
+        let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
+            HttpResponse {
+                status: 429,
+                body: "[]".into(),
+            },
+        ]);
+        assert!(
+            test_adapter(transport)
+                .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .is_err()
+        );
+        let transport = funding_transport(vec![json!([
+            funding_row(1, "xyz:MU", 101, "1", "2"),
+            funding_row(2, "xyz:MU", 100, "1", "2")
+        ])]);
+        assert!(
+            test_adapter(transport)
+                .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 101)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_history_rejects_invalid_scope_or_future_interval_without_io() {
+        let transport = ScriptedTransport::new([]);
+        let gateway = test_adapter(transport.clone());
+        for (exchange, symbol, from, through) in [
+            (Exchange::Bybit, "MUUSDC", 100, 100),
+            (Exchange::TradeXyz, "MUUSDT", 100, 100),
+            (Exchange::TradeXyz, "MUUSDC", 101, 100),
+            (Exchange::TradeXyz, "MUUSDC", 100, u64::MAX),
+        ] {
+            assert!(
+                gateway
+                    .funding_history(exchange, symbol, from, through)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn funding_history_stops_at_row_limit_instead_of_returning_partial_history() {
+        let pages = (0..101)
+            .map(|page| {
+                json!(
+                    (0..500)
+                        .map(|index| {
+                            let id = page * 500 + index;
+                            funding_row(id, "ETH", 101 + id, "1", "2")
+                        })
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect();
+        let transport = funding_transport(pages);
+        let error = test_adapter(transport.clone())
+            .funding_history(Exchange::TradeXyz, "MUUSDC", 100, 200_000)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("row limit"));
+        assert_eq!(transport.requests().len(), 103);
     }
 
     fn limit_intent(client_order_id: &str) -> OrderIntent {

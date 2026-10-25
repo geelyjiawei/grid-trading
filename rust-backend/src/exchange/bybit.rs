@@ -1,12 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
+use rust_decimal::Decimal;
 use serde::Serialize;
+use serde_json::Value;
 use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -31,6 +33,7 @@ use crate::{
         },
         codec::validate_snapshot_request,
         execution::assemble_execution_snapshot,
+        funding::{FundingHistorySnapshot, FundingPayment},
         protocol::{
             HttpMethod, HttpResponse, HttpTransport, MillisecondClock, Parameters,
             PreparedHttpRequest, encode_parameters,
@@ -49,6 +52,10 @@ const MAX_OPEN_ORDER_PAGES: usize = 100;
 const ORDER_HISTORY_PAGE_LIMIT: usize = 50;
 const MAX_ORDER_HISTORY_PAGES: usize = 20;
 const MAX_EXACT_ORDER_PAGES: usize = 20;
+const FUNDING_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const FUNDING_RETENTION_MS: u64 = 730 * 24 * 60 * 60 * 1_000;
+const MAX_FUNDING_REQUESTS: usize = 256;
+const FUNDING_PAGE_LIMIT: usize = 50;
 const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 
 mod order_ws;
@@ -530,6 +537,163 @@ where
     S: BybitRequestSigner,
     C: MillisecondClock,
 {
+    async fn funding_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<FundingHistorySnapshot, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Bybit, symbol)?;
+        let symbol = symbol.trim().to_ascii_uppercase();
+        let asset = if symbol.ends_with("USDT") {
+            "USDT"
+        } else if symbol.ends_with("USDC") || symbol.ends_with("PERP") {
+            "USDC"
+        } else {
+            return Err(SnapshotError::new(
+                "Bybit funding settlement currency is unsupported",
+            ));
+        };
+        let now = self.clock.now_millis();
+        if from_ms > through_ms || through_ms > now {
+            return Err(SnapshotError::new(
+                "Bybit funding interval is invalid or in the future",
+            ));
+        }
+        // The endpoint only retains two years; never label an older empty scan complete.
+        if from_ms < now.saturating_sub(FUNDING_RETENTION_MS) {
+            return Err(SnapshotError::new(
+                "Bybit funding history exceeds the retention limit",
+            ));
+        }
+        let mut payments = BTreeMap::<String, FundingPayment>::new();
+        let mut request_count = 0;
+        let mut window_start = from_ms;
+        loop {
+            let window_end = through_ms.min(window_start.saturating_add(FUNDING_WINDOW_MS - 1));
+            let mut cursor: Option<String> = None;
+            let mut seen_cursors = BTreeSet::new();
+            loop {
+                if request_count == MAX_FUNDING_REQUESTS {
+                    return Err(SnapshotError::new(
+                        "Bybit funding history request limit exceeded",
+                    ));
+                }
+                let mut query = vec![
+                    ("accountType".into(), "UNIFIED".into()),
+                    ("category".into(), CATEGORY.into()),
+                    ("type".into(), "SETTLEMENT".into()),
+                    ("currency".into(), asset.into()),
+                    ("startTime".into(), window_start.to_string()),
+                    ("endTime".into(), window_end.to_string()),
+                    ("limit".into(), FUNDING_PAGE_LIMIT.to_string()),
+                ];
+                if let Some(cursor) = &cursor {
+                    query.push(("cursor".into(), cursor.clone()));
+                }
+                let request = self
+                    .signed_get("/v5/account/transaction-log", query)
+                    .map_err(|error| SnapshotError::new(error.to_string()))?;
+                request_count += 1;
+                let body = self
+                    .execute_snapshot(request, "Bybit settled funding history")
+                    .await?;
+                let value: Value = serde_json::from_str(&body)
+                    .map_err(|_| SnapshotError::new("Bybit funding response is not valid JSON"))?;
+                let result = value
+                    .get("result")
+                    .ok_or_else(|| SnapshotError::new("Bybit funding result is missing"))?;
+                let rows = result
+                    .get("list")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        SnapshotError::new("Bybit funding list is missing or invalid")
+                    })?;
+                if rows.len() > FUNDING_PAGE_LIMIT {
+                    return Err(SnapshotError::new(
+                        "Bybit funding page exceeds the history limit",
+                    ));
+                }
+                for row in rows {
+                    let row_symbol = funding_text(row, "symbol")?;
+                    let row_type = funding_text(row, "type")?;
+                    if row_type != "SETTLEMENT" {
+                        continue;
+                    }
+                    if funding_text(row, "category")? != CATEGORY
+                        || funding_text(row, "currency")? != asset
+                    {
+                        return Err(SnapshotError::new(
+                            "Bybit funding settlement scope is invalid",
+                        ));
+                    }
+                    let at_ms = funding_text(row, "transactionTime")?
+                        .parse::<u64>()
+                        .map_err(|_| SnapshotError::new("Bybit funding timestamp is invalid"))?;
+                    if at_ms < window_start || at_ms > window_end {
+                        return Err(SnapshotError::new(
+                            "Bybit funding receipt is outside the requested interval",
+                        ));
+                    }
+                    if row_symbol != symbol {
+                        continue;
+                    }
+                    // funding is already receive-positive. cashFlow/change also contain session PnL/fees.
+                    let payment = FundingPayment {
+                        id: funding_text(row, "id")?.to_owned(),
+                        at_ms,
+                        amount: funding_decimal(row, "funding")?,
+                        asset: asset.into(),
+                        position_quantity: Some(funding_decimal(row, "size")?),
+                    };
+                    if payment.position_quantity == Some(Decimal::ZERO) && !payment.amount.is_zero()
+                    {
+                        return Err(SnapshotError::new(
+                            "Bybit nonzero funding receipt has zero settlement position",
+                        ));
+                    }
+                    if let Some(previous) = payments.get(&payment.id) {
+                        if previous != &payment {
+                            return Err(SnapshotError::new(
+                                "Bybit funding receipt identity conflict",
+                            ));
+                        }
+                    } else {
+                        payments.insert(payment.id.clone(), payment);
+                    }
+                }
+                let next = result
+                    .get("nextPageCursor")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        SnapshotError::new("Bybit funding cursor is missing or invalid")
+                    })?;
+                if next.is_empty() {
+                    break;
+                }
+                if next.trim().is_empty() || !seen_cursors.insert(next.to_owned()) {
+                    return Err(SnapshotError::new("Bybit funding cursor did not advance"));
+                }
+                cursor = Some(next.to_owned());
+            }
+            if window_end == through_ms {
+                break;
+            }
+            window_start = window_end + 1;
+        }
+        let mut payments = payments.into_values().collect::<Vec<_>>();
+        payments.sort_by(|left, right| (left.at_ms, &left.id).cmp(&(right.at_ms, &right.id)));
+        Ok(FundingHistorySnapshot {
+            exchange,
+            symbol,
+            from_ms,
+            through_ms,
+            payments,
+            account_fills: None,
+        })
+    }
+
     async fn account_balance_snapshot(
         &self,
         exchange: Exchange,
@@ -552,6 +716,36 @@ where
             SnapshotError::new(format!("invalid Bybit account balance snapshot: {error}"))
         })
     }
+}
+
+fn funding_text<'a>(value: &'a Value, field: &str) -> Result<&'a str, SnapshotError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && *text == text.trim())
+        .ok_or_else(|| {
+            SnapshotError::new(format!("Bybit funding field {field} is missing or invalid"))
+        })
+}
+
+fn funding_decimal(value: &Value, field: &str) -> Result<Decimal, SnapshotError> {
+    let text = funding_text(value, field)?;
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let valid = match unsigned.split_once('.') {
+        Some((whole, fraction)) => digits(whole) && digits(fraction),
+        None => digits(unsigned),
+    };
+    if !valid {
+        return Err(SnapshotError::new(format!(
+            "Bybit funding field {field} is invalid"
+        )));
+    }
+    Decimal::from_str_exact(text).map_err(|_| {
+        SnapshotError::new(format!(
+            "Bybit funding field {field} is invalid or loses precision"
+        ))
+    })
 }
 
 #[async_trait]
@@ -1432,6 +1626,316 @@ mod tests {
             status: 200,
             body: body.into(),
         })
+    }
+
+    const FUNDING_START: u64 = 1_699_000_000_000;
+
+    fn funding_row(id: &str, at_ms: u64, amount: &str, size: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "symbol": "MUUSDT", "category": "linear", "type": "SETTLEMENT",
+            "transactionTime": at_ms.to_string(), "funding": amount, "size": size,
+            "currency": "USDT", "cashFlow": "999", "fee": "12", "change": "987"
+        })
+    }
+
+    fn funding_page(rows: Vec<serde_json::Value>, cursor: &str) -> String {
+        serde_json::json!({"retCode": 0, "retMsg": "OK", "result": {
+            "list": rows, "nextPageCursor": cursor
+        }})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn funding_history_preserves_signs_positions_and_filters_response_symbol() {
+        let mut other = funding_row("other", FUNDING_START, "90", "3");
+        other["symbol"] = serde_json::json!("BTCUSDT");
+        let mut trade = funding_row("trade", FUNDING_START, "100", "3");
+        trade["type"] = serde_json::json!("TRADE");
+        let transport = MockTransport::with_response(ok(funding_page(
+            vec![
+                funding_row("received", FUNDING_START, "1.25", "-10"),
+                funding_row("paid", FUNDING_START + 1, "-2.5", "20"),
+                funding_row("zero", FUNDING_START + 2, "0", "0"),
+                other,
+                trade,
+            ],
+            "",
+        )));
+        let history = adapter(transport.clone())
+            .funding_history(Exchange::Bybit, "muusdt", FUNDING_START, FUNDING_START + 2)
+            .await
+            .unwrap();
+        assert_eq!(history.symbol, "MUUSDT");
+        assert_eq!(history.exchange, Exchange::Bybit);
+        assert_eq!(
+            (history.from_ms, history.through_ms),
+            (FUNDING_START, FUNDING_START + 2)
+        );
+        assert!(history.account_fills.is_none());
+        assert_eq!(history.payments.len(), 3);
+        assert_eq!(history.payments[0].amount, Decimal::new(125, 2));
+        assert_eq!(
+            history.payments[0].position_quantity,
+            Some(Decimal::from(-10))
+        );
+        assert_eq!(history.payments[1].amount, Decimal::new(-25, 1));
+        assert_eq!(
+            history.payments[1].position_quantity,
+            Some(Decimal::from(20))
+        );
+        assert_eq!(history.payments[2].amount, Decimal::ZERO);
+        assert_eq!(history.payments[2].position_quantity, Some(Decimal::ZERO));
+        let request = &transport.requests()[0];
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.path, "/v5/account/transaction-log");
+        assert!(request.headers.iter().any(|(key, _)| key == "X-BAPI-SIGN"));
+        for (key, value) in [
+            ("accountType", "UNIFIED"),
+            ("category", "linear"),
+            ("limit", "50"),
+        ] {
+            assert!(request.query.contains(&(key.into(), value.into())));
+        }
+        assert!(!request.query.iter().any(|(key, _)| key == "symbol"));
+    }
+
+    #[tokio::test]
+    async fn funding_history_usdc_uses_only_funding_not_session_pnl_or_fees() {
+        let mut row = funding_row("usdc", FUNDING_START, "-0.75", "-2");
+        row["symbol"] = serde_json::json!("MUPERP");
+        row["currency"] = serde_json::json!("USDC");
+        let transport = MockTransport::with_response(ok(funding_page(vec![row], "")));
+        let result = adapter(transport)
+            .funding_history(Exchange::Bybit, "MUPERP", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap();
+        assert_eq!(result.payments[0].amount, Decimal::new(-75, 2));
+        assert_eq!(result.payments[0].asset, "USDC");
+    }
+
+    #[tokio::test]
+    async fn funding_history_exhausts_cursor_then_advances_nonoverlapping_seven_day_window() {
+        let end = FUNDING_START + 604_800_001;
+        let transport = MockTransport::with_response(ok(funding_page(
+            vec![funding_row("a", FUNDING_START, "1", "2")],
+            "opaque%3Anext",
+        )));
+        transport.push(ok(funding_page(
+            vec![funding_row("b", FUNDING_START + 1, "2", "2")],
+            "",
+        )));
+        transport.push(ok(funding_page(vec![funding_row("c", end, "3", "2")], "")));
+        let result = adapter(transport.clone())
+            .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, end)
+            .await
+            .unwrap();
+        assert_eq!(result.payments.len(), 3);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[1]
+                .query
+                .contains(&("cursor".into(), "opaque%3Anext".into()))
+        );
+        assert!(!requests[2].query.iter().any(|(key, _)| key == "cursor"));
+        let mut previous_end = None;
+        for index in [0, 2] {
+            let query = &requests[index].query;
+            let time = |name: &str| {
+                query
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .unwrap()
+                    .1
+                    .parse::<u64>()
+                    .unwrap()
+            };
+            let start = time("startTime");
+            let through = time("endTime");
+            assert!(through - start <= 604_800_000);
+            if let Some(previous) = previous_end {
+                assert_eq!(start, previous + 1);
+            }
+            previous_end = Some(through);
+        }
+        assert_eq!(previous_end, Some(end));
+    }
+
+    #[tokio::test]
+    async fn funding_history_rejects_missing_malformed_out_of_range_and_wrong_currency() {
+        for (field, value) in [
+            ("funding", serde_json::Value::Null),
+            ("funding", serde_json::json!("")),
+            ("funding", serde_json::json!("NaN")),
+            ("funding", serde_json::json!("1_000")),
+            ("funding", serde_json::json!("1.")),
+            (
+                "funding",
+                serde_json::json!("0.123456789012345678901234567890"),
+            ),
+            ("funding", serde_json::json!(1.5)),
+            ("size", serde_json::Value::Null),
+            ("size", serde_json::json!("")),
+            ("size", serde_json::json!("0")),
+            ("size", serde_json::json!("1e100")),
+            ("id", serde_json::json!("")),
+            (
+                "transactionTime",
+                serde_json::json!((FUNDING_START - 1).to_string()),
+            ),
+            (
+                "transactionTime",
+                serde_json::json!((FUNDING_START + 1).to_string()),
+            ),
+            ("currency", serde_json::json!("USDC")),
+            ("category", serde_json::json!("inverse")),
+        ] {
+            let mut row = funding_row("bad", FUNDING_START, "1", "2");
+            row[field] = value;
+            let transport = MockTransport::with_response(ok(funding_page(vec![row], "")));
+            assert!(
+                adapter(transport)
+                    .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                    .await
+                    .is_err(),
+                "accepted {field}"
+            );
+        }
+        for field in ["size", "funding", "symbol", "type", "transactionTime"] {
+            let mut row = funding_row("bad", FUNDING_START, "1", "2");
+            row.as_object_mut().unwrap().remove(field);
+            let transport = MockTransport::with_response(ok(funding_page(vec![row], "")));
+            assert!(
+                adapter(transport)
+                    .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                    .await
+                    .is_err(),
+                "accepted missing {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn funding_history_rejects_incomplete_envelopes_and_cursor_cycles() {
+        for body in [
+            "{}",
+            r#"{"retCode":0,"result":{"list":[]}}"#,
+            r#"{"retCode":0,"result":{"list":null,"nextPageCursor":""}}"#,
+            r#"{"retCode":0,"result":{"list":[],"nextPageCursor":null}}"#,
+        ] {
+            let transport = MockTransport::with_response(ok(body));
+            assert!(
+                adapter(transport)
+                    .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                    .await
+                    .is_err()
+            );
+        }
+        let transport = MockTransport::with_response(ok(funding_page(vec![], "repeat")));
+        transport.push(ok(funding_page(vec![], "repeat")));
+        let error = adapter(transport.clone())
+            .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("cursor"));
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn funding_history_rejects_out_of_window_account_rows_before_symbol_filtering() {
+        let mut row = funding_row("other", FUNDING_START + 1, "1", "2");
+        row["symbol"] = serde_json::json!("BTCUSDT");
+        let transport = MockTransport::with_response(ok(funding_page(vec![row], "")));
+        let error = adapter(transport)
+            .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("interval"));
+    }
+
+    #[tokio::test]
+    async fn funding_history_deduplicates_identical_receipts_and_rejects_conflicting_ids() {
+        for amount in ["1", "2"] {
+            let transport = MockTransport::with_response(ok(funding_page(
+                vec![funding_row("same", FUNDING_START, "1", "2")],
+                "next",
+            )));
+            transport.push(ok(funding_page(
+                vec![funding_row("same", FUNDING_START, amount, "2")],
+                "",
+            )));
+            let result = adapter(transport)
+                .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await;
+            if amount == "1" {
+                assert_eq!(result.unwrap().payments.len(), 1);
+            } else {
+                assert!(result.unwrap_err().message.contains("conflict"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn funding_history_accepts_empty_history_but_rejects_http_errors_and_oversized_pages() {
+        let transport = MockTransport::with_response(ok(funding_page(vec![], "")));
+        let history = adapter(transport)
+            .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap();
+        assert!(history.payments.is_empty());
+        let rows = (0..51)
+            .map(|index| funding_row(&index.to_string(), FUNDING_START, "1", "2"))
+            .collect();
+        for response in [
+            ok(funding_page(rows, "")),
+            Ok(HttpResponse {
+                status: 429,
+                body: funding_page(vec![], ""),
+            }),
+            ok(
+                r#"{"retCode":10001,"retMsg":"bad request","result":{"list":[],"nextPageCursor":""}}"#,
+            ),
+            Err(TransportError::Other("offline".into())),
+        ] {
+            let transport = MockTransport::with_response(response);
+            assert!(
+                adapter(transport)
+                    .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn funding_history_fails_closed_at_request_cap_and_rejects_invalid_requests_locally() {
+        let transport = MockTransport::default();
+        for index in 0..256 {
+            transport.push(ok(funding_page(vec![], &format!("cursor-{index}"))));
+        }
+        let error = adapter(transport.clone())
+            .funding_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("limit"));
+        assert_eq!(transport.requests().len(), 256);
+        let transport = MockTransport::default();
+        let gateway = adapter(transport.clone());
+        for (exchange, symbol, from, through) in [
+            (Exchange::Binance, "MUUSDT", FUNDING_START, FUNDING_START),
+            (Exchange::Bybit, "", FUNDING_START, FUNDING_START),
+            (Exchange::Bybit, "MUUSDT", FUNDING_START + 1, FUNDING_START),
+            (Exchange::Bybit, "MUUSDT", FUNDING_START, 1_700_000_000_124),
+            (Exchange::Bybit, "MUUSDT", 0, FUNDING_START),
+        ] {
+            assert!(
+                gateway
+                    .funding_history(exchange, symbol, from, through)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(transport.requests().is_empty());
     }
 
     #[tokio::test]

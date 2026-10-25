@@ -33,9 +33,10 @@ use crate::{
         MarketSnapshot, PreparedStrategyKind, PreparedStrategyLifecycle,
         PreparedStrategyStopOutcome, RuntimeCoordinator, RuntimeCoordinatorError,
         RuntimeRegistryEntry, ShadowCollectionError, StrategyBootstrapError, StrategyLifecycle,
-        StrategyOrderPurpose, StrategyState, StrategyTransition, advance_reference_time_ms,
-        build_grid_preview, collect_stable_exchange_view, collect_strategy_shadow_view,
-        ensure_available_margin_snapshot, load_authoritative_fee_config,
+        StrategyOrderPurpose, StrategyRunId, StrategyState, StrategyTransition,
+        advance_reference_time_ms, build_grid_preview, collect_stable_exchange_view,
+        collect_strategy_shadow_view, ensure_available_margin_snapshot,
+        load_authoritative_fee_config,
     },
     exchange::{
         AccountBalanceSnapshotGateway, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
@@ -46,6 +47,9 @@ use crate::{
         configured::{
             ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayFactory,
             SharedConfiguredExchangeGateway,
+        },
+        funding::{
+            FundingAccountFill, FundingAttribution, FundingHistorySnapshot, attribute_funding,
         },
         registry::{ExchangeGatewayRegistry, ReadOnlyExchangeGateway, RegistryError},
     },
@@ -3526,22 +3530,14 @@ async fn exchange_risk(
                 }
             };
             let profit_calculation_has_risk = profit_metrics.is_none();
-            let fees_settled = strategy.pending_fee_valuation_count() == 0;
-            let profit_fields = json!({
-                "gross_profit": strategy.gross_realized_profit.to_string(),
-                "realized_net_profit": profit_metrics.filter(|_| fees_settled).map(|metrics| metrics.realized_net_profit.to_string()),
-                "unrealised_pnl": profit_metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
-                "grid_unrealised_pnl": profit_metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
-                "total_equity_profit": profit_metrics.filter(|_| fees_settled).map(|metrics| metrics.total_equity_profit.to_string()),
-                "total_profit": profit_metrics.filter(|_| fees_settled).map(|metrics| metrics.total_equity_profit.to_string()),
-                "profit_mark_price": profit_metrics.map(|metrics| metrics.mark_price.to_string()),
-                "profit_scope": "strategy_owned_inventory",
-                "profit_calculation_error": profit_calculation_has_risk.then_some("strategy_profit_unavailable"),
-                "total_fee": fees_settled.then(|| strategy.total_fee.to_string()),
-                "fee_valuation_pending_count": strategy.pending_fee_valuation_count(),
-                "total_volume": strategy.total_volume.to_string(),
-                "completed_pairs": strategy.completed_pairs,
-            });
+            let funding = if order_protection_risk || report.orders.pending_submission_count > 0 {
+                Err(SnapshotError::new(
+                    "funding attribution requires fully accounted strategy orders",
+                ))
+            } else {
+                collect_strategy_funding(gateway.as_ref(), &strategy).await
+            };
+            let profit_fields = strategy_profit_fields(&strategy, profit_metrics, funding);
             let response = json!({
                 "version": 1,
                 "symbol": symbol,
@@ -3926,6 +3922,239 @@ struct StrategyProfitMetrics {
     mark_price: Decimal,
 }
 
+async fn collect_strategy_funding(
+    gateway: &dyn ReadOnlyExchangeGateway,
+    strategy: &StrategyState,
+) -> Result<FundingAttribution, SnapshotError> {
+    let now =
+        unix_time_ms().map_err(|_| SnapshotError::new("funding query clock is unavailable"))?;
+    let through_ms = if matches!(
+        strategy.lifecycle,
+        StrategyLifecycle::Stopped | StrategyLifecycle::Closed
+    ) {
+        strategy.updated_at_ms.min(now)
+    } else {
+        now
+    };
+    let history = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        gateway.funding_history(
+            strategy.exchange,
+            &strategy.symbol,
+            strategy.created_at_ms,
+            through_ms,
+        ),
+    )
+    .await
+    .map_err(|_| SnapshotError::new("funding history query timed out"))??;
+    attribute_strategy_funding(strategy, &history)
+}
+
+fn attribute_strategy_funding(
+    strategy: &StrategyState,
+    history: &FundingHistorySnapshot,
+) -> Result<FundingAttribution, SnapshotError> {
+    let last_settlement = history.payments.iter().map(|payment| payment.at_ms).max();
+    let mut owned = Vec::new();
+    if let Some(last_settlement) = last_settlement {
+        for event in strategy.inventory_events.values() {
+            let at_ms = event.execution_time_ms.ok_or_else(|| {
+                SnapshotError::new("funding attribution requires exact execution times")
+            })?;
+            if at_ms > last_settlement {
+                continue;
+            }
+            let order = strategy
+                .orders
+                .get(&event.source_client_order_id)
+                .ok_or_else(|| {
+                    SnapshotError::new("funding execution has no strategy-owned order")
+                })?;
+            if event.quantity <= Decimal::ZERO {
+                return Err(SnapshotError::new("funding execution quantity is invalid"));
+            }
+            owned.push(FundingAccountFill {
+                trade_id: event.exchange_trade_id.clone().ok_or_else(|| {
+                    SnapshotError::new("funding execution has no exact exchange trade id")
+                })?,
+                exchange_order_id: order.exchange_order_id.clone().ok_or_else(|| {
+                    SnapshotError::new("funding execution has no exact exchange order id")
+                })?,
+                at_ms,
+                signed_quantity: match order.shape.side {
+                    OrderSide::Buy => event.quantity,
+                    OrderSide::Sell => -event.quantity,
+                },
+            });
+        }
+        if let Some(account_fills) = &history.account_fills {
+            let owned_orders = strategy
+                .orders
+                .values()
+                .filter_map(|order| order.exchange_order_id.as_deref())
+                .collect::<BTreeSet<_>>();
+            let owned_trades = owned
+                .iter()
+                .map(|fill| fill.trade_id.as_str())
+                .collect::<BTreeSet<_>>();
+            // Legacy baselines have no exchange observation timestamp. External fills
+            // after creation make that replay boundary unknowable; never double-count them.
+            if account_fills.iter().any(|fill| {
+                fill.at_ms <= last_settlement
+                    && !owned_orders.contains(fill.exchange_order_id.as_str())
+            }) {
+                return Err(SnapshotError::new(
+                    "funding baseline boundary is ambiguous after external executions",
+                ));
+            }
+            if account_fills.iter().any(|fill| {
+                fill.at_ms <= last_settlement
+                    && owned_orders.contains(fill.exchange_order_id.as_str())
+                    && !owned_trades.contains(fill.trade_id.as_str())
+            }) {
+                return Err(SnapshotError::new(
+                    "funding settlement includes pending strategy executions",
+                ));
+            }
+        }
+    }
+    attribute_funding(
+        history,
+        strategy.exchange,
+        &strategy.symbol,
+        strategy.created_at_ms,
+        strategy.baseline.signed_quantity,
+        &owned,
+    )
+}
+
+fn strategy_profit_fields(
+    strategy: &StrategyState,
+    metrics: Option<StrategyProfitMetrics>,
+    funding: Result<FundingAttribution, SnapshotError>,
+) -> Value {
+    if let Err(error) = &funding {
+        tracing::warn!(exchange = ?strategy.exchange, symbol = %strategy.symbol,
+            run_id = strategy.run_id.as_str(), error = %error, "strategy funding attribution is unavailable");
+    }
+    let fees_settled = strategy.pending_fee_valuation_count() == 0;
+    let funding = funding.ok();
+    let net = metrics
+        .filter(|_| fees_settled)
+        .zip(funding)
+        .and_then(|(metrics, funding)| metrics.total_equity_profit.checked_add(funding.net_income));
+    json!({
+        "gross_profit": strategy.gross_realized_profit.to_string(),
+        "realized_net_profit": metrics.filter(|_| fees_settled).map(|metrics| metrics.realized_net_profit.to_string()),
+        "unrealised_pnl": metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
+        "grid_unrealised_pnl": metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
+        "trading_net_equity_profit": metrics.filter(|_| fees_settled).map(|metrics| metrics.total_equity_profit.to_string()),
+        "funding_status": if funding.is_some() { "verified" } else { "unavailable" },
+        "funding_net_income": funding.map(|funding| funding.net_income.to_string()),
+        "funding_payment_count": funding.map(|funding| funding.payment_count),
+        "funding_observed_through_ms": funding.map(|funding| funding.through_ms),
+        "funding_attribution": "owned_quantity_share",
+        "total_equity_profit": net.map(|value| value.to_string()),
+        "total_profit": net.map(|value| value.to_string()),
+        "profit_mark_price": metrics.map(|metrics| metrics.mark_price.to_string()),
+        "profit_scope": "strategy_owned_inventory",
+        "profit_calculation_error": if metrics.is_none() { Some("strategy_profit_unavailable") }
+            else if funding.is_none() { Some("strategy_funding_unavailable") }
+            else if fees_settled && net.is_none() { Some("strategy_profit_arithmetic_invalid") } else { None },
+        "total_fee": fees_settled.then(|| strategy.total_fee.to_string()),
+        "fee_valuation_pending_count": strategy.pending_fee_valuation_count(),
+        "total_volume": strategy.total_volume.to_string(),
+        "completed_pairs": strategy.completed_pairs,
+    })
+}
+
+async fn strategy_funding_audit(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let run_id = match StrategyRunId::parse(run_id) {
+        Ok(run_id) => run_id,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_run_id",
+                "The strategy run id is invalid",
+            );
+        }
+    };
+    let _permit = match state.risk_snapshot_gate.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "risk_snapshot_busy",
+                "A read-only audit is already running",
+            );
+        }
+    };
+    let root = state.strategy_root.clone();
+    let wanted = run_id.clone();
+    let catalog = match tokio::task::spawn_blocking(move || {
+        load_strategy_catalog_for_run_ids(root, &[wanted])
+    })
+    .await
+    {
+        Ok(Ok(catalog)) if catalog.anomalies().is_empty() => catalog,
+        _ => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_catalog_unavailable",
+                "The strategy funding ledger could not be verified",
+            );
+        }
+    };
+    let Some(StrategyCatalogSnapshot::Active(strategy)) = catalog
+        .entries()
+        .iter()
+        .find(|entry| entry.run_id() == run_id.as_str())
+    else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "strategy_not_found",
+            "The executed strategy run was not found",
+        );
+    };
+    if !matches!(
+        strategy.lifecycle,
+        StrategyLifecycle::Stopped | StrategyLifecycle::Closed
+    ) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "strategy_ledger_not_terminal",
+            "Run-level funding audits require a terminal ledger; use the live risk snapshot for active strategies",
+        );
+    }
+    let gateway = match read_gateway(&state, strategy.exchange) {
+        Ok(gateway) => gateway,
+        Err(error) => return error.response(),
+    };
+    match collect_strategy_funding(gateway.as_ref(), strategy).await {
+        Ok(funding) => no_store_json(
+            StatusCode::OK,
+            json!({
+                "exchange": strategy.exchange, "symbol": strategy.symbol, "run_id": strategy.run_id.as_str(),
+                "funding_status": "verified", "funding_net_income": funding.net_income.to_string(),
+                "funding_payment_count": funding.payment_count, "funding_observed_through_ms": funding.through_ms,
+                "funding_attribution": "owned_quantity_share",
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(run_id = run_id.as_str(), error = %error, "read-only funding audit is unavailable");
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strategy_funding_unavailable",
+                "The settled funding history or strategy ownership could not be verified",
+            )
+        }
+    }
+}
+
 fn strategy_profit_metrics(
     strategy: &StrategyState,
     position: &PositionSnapshot,
@@ -4190,6 +4419,7 @@ fn router_with_state(state: ApiState) -> Router {
         .route("/api/grid/status", get(grid_status))
         .route("/api/grid/status/{symbol}", get(grid_symbol_status))
         .route("/api/grid/history", get(strategy_history))
+        .route("/api/grid/funding/{run_id}", get(strategy_funding_audit))
         .route("/api/grid/preview", post(grid_preview))
         .route("/api/grid/start", post(start_grid_web))
         .route("/api/grid/stop", post(stop_only_grid_web))
@@ -4836,6 +5066,23 @@ mod tests {
 
     #[async_trait]
     impl AccountBalanceSnapshotGateway for StrategyRiskGateway {
+        async fn funding_history(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            from_ms: u64,
+            through_ms: u64,
+        ) -> Result<FundingHistorySnapshot, SnapshotError> {
+            Ok(FundingHistorySnapshot {
+                exchange,
+                symbol: symbol.into(),
+                from_ms,
+                through_ms,
+                payments: vec![],
+                account_fills: None,
+            })
+        }
+
         async fn account_balance_snapshot(
             &self,
             _exchange: Exchange,
@@ -6614,6 +6861,131 @@ mod tests {
     }
 
     #[test]
+    fn strategy_net_profit_adds_funding_income_and_deducts_paid_funding_once() {
+        let directory = tempdir().unwrap();
+        let (mut strategy, _) = persist_clean_running_strategy(directory.path());
+        strategy.gross_realized_profit = Decimal::from(10);
+        strategy.total_fee = Decimal::from(2);
+        let metrics = StrategyProfitMetrics {
+            realized_net_profit: Decimal::from(8),
+            grid_unrealized_profit: Decimal::from(-12),
+            total_equity_profit: Decimal::from(-4),
+            mark_price: Decimal::ONE,
+        };
+        for (income, expected) in [(3, "-1"), (-3, "-7"), (0, "-4")] {
+            let fields = strategy_profit_fields(
+                &strategy,
+                Some(metrics),
+                Ok(FundingAttribution {
+                    net_income: Decimal::from(income),
+                    payment_count: 1,
+                    through_ms: 500,
+                }),
+            );
+            assert_eq!(fields["total_equity_profit"], expected);
+            assert_eq!(fields["total_profit"], expected);
+            assert_eq!(fields["trading_net_equity_profit"], "-4");
+            assert_eq!(fields["realized_net_profit"], "8");
+            assert_eq!(fields["total_fee"], "2");
+            assert_eq!(fields["funding_status"], "verified");
+            assert_eq!(fields["funding_net_income"], income.to_string());
+            assert_eq!(fields["profit_calculation_error"], Value::Null);
+        }
+        let missing = strategy_profit_fields(
+            &strategy,
+            Some(metrics),
+            Err(SnapshotError::new("truncated history")),
+        );
+        assert_eq!(missing["total_equity_profit"], Value::Null);
+        assert_eq!(missing["realized_net_profit"], "8");
+        assert_eq!(missing["funding_net_income"], Value::Null);
+        assert_eq!(missing["funding_status"], "unavailable");
+        assert_eq!(
+            missing["profit_calculation_error"],
+            "strategy_funding_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_audit_rejects_invalid_run_identity_without_touching_execution() {
+        let app = router_with_state(ApiState::for_test(
+            verifier(),
+            false,
+            Arc::new(FileIdempotencyStore::new(tempdir().unwrap().path())),
+            Arc::new(DisabledStartGridCommand),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/funding/invalid-id!")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn strategy_funding_rejects_external_fills_with_an_untimestamped_legacy_baseline() {
+        let directory = tempdir().unwrap();
+        let (strategy, _) = persist_clean_running_strategy(directory.path());
+        let history = FundingHistorySnapshot {
+            exchange: strategy.exchange,
+            symbol: strategy.symbol.clone(),
+            from_ms: strategy.created_at_ms,
+            through_ms: strategy.created_at_ms + 20,
+            payments: vec![crate::exchange::funding::FundingPayment {
+                id: "funding".into(),
+                at_ms: strategy.created_at_ms + 10,
+                amount: Decimal::from(-3),
+                asset: "USDT".into(),
+                position_quantity: None,
+            }],
+            account_fills: Some(vec![FundingAccountFill {
+                trade_id: "manual".into(),
+                exchange_order_id: "manual-order".into(),
+                at_ms: strategy.created_at_ms + 1,
+                signed_quantity: Decimal::from(10),
+            }]),
+        };
+        let error = attribute_strategy_funding(&strategy, &history).unwrap_err();
+        assert!(error.to_string().contains("baseline boundary is ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn funding_audit_refuses_nonterminal_strategy_without_exchange_queries() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        let (strategy, _) = persist_clean_running_strategy(&root);
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_strategy_root(root),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/grid/funding/{}", strategy.run_id.as_str()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "strategy_ledger_not_terminal"
+        );
+    }
+
+    #[test]
     fn strategy_profit_metrics_fail_closed_when_exchange_position_diverges_from_the_ledger() {
         let directory = tempdir().unwrap();
         let (strategy, mut gateway) = persist_clean_running_strategy(directory.path());
@@ -6621,6 +6993,62 @@ mod tests {
         gateway.position.legs[0].entry_price = Some(Decimal::from_str_exact("0.40000").unwrap());
 
         assert!(strategy_profit_metrics(&strategy, &gateway.position).is_err());
+    }
+
+    #[tokio::test]
+    async fn live_funding_is_unknown_when_partial_execution_is_offset_by_a_manual_fill() {
+        let directory = tempdir().unwrap();
+        let strategy_root = directory.path().join("strategies");
+        let (_, mut gateway) = persist_clean_running_strategy(&strategy_root);
+        gateway.open_orders[0].lifecycle =
+            OrderLifecycle::Active(ActiveOrderStatus::PartiallyFilled);
+        gateway.open_orders[0].executed_quantity = Some(Decimal::from(10));
+        // A manual offset keeps the exchange net quantity equal to the stale ledger.
+        // Position equality alone must not authorize a final funding/net-profit value.
+        gateway.position.legs[0].signed_quantity = Decimal::ZERO;
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                false,
+                Arc::new(FileIdempotencyStore::new(
+                    directory.path().join("idempotency"),
+                )),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_exchange_gateways(gateways)
+            .with_strategy_root(strategy_root),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let risk = response_json(response).await;
+        assert_eq!(risk["actual_position_net_qty"], "0");
+        assert_eq!(
+            risk["shadow_audit"]["orders"]["partial_execution_pending_count"],
+            1
+        );
+        assert_eq!(risk["funding_status"], "unavailable");
+        assert_eq!(risk["total_equity_profit"], Value::Null);
+        assert_eq!(
+            risk["profit_calculation_error"],
+            "strategy_funding_unavailable"
+        );
     }
 
     #[tokio::test]
