@@ -104,6 +104,8 @@ fn strategy_header(state: &StrategyState) -> StrategyState {
         initial_deployment_complete,
         risk_exit_reason,
         risk_trigger_mark_price,
+        profit_protection,
+        profit_protection_trigger,
         trigger_armed_price,
         trigger_observed_price,
         triggered_at_ms,

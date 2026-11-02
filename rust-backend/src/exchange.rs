@@ -552,6 +552,18 @@ pub trait AccountBalanceSnapshotGateway: Send + Sync {
     ) -> Result<funding::FundingHistorySnapshot, SnapshotError> {
         Err(SnapshotError::new("settled funding history is unavailable"))
     }
+
+    /// Trading decisions must refresh settled income instead of trusting a UI cache.
+    async fn fresh_funding_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<funding::FundingHistorySnapshot, SnapshotError> {
+        self.funding_history(exchange, symbol, from_ms, through_ms)
+            .await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

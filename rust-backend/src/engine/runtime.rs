@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::{StreamExt, stream};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -18,7 +19,8 @@ use crate::{
     engine::{
         ArmedStrategyLifecycle, ArmedStrategyState, CancellationResult, CancellationServiceError,
         ExecutionAccountingError, ExecutionSyncService, FeeValuationSource, PendingFeeValuation,
-        PeriodicReadPriority, ReconciliationError, ReconciliationResult, ResolvedFeeValuation,
+        PeriodicReadPriority, ProfitProtectionControlError, ProfitProtectionObservation,
+        ProfitProtectionStatus, ReconciliationError, ReconciliationResult, ResolvedFeeValuation,
         StrategyBootstrapError, StrategyLifecycle, StrategyMachine, StrategyMachineError,
         StrategyOrderPurpose, StrategyOrderRecord, StrategyOrderTracking, StrategyRunId,
         StrategyState, StrategyStateError, StrategyStateStore, StrategyStoreError,
@@ -475,6 +477,81 @@ impl<G> PreparedLeasedFileStrategy<G> {
                 .settle_fee_valuations(&resolved.client_order_id, &resolved.fee_valuations, now_ms),
             _ => Err(StrategyStateError::InvalidExecutionAudit.into()),
         }
+    }
+
+    pub fn profit_protection_status(
+        &self,
+        observation: ProfitProtectionObservation,
+    ) -> Result<ProfitProtectionStatus, ProfitProtectionControlError> {
+        let runtime = self
+            .active_runtime()
+            .ok_or(ProfitProtectionControlError::NotRunning)?;
+        let snapshot = runtime.runtime().machine().store().snapshot();
+        Ok(ProfitProtectionStatus {
+            run_id: snapshot.run_id.clone(),
+            exchange: snapshot.exchange,
+            symbol: snapshot.symbol.clone(),
+            lifecycle: self.lifecycle(),
+            profit_protection: snapshot.profit_protection.clone(),
+            observation,
+            trigger: snapshot.profit_protection_trigger.clone(),
+        })
+    }
+
+    pub fn update_profit_protection(
+        &mut self,
+        expected_revision: u64,
+        take_profit_amount: Option<Decimal>,
+        stop_loss_amount: Option<Decimal>,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, ProfitProtectionControlError> {
+        let Some(PreparedLeasedFileStrategyInner::Active(runtime)) = self.inner.as_mut() else {
+            return Err(ProfitProtectionControlError::NotRunning);
+        };
+        runtime
+            .runtime_mut()
+            .machine_mut()
+            .update_profit_protection(
+                expected_revision,
+                take_profit_amount,
+                stop_loss_amount,
+                now_ms,
+            )
+            .map_err(|error| match error {
+                StrategyMachineError::InvalidState(StrategyStateError::InvalidProfitProtection) => {
+                    ProfitProtectionControlError::InvalidLimits
+                }
+                StrategyMachineError::InvalidState(
+                    StrategyStateError::ProfitProtectionRevisionConflict,
+                ) => ProfitProtectionControlError::RevisionConflict,
+                StrategyMachineError::InvalidState(StrategyStateError::ProfitProtectionLocked) => {
+                    ProfitProtectionControlError::NotRunning
+                }
+                error => ProfitProtectionControlError::State(error),
+            })
+    }
+
+    pub fn evaluate_profit_protection(
+        &mut self,
+        net_profit: Decimal,
+        mark_price: Decimal,
+        observed_at_ms: u64,
+        expected_protection_revision: u64,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        let Some(PreparedLeasedFileStrategyInner::Active(runtime)) = self.inner.as_mut() else {
+            return Err(StrategyStateError::ProfitProtectionLocked.into());
+        };
+        runtime
+            .runtime_mut()
+            .machine_mut()
+            .evaluate_profit_protection(
+                net_profit,
+                mark_price,
+                observed_at_ms,
+                expected_protection_revision,
+                now_ms,
+            )
     }
 
     pub fn request_stop(
@@ -2213,6 +2290,19 @@ where
                         "authoritative open-order progress snapshot is unavailable: {error}"
                     ),
                 });
+                let lifecycle = self.machine.store().snapshot().lifecycle;
+                if matches!(
+                    lifecycle,
+                    StrategyLifecycle::StopRequested | StrategyLifecycle::RiskExitRequested
+                ) {
+                    return self
+                        .drive_exit(
+                            report,
+                            lifecycle,
+                            advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                        )
+                        .await;
+                }
                 return Ok(report);
             }
         };
@@ -2603,9 +2693,6 @@ where
             .await?;
             self.validate_ledger_ownership()?;
         }
-        if report.is_blocked() {
-            return Ok(report);
-        }
         if matches!(
             lifecycle,
             StrategyLifecycle::StopRequested | StrategyLifecycle::RiskExitRequested
@@ -2617,6 +2704,9 @@ where
                     advance_reference_time_ms(now_ms, tick_started.elapsed()),
                 )
                 .await;
+        }
+        if report.is_blocked() {
+            return Ok(report);
         }
 
         let input_read = load_strategy_inputs(
@@ -3168,6 +3258,14 @@ where
         now_ms: u64,
     ) -> Result<RuntimeTickReport, RuntimeTickError> {
         let exit_started = Instant::now();
+        // Read/accounting failures do not prohibit first exact-ID cancels, but
+        // cannot authorize unknown retries, terminal convergence or a close.
+        let cancellation_only = report.blockers.iter().any(|blocker| {
+            matches!(
+                blocker.stage,
+                RuntimeStage::LedgerReconciliation | RuntimeStage::ExecutionAccounting
+            )
+        });
         let (exchange, symbol, cancellation_targets) = {
             let state = self.machine.store().snapshot();
             let targets = state
@@ -3239,21 +3337,27 @@ where
                 Some(CancellationState::Resolved { .. }) => {
                     return Err(RuntimeTickError::IntentLedgerMismatch);
                 }
+                Some(CancellationState::SubmitUnknown { .. }) if cancellation_only => {
+                    report.cancellations.push(RuntimeCancellation {
+                        client_order_id: target.client_order_id.clone(),
+                        result: CancellationResult::SubmitUnknown,
+                    });
+                    report.blockers.push(RuntimeBlocker {
+                        stage: RuntimeStage::CancellationUnknown,
+                        client_order_id: Some(target.client_order_id.clone()),
+                        message: "unknown cancellation is waiting for fresh authoritative active evidence before retry".into(),
+                    });
+                }
                 Some(CancellationState::Prepared)
                 | Some(CancellationState::SubmitUnknown { .. })
                 | None => dispatch_targets.push(target.clone()),
             }
         }
 
-        let dispatch_batch = dispatch_targets
-            .iter()
-            .take(self.maximum_submissions_per_tick)
-            .cloned()
-            .collect::<Vec<_>>();
         let cancellation_results = cancel_many_with(
             &self.gateway,
             &mut self.intent_store,
-            dispatch_batch,
+            dispatch_targets,
             now_ms,
         )
         .await?;
@@ -3286,12 +3390,9 @@ where
                 message: message.into(),
             });
         }
-        if dispatch_targets.len() > self.maximum_submissions_per_tick {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::CancellationPending,
-                client_order_id: None,
-                message: "additional active orders remain queued for cancellation".into(),
-            });
+        if cancellation_only {
+            self.validate_ledger_ownership()?;
+            return Ok(report);
         }
         let acknowledged_ids = report
             .cancellations
@@ -5071,6 +5172,138 @@ mod tests {
             runtime.verify_ledger_ownership(),
             Err(RuntimeTickError::IntentLedgerMismatch)
         ));
+    }
+
+    #[tokio::test]
+    async fn profit_protection_prepared_bridge_preserves_identity_and_maps_control_errors() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        let run_id = StrategyRunId::parse("profit01").unwrap();
+        let mut prepared = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            run_id.clone(),
+            config(None),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        let observation = ProfitProtectionObservation {
+            status: "available".into(),
+            observed_at_ms: Some(1_102),
+            net_profit: Some(Decimal::new(10, 0)),
+            error: None,
+        };
+        let initial = prepared
+            .profit_protection_status(observation.clone())
+            .unwrap();
+        assert_eq!(initial.run_id, run_id);
+        assert_eq!(initial.exchange, Exchange::Binance);
+        assert_eq!(initial.symbol, "MUUSDT");
+        assert_eq!(
+            initial.lifecycle,
+            PreparedStrategyLifecycle::AwaitingOpening
+        );
+        assert_eq!(
+            initial.profit_protection,
+            crate::engine::ProfitProtection::default()
+        );
+        assert_eq!(initial.observation, observation);
+        assert!(initial.trigger.is_none());
+        assert!(matches!(
+            prepared.update_profit_protection(0, Some(Decimal::ZERO), None, 1_101),
+            Err(ProfitProtectionControlError::InvalidLimits)
+        ));
+        assert!(matches!(
+            prepared.update_profit_protection(1, Some(Decimal::ONE), None, 1_101),
+            Err(ProfitProtectionControlError::RevisionConflict)
+        ));
+        assert!(matches!(
+            prepared
+                .update_profit_protection(0, Some(Decimal::new(10, 0)), None, 1_101)
+                .unwrap(),
+            StrategyTransition::Updated { .. }
+        ));
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(gateway.cancellation_call_count(), 0);
+        assert!(matches!(
+            prepared
+                .evaluate_profit_protection(
+                    Decimal::new(10, 0),
+                    Decimal::new(1014, 0),
+                    1_102,
+                    1,
+                    1_103
+                )
+                .unwrap(),
+            StrategyTransition::RiskExitRequested {
+                reason: crate::engine::RiskExitReason::ProfitTakeProfit,
+                ..
+            }
+        ));
+        let latched = prepared.profit_protection_status(observation).unwrap();
+        assert_eq!(latched.profit_protection.revision, 1);
+        assert_eq!(
+            latched.lifecycle,
+            PreparedStrategyLifecycle::RiskExitRequested
+        );
+        assert_eq!(latched.trigger.unwrap().net_profit, Decimal::new(10, 0));
+        assert!(matches!(
+            prepared.update_profit_protection(1, None, None, 1_104),
+            Err(ProfitProtectionControlError::NotRunning)
+        ));
+        assert_eq!(
+            prepared
+                .evaluate_profit_protection(
+                    Decimal::new(10, 0),
+                    Decimal::new(1014, 0),
+                    1_104,
+                    1,
+                    1_104
+                )
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+    }
+
+    #[tokio::test]
+    async fn profit_protection_prepared_bridge_rejects_armed_updates_and_evaluation() {
+        let directory = tempdir().unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+        gateway.set_market_price(Decimal::new(1010, 0), 1_100);
+        let mut prepared = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            StrategyRunId::parse("profit02").unwrap(),
+            triggered_config(),
+            1_100,
+            runtime_settings(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            prepared.profit_protection_status(ProfitProtectionObservation::default()),
+            Err(ProfitProtectionControlError::NotRunning)
+        ));
+        assert!(matches!(
+            prepared.update_profit_protection(0, Some(Decimal::ONE), None, 1_101),
+            Err(ProfitProtectionControlError::NotRunning)
+        ));
+        assert!(matches!(
+            prepared.evaluate_profit_protection(
+                Decimal::ONE,
+                Decimal::new(1014, 0),
+                1_101,
+                0,
+                1_101
+            ),
+            Err(StrategyMachineError::InvalidState(
+                StrategyStateError::ProfitProtectionLocked
+            ))
+        ));
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(gateway.cancellation_call_count(), 0);
     }
 
     #[tokio::test]
@@ -10140,6 +10373,322 @@ mod tests {
         );
     }
 
+    async fn protective_cancel_fixture(
+        net_profit: Option<Decimal>,
+    ) -> (
+        StrategyRuntime<MockGateway, MemoryOrderIntentStore, MemoryStrategyStateStore>,
+        MockGateway,
+        AuthoritativeOrder,
+        u64,
+    ) {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let baseline = PositionBaseline::from_authoritative_position(
+            Decimal::new(-3, 0),
+            Some(Decimal::new(1010, 0)),
+        )
+        .unwrap();
+        let machine = machine_with_baseline(config(None), &rules, baseline.clone());
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine.store().snapshot().orders[&opening_id]
+            .shape
+            .quantity;
+        gateway.set_position(baseline.signed_quantity, baseline.entry_price);
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(
+            baseline.signed_quantity - opening_quantity,
+            Some(Decimal::new(1012, 0)),
+        );
+        let deployed = runtime.tick(1_200).await.unwrap();
+        assert!(!deployed.is_blocked(), "{deployed:?}");
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Running
+        );
+        let manual_order = {
+            let mut state = gateway.state.lock().unwrap();
+            let mut manual = state.orders[&opening_id].clone();
+            manual.client_order_id = ClientOrderId::parse("manual_read_failure").unwrap();
+            manual.exchange_order_id = "manual-read-failure-order".into();
+            manual.shape.quantity = Decimal::new(5, 1);
+            manual.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::New);
+            manual.executed_quantity = Some(Decimal::ZERO);
+            state
+                .orders
+                .insert(manual.client_order_id.clone(), manual.clone());
+            manual
+        };
+        let exit_at = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .updated_at_ms
+            .max(1_200)
+            + 50;
+        if let Some(net) = net_profit {
+            runtime
+                .machine_mut()
+                .update_profit_protection(
+                    0,
+                    Some(Decimal::new(5, 0)),
+                    Some(Decimal::new(5, 0)),
+                    exit_at,
+                )
+                .unwrap();
+            assert!(matches!(
+                runtime
+                    .machine_mut()
+                    .evaluate_profit_protection(
+                        net,
+                        Decimal::new(1014, 0),
+                        exit_at + 1,
+                        1,
+                        exit_at + 2
+                    )
+                    .unwrap(),
+                StrategyTransition::RiskExitRequested { .. }
+            ));
+        } else {
+            runtime.machine_mut().request_stop(exit_at).unwrap();
+        }
+        runtime.maximum_submissions_per_tick = 1;
+        (runtime, gateway, manual_order, exit_at + 100)
+    }
+
+    fn protective_cancel_ids<S: StrategyStateStore>(
+        machine: &StrategyMachine<S>,
+    ) -> BTreeSet<ClientOrderId> {
+        machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                !matches!(order.purpose, StrategyOrderPurpose::RiskClose)
+                    && matches!(
+                        order.tracking,
+                        StrategyOrderTracking::Intent {
+                            state: IntentState::Accepted { .. }
+                        }
+                    )
+            })
+            .map(|order| order.client_order_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn protective_cancel_progress_read_failure_dispatches_owned_ids_without_close_or_final_stop()
+     {
+        for net in [None, Some(Decimal::new(5, 0)), Some(Decimal::new(-5, 0))] {
+            let (mut runtime, gateway, manual, now) = protective_cancel_fixture(net).await;
+            let before = runtime.machine().store().snapshot().clone();
+            let targets = protective_cancel_ids(runtime.machine());
+            assert!(targets.len() > 1);
+            let placements = gateway.placement_call_count();
+            let lookups = gateway.order_lookup_call_count();
+            let executions = gateway.execution_snapshot_call_count();
+            let inputs = gateway.all_bootstrap_call_count();
+            gateway.fail_next_open_progress("protective progress read unavailable");
+
+            let blocked = runtime.tick(now).await.unwrap();
+
+            assert!(
+                blocked.blockers.iter().any(|blocker| blocker.stage
+                    == RuntimeStage::LedgerReconciliation
+                    && blocker.client_order_id.is_none()),
+                "{blocked:?}"
+            );
+            assert_eq!(
+                gateway
+                    .cancellation_ids()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                targets,
+                "read failure must not prevent first exact owned cancellations"
+            );
+            assert_eq!(gateway.cancellation_call_count(), targets.len());
+            assert_eq!(gateway.cancellation_batch_call_count(), 1);
+            assert!(blocked.submissions.is_empty());
+            assert_eq!(gateway.placement_call_count(), placements);
+            assert_eq!(runtime.machine().store().snapshot(), &before);
+            assert_eq!(gateway.order_lookup_call_count(), lookups);
+            assert_eq!(gateway.execution_snapshot_call_count(), executions);
+            assert_eq!(gateway.all_bootstrap_call_count(), inputs);
+            assert_eq!(
+                gateway.state.lock().unwrap().orders[&manual.client_order_id],
+                manual
+            );
+            for id in &targets {
+                gateway.mark_order_cancelled(id);
+            }
+            gateway.fail_next_open_progress("protective progress still unavailable");
+            let repeated = runtime.tick(now + 100).await.unwrap();
+            assert!(repeated.is_blocked());
+            assert_eq!(
+                gateway.cancellation_call_count(),
+                targets.len(),
+                "ACK is not resent"
+            );
+            assert_eq!(
+                runtime.machine().store().snapshot(),
+                &before,
+                "failed reads forbid terminal sync, final stop and close even if exchange orders terminated"
+            );
+            assert_eq!(gateway.placement_call_count(), placements);
+            assert!(!gateway.cancellation_ids().contains(&manual.client_order_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn protective_cancel_missing_execution_dispatches_owned_ids_without_close_or_final_stop()
+    {
+        for net in [None, Some(Decimal::new(5, 0)), Some(Decimal::new(-5, 0))] {
+            let (mut runtime, gateway, manual, now) = protective_cancel_fixture(net).await;
+            let before = runtime.machine().store().snapshot().clone();
+            let targets = protective_cancel_ids(runtime.machine());
+            let missing = targets.iter().next().unwrap().clone();
+            {
+                let mut state = gateway.state.lock().unwrap();
+                state.executions.remove(&missing);
+                state.orders.get_mut(&missing).unwrap().executed_quantity = None;
+            }
+            let placements = gateway.placement_call_count();
+            let inputs = gateway.all_bootstrap_call_count();
+
+            let blocked = runtime.tick(now).await.unwrap();
+
+            assert!(
+                blocked
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.stage == RuntimeStage::ExecutionAccounting
+                        && blocker.client_order_id.as_ref() == Some(&missing)),
+                "{blocked:?}"
+            );
+            assert_eq!(
+                gateway
+                    .cancellation_ids()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                targets,
+                "one missing execution cannot leave known owned orders uncancelled"
+            );
+            assert_eq!(gateway.cancellation_call_count(), targets.len());
+            assert!(blocked.submissions.is_empty());
+            assert_eq!(gateway.placement_call_count(), placements);
+            assert_eq!(
+                gateway.all_bootstrap_call_count(),
+                inputs,
+                "blocked exit must not read position or derive a close quantity"
+            );
+            let after = runtime.machine().store().snapshot();
+            assert_eq!(after.lifecycle, before.lifecycle);
+            assert_eq!(after.baseline, before.baseline);
+            assert_eq!(
+                after.grid_position_net_quantity,
+                before.grid_position_net_quantity
+            );
+            assert_eq!(after.lots_by_level, before.lots_by_level);
+            assert_eq!(after.config, before.config);
+            assert_eq!(after.total_fee, before.total_fee);
+            assert!(
+                !after
+                    .orders
+                    .values()
+                    .any(|order| matches!(order.purpose, StrategyOrderPurpose::RiskClose))
+            );
+            assert_eq!(
+                gateway.state.lock().unwrap().orders[&manual.client_order_id],
+                manual
+            );
+            let repeated = runtime.tick(now + 100).await.unwrap();
+            assert!(repeated.is_blocked());
+            assert_eq!(gateway.cancellation_call_count(), targets.len());
+            assert_eq!(gateway.placement_call_count(), placements);
+            assert_eq!(
+                runtime.machine().store().snapshot().lifecycle,
+                before.lifecycle
+            );
+            assert!(!gateway.cancellation_ids().contains(&manual.client_order_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn protective_cancel_unknown_is_never_resent_after_repeated_bad_reads() {
+        for net in [None, Some(Decimal::new(-5, 0))] {
+            let (mut runtime, gateway, manual, now) = protective_cancel_fixture(net).await;
+            let before = runtime.machine().store().snapshot().clone();
+            let targets = protective_cancel_ids(runtime.machine());
+            let placements = gateway.placement_call_count();
+            gateway.fail_next_cancellation(CancellationError::Unknown {
+                message: "timeout after protective cancellation write".into(),
+            });
+            gateway.fail_next_open_progress("first protective progress read failed");
+            let first = runtime.tick(now).await.unwrap();
+            assert_eq!(gateway.cancellation_call_count(), targets.len());
+            let unknown = first
+                .cancellations
+                .iter()
+                .find(|row| row.result == CancellationResult::SubmitUnknown)
+                .expect("one protective cancellation must remain unknown")
+                .client_order_id
+                .clone();
+            {
+                let mut state = gateway.state.lock().unwrap();
+                state.orders.remove(&unknown);
+                state.executions.remove(&unknown);
+            }
+            for offset in [100, 200, 300] {
+                if offset < 300 {
+                    gateway.fail_next_open_progress("protective progress read still failed");
+                }
+                let blocked = runtime.tick(now + offset).await.unwrap();
+                assert!(blocked.is_blocked(), "{blocked:?}");
+                assert_eq!(
+                    gateway.cancellation_call_count(),
+                    targets.len(),
+                    "unknown cancellation requires fresh active proof before retry"
+                );
+                assert!(
+                    blocked
+                        .blockers
+                        .iter()
+                        .any(|blocker| blocker.stage == RuntimeStage::CancellationUnknown
+                            && blocker.client_order_id.as_ref() == Some(&unknown)),
+                    "unknown cancellation must remain visibly blocked: {blocked:?}"
+                );
+                assert!(matches!(
+                    runtime.intent_store().snapshot().cancellations[&unknown].state,
+                    CancellationState::SubmitUnknown { .. }
+                ));
+                assert_eq!(gateway.placement_call_count(), placements);
+                assert_eq!(
+                    runtime.machine().store().snapshot().lifecycle,
+                    before.lifecycle
+                );
+                assert_eq!(
+                    runtime.machine().store().snapshot().baseline,
+                    before.baseline
+                );
+                assert_eq!(
+                    runtime
+                        .machine()
+                        .store()
+                        .snapshot()
+                        .grid_position_net_quantity,
+                    before.grid_position_net_quantity
+                );
+                assert_eq!(
+                    gateway.state.lock().unwrap().orders[&manual.client_order_id],
+                    manual
+                );
+                assert!(!gateway.cancellation_ids().contains(&manual.client_order_id));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn acknowledged_cancellations_never_starve_later_orders_under_a_small_batch_limit() {
         let rules = rules();
@@ -10162,12 +10711,54 @@ mod tests {
         runtime.machine_mut().request_stop(1_250).unwrap();
         runtime.maximum_submissions_per_tick = 1;
 
-        runtime.tick(1_300).await.unwrap();
-        runtime.tick(1_400).await.unwrap();
-
-        let ids = gateway.cancellation_ids();
-        assert_eq!(ids.len(), 2);
-        assert_ne!(ids[0], ids[1]);
+        let targets = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .filter(|order| {
+                matches!(
+                    order.tracking,
+                    StrategyOrderTracking::Intent {
+                        state: IntentState::Accepted { .. }
+                    }
+                )
+            })
+            .map(|order| order.client_order_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.len() > 1);
+        let first = runtime.tick(1_300).await.unwrap();
+        let ids = gateway
+            .cancellation_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids, targets,
+            "all active owned targets must dispatch on the first exit tick"
+        );
+        assert_eq!(gateway.cancellation_call_count(), targets.len());
+        assert_eq!(gateway.cancellation_batch_call_count(), 1);
+        assert!(
+            !first
+                .blockers
+                .iter()
+                .any(|blocker| blocker.stage == RuntimeStage::CancellationPending
+                    && blocker.client_order_id.is_none())
+        );
+        let second = runtime.tick(1_400).await.unwrap();
+        assert_eq!(
+            gateway.cancellation_call_count(),
+            targets.len(),
+            "ACKed requests must not be resent"
+        );
+        assert_eq!(gateway.cancellation_batch_call_count(), 1);
+        assert!(
+            second
+                .cancellations
+                .iter()
+                .all(|cancellation| cancellation.result == CancellationResult::AlreadyAcknowledged)
+        );
     }
 
     #[tokio::test]
@@ -10218,8 +10809,13 @@ mod tests {
         };
         let expected_position = -opening_quantity + signed_delta;
         gateway.set_position(expected_position, Some(Decimal::new(1014, 0)));
-        gateway.set_cancellation_marks_terminal(true);
-        runtime.maximum_submissions_per_tick = 100;
+        for id in gateway
+            .cancellation_ids()
+            .iter()
+            .filter(|id| **id != raced_id)
+        {
+            gateway.mark_order_cancelled(id);
+        }
 
         let reconcile_at = runtime
             .machine()
@@ -10468,6 +11064,192 @@ mod tests {
                 .get(&risk_close.client_order_id)
                 .is_some_and(|order| order.terminal_processed)
         );
+    }
+
+    #[tokio::test]
+    async fn profit_protection_exit_accounts_cancel_fill_race_and_preserves_manual_baseline_and_order()
+     {
+        for (net, reason) in [
+            (
+                Decimal::new(5, 0),
+                crate::engine::RiskExitReason::ProfitTakeProfit,
+            ),
+            (
+                Decimal::new(-5, 0),
+                crate::engine::RiskExitReason::ProfitStopLoss,
+            ),
+        ] {
+            let rules = rules();
+            let gateway = MockGateway::new(rules.clone(), 1_100);
+            let baseline_quantity = Decimal::new(-3, 0);
+            let baseline = PositionBaseline::from_authoritative_position(
+                baseline_quantity,
+                Some(Decimal::new(1010, 0)),
+            )
+            .unwrap();
+            let machine = machine_with_baseline(config(None), &rules, baseline.clone());
+            let opening_id = opening_id(&machine);
+            let opening_quantity = machine.store().snapshot().orders[&opening_id]
+                .shape
+                .quantity;
+            gateway.set_position(baseline_quantity, Some(Decimal::new(1010, 0)));
+            let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+            runtime.tick(1_100).await.unwrap();
+            gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+            gateway.set_position(
+                baseline_quantity - opening_quantity,
+                Some(Decimal::new(1012, 0)),
+            );
+            runtime.tick(1_200).await.unwrap();
+            let (manual_id, manual_order) = {
+                let mut state = gateway.state.lock().unwrap();
+                let mut manual = state.orders[&opening_id].clone();
+                manual.client_order_id = ClientOrderId::parse("manual_protection").unwrap();
+                manual.exchange_order_id = "manual-protection-order".into();
+                manual.shape.quantity = Decimal::new(5, 1);
+                manual.lifecycle = OrderLifecycle::Active(ActiveOrderStatus::New);
+                manual.executed_quantity = Some(Decimal::ZERO);
+                let id = manual.client_order_id.clone();
+                state.orders.insert(id.clone(), manual.clone());
+                (id, manual)
+            };
+            let configured_at = runtime
+                .machine()
+                .store()
+                .snapshot()
+                .updated_at_ms
+                .max(1_200)
+                + 10;
+            runtime
+                .machine_mut()
+                .update_profit_protection(
+                    0,
+                    Some(Decimal::new(5, 0)),
+                    Some(Decimal::new(5, 0)),
+                    configured_at,
+                )
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .machine_mut()
+                    .evaluate_profit_protection(
+                        net,
+                        Decimal::new(1014, 0),
+                        configured_at + 1,
+                        1,
+                        configured_at + 2
+                    )
+                    .unwrap(),
+                StrategyTransition::RiskExitRequested {
+                    reason,
+                    mark_price: Decimal::new(1014, 0)
+                }
+            );
+            runtime.maximum_submissions_per_tick = 1;
+            let owned_targets = runtime
+                .machine()
+                .store()
+                .snapshot()
+                .orders
+                .values()
+                .filter(|order| {
+                    matches!(
+                        order.tracking,
+                        StrategyOrderTracking::Intent {
+                            state: IntentState::Accepted { .. }
+                        }
+                    )
+                })
+                .map(|order| order.client_order_id.clone())
+                .collect::<BTreeSet<_>>();
+            let placements_before_exit = gateway.placement_call_count();
+            let cancelling = runtime.tick(configured_at + 50).await.unwrap();
+            assert_eq!(
+                gateway
+                    .cancellation_ids()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                owned_targets
+            );
+            assert_eq!(
+                gateway.placement_call_count(),
+                placements_before_exit,
+                "ACK is not terminal proof; no close yet"
+            );
+            assert_eq!(cancelling.cancellations.len(), owned_targets.len());
+            assert!(!owned_targets.contains(&manual_id));
+
+            let raced_id = owned_targets.iter().next().unwrap().clone();
+            let raced_shape = gateway.state.lock().unwrap().orders[&raced_id]
+                .shape
+                .clone();
+            gateway.fill_order(&raced_id, raced_shape.price.unwrap(), Decimal::new(1, 2));
+            for id in owned_targets.iter().filter(|id| **id != raced_id) {
+                gateway.mark_order_cancelled(id);
+            }
+            let raced_delta = match raced_shape.side {
+                OrderSide::Buy => raced_shape.quantity,
+                OrderSide::Sell => -raced_shape.quantity,
+            };
+            let expected_grid_quantity = -opening_quantity + raced_delta;
+            gateway.set_position(
+                baseline_quantity + expected_grid_quantity,
+                Some(Decimal::new(1012, 0)),
+            );
+            let closing_at = runtime
+                .machine()
+                .store()
+                .snapshot()
+                .updated_at_ms
+                .max(configured_at + 100);
+            let closing = runtime.tick(closing_at).await.unwrap();
+            assert_eq!(closing.submissions.len(), 1, "{closing:?}");
+            assert_eq!(gateway.cancellation_call_count(), owned_targets.len());
+            let close = gateway.placement_intents().last().unwrap().clone();
+            assert_eq!(close.shape.quantity, expected_grid_quantity.abs());
+            assert_eq!(close.shape.side, OrderSide::Buy);
+            assert!(close.shape.reduce_only);
+            assert_eq!(close.shape.kind, OrderKind::Market);
+            assert_eq!(
+                runtime.intent_store().snapshot().cancellations[&raced_id].state,
+                CancellationState::Resolved {
+                    status: TerminalOrderStatus::Filled
+                }
+            );
+            gateway.fill_order(
+                &close.client_order_id,
+                Decimal::new(1014, 0),
+                Decimal::new(5, 2),
+            );
+            gateway.set_position(baseline_quantity, Some(Decimal::new(1010, 0)));
+            let closed_at = runtime
+                .machine()
+                .store()
+                .snapshot()
+                .updated_at_ms
+                .max(closing_at + 100);
+            let closed = runtime.tick(closed_at).await.unwrap();
+            assert!(!closed.is_blocked(), "{closed:?}");
+            let state = runtime.machine().store().snapshot();
+            assert_eq!(state.lifecycle, StrategyLifecycle::Closed);
+            assert_eq!(state.baseline, baseline);
+            assert_eq!(
+                state.expected_exchange_position().unwrap(),
+                baseline_quantity
+            );
+            assert_eq!(state.grid_position_net_quantity, Decimal::ZERO);
+            assert_eq!(state.risk_exit_reason, Some(reason));
+            assert_eq!(
+                state.profit_protection_trigger.as_ref().unwrap().net_profit,
+                net
+            );
+            assert!(state.replacement_obligations.is_empty());
+            assert_eq!(
+                gateway.state.lock().unwrap().orders[&manual_id],
+                manual_order
+            );
+            assert!(!gateway.cancellation_ids().contains(&manual_id));
+        }
     }
 
     #[tokio::test]

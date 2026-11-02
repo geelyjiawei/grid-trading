@@ -4,6 +4,7 @@ import App from "./App.vue";
 import "../test-support/dialog-mock";
 import { ApiError, api } from "./api/client";
 import type { GridStatus, PriceSnapshot, RiskSnapshot } from "./api/types";
+import ProfitProtectionPanel from "./components/ProfitProtectionPanel.vue";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -83,6 +84,72 @@ describe("theme control", () => {
 });
 
 describe("workspace request isolation", () => {
+  it("refreshes protection only for the selected enabled run on the existing status cadence", async () => {
+    vi.useFakeTimers();
+    const protection = { revision: 0, take_profit_amount: "20", stop_loss_amount: null, updated_at_ms: null };
+    const grids: GridStatus[] = [
+      { run_id: "protected-a", exchange: "binance", symbol: "BTCUSDT", running: true, lifecycle: "running", profit_protection: protection },
+      { run_id: "protected-b", exchange: "aster", symbol: "ANSEMUSDT", running: true, lifecycle: "running", profit_protection: protection },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValue({});
+    const reads = vi.spyOn(api, "profitProtection").mockImplementation(async (exchange, symbol, run_id) => ({
+      exchange, symbol, run_id, lifecycle: "running", profit_protection: protection,
+      observation: { status: "checking", observed_at_ms: null, net_profit: null, error: null }, trigger: null,
+    }));
+    const save = vi.spyOn(api, "updateProfitProtection");
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.findComponent(ProfitProtectionPanel).exists()).toBe(true);
+    expect(reads.mock.calls).toEqual([["binance", "BTCUSDT", "protected-a"]]);
+    const balanceReads = vi.mocked(api.balance).mock.calls.length;
+    const riskReads = vi.mocked(api.risk).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(api.balance).toHaveBeenCalledTimes(balanceReads);
+    expect(api.risk).toHaveBeenCalledTimes(riskReads);
+    expect(save).not.toHaveBeenCalled();
+    await wrapper.findAll("button.strategy-row")[1]!.trigger("click");
+    await flushPromises();
+    expect(reads).toHaveBeenLastCalledWith("aster", "ANSEMUSDT", "protected-b");
+    wrapper.unmount();
+  });
+
+  it("hides the previous strategy protection immediately while editing the selected symbol", async () => {
+    installWorkspaceMocks([{ run_id: "previous-run", exchange: "binance", symbol: "BTCUSDT", running: true }]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValue({});
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.findComponent(ProfitProtectionPanel).exists()).toBe(true);
+    await wrapper.get(".symbol-control input").setValue("ETHUSDT");
+    expect(wrapper.findComponent(ProfitProtectionPanel).exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("does not leave protection marked monitoring when a status refresh fails", async () => {
+    vi.useFakeTimers();
+    const protection = { revision: 1, take_profit_amount: "20", stop_loss_amount: null, updated_at_ms: null };
+    installWorkspaceMocks([{ run_id: "protected-run", exchange: "binance", symbol: "BTCUSDT", running: true, lifecycle: "running", profit_protection: protection }]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValue({});
+    const reads = vi.spyOn(api, "profitProtection").mockResolvedValue({
+      exchange: "binance", symbol: "BTCUSDT", run_id: "protected-run", lifecycle: "running", profit_protection: protection,
+      observation: { status: "verified", observed_at_ms: 12, net_profit: "1", error: null }, trigger: null,
+    });
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.get('[data-testid="protection-status"]').text()).toContain("监控中");
+    vi.mocked(api.gridStatus).mockRejectedValue(new ApiError("status unavailable", 503));
+    reads.mockRejectedValue(new ApiError("protection unavailable", 503));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(wrapper.get('[data-testid="protection-status"]').text()).toContain("暂不可用");
+    wrapper.unmount();
+  });
   it.each(["run", "exchange", "symbol"])("clears cached unselected profit after a mismatched %s response", async (field) => {
     vi.useFakeTimers();
     const grids: GridStatus[] = [

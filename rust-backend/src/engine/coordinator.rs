@@ -8,6 +8,7 @@ use std::{
 };
 
 use futures::future::join_all;
+use rust_decimal::Decimal;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -29,10 +30,10 @@ use crate::{
 use super::exchange_inputs::advance_reference_time_ms;
 use super::{
     FileStrategyStartError, PreparedStrategyLifecycle, PreparedStrategyStep,
-    PreparedStrategyStopOutcome, RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry,
-    RuntimeRegistryAdvanceError, RuntimeRegistryEntry, RuntimeRegistryStopError, RuntimeSettings,
-    RuntimeStartupReport, StrategyRunId, prepare_leased_file_strategy,
-    recover_discovered_strategies,
+    PreparedStrategyStopOutcome, ProfitProtectionControlError, ProfitProtectionStatus,
+    RuntimeRecoveryProvider, RuntimeRegistration, RuntimeRegistry, RuntimeRegistryAdvanceError,
+    RuntimeRegistryEntry, RuntimeRegistryStopError, RuntimeSettings, RuntimeStartupReport,
+    StrategyRunId, prepare_leased_file_strategy, recover_discovered_strategies,
 };
 
 pub trait RuntimeExchangeGateway:
@@ -133,6 +134,54 @@ impl<G> RuntimeCoordinator<G> {
 
     pub fn recovery_completed(&self) -> bool {
         self.recovery_completed.load(Ordering::Acquire)
+    }
+
+    pub async fn profit_protection_status(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        run_id: &StrategyRunId,
+    ) -> Result<ProfitProtectionStatus, ProfitProtectionControlError> {
+        self.registry
+            .profit_protection_status(exchange, symbol, run_id)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_profit_protection(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        run_id: &StrategyRunId,
+        expected_revision: u64,
+        take_profit_amount: Option<Decimal>,
+        stop_loss_amount: Option<Decimal>,
+        now_ms: u64,
+    ) -> Result<ProfitProtectionStatus, ProfitProtectionControlError> {
+        self.registry
+            .update_profit_protection(
+                exchange,
+                symbol,
+                run_id,
+                expected_revision,
+                take_profit_amount,
+                stop_loss_amount,
+                now_ms,
+            )
+            .await
+    }
+
+    pub(crate) async fn spawn_profit_protection_checks(&self, now_ms: u64) -> usize
+    where
+        G: Clone
+            + AccountBalanceSnapshotGateway
+            + PositionSnapshotGateway
+            + crate::exchange::OpenOrderSnapshotGateway
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.registry.spawn_profit_protection_checks(now_ms).await
     }
 
     pub(crate) async fn spawn_fee_settlements(&self, now_ms: u64) -> usize

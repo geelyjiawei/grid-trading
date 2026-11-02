@@ -5,6 +5,42 @@ export type PositionSizingMode = "investment" | "fixed_grid_qty";
 export type InitialOrderType = "market" | "limit" | "post_only";
 export type DecimalValue = string | number;
 
+export interface ProfitProtection {
+  revision: number;
+  take_profit_amount: string | null;
+  stop_loss_amount: string | null;
+  updated_at_ms: number | null;
+}
+
+export interface ProfitProtectionTrigger {
+  net_profit: string;
+  mark_price: string;
+  observed_at_ms: number;
+  protection_revision: number;
+}
+
+export interface ProfitProtectionStatus {
+  run_id: string;
+  exchange: Exchange;
+  symbol: string;
+  lifecycle: string;
+  profit_protection: ProfitProtection;
+  observation: {
+    status: string;
+    observed_at_ms: number | null;
+    net_profit: string | null;
+    error: string | null;
+  };
+  trigger: ProfitProtectionTrigger | null;
+}
+
+export interface ProfitProtectionUpdate {
+  run_id: string;
+  expected_revision: number;
+  take_profit_amount: string | null;
+  stop_loss_amount: string | null;
+}
+
 export interface GridConfigRequest {
   exchange?: Exchange;
   symbol: string;
@@ -44,6 +80,9 @@ export interface GridStatus {
   engine_running?: boolean;
   runtime_advancing?: boolean;
   lifecycle?: string;
+  profit_protection?: ProfitProtection;
+  profit_protection_trigger?: ProfitProtectionTrigger | null;
+  risk_exit_reason?: "take_profit" | "stop_loss" | "profit_take_profit" | "profit_stop_loss" | null;
   direction?: Direction;
   grid_mode?: GridMode;
   grid_count?: number;

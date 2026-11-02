@@ -8,15 +8,16 @@ use std::{
 };
 
 use futures::{StreamExt, stream};
+use rust_decimal::Decimal;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::domain::{ClientOrderId, Exchange};
 use crate::exchange::{
     AccountBalanceSnapshotGateway, ExchangeIdentityGateway, ExecutionSnapshotGateway,
     HistoricalPriceGateway, InstrumentRulesGateway, LeverageGateway, MarketSnapshotGateway,
-    OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway, PositionSnapshotGateway,
-    TradingFeeRateGateway,
+    OpenOrderSnapshotGateway, OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway,
+    PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
 };
 use crate::persistence::{StrategyDiscoveryAnomaly, StrategyDiscoveryReport, StrategyFilePaths};
 
@@ -27,13 +28,19 @@ use super::{
     FileStrategyRecoveryError, PendingFeeValuation, PreparedLeasedFileStrategy,
     PreparedStrategyKind, PreparedStrategyLifecycle, PreparedStrategyStep,
     PreparedStrategyStepError, PreparedStrategyStopError, PreparedStrategyStopOutcome,
-    RuntimeSettings, RuntimeTickReport, StrategyRunId, claim_leased_file_strategy,
+    ProfitProtectionControlError, ProfitProtectionObservation, ProfitProtectionStatus,
+    RuntimeSettings, RuntimeTickReport, StrategyRunId, StrategyState, StrategyStateStore,
+    StrategyTransition, attribute_strategy_funding, claim_leased_file_strategy,
+    collect_strategy_shadow_view, strategy_profit_metrics,
 };
 
 const FEE_SETTLEMENT_BATCH_SIZE: usize = 8;
 const FEE_SETTLEMENT_CONCURRENCY: usize = 2;
 const FEE_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_secs(5);
 const FEE_SETTLEMENT_PRICE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROFIT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const PROFIT_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const PROFIT_CHECK_CONCURRENCY: usize = 2;
 
 struct RuntimeSlot<G> {
     exchange: Exchange,
@@ -42,6 +49,7 @@ struct RuntimeSlot<G> {
     unlocked_placements: AtomicUsize,
     execution_waiters: PeriodicPriority,
     fee_settlement: std::sync::Mutex<FeeSettlementSchedule>,
+    profit_check: std::sync::Mutex<ProfitCheckSchedule>,
     strategy: Mutex<PreparedLeasedFileStrategy<G>>,
 }
 
@@ -50,6 +58,34 @@ struct FeeSettlementSchedule {
     in_flight: bool,
     not_before: Option<Instant>,
     after: Option<ClientOrderId>,
+}
+
+#[derive(Default)]
+struct ProfitCheckSchedule {
+    in_flight: bool,
+    not_before: Option<Instant>,
+    observation: ProfitProtectionObservation,
+}
+
+struct ProfitCheckLease<G>(RuntimeSlotHandle<G>);
+
+impl<G> Drop for ProfitCheckLease<G> {
+    fn drop(&mut self) {
+        let mut schedule = self
+            .0
+            .profit_check
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        schedule.in_flight = false;
+        schedule.not_before = Some(Instant::now() + PROFIT_CHECK_INTERVAL);
+        if schedule.observation.status == "checking" {
+            schedule.observation = ProfitProtectionObservation {
+                status: "unavailable".into(),
+                error: Some("strategy changed during verification; retry pending".into()),
+                ..Default::default()
+            };
+        }
+    }
 }
 
 struct FeeSettlementLease<G>(RuntimeSlotHandle<G>);
@@ -85,12 +121,16 @@ impl Drop for UnlockedPlacementReservation<'_> {
 
 pub struct RuntimeRegistry<G> {
     entries: RwLock<BTreeMap<StrategyRunId, RuntimeSlotHandle<G>>>,
+    profit_check_capacity: Arc<Semaphore>,
+    profit_check_after: std::sync::Mutex<Option<StrategyRunId>>,
 }
 
 impl<G> Default for RuntimeRegistry<G> {
     fn default() -> Self {
         Self {
             entries: RwLock::new(BTreeMap::new()),
+            profit_check_capacity: Arc::new(Semaphore::new(PROFIT_CHECK_CONCURRENCY)),
+            profit_check_after: std::sync::Mutex::new(None),
         }
     }
 }
@@ -165,6 +205,160 @@ impl<G> RuntimeRegistry<G> {
         Self::default()
     }
 
+    pub async fn profit_protection_status(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        run_id: &StrategyRunId,
+    ) -> Result<ProfitProtectionStatus, ProfitProtectionControlError> {
+        let slot = self
+            .profit_protection_slot(exchange, symbol, run_id)
+            .await?;
+        let strategy = slot.strategy.lock().await;
+        profit_status(&slot, &strategy)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_profit_protection(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        run_id: &StrategyRunId,
+        expected_revision: u64,
+        take_profit_amount: Option<Decimal>,
+        stop_loss_amount: Option<Decimal>,
+        now_ms: u64,
+    ) -> Result<ProfitProtectionStatus, ProfitProtectionControlError> {
+        let started = Instant::now();
+        let slot = self
+            .profit_protection_slot(exchange, symbol, run_id)
+            .await?;
+        let _waiter = ExecutionWaiter::register_stop(&slot.execution_waiters);
+        let mut strategy = slot.strategy.lock().await;
+        let effective_now =
+            advance_reference_time_ms(now_ms, started.elapsed()).max(strategy.updated_at_ms());
+        let transition = strategy.update_profit_protection(
+            expected_revision,
+            take_profit_amount,
+            stop_loss_amount,
+            effective_now,
+        )?;
+        if transition != StrategyTransition::NoChange {
+            let mut schedule = slot
+                .profit_check
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            schedule.observation = ProfitProtectionObservation::default();
+            schedule.not_before = None;
+        }
+        profit_status(&slot, &strategy)
+    }
+
+    async fn profit_protection_slot(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        run_id: &StrategyRunId,
+    ) -> Result<RuntimeSlotHandle<G>, ProfitProtectionControlError> {
+        let entries = self.entries.read().await;
+        let slot = entries.get(run_id).ok_or_else(|| {
+            if entries.values().any(|slot| {
+                slot.exchange == exchange
+                    && slot.symbol == symbol
+                    && slot.owns_market.load(Ordering::Acquire)
+            }) {
+                ProfitProtectionControlError::RunMismatch
+            } else {
+                ProfitProtectionControlError::NotFound
+            }
+        })?;
+        if slot.exchange != exchange || slot.symbol != symbol {
+            return Err(ProfitProtectionControlError::RunMismatch);
+        }
+        Ok(Arc::clone(slot))
+    }
+
+    pub(crate) async fn spawn_profit_protection_checks(&self, now_ms: u64) -> usize
+    where
+        G: Clone
+            + AccountBalanceSnapshotGateway
+            + PositionSnapshotGateway
+            + OpenOrderSnapshotGateway
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut slots = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .map(|(id, slot)| (id.clone(), Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        rotate_profit_slots(
+            &mut slots,
+            self.profit_check_after
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref(),
+        );
+        let mut spawned = 0;
+        for (run_id, slot) in slots {
+            if !slot.owns_market.load(Ordering::Acquire)
+                || slot.execution_waiters.has_waiters()
+                || slot.unlocked_placements.load(Ordering::Acquire) > 0
+            {
+                continue;
+            }
+            let Ok(permit) = Arc::clone(&self.profit_check_capacity).try_acquire_owned() else {
+                break;
+            };
+            let work = {
+                let Ok(strategy) = slot.strategy.try_lock() else {
+                    continue;
+                };
+                let Some(runtime) = strategy.active_runtime() else {
+                    continue;
+                };
+                let state = runtime.runtime().machine().store().snapshot();
+                if !profit_check_enabled(state)
+                    || slot.execution_waiters.has_waiters()
+                    || slot.unlocked_placements.load(Ordering::Acquire) > 0
+                {
+                    continue;
+                }
+                let mut schedule = slot
+                    .profit_check
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if schedule.in_flight || schedule.not_before.is_some_and(|at| Instant::now() < at) {
+                    continue;
+                }
+                schedule.in_flight = true;
+                schedule.observation = ProfitProtectionObservation {
+                    status: "checking".into(),
+                    ..Default::default()
+                };
+                (
+                    runtime.runtime().gateway().clone(),
+                    runtime.runtime().machine().store().shared_snapshot(),
+                )
+            };
+            let lease = ProfitCheckLease(Arc::clone(&slot));
+            tokio::spawn(async move {
+                let _lease = lease;
+                let _permit = permit;
+                check_profit_protection(slot, work.0, work.1, now_ms).await;
+            });
+            *self
+                .profit_check_after
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(run_id);
+            spawned += 1;
+        }
+        spawned
+    }
+
     pub async fn register(
         &self,
         strategy: PreparedLeasedFileStrategy<G>,
@@ -202,6 +396,7 @@ impl<G> RuntimeRegistry<G> {
                 unlocked_placements: AtomicUsize::new(0),
                 execution_waiters: PeriodicPriority::default(),
                 fee_settlement: std::sync::Mutex::new(FeeSettlementSchedule::default()),
+                profit_check: std::sync::Mutex::new(ProfitCheckSchedule::default()),
                 strategy: Mutex::new(strategy),
             }),
         );
@@ -603,6 +798,309 @@ impl<G> RuntimeRegistry<G> {
     }
 }
 
+fn profit_check_enabled(state: &StrategyState) -> bool {
+    matches!(
+        state.lifecycle,
+        super::StrategyLifecycle::AwaitingOpening
+            | super::StrategyLifecycle::DeployingGrid
+            | super::StrategyLifecycle::Running
+    ) && state.profit_protection_trigger.is_none()
+        && (state.profit_protection.take_profit_amount.is_some()
+            || state.profit_protection.stop_loss_amount.is_some())
+}
+
+fn rotate_profit_slots<T>(slots: &mut [(StrategyRunId, T)], after: Option<&StrategyRunId>) {
+    if let Some(after) = after {
+        let start = slots.iter().position(|(run, _)| run > after).unwrap_or(0);
+        slots.rotate_left(start);
+    }
+}
+
+fn profit_status<G>(
+    slot: &RuntimeSlot<G>,
+    strategy: &PreparedLeasedFileStrategy<G>,
+) -> Result<ProfitProtectionStatus, ProfitProtectionControlError> {
+    let mut observation = slot
+        .profit_check
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .observation
+        .clone();
+    let mut status = strategy.profit_protection_status(observation.clone())?;
+    if let Some(trigger) = &status.trigger {
+        observation = ProfitProtectionObservation {
+            status: "triggered".into(),
+            observed_at_ms: Some(trigger.observed_at_ms),
+            net_profit: Some(trigger.net_profit),
+            error: None,
+        };
+    } else if status.profit_protection.take_profit_amount.is_none()
+        && status.profit_protection.stop_loss_amount.is_none()
+    {
+        observation = ProfitProtectionObservation {
+            status: "disabled".into(),
+            ..Default::default()
+        };
+    } else if observation.status.is_empty() {
+        observation.status = "checking".into();
+    }
+    status.observation = observation;
+    Ok(status)
+}
+
+struct VerifiedProfitSample {
+    net_profit: Decimal,
+    mark_price: Decimal,
+    observed_at_ms: u64,
+    funding_through_ms: u64,
+}
+
+async fn profit_sample<G>(
+    gateway: &G,
+    state: &StrategyState,
+    funding: crate::exchange::funding::FundingAttribution,
+    now_ms: u64,
+) -> Result<VerifiedProfitSample, SnapshotError>
+where
+    G: OpenOrderSnapshotGateway + PositionSnapshotGateway,
+{
+    let collected = tokio::time::timeout(
+        PROFIT_CHECK_TIMEOUT,
+        collect_strategy_shadow_view(gateway, state),
+    )
+    .await
+    .map_err(|_| SnapshotError::new("profit protection exchange verification timed out"))?
+    .map_err(|error| SnapshotError::new(error.to_string()))?;
+    if !collected.report.clean {
+        return Err(SnapshotError::new(
+            "profit protection requires exact order and inventory ownership",
+        ));
+    }
+    let metrics = strategy_profit_metrics(state, &collected.position)?;
+    Ok(VerifiedProfitSample {
+        net_profit: metrics
+            .total_equity_profit
+            .checked_add(funding.net_income)
+            .ok_or_else(|| SnapshotError::new("strategy net profit arithmetic overflowed"))?,
+        mark_price: metrics.mark_price,
+        observed_at_ms: now_ms,
+        funding_through_ms: funding.through_ms,
+    })
+}
+
+async fn collect_profit_sample<G>(
+    slot: &RuntimeSlot<G>,
+    gateway: &G,
+    identity: &StrategyState,
+    now_ms: u64,
+) -> Result<(Arc<StrategyState>, VerifiedProfitSample), SnapshotError>
+where
+    G: AccountBalanceSnapshotGateway + OpenOrderSnapshotGateway + PositionSnapshotGateway,
+{
+    if identity.pending_fee_valuation_count() != 0 {
+        return Err(SnapshotError::new(
+            "actual execution fees are not settled yet",
+        ));
+    }
+    let started = Instant::now();
+    let cached = tokio::time::timeout(
+        PROFIT_CHECK_TIMEOUT,
+        gateway.funding_history(
+            identity.exchange,
+            &identity.symbol,
+            identity.created_at_ms,
+            now_ms,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| Err(SnapshotError::new("funding history verification timed out")));
+    let observed = advance_reference_time_ms(now_ms, started.elapsed());
+    let refresh = cached.as_ref().map_or(true, |history| {
+        !profit_evidence_fresh(history.through_ms, observed)
+    });
+    let history = if refresh {
+        fresh_profit_funding(gateway, identity, observed).await?
+    } else {
+        cached?
+    };
+    let state = capture_profit_state(slot, identity)?;
+    let funding = attribute_strategy_funding(&state, &history)?;
+    let sample = profit_sample(
+        gateway,
+        &state,
+        funding,
+        advance_reference_time_ms(now_ms, started.elapsed()),
+    )
+    .await?;
+    if refresh
+        || state
+            .profit_protection
+            .triggered_reason(sample.net_profit)
+            .is_none()
+    {
+        return Ok((state, sample));
+    }
+    // Rebase only after funding I/O, keeping the final exact-revision fence short.
+    let through = advance_reference_time_ms(now_ms, started.elapsed());
+    let history = fresh_profit_funding(gateway, identity, through).await?;
+    let state = capture_profit_state(slot, identity)?;
+    let funding = attribute_strategy_funding(&state, &history)?;
+    let sample = profit_sample(
+        gateway,
+        &state,
+        funding,
+        advance_reference_time_ms(now_ms, started.elapsed()),
+    )
+    .await?;
+    Ok((state, sample))
+}
+
+fn profit_evidence_fresh(at_ms: u64, now_ms: u64) -> bool {
+    now_ms.checked_sub(at_ms).is_some_and(|age| age <= 5_000)
+}
+
+fn capture_profit_state<G>(
+    slot: &RuntimeSlot<G>,
+    identity: &StrategyState,
+) -> Result<Arc<StrategyState>, SnapshotError> {
+    if slot.execution_waiters.has_waiters() || slot.unlocked_placements.load(Ordering::Acquire) > 0
+    {
+        return Err(SnapshotError::new(
+            "trading work has priority; profit verification will retry",
+        ));
+    }
+    let strategy = slot
+        .strategy
+        .try_lock()
+        .map_err(|_| SnapshotError::new("strategy is advancing; profit verification will retry"))?;
+    let runtime = strategy
+        .active_runtime()
+        .ok_or_else(|| SnapshotError::new("strategy is no longer active"))?;
+    let state = runtime.runtime().machine().store().shared_snapshot();
+    if state.run_id != identity.run_id
+        || state.profit_protection.revision != identity.profit_protection.revision
+        || !profit_check_enabled(&state)
+    {
+        return Err(SnapshotError::new(
+            "profit protection configuration or lifecycle changed",
+        ));
+    }
+    if state.pending_fee_valuation_count() != 0 {
+        return Err(SnapshotError::new(
+            "actual execution fees are not settled yet",
+        ));
+    }
+    Ok(state)
+}
+
+async fn fresh_profit_funding<G: AccountBalanceSnapshotGateway>(
+    gateway: &G,
+    state: &StrategyState,
+    through: u64,
+) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
+    let history = tokio::time::timeout(
+        PROFIT_CHECK_TIMEOUT,
+        gateway.fresh_funding_history(state.exchange, &state.symbol, state.created_at_ms, through),
+    )
+    .await
+    .map_err(|_| SnapshotError::new("fresh funding verification timed out"))??;
+    if history.through_ms != through {
+        return Err(SnapshotError::new(
+            "fresh funding does not cover the decision interval",
+        ));
+    }
+    Ok(history)
+}
+
+async fn check_profit_protection<G>(
+    slot: RuntimeSlotHandle<G>,
+    gateway: G,
+    captured: Arc<StrategyState>,
+    now_ms: u64,
+) where
+    G: AccountBalanceSnapshotGateway + OpenOrderSnapshotGateway + PositionSnapshotGateway,
+{
+    let started = Instant::now();
+    let result = collect_profit_sample(&slot, &gateway, &captured, now_ms).await;
+    if slot.execution_waiters.has_waiters() || slot.unlocked_placements.load(Ordering::Acquire) > 0
+    {
+        return;
+    }
+    let Ok(mut strategy) = slot.strategy.try_lock() else {
+        return;
+    };
+    if slot.execution_waiters.has_waiters() || slot.unlocked_placements.load(Ordering::Acquire) > 0
+    {
+        return;
+    }
+    let Some(runtime) = strategy.active_runtime() else {
+        return;
+    };
+    let state = runtime.runtime().machine().store().snapshot();
+    if state.run_id != captured.run_id
+        || state.profit_protection.revision != captured.profit_protection.revision
+        || !profit_check_enabled(state)
+    {
+        return;
+    }
+    let effective_now =
+        advance_reference_time_ms(now_ms, started.elapsed()).max(state.updated_at_ms);
+    let result = result.and_then(|(observed_state, sample)| {
+        if observed_state.revision != state.revision {
+            return Err(SnapshotError::new(
+                "strategy changed during the final profit snapshot; retry pending",
+            ));
+        }
+        if !profit_evidence_fresh(sample.observed_at_ms, effective_now)
+            || !profit_evidence_fresh(sample.funding_through_ms, effective_now)
+        {
+            return Err(SnapshotError::new(
+                "profit or funding evidence is older than five seconds; retry pending",
+            ));
+        }
+        Ok(sample)
+    });
+    let observation = match result {
+        Ok(sample) => {
+            match strategy.evaluate_profit_protection(
+                sample.net_profit,
+                sample.mark_price,
+                sample.observed_at_ms,
+                captured.profit_protection.revision,
+                effective_now,
+            ) {
+                Ok(transition) => ProfitProtectionObservation {
+                    status: if matches!(transition, StrategyTransition::RiskExitRequested { .. }) {
+                        "triggered"
+                    } else {
+                        "verified"
+                    }
+                    .into(),
+                    observed_at_ms: Some(sample.observed_at_ms),
+                    net_profit: Some(sample.net_profit),
+                    error: None,
+                },
+                Err(error) => ProfitProtectionObservation {
+                    status: "unavailable".into(),
+                    observed_at_ms: Some(effective_now),
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                },
+            }
+        }
+        Err(error) => ProfitProtectionObservation {
+            status: "unavailable".into(),
+            observed_at_ms: Some(effective_now),
+            error: Some(error.to_string()),
+            ..Default::default()
+        },
+    };
+    slot.profit_check
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .observation = observation;
+}
+
 async fn settle_fee_batch<G>(
     slot: RuntimeSlotHandle<G>,
     run_id: StrategyRunId,
@@ -818,6 +1316,20 @@ mod fee_settlement_tests {
         exchange: Exchange,
         prices: Arc<PriceGate>,
         snapshot: Option<OrderExecutionSnapshot>,
+        profit: Arc<std::sync::Mutex<ProfitFixture>>,
+        profit_calls: Arc<AtomicUsize>,
+        profit_gate: Arc<Semaphore>,
+    }
+
+    #[derive(Default)]
+    struct ProfitFixture {
+        orders: Vec<AuthoritativeOrder>,
+        position_quantity: Decimal,
+        hold_funding: bool,
+        funding_unavailable: bool,
+        cached_funding_error: bool,
+        cached_funding_lag: u64,
+        fresh_funding_lag: u64,
     }
 
     struct PriceGate {
@@ -842,6 +1354,9 @@ mod fee_settlement_tests {
                     reject_before_minute: AtomicUsize::new(0),
                 }),
                 snapshot: None,
+                profit: Arc::new(std::sync::Mutex::new(ProfitFixture::default())),
+                profit_calls: Arc::new(AtomicUsize::new(0)),
+                profit_gate: Arc::new(Semaphore::new(0)),
             }
         }
 
@@ -854,11 +1369,108 @@ mod fee_settlement_tests {
             .await
             .expect("fee lookup must start");
         }
+
+        async fn profit_history(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            from_ms: u64,
+            through_ms: u64,
+            fresh: bool,
+        ) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
+            self.profit_calls.fetch_add(1, Ordering::AcqRel);
+            let hold = self.profit.lock().unwrap().hold_funding;
+            if hold {
+                self.profit_gate.acquire().await.unwrap().forget();
+            }
+            let state = self.profit.lock().unwrap();
+            if state.funding_unavailable || (!fresh && state.cached_funding_error) {
+                return Err(SnapshotError::new("funding unavailable"));
+            }
+            Ok(crate::exchange::funding::FundingHistorySnapshot {
+                exchange,
+                symbol: symbol.to_owned(),
+                from_ms,
+                through_ms: through_ms.saturating_sub(if fresh {
+                    state.fresh_funding_lag
+                } else {
+                    state.cached_funding_lag
+                }),
+                payments: Vec::new(),
+                account_fills: Some(Vec::new()),
+            })
+        }
     }
 
     impl ExchangeIdentityGateway for FeeGateway {
         fn exchange(&self) -> Exchange {
             self.exchange
+        }
+    }
+
+    #[async_trait]
+    impl crate::exchange::OpenOrderSnapshotGateway for FeeGateway {
+        async fn open_orders_snapshot(
+            &self,
+            _exchange: Exchange,
+            _symbol: &str,
+        ) -> Result<Vec<AuthoritativeOrder>, SnapshotError> {
+            Ok(self.profit.lock().unwrap().orders.clone())
+        }
+    }
+
+    #[async_trait]
+    impl PositionSnapshotGateway for FeeGateway {
+        async fn position_snapshot(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+        ) -> Result<crate::exchange::PositionSnapshot, SnapshotError> {
+            let quantity = self.profit.lock().unwrap().position_quantity;
+            Ok(crate::exchange::PositionSnapshot {
+                exchange,
+                symbol: symbol.to_owned(),
+                legs: vec![crate::exchange::PositionLeg {
+                    side: crate::exchange::PositionSide::Both,
+                    signed_quantity: quantity,
+                    entry_price: (!quantity.is_zero()).then_some(Decimal::new(1014, 0)),
+                    mark_price: Decimal::new(1014, 0),
+                    unrealized_profit: Decimal::ZERO,
+                    leverage: Some(Decimal::new(5, 0)),
+                }],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AccountBalanceSnapshotGateway for FeeGateway {
+        async fn account_balance_snapshot(
+            &self,
+            _exchange: Exchange,
+        ) -> Result<crate::exchange::AccountBalanceSnapshot, SnapshotError> {
+            panic!("profit checks must not request unrelated account balance");
+        }
+
+        async fn funding_history(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            from_ms: u64,
+            through_ms: u64,
+        ) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
+            self.profit_history(exchange, symbol, from_ms, through_ms, false)
+                .await
+        }
+
+        async fn fresh_funding_history(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            from_ms: u64,
+            through_ms: u64,
+        ) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
+            self.profit_history(exchange, symbol, from_ms, through_ms, true)
+                .await
         }
     }
 
@@ -1121,6 +1733,560 @@ mod fee_settlement_tests {
             .store()
             .snapshot()
             .total_fee
+    }
+
+    #[tokio::test]
+    async fn profit_protection_controls_pin_run_and_revision_without_changing_inventory() {
+        let directory = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = pending_strategy(directory.path(), &gateway, "pctrl001", 0, false).await;
+        let run = strategy.run_id().clone();
+        let before = strategy
+            .active_runtime()
+            .unwrap()
+            .runtime()
+            .machine()
+            .store()
+            .snapshot()
+            .clone();
+        let registry = RuntimeRegistry::new();
+        assert!(matches!(
+            registry.register(strategy).await,
+            RuntimeRegistration::Registered
+        ));
+        let initial = registry
+            .profit_protection_status(Exchange::Binance, "MUUSDT", &run)
+            .await
+            .unwrap();
+        assert_eq!(initial.profit_protection.revision, 0);
+        assert_eq!(initial.observation.status, "disabled");
+        assert!(matches!(
+            registry
+                .profit_protection_status(Exchange::Bybit, "MUUSDT", &run)
+                .await,
+            Err(ProfitProtectionControlError::RunMismatch)
+        ));
+        assert!(matches!(
+            registry
+                .profit_protection_status(Exchange::Binance, "OTHERUSDT", &run)
+                .await,
+            Err(ProfitProtectionControlError::RunMismatch)
+        ));
+        let updated = registry
+            .update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                0,
+                Some(Decimal::TEN),
+                Some(Decimal::ONE),
+                1_300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.profit_protection.revision, 1);
+        assert_eq!(
+            updated.profit_protection.take_profit_amount,
+            Some(Decimal::TEN)
+        );
+        assert_eq!(updated.observation.status, "checking");
+        assert!(matches!(
+            registry
+                .update_profit_protection(Exchange::Binance, "MUUSDT", &run, 0, None, None, 1_400)
+                .await,
+            Err(ProfitProtectionControlError::RevisionConflict)
+        ));
+        let slot = registry.entries.read().await.get(&run).unwrap().clone();
+        let after = slot
+            .strategy
+            .lock()
+            .await
+            .active_runtime()
+            .unwrap()
+            .runtime()
+            .machine()
+            .store()
+            .snapshot()
+            .clone();
+        assert_eq!(after.baseline, before.baseline);
+        assert_eq!(after.orders, before.orders);
+        assert_eq!(
+            after.grid_position_net_quantity,
+            before.grid_position_net_quantity
+        );
+        let disabled = registry
+            .update_profit_protection(Exchange::Binance, "MUUSDT", &run, 1, None, None, 1_500)
+            .await
+            .unwrap();
+        assert_eq!(disabled.observation.status, "disabled");
+        registry.request_stop(&run, 1_600).await.unwrap();
+        assert!(matches!(
+            registry
+                .update_profit_protection(
+                    Exchange::Binance,
+                    "MUUSDT",
+                    &run,
+                    2,
+                    Some(Decimal::TEN),
+                    None,
+                    1_700
+                )
+                .await,
+            Err(ProfitProtectionControlError::NotRunning)
+        ));
+        assert_eq!(gateway.prices.calls.load(Ordering::Acquire), 0);
+    }
+
+    async fn profit_strategy(
+        root: &std::path::Path,
+        gateway: &FeeGateway,
+        run: &str,
+    ) -> PreparedLeasedFileStrategy<FeeGateway> {
+        profit_strategy_with_fills(root, gateway, run, 0).await
+    }
+
+    async fn profit_strategy_with_fills(
+        root: &std::path::Path,
+        gateway: &FeeGateway,
+        run: &str,
+        fills: usize,
+    ) -> PreparedLeasedFileStrategy<FeeGateway> {
+        let mut strategy = pending_strategy(root, gateway, run, fills, false).await;
+        gateway.prices.permits.add_permits(fills);
+        for work in strategy.prepare_pending_fee_work(8) {
+            strategy
+                .complete_fee_valuation(work.resolve().await.unwrap(), 1_300)
+                .unwrap();
+        }
+        let paths = strategy.paths().clone();
+        drop(strategy);
+        let mut machine =
+            StrategyMachine::new(FileStrategyStateStore::load(paths.state()).unwrap());
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        machine.materialize_replacements(&rules, 1_400).unwrap();
+        let ready = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut intents = FileOrderIntentStore::load(paths.intents()).unwrap();
+        for (index, order) in ready.into_iter().enumerate() {
+            if order.tracking != StrategyOrderTracking::Ready {
+                continue;
+            }
+            let intent = OrderIntent::prepare(
+                order.client_order_id.clone(),
+                gateway.exchange(),
+                order.shape.clone(),
+                1_000,
+            )
+            .unwrap();
+            intents.insert_prepared(intent).unwrap();
+            intents
+                .transition(
+                    &order.client_order_id,
+                    IntentState::Accepted {
+                        exchange_order_id: format!("profit-order-{index}"),
+                    },
+                    1_200,
+                )
+                .unwrap();
+            let accepted = intents
+                .snapshot()
+                .intents
+                .get(&order.client_order_id)
+                .unwrap()
+                .clone();
+            machine.synchronize_intent(&accepted, 1_400).unwrap();
+            gateway
+                .profit
+                .lock()
+                .unwrap()
+                .orders
+                .push(AuthoritativeOrder {
+                    client_order_id: order.client_order_id,
+                    exchange_order_id: format!("profit-order-{index}"),
+                    exchange: gateway.exchange(),
+                    shape: order.shape,
+                    lifecycle: OrderLifecycle::Active(crate::exchange::ActiveOrderStatus::New),
+                    executed_quantity: Some(Decimal::ZERO),
+                });
+        }
+        gateway.profit.lock().unwrap().position_quantity = machine
+            .store()
+            .snapshot()
+            .expected_exchange_position()
+            .unwrap();
+        drop(machine);
+        recover_leased_file_strategy(
+            gateway.clone(),
+            paths,
+            RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn wait_profit(
+        registry: &RuntimeRegistry<FeeGateway>,
+        run: &StrategyRunId,
+    ) -> ProfitProtectionStatus {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = registry
+                    .profit_protection_status(Exchange::Binance, "MUUSDT", run)
+                    .await
+                    .unwrap();
+                if status.observation.status != "checking" {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("profit check must finish")
+    }
+
+    #[tokio::test]
+    async fn profit_protection_background_verifies_exact_ownership_and_stays_off_when_disabled() {
+        let dir = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = profit_strategy(dir.path(), &gateway, "pmon0001").await;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        assert_eq!(registry.spawn_profit_protection_checks(2_000).await, 0);
+        registry
+            .update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                0,
+                Some(Decimal::TEN),
+                None,
+                1_500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.spawn_profit_protection_checks(2_000).await, 1);
+        let status = wait_profit(&registry, &run).await;
+        assert_eq!(status.observation.status, "verified", "{status:?}");
+        assert_eq!(status.observation.net_profit, Some(Decimal::ZERO));
+        assert!(status.trigger.is_none());
+        assert_eq!(registry.spawn_profit_protection_checks(2_001).await, 0);
+        registry
+            .update_profit_protection(Exchange::Binance, "MUUSDT", &run, 1, None, None, 2_100)
+            .await
+            .unwrap();
+        assert_eq!(registry.spawn_profit_protection_checks(5_000).await, 0);
+        assert_eq!(gateway.profit_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn profit_protection_background_network_does_not_block_edits_or_stop_or_apply_old_config()
+    {
+        let dir = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        gateway.profit.lock().unwrap().hold_funding = true;
+        let strategy = profit_strategy(dir.path(), &gateway, "pmon0002").await;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        registry
+            .update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                0,
+                Some(Decimal::TEN),
+                None,
+                1_500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.spawn_profit_protection_checks(2_000).await, 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gateway.profit_calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.spawn_profit_protection_checks(2_000).await, 0);
+        let disabled = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                1,
+                None,
+                None,
+                2_100,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(disabled.observation.status, "disabled");
+        tokio::time::timeout(Duration::from_secs(1), registry.request_stop(&run, 2_200))
+            .await
+            .unwrap()
+            .unwrap();
+        gateway.profit_gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let status = registry
+            .profit_protection_status(Exchange::Binance, "MUUSDT", &run)
+            .await
+            .unwrap();
+        assert_eq!(status.observation.status, "disabled");
+        assert!(status.trigger.is_none());
+    }
+
+    #[tokio::test]
+    async fn profit_protection_background_never_guesses_missing_funding_or_external_inventory() {
+        for bad_funding in [true, false] {
+            let dir = tempdir().unwrap();
+            let gateway = FeeGateway::new();
+            let strategy = profit_strategy(dir.path(), &gateway, "pmon0003").await;
+            if bad_funding {
+                gateway.profit.lock().unwrap().funding_unavailable = true;
+            } else {
+                gateway.profit.lock().unwrap().position_quantity = Decimal::ONE;
+            }
+            let run = strategy.run_id().clone();
+            let registry = RuntimeRegistry::new();
+            registry.register(strategy).await;
+            registry
+                .update_profit_protection(
+                    Exchange::Binance,
+                    "MUUSDT",
+                    &run,
+                    0,
+                    Some(Decimal::ONE),
+                    Some(Decimal::ONE),
+                    1_500,
+                )
+                .await
+                .unwrap();
+            assert_eq!(registry.spawn_profit_protection_checks(2_000).await, 1);
+            let status = wait_profit(&registry, &run).await;
+            assert_eq!(status.observation.status, "unavailable", "{status:?}");
+            assert!(status.observation.net_profit.is_none());
+            assert!(status.trigger.is_none());
+            assert_ne!(
+                status.lifecycle,
+                PreparedStrategyLifecycle::RiskExitRequested
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn profit_protection_background_latches_only_after_fresh_funding_and_durable_exact_snapshot()
+     {
+        let dir = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = profit_strategy_with_fills(dir.path(), &gateway, "pmon0004", 1).await;
+        let run = strategy.run_id().clone();
+        let paths = strategy.paths().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        registry
+            .update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                0,
+                None,
+                Some(Decimal::new(1, 2)),
+                1_500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.spawn_profit_protection_checks(2_000).await, 1);
+        let status = wait_profit(&registry, &run).await;
+        assert_eq!(status.observation.status, "triggered", "{status:?}");
+        assert_eq!(
+            status.lifecycle,
+            PreparedStrategyLifecycle::RiskExitRequested
+        );
+        assert!(status.trigger.as_ref().unwrap().net_profit < Decimal::ZERO);
+        assert_eq!(gateway.profit_calls.load(Ordering::Acquire), 2);
+        let persisted = FileStrategyStateStore::load(paths.state()).unwrap();
+        assert_eq!(
+            persisted.snapshot().profit_protection_trigger,
+            status.trigger
+        );
+        assert_eq!(
+            persisted.snapshot().lifecycle,
+            StrategyLifecycle::RiskExitRequested
+        );
+        assert_eq!(registry.spawn_profit_protection_checks(2_001).await, 0);
+    }
+
+    #[tokio::test]
+    async fn profit_protection_background_rejects_pending_fees_without_account_or_funding_reads() {
+        let dir = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = pending_strategy(dir.path(), &gateway, "pmon0005", 1, false).await;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        registry
+            .update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                0,
+                None,
+                Some(Decimal::new(1, 2)),
+                1_500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.spawn_profit_protection_checks(2_000).await, 1);
+        let status = wait_profit(&registry, &run).await;
+        assert_eq!(status.observation.status, "unavailable");
+        assert!(status.trigger.is_none());
+        assert_eq!(gateway.profit_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn profit_protection_admission_rotates_past_always_due_early_runs() {
+        let source = (1..=5)
+            .map(|n| (StrategyRunId::parse(format!("fair000{n}")).unwrap(), ()))
+            .collect::<Vec<_>>();
+        let mut cursor = None;
+        let mut visited = Vec::new();
+        for _ in 0..3 {
+            let mut slots = source.clone();
+            rotate_profit_slots(&mut slots, cursor.as_ref());
+            for (id, _) in slots.into_iter().take(2) {
+                visited.push(id.clone());
+                cursor = Some(id);
+            }
+        }
+        assert_eq!(
+            visited
+                .iter()
+                .map(StrategyRunId::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "fair0001", "fair0002", "fair0003", "fair0004", "fair0005", "fair0001"
+            ]
+        );
+    }
+
+    #[test]
+    fn profit_protection_evidence_deadline_includes_elapsed_request_time_and_future_cutoffs() {
+        for (cutoff, decision, expected) in [
+            (1_000, 6_000, true),
+            (1_000, 6_001, false),
+            (6_001, 6_000, false),
+        ] {
+            assert_eq!(profit_evidence_fresh(cutoff, decision), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn profit_protection_recaptures_accounting_after_funding_before_short_shadow_fence() {
+        let dir = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = profit_strategy(dir.path(), &gateway, "pmon0006").await;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        registry
+            .update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                0,
+                Some(Decimal::TEN),
+                None,
+                1_500,
+            )
+            .await
+            .unwrap();
+        let slot = registry.entries.read().await.get(&run).unwrap().clone();
+        let mut captured = slot
+            .strategy
+            .lock()
+            .await
+            .active_runtime()
+            .unwrap()
+            .runtime()
+            .machine()
+            .store()
+            .snapshot()
+            .clone();
+        captured.revision -= 1;
+        check_profit_protection(Arc::clone(&slot), gateway, Arc::new(captured), 10_000).await;
+        let status = registry
+            .profit_protection_status(Exchange::Binance, "MUUSDT", &run)
+            .await
+            .unwrap();
+        assert_eq!(status.observation.status, "verified");
+        assert!(status.trigger.is_none());
+    }
+
+    #[tokio::test]
+    async fn profit_protection_refreshes_stale_noncrossing_funding_and_recovered_cached_errors() {
+        for cached_error in [true, false] {
+            let dir = tempdir().unwrap();
+            let gateway = FeeGateway::new();
+            let strategy = profit_strategy(dir.path(), &gateway, "pmon0007").await;
+            gateway.profit.lock().unwrap().cached_funding_error = cached_error;
+            gateway.profit.lock().unwrap().cached_funding_lag = 6_000;
+            let run = strategy.run_id().clone();
+            let registry = RuntimeRegistry::new();
+            registry.register(strategy).await;
+            registry
+                .update_profit_protection(
+                    Exchange::Binance,
+                    "MUUSDT",
+                    &run,
+                    0,
+                    Some(Decimal::TEN),
+                    None,
+                    1_500,
+                )
+                .await
+                .unwrap();
+            registry.spawn_profit_protection_checks(10_000).await;
+            let status = wait_profit(&registry, &run).await;
+            assert_eq!(status.observation.status, "verified", "{status:?}");
+            assert_eq!(gateway.profit_calls.load(Ordering::Acquire), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn profit_protection_expired_funding_cannot_be_made_fresh_by_a_later_position_read() {
+        let dir = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = profit_strategy(dir.path(), &gateway, "pmon0008").await;
+        gateway.profit.lock().unwrap().cached_funding_lag = 6_000;
+        gateway.profit.lock().unwrap().fresh_funding_lag = 6_000;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        registry
+            .update_profit_protection(
+                Exchange::Binance,
+                "MUUSDT",
+                &run,
+                0,
+                Some(Decimal::TEN),
+                None,
+                1_500,
+            )
+            .await
+            .unwrap();
+        registry.spawn_profit_protection_checks(10_000).await;
+        let status = wait_profit(&registry, &run).await;
+        assert_eq!(status.observation.status, "unavailable", "{status:?}");
+        assert!(status.trigger.is_none());
     }
 
     #[tokio::test]

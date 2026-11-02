@@ -141,6 +141,20 @@ impl FundingHistoryCache {
         }
     }
 
+    async fn refresh(
+        &self,
+        key: String,
+        through_ms: u64,
+        timeout: Duration,
+        request: impl std::future::Future<Output = Result<FundingHistorySnapshot, SnapshotError>>,
+    ) -> Result<FundingHistorySnapshot, SnapshotError> {
+        let result = tokio::time::timeout(timeout, request)
+            .await
+            .unwrap_or_else(|_| Err(SnapshotError::new("funding history request timed out")));
+        self.insert(key, through_ms, result.clone(), Instant::now());
+        result
+    }
+
     async fn get_or_fetch(
         &self,
         key: String,
@@ -151,11 +165,7 @@ impl FundingHistoryCache {
         if let Some(cached) = self.get(&key, through_ms, Instant::now()) {
             return cached;
         }
-        let result = tokio::time::timeout(timeout, request)
-            .await
-            .unwrap_or_else(|_| Err(SnapshotError::new("funding history request timed out")));
-        self.insert(key, through_ms, result.clone(), Instant::now());
-        result
+        self.refresh(key, through_ms, timeout, request).await
     }
 
     fn get(
@@ -1214,6 +1224,25 @@ impl AccountBalanceSnapshotGateway for SharedConfiguredExchangeGateway {
             )
             .await
     }
+
+    async fn fresh_funding_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<FundingHistorySnapshot, SnapshotError> {
+        self.snapshot_caches
+            .funding_history
+            .refresh(
+                funding_history_cache_key(exchange, symbol, from_ms),
+                through_ms,
+                FUNDING_HISTORY_REQUEST_TIMEOUT,
+                self.inner
+                    .funding_history(exchange, symbol, from_ms, through_ms),
+            )
+            .await
+    }
 }
 
 #[async_trait]
@@ -1432,6 +1461,44 @@ mod tests {
             }],
             account_fills: Some(vec![]),
         }
+    }
+
+    #[tokio::test]
+    async fn profit_protection_fresh_funding_bypasses_stale_success_and_error_cache() {
+        let cache = FundingHistoryCache::new();
+        cache.insert("key".into(), 200, Ok(funding_snapshot(200)), Instant::now());
+        let fresh = cache
+            .refresh("key".into(), 300, Duration::from_secs(1), async {
+                Ok(funding_snapshot(300))
+            })
+            .await
+            .unwrap();
+        assert_eq!(fresh.through_ms, 300);
+        assert_eq!(cache.get("key", 300, Instant::now()), Some(Ok(fresh)));
+        cache.insert(
+            "key".into(),
+            300,
+            Err(SnapshotError::new("prior outage")),
+            Instant::now(),
+        );
+        let recovered = cache
+            .refresh("key".into(), 400, Duration::from_secs(1), async {
+                Ok(funding_snapshot(400))
+            })
+            .await
+            .unwrap();
+        assert_eq!(recovered.through_ms, 400);
+        assert!(
+            cache
+                .refresh(
+                    "key".into(),
+                    500,
+                    Duration::from_millis(1),
+                    std::future::pending()
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

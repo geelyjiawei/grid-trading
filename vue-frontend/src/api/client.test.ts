@@ -6,6 +6,32 @@ afterEach(() => {
 });
 
 describe("typed API client", () => {
+  it("reads protection for one exact run and saves full decimal replacements only", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ run_id: "run/1" })));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.profitProtection("trade_xyz", "MU/USDC", "run/1");
+    await api.updateProfitProtection("trade_xyz", "MU/USDC", {
+      run_id: "run/1", expected_revision: 4,
+      take_profit_amount: "100.000000000000000001", stop_loss_amount: null,
+    });
+    await api.updateProfitProtection("trade_xyz", "MU/USDC", {
+      run_id: "run/1", expected_revision: 5, take_profit_amount: null, stop_loss_amount: null,
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/grid/profit-protection/MU%2FUSDC?run_id=run%2F1&exchange=trade_xyz",
+      "/api/grid/profit-protection/MU%2FUSDC?exchange=trade_xyz",
+      "/api/grid/profit-protection/MU%2FUSDC?exchange=trade_xyz",
+    ]);
+    expect(JSON.parse(fetchMock.mock.calls[1]![1].body)).toEqual({
+      run_id: "run/1", expected_revision: 4,
+      take_profit_amount: "100.000000000000000001", stop_loss_amount: null,
+    });
+    expect(JSON.parse(fetchMock.mock.calls[2]![1].body)).toEqual({
+      run_id: "run/1", expected_revision: 5, take_profit_amount: null, stop_loss_amount: null,
+    });
+    expect(fetchMock.mock.calls[1]![1].credentials).toBe("same-origin");
+    expect(new Headers(fetchMock.mock.calls[1]![1].headers).get("Content-Type")).toBe("application/json");
+  });
   it("uses same-origin credentials and decodes a successful response", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

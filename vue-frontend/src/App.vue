@@ -25,6 +25,7 @@ import GridConfigurationPanel from "./components/GridConfigurationPanel.vue";
 import MarketOverview from "./components/MarketOverview.vue";
 import StrategyList from "./components/StrategyList.vue";
 import StrategyOverview from "./components/StrategyOverview.vue";
+import ProfitProtectionPanel from "./components/ProfitProtectionPanel.vue";
 import ExchangeRecordsPanel from "./components/ExchangeRecordsPanel.vue";
 import { exchangeName, quoteAsset, strategyCanStop } from "./format";
 import { matchingStrategyRisk } from "./strategy-profit";
@@ -68,6 +69,7 @@ const fees = ref<FeeRates | null>(null);
 const grids = ref<GridStatus[]>([]);
 const tradingEnabled = ref(false);
 const selectedStatus = ref<GridStatus | null>(null);
+const protectionRefreshKey = ref(0);
 const risk = ref<RiskSnapshot | null>(null);
 const riskReceivedAt = ref(0);
 const profitClock = ref(Date.now());
@@ -329,6 +331,7 @@ async function refreshStrategies(): Promise<void> {
     tradingEnabled.value = false;
     strategyError.value = messageFrom(reason, "无法读取运行策略");
   } finally {
+    protectionRefreshKey.value += 1;
     profitClock.value = Date.now();
     statusRefreshRunning = false;
     loading.value = false;
@@ -824,6 +827,14 @@ onUnmounted(() => {
         :stop-busy="stopBusy"
         :stop-error="stopError"
         @stop="stopStrategy"
+      />
+      <ProfitProtectionPanel
+        v-if="selectedStatus && authenticated && selectedStatus.exchange === activeExchange && selectedStatus.symbol === symbol"
+        :key="`${activeExchange}:${symbol}:${selectedStatus.run_id ?? ''}`"
+        class="dashboard-span"
+        :status="selectedStatus"
+        :refresh-key="protectionRefreshKey"
+        @unauthorized="authenticated = false"
       />
       <GridConfigurationPanel
         :exchange="activeExchange"

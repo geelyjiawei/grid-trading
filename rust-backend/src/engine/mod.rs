@@ -10,11 +10,13 @@ mod grid_plan;
 mod leverage;
 mod periodic_priority;
 mod preview;
+mod profit_protection;
 mod reconciliation;
 mod runtime;
 mod shadow_audit;
 mod shadow_collector;
 mod strategy_machine;
+mod strategy_profit;
 mod submission;
 mod supervisor;
 
@@ -51,6 +53,10 @@ pub use grid_plan::{
 pub use leverage::{LeveragePreflightError, LeveragePreflightResult, ensure_symbol_leverage};
 pub(crate) use periodic_priority::PeriodicReadPriority;
 pub use preview::{GridCycleEstimate, GridPreviewError, GridPreviewMetrics, build_grid_preview};
+pub use profit_protection::{
+    ProfitProtection, ProfitProtectionControlError, ProfitProtectionObservation,
+    ProfitProtectionStatus, ProfitProtectionTrigger,
+};
 pub use reconciliation::{
     ReconciliationError, ReconciliationResult, ReconciliationService, reconcile_with,
 };
@@ -81,6 +87,10 @@ pub use strategy_machine::{
     StrategyLifecycle, StrategyMachine, StrategyMachineError, StrategyOrderPurpose,
     StrategyOrderRecord, StrategyOrderTracking, StrategyRunId, StrategyState, StrategyStateError,
     StrategyStateStore, StrategyStoreError, StrategyTransition, ValidatedStrategyState,
+};
+pub(crate) use strategy_profit::{
+    StrategyProfitMetrics, attribute_strategy_funding, collect_strategy_funding_at,
+    strategy_profit_metrics, validated_one_way_quantity,
 };
 pub use submission::{
     SubmissionError, SubmissionResult, SubmissionService, submit_many_with, submit_with,

@@ -15,6 +15,8 @@ import type {
   OpenOrdersResponse,
   PositionsResponse,
   PriceSnapshot,
+  ProfitProtectionStatus,
+  ProfitProtectionUpdate,
   RiskSnapshot,
   StrategyCommandResponse,
   TradesResponse,
@@ -101,6 +103,18 @@ export const api = {
   balance: (exchange: Exchange) =>
     request<BalanceSnapshot>(withExchange("/api/balance", exchange)),
   gridStatus: () => request<GridStatusList>("/api/grid/status"),
+  profitProtection: (exchange: Exchange, symbol: string, runId: string) =>
+    request<ProfitProtectionStatus>(withExchange(
+      `/api/grid/profit-protection/${encodeURIComponent(symbol)}?run_id=${encodeURIComponent(runId)}`,
+      exchange,
+    )),
+  updateProfitProtection: (exchange: Exchange, symbol: string, update: ProfitProtectionUpdate) =>
+    request<ProfitProtectionStatus>(withExchange(
+      `/api/grid/profit-protection/${encodeURIComponent(symbol)}`, exchange,
+    ), {
+      method: "POST",
+      body: JSON.stringify(update),
+    }),
   preview: (config: GridConfigRequest) =>
     request<GridPreview>("/api/grid/preview", {
       method: "POST",

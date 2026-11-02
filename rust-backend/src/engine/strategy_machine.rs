@@ -20,6 +20,7 @@ use super::{
     execution_accounting::{
         ExecutionAuditRecord, FeeValuation, FeeValuationSource, ValuedExecutionReport,
     },
+    profit_protection::{ProfitProtection, ProfitProtectionTrigger},
 };
 
 const ASTER_TRADE_TIMESTAMP_ROUNDING_TOLERANCE_MS: u64 = 100;
@@ -119,6 +120,8 @@ pub enum StrategyLifecycle {
 pub enum RiskExitReason {
     StopLoss,
     TakeProfit,
+    ProfitTakeProfit,
+    ProfitStopLoss,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +272,10 @@ pub struct StrategyState {
     pub risk_exit_reason: Option<RiskExitReason>,
     #[serde(default)]
     pub risk_trigger_mark_price: Option<Decimal>,
+    #[serde(default)]
+    pub profit_protection: ProfitProtection,
+    #[serde(default)]
+    pub profit_protection_trigger: Option<ProfitProtectionTrigger>,
     #[serde(default)]
     pub trigger_armed_price: Option<Decimal>,
     #[serde(default)]
@@ -428,6 +435,8 @@ impl StrategyState {
             initial_deployment_complete: false,
             risk_exit_reason: None,
             risk_trigger_mark_price: None,
+            profit_protection: ProfitProtection::default(),
+            profit_protection_trigger: None,
             trigger_armed_price: trigger_activation.map(|activation| activation.armed_price),
             trigger_observed_price: trigger_activation.map(|activation| activation.observed_price),
             triggered_at_ms: trigger_activation.map(|activation| activation.triggered_at_ms),
@@ -598,6 +607,53 @@ impl StrategyState {
         self.validate_internal(true)
     }
 
+    fn validate_profit_protection(&self) -> Result<(), StrategyStateError> {
+        let protection = &self.profit_protection;
+        protection.validate_limits()?;
+        if protection.revision > self.revision
+            || (protection.revision == 0 && protection != &ProfitProtection::default())
+            || (protection.revision > 0
+                && protection.updated_at_ms.is_none_or(|updated| {
+                    updated < self.created_at_ms || updated > self.updated_at_ms
+                }))
+        {
+            return Err(StrategyStateError::InvalidProfitProtection);
+        }
+        match &self.profit_protection_trigger {
+            None => {
+                if matches!(
+                    self.risk_exit_reason,
+                    Some(RiskExitReason::ProfitTakeProfit | RiskExitReason::ProfitStopLoss)
+                ) {
+                    return Err(StrategyStateError::InvalidProfitProtection);
+                }
+            }
+            Some(trigger) => {
+                if protection.revision == 0
+                    || trigger.protection_revision != protection.revision
+                    || trigger.mark_price <= Decimal::ZERO
+                    || self.risk_trigger_mark_price != Some(trigger.mark_price)
+                    || trigger.observed_at_ms < self.created_at_ms
+                    || trigger.observed_at_ms > self.updated_at_ms
+                    || protection
+                        .updated_at_ms
+                        .is_none_or(|updated| trigger.observed_at_ms < updated)
+                    || protection.triggered_reason(trigger.net_profit).is_none()
+                    || protection.triggered_reason(trigger.net_profit) != self.risk_exit_reason
+                    || matches!(
+                        self.lifecycle,
+                        StrategyLifecycle::AwaitingOpening
+                            | StrategyLifecycle::DeployingGrid
+                            | StrategyLifecycle::Running
+                    )
+                {
+                    return Err(StrategyStateError::InvalidProfitProtection);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_internal(&self, replay_inventory: bool) -> Result<(), StrategyStateError> {
         if !matches!(self.version, 1 | 2) {
             return Err(StrategyStateError::UnsupportedVersion(self.version));
@@ -641,6 +697,7 @@ impl StrategyState {
             .validate_snapshot(&self.config, &self.instrument_rules)
             .map_err(StrategyStateError::InvalidPlan)?;
         validate_risk_prices(&self.config, self.plan.reference_price)?;
+        self.validate_profit_protection()?;
         if self
             .risk_trigger_mark_price
             .is_some_and(|price| price <= Decimal::ZERO)
@@ -2561,6 +2618,108 @@ where
         let message = "authoritative exchange instrument rules changed".to_owned();
         next.fail(message.clone());
         self.finalize_and_store(next, now_ms, StrategyTransition::Failed { message })
+    }
+
+    pub fn update_profit_protection(
+        &mut self,
+        expected_revision: u64,
+        take_profit_amount: Option<Decimal>,
+        stop_loss_amount: Option<Decimal>,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
+        let snapshot = self.store.snapshot();
+        if !matches!(
+            snapshot.lifecycle,
+            StrategyLifecycle::AwaitingOpening
+                | StrategyLifecycle::DeployingGrid
+                | StrategyLifecycle::Running
+        ) || snapshot.profit_protection_trigger.is_some()
+        {
+            return Err(StrategyStateError::ProfitProtectionLocked.into());
+        }
+        let mut protection = ProfitProtection {
+            revision: snapshot.profit_protection.revision,
+            take_profit_amount,
+            stop_loss_amount,
+            updated_at_ms: Some(now_ms),
+        };
+        protection.validate_limits()?;
+        if expected_revision != protection.revision {
+            return Err(StrategyStateError::ProfitProtectionRevisionConflict.into());
+        }
+        if snapshot.profit_protection.take_profit_amount == take_profit_amount
+            && snapshot.profit_protection.stop_loss_amount == stop_loss_amount
+        {
+            return Ok(StrategyTransition::NoChange);
+        }
+        protection.revision =
+            protection
+                .revision
+                .checked_add(1)
+                .ok_or(StrategyStateError::NumericOverflow(
+                    "profit protection revision",
+                ))?;
+        let mut next = snapshot.clone();
+        next.profit_protection = protection;
+        self.finalize_and_store(
+            next,
+            now_ms,
+            StrategyTransition::Updated {
+                new_obligation_ids: Vec::new(),
+            },
+        )
+    }
+
+    pub fn evaluate_profit_protection(
+        &mut self,
+        net_profit: Decimal,
+        mark_price: Decimal,
+        observed_at_ms: u64,
+        expected_protection_revision: u64,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        if mark_price <= Decimal::ZERO {
+            return Err(StrategyStateError::InvalidMarketPrice.into());
+        }
+        self.ensure_snapshot_validated()?;
+        let snapshot = self.store.snapshot();
+        let protection = &snapshot.profit_protection;
+        if !matches!(
+            snapshot.lifecycle,
+            StrategyLifecycle::AwaitingOpening
+                | StrategyLifecycle::DeployingGrid
+                | StrategyLifecycle::Running
+        ) || snapshot.profit_protection_trigger.is_some()
+            || protection.revision != expected_protection_revision
+            || now_ms
+                .checked_sub(observed_at_ms)
+                .is_none_or(|age_ms| age_ms > 5_000)
+            || observed_at_ms < snapshot.created_at_ms
+            || protection
+                .updated_at_ms
+                .is_some_and(|updated| observed_at_ms < updated)
+        {
+            return Ok(StrategyTransition::NoChange);
+        }
+        let Some(reason) = protection.triggered_reason(net_profit) else {
+            return Ok(StrategyTransition::NoChange);
+        };
+        let mut next = snapshot.clone();
+        next.lifecycle = StrategyLifecycle::RiskExitRequested;
+        next.risk_exit_reason = Some(reason);
+        next.risk_trigger_mark_price = Some(mark_price);
+        next.profit_protection_trigger = Some(ProfitProtectionTrigger {
+            net_profit,
+            mark_price,
+            observed_at_ms,
+            protection_revision: expected_protection_revision,
+        });
+        self.finalize_and_store(
+            next,
+            now_ms,
+            StrategyTransition::RiskExitRequested { reason, mark_price },
+        )
     }
 
     pub fn evaluate_risk_price(
@@ -4909,6 +5068,12 @@ pub enum StrategyStateError {
     InvalidRiskPriceDirection,
     #[error("risk exit state is incomplete or invalid")]
     InvalidRiskExitState,
+    #[error("profit protection settings or trigger evidence are invalid")]
+    InvalidProfitProtection,
+    #[error("profit protection revision changed")]
+    ProfitProtectionRevisionConflict,
+    #[error("profit protection is locked after strategy exit")]
+    ProfitProtectionLocked,
     #[error("triggered strategy activation metadata is incomplete or invalid")]
     InvalidTriggerActivation,
     #[error("market price must be positive")]
@@ -5158,6 +5323,395 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn profit_protection_legacy_defaults_disabled() {
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        assert_eq!(initial.profit_protection, ProfitProtection::default());
+        let mut json = serde_json::to_value(&initial).unwrap();
+        json.as_object_mut().unwrap().remove("profit_protection");
+        json.as_object_mut()
+            .unwrap()
+            .remove("profit_protection_trigger");
+        let restored: StrategyState = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, initial);
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(restored));
+        assert_eq!(
+            machine
+                .evaluate_profit_protection(Decimal::MIN, decimal(1012), 101, 0, 101)
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(machine.store().write_attempts(), 0);
+    }
+
+    #[test]
+    fn profit_protection_updates_are_independent_cas_full_replacements() {
+        let mut machine = short_machine_with_opening();
+        let before = machine.store().snapshot().clone();
+        assert!(matches!(
+            machine
+                .update_profit_protection(0, Some(decimal(10)), Some(decimal(5)), 300)
+                .unwrap(),
+            StrategyTransition::Updated { .. }
+        ));
+        let configured = machine.store().snapshot().clone();
+        assert_eq!(
+            configured.profit_protection,
+            ProfitProtection {
+                revision: 1,
+                take_profit_amount: Some(decimal(10)),
+                stop_loss_amount: Some(decimal(5)),
+                updated_at_ms: Some(300),
+            }
+        );
+        let mut expected = before.clone();
+        expected.profit_protection = configured.profit_protection.clone();
+        expected.revision += 1;
+        expected.updated_at_ms = 300;
+        assert_eq!(
+            configured, expected,
+            "settings must not change trading/accounting state"
+        );
+        assert_eq!(
+            machine
+                .update_profit_protection(1, Some(decimal(10)), Some(decimal(5)), 301)
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(machine.store().snapshot(), &configured);
+        assert!(matches!(
+            machine.update_profit_protection(0, Some(decimal(10)), Some(decimal(5)), 302),
+            Err(StrategyMachineError::InvalidState(
+                StrategyStateError::ProfitProtectionRevisionConflict
+            ))
+        ));
+        machine
+            .update_profit_protection(1, None, Some(decimal(7)), 303)
+            .unwrap();
+        assert_eq!(
+            machine
+                .store()
+                .snapshot()
+                .profit_protection
+                .take_profit_amount,
+            None
+        );
+        machine
+            .update_profit_protection(2, None, None, 304)
+            .unwrap();
+        assert_eq!(
+            machine.store().snapshot().profit_protection,
+            ProfitProtection {
+                revision: 3,
+                take_profit_amount: None,
+                stop_loss_amount: None,
+                updated_at_ms: Some(304),
+            }
+        );
+    }
+
+    #[test]
+    fn profit_protection_rejects_nonpositive_limits_without_writes() {
+        for (tp, sl) in [
+            (Some(Decimal::ZERO), None),
+            (Some(decimal(-1)), None),
+            (None, Some(Decimal::ZERO)),
+            (None, Some(Decimal::MIN)),
+        ] {
+            let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+                Direction::Long,
+                PositionBaseline::flat(),
+            )));
+            let before = machine.store().snapshot().clone();
+            assert!(matches!(
+                machine.update_profit_protection(0, tp, sl, 101),
+                Err(StrategyMachineError::InvalidState(
+                    StrategyStateError::InvalidProfitProtection
+                ))
+            ));
+            assert_eq!(machine.store().snapshot(), &before);
+            assert_eq!(machine.store().write_attempts(), 0);
+        }
+    }
+
+    #[test]
+    fn profit_protection_only_live_lifecycles_allow_updates() {
+        for lifecycle in [
+            StrategyLifecycle::AwaitingOpening,
+            StrategyLifecycle::DeployingGrid,
+            StrategyLifecycle::Running,
+            StrategyLifecycle::RiskExitRequested,
+            StrategyLifecycle::StopRequested,
+            StrategyLifecycle::Stopped,
+            StrategyLifecycle::Failed,
+            StrategyLifecycle::Closed,
+        ] {
+            let mut initial = if lifecycle == StrategyLifecycle::Running {
+                let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+                    Direction::Short,
+                    PositionBaseline::flat(),
+                )));
+                complete_initial_deployment(&mut machine, 200);
+                machine.store().snapshot().clone()
+            } else if lifecycle == StrategyLifecycle::DeployingGrid {
+                short_machine_with_opening().store().snapshot().clone()
+            } else {
+                state(Direction::Short, PositionBaseline::flat())
+            };
+            initial.lifecycle = lifecycle;
+            if lifecycle == StrategyLifecycle::Failed {
+                initial.failure = Some("test failure".into());
+            }
+            if lifecycle == StrategyLifecycle::RiskExitRequested {
+                initial.risk_exit_reason = Some(RiskExitReason::StopLoss);
+                initial.risk_trigger_mark_price = Some(decimal(1012));
+            }
+            initial.validate().unwrap();
+            let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(initial));
+            let result = machine.update_profit_protection(0, Some(decimal(10)), None, 1000);
+            if matches!(
+                lifecycle,
+                StrategyLifecycle::AwaitingOpening
+                    | StrategyLifecycle::DeployingGrid
+                    | StrategyLifecycle::Running
+            ) {
+                assert!(matches!(
+                    result.unwrap(),
+                    StrategyTransition::Updated { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(StrategyMachineError::InvalidState(
+                        StrategyStateError::ProfitProtectionLocked
+                    ))
+                ));
+                assert_eq!(machine.store().write_attempts(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn profit_protection_inclusive_limits_latch_once_for_all_directions() {
+        for direction in [Direction::Long, Direction::Short, Direction::Neutral] {
+            for (net, reason) in [
+                (decimal(10), RiskExitReason::ProfitTakeProfit),
+                (decimal(-5), RiskExitReason::ProfitStopLoss),
+                (Decimal::MIN, RiskExitReason::ProfitStopLoss),
+                (Decimal::MAX, RiskExitReason::ProfitTakeProfit),
+            ] {
+                let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+                    direction,
+                    PositionBaseline::flat(),
+                )));
+                machine
+                    .update_profit_protection(0, Some(decimal(10)), Some(decimal(5)), 101)
+                    .unwrap();
+                let configured = machine.store().snapshot().clone();
+                assert_eq!(
+                    machine
+                        .evaluate_profit_protection(net, decimal(1012), 102, 1, 103)
+                        .unwrap(),
+                    StrategyTransition::RiskExitRequested {
+                        reason,
+                        mark_price: decimal(1012)
+                    }
+                );
+                let latched = machine.store().snapshot().clone();
+                assert_eq!(
+                    latched.profit_protection_trigger,
+                    Some(ProfitProtectionTrigger {
+                        net_profit: net,
+                        mark_price: decimal(1012),
+                        observed_at_ms: 102,
+                        protection_revision: 1
+                    })
+                );
+                assert_eq!(latched.lifecycle, StrategyLifecycle::RiskExitRequested);
+                assert_eq!(latched.risk_exit_reason, Some(reason));
+                assert_eq!(latched.risk_trigger_mark_price, Some(decimal(1012)));
+                assert_eq!(latched.orders, configured.orders);
+                assert!(latched.ready_intents(104).unwrap().is_empty());
+                assert_eq!(
+                    machine
+                        .evaluate_profit_protection(-net, decimal(1013), 104, 1, 104)
+                        .unwrap(),
+                    StrategyTransition::NoChange
+                );
+                assert_eq!(machine.store().snapshot(), &latched);
+                assert!(matches!(
+                    machine.update_profit_protection(1, None, None, 104),
+                    Err(StrategyMachineError::InvalidState(
+                        StrategyStateError::ProfitProtectionLocked
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn profit_protection_discards_stale_future_old_config_and_uncrossed_observations() {
+        for (net, observed, revision, now) in [
+            (decimal(10), 101, 1, 5102),
+            (decimal(10), 103, 1, 102),
+            (decimal(10), 100, 1, 102),
+            (decimal(10), 102, 0, 102),
+            (decimal(9), 102, 1, 102),
+            (decimal(-4), 102, 1, 102),
+        ] {
+            let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+                Direction::Long,
+                PositionBaseline::flat(),
+            )));
+            machine
+                .update_profit_protection(0, Some(decimal(10)), Some(decimal(5)), 101)
+                .unwrap();
+            let before = machine.store().snapshot().clone();
+            assert_eq!(
+                machine
+                    .evaluate_profit_protection(net, decimal(1012), observed, revision, now)
+                    .unwrap(),
+                StrategyTransition::NoChange
+            );
+            assert_eq!(machine.store().snapshot(), &before);
+        }
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+            Direction::Long,
+            PositionBaseline::flat(),
+        )));
+        machine
+            .update_profit_protection(0, Some(decimal(10)), None, 101)
+            .unwrap();
+        assert!(matches!(
+            machine
+                .evaluate_profit_protection(decimal(10), decimal(1012), 101, 1, 5101)
+                .unwrap(),
+            StrategyTransition::RiskExitRequested { .. }
+        ));
+    }
+
+    #[test]
+    fn profit_protection_rejects_invalid_mark_and_rolls_back_failed_writes() {
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+            Direction::Short,
+            PositionBaseline::flat(),
+        )));
+        let before = machine.store().snapshot().clone();
+        machine.store_mut().fail_next_write();
+        assert!(matches!(
+            machine.update_profit_protection(0, Some(decimal(10)), None, 101),
+            Err(StrategyMachineError::Persistence(_))
+        ));
+        assert_eq!(machine.store().snapshot(), &before);
+        machine
+            .update_profit_protection(0, Some(decimal(10)), None, 102)
+            .unwrap();
+        let configured = machine.store().snapshot().clone();
+        for mark in [Decimal::ZERO, decimal(-1)] {
+            assert!(matches!(
+                machine.evaluate_profit_protection(decimal(10), mark, 103, 1, 103),
+                Err(StrategyMachineError::InvalidState(
+                    StrategyStateError::InvalidMarketPrice
+                ))
+            ));
+        }
+        machine.store_mut().fail_next_write();
+        assert!(matches!(
+            machine.evaluate_profit_protection(decimal(10), decimal(1012), 103, 1, 103),
+            Err(StrategyMachineError::Persistence(_))
+        ));
+        assert_eq!(machine.store().snapshot(), &configured);
+    }
+
+    #[test]
+    fn profit_protection_snapshot_validation_rejects_malformed_settings_and_evidence() {
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(state(
+            Direction::Short,
+            PositionBaseline::flat(),
+        )));
+        machine
+            .update_profit_protection(0, Some(decimal(10)), Some(decimal(5)), 101)
+            .unwrap();
+        let configured = machine.store().snapshot().clone();
+        for case in 0..6 {
+            let mut invalid = configured.clone();
+            match case {
+                0 => invalid.profit_protection.take_profit_amount = Some(Decimal::ZERO),
+                1 => invalid.profit_protection.stop_loss_amount = Some(decimal(-5)),
+                2 => invalid.profit_protection.updated_at_ms = None,
+                3 => invalid.profit_protection.updated_at_ms = Some(99),
+                4 => invalid.profit_protection.updated_at_ms = Some(102),
+                _ => invalid.profit_protection.revision = 0,
+            }
+            assert_eq!(
+                invalid.validate(),
+                Err(StrategyStateError::InvalidProfitProtection),
+                "case {case}"
+            );
+        }
+        machine
+            .evaluate_profit_protection(decimal(10), decimal(1012), 102, 1, 103)
+            .unwrap();
+        let latched = machine.store().snapshot().clone();
+        for case in 0..9 {
+            let mut invalid = latched.clone();
+            let evidence = invalid.profit_protection_trigger.as_mut().unwrap();
+            match case {
+                0 => evidence.protection_revision = 0,
+                1 => evidence.net_profit = decimal(9),
+                2 => evidence.mark_price = Decimal::ZERO,
+                3 => evidence.mark_price = decimal(1013),
+                4 => evidence.observed_at_ms = 100,
+                5 => evidence.observed_at_ms = 104,
+                6 => invalid.profit_protection_trigger = None,
+                7 => invalid.risk_exit_reason = Some(RiskExitReason::StopLoss),
+                _ => invalid.lifecycle = StrategyLifecycle::AwaitingOpening,
+            }
+            assert_eq!(
+                invalid.validate(),
+                Err(StrategyStateError::InvalidProfitProtection),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn profit_protection_incremental_journal_roundtrip_preserves_settings_and_latch() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("protection.json");
+        let initial = state(Direction::Short, PositionBaseline::flat());
+        let mut machine =
+            StrategyMachine::new(FileStrategyStateStore::create(&path, initial).unwrap());
+        machine
+            .update_profit_protection(0, Some(decimal(10)), Some(decimal(5)), 101)
+            .unwrap();
+        let checkpoint = std::fs::read(&path).unwrap();
+        machine
+            .update_profit_protection(1, Some(decimal(12)), Some(decimal(6)), 102)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), checkpoint);
+        assert_eq!(
+            FileStrategyStateStore::load(&path).unwrap().snapshot(),
+            machine.store().snapshot()
+        );
+        machine
+            .evaluate_profit_protection(decimal(-6), decimal(1012), 103, 2, 104)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), checkpoint);
+        let restored = FileStrategyStateStore::load(&path).unwrap();
+        assert_eq!(restored.snapshot(), machine.store().snapshot());
+        let latched = restored.snapshot().clone();
+        let mut restarted = StrategyMachine::new(MemoryStrategyStateStore::new(latched.clone()));
+        assert_eq!(
+            restarted
+                .evaluate_profit_protection(decimal(-100), decimal(1012), 105, 2, 105)
+                .unwrap(),
+            StrategyTransition::NoChange
+        );
+        assert_eq!(restarted.store().snapshot(), &latched);
+        assert_eq!(restarted.store().write_attempts(), 0);
     }
 
     fn legacy_capacity_machine() -> StrategyMachine<MemoryStrategyStateStore> {

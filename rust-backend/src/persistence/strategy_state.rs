@@ -206,6 +206,10 @@ impl FileStrategyStateStore {
         &self.path
     }
 
+    pub(crate) fn shared_snapshot(&self) -> Arc<StrategyState> {
+        Arc::clone(&self.snapshot)
+    }
+
     pub(crate) fn relocate(&mut self, path: impl Into<PathBuf>) {
         self.path = path.into();
     }

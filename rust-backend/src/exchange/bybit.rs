@@ -21,9 +21,10 @@ use crate::{
         ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway,
-        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway, TradingFeeRates,
+        OrderCancellationTarget, OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup,
+        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
+        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
+        TradingFeeRates,
         bybit_codec::{
             parse_account_balance_snapshot, parse_cancellation_acknowledgement, parse_error,
             parse_exact_order_record, parse_execution_page, parse_historical_minute_open,
@@ -45,6 +46,7 @@ use crate::{
 const PRODUCTION_BASE_URL: &str = "https://api.bybit.com";
 const TESTNET_BASE_URL: &str = "https://api-testnet.bybit.com";
 const CATEGORY: &str = "linear";
+const MAX_BATCH_CANCELLATIONS: usize = 20;
 const EXECUTION_PAGE_LIMIT: usize = 100;
 const MAX_EXECUTION_PAGES: usize = 100;
 const OPEN_ORDER_PAGE_LIMIT: usize = 50;
@@ -930,6 +932,101 @@ where
             message: error.message,
         })
     }
+
+    async fn cancel_orders(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let mut order_ids = BTreeSet::new();
+        let mut client_ids = BTreeSet::new();
+        if validate_snapshot_request(exchange, Exchange::Bybit, symbol).is_err()
+            || targets.iter().any(|target| {
+                target.exchange_order_id.is_empty()
+                    || target.exchange_order_id.len() > 128
+                    || !target
+                        .exchange_order_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_graphic())
+                    || !order_ids.insert(&target.exchange_order_id)
+                    || !client_ids.insert(&target.client_order_id)
+            })
+        {
+            return vec![
+                Err(invalid_cancellation(
+                    "a valid Bybit symbol and unique order identities are required",
+                ));
+                targets.len()
+            ];
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let mut results = Vec::with_capacity(targets.len());
+        for chunk in targets.chunks(MAX_BATCH_CANCELLATIONS) {
+            let payload = serde_json::json!({"category":CATEGORY,"request":chunk.iter().map(|target| {
+                serde_json::json!({"symbol":symbol,"orderId":target.exchange_order_id,"orderLinkId":target.client_order_id.as_str()})
+            }).collect::<Vec<_>>()});
+            let request = match self.signed_post("/v5/order/cancel-batch", &payload) {
+                Ok(request) => request,
+                Err(error) => {
+                    results.extend(vec![
+                        Err(invalid_cancellation(error.to_string()));
+                        chunk.len()
+                    ]);
+                    continue;
+                }
+            };
+            let root = match self.transport.execute(request).await {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    serde_json::from_str::<Value>(&response.body).ok()
+                }
+                _ => None,
+            };
+            let lists = root
+                .as_ref()
+                .filter(|root| root.get("retCode").and_then(Value::as_i64) == Some(0))
+                .and_then(|root| {
+                    Some((
+                        root.pointer("/result/list")?.as_array()?,
+                        root.pointer("/retExtInfo/list")?.as_array()?,
+                    ))
+                })
+                .filter(|(rows, statuses)| {
+                    rows.len() == chunk.len() && statuses.len() == chunk.len()
+                });
+            let Some((rows, statuses)) = lists else {
+                results.extend(vec![
+                    Err(CancellationError::Unknown {
+                        message: "Bybit batch cancellation has no complete result and status lists"
+                            .into(),
+                    });
+                    chunk.len()
+                ]);
+                continue;
+            };
+            results.extend(rows.iter().zip(statuses).zip(chunk).map(|((row, status), target)| {
+                if row.get("category").and_then(Value::as_str) != Some(CATEGORY)
+                    || row.get("symbol").and_then(Value::as_str) != Some(symbol.as_str())
+                    || row.get("orderId").and_then(Value::as_str) != Some(target.exchange_order_id.as_str())
+                    || row.get("orderLinkId").and_then(Value::as_str) != Some(target.client_order_id.as_str())
+                    || status.get("code").and_then(Value::as_i64) != Some(0)
+                {
+                    return Err(CancellationError::Unknown {
+                        message: "Bybit batch cancellation row failed or has mismatched identities".into(),
+                    });
+                }
+                // Acceptance only: the engine must still reconcile terminal order/fill evidence.
+                Ok(CancellationAcknowledgement {
+                    client_order_id: target.client_order_id.clone(),
+                    exchange_order_id: target.exchange_order_id.clone(),
+                })
+            }));
+        }
+        results
+    }
 }
 
 #[async_trait]
@@ -1523,6 +1620,228 @@ mod tests {
         domain::{IntentState, OrderShape, TerminalOrderStatus},
         exchange::{ActiveOrderStatus, OrderLifecycle, protocol::TransportError},
     };
+
+    mod native_cancel_tests {
+        use super::*;
+        use crate::exchange::OrderCancellationTarget;
+        use serde_json::json;
+
+        fn targets(count: usize) -> Vec<OrderCancellationTarget> {
+            (0..count)
+                .map(|i| OrderCancellationTarget {
+                    client_order_id: ClientOrderId::parse(format!("g_{i}_S_native")).unwrap(),
+                    exchange_order_id: format!("order-{i}"),
+                })
+                .collect()
+        }
+
+        #[derive(Clone)]
+        struct BatchTransport {
+            requests: Arc<Mutex<Vec<PreparedHttpRequest>>>,
+            body: Option<Value>,
+        }
+
+        #[async_trait]
+        impl HttpTransport for BatchTransport {
+            async fn execute(
+                &self,
+                request: PreparedHttpRequest,
+            ) -> Result<HttpResponse, TransportError> {
+                assert_eq!(request.path, "/v5/order/cancel-batch");
+                assert_eq!(request.method, HttpMethod::Post);
+                let payload: Value = serde_json::from_str(&request.body_string()).unwrap();
+                assert_eq!(payload["category"], "linear");
+                let rows = payload["request"].as_array().unwrap();
+                assert!(rows.len() <= 20 && !rows.is_empty());
+                let body = self.body.clone().unwrap_or_else(|| json!({"retCode":0,"retMsg":"OK",
+                    "result":{"list":rows.iter().map(|row| json!({"category":"linear","symbol":row["symbol"],"orderId":row["orderId"],"orderLinkId":row["orderLinkId"]})).collect::<Vec<_>>()},
+                    "retExtInfo":{"list":rows.iter().map(|_| json!({"code":0,"msg":"OK"})).collect::<Vec<_>>()}}));
+                self.requests.lock().unwrap().push(request);
+                Ok(HttpResponse {
+                    status: 200,
+                    body: body.to_string(),
+                })
+            }
+        }
+
+        fn subject(
+            body: Option<Value>,
+        ) -> (
+            BybitAdapter<BatchTransport, BybitHmacSha256Signer, FixedClock>,
+            BatchTransport,
+        ) {
+            let transport = BatchTransport {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                body,
+            };
+            let adapter = BybitAdapter::with_base_url(
+                transport.clone(),
+                BybitHmacSha256Signer::new("test-secret").unwrap(),
+                FixedClock(1),
+                "test-key",
+                "https://example.test",
+            );
+            (adapter, transport)
+        }
+
+        #[tokio::test]
+        async fn native_cancel_splits_twenty_exact_targets_and_excludes_manual_orders() {
+            for count in [1, 20, 43] {
+                let (adapter, transport) = subject(None);
+                let targets = targets(count);
+                let result = adapter
+                    .cancel_orders(Exchange::Bybit, "MUUSDT", &targets)
+                    .await;
+                assert_eq!(result.len(), count);
+                for (ack, target) in result.iter().zip(&targets) {
+                    let ack = ack.as_ref().unwrap();
+                    assert_eq!(ack.client_order_id, target.client_order_id);
+                    assert_eq!(ack.exchange_order_id, target.exchange_order_id);
+                }
+                let requests = transport.requests.lock().unwrap();
+                assert_eq!(requests.len(), count.div_ceil(20));
+                let sent = requests
+                    .iter()
+                    .flat_map(|r| {
+                        serde_json::from_str::<Value>(&r.body_string()).unwrap()["request"]
+                            .as_array()
+                            .unwrap()
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(sent.len(), count);
+                assert!(
+                    sent.iter()
+                        .all(|r| r["symbol"] == "MUUSDT" && r["orderId"] != "manual-order")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_checks_both_identity_and_per_row_status() {
+            let good = json!({"category":"linear","symbol":"MUUSDT","orderId":"order-0","orderLinkId":"g_0_S_native"});
+            for (rows, statuses) in [
+                (json!([good.clone()]), json!([])),
+                (json!([]), json!([{"code":0}])),
+                (
+                    json!([good.clone(), good.clone()]),
+                    json!([{"code":0},{"code":0}]),
+                ),
+                (
+                    json!([good.clone()]),
+                    json!([{"code":110001,"msg":"not found"}]),
+                ),
+                (
+                    json!([{ "category":"linear","symbol":"BTCUSDT","orderId":"order-0","orderLinkId":"g_0_S_native"}]),
+                    json!([{"code":0}]),
+                ),
+                (
+                    json!([{ "category":"linear","symbol":"MUUSDT","orderId":"manual-order","orderLinkId":"g_0_S_native"}]),
+                    json!([{"code":0}]),
+                ),
+                (
+                    json!([{ "category":"linear","symbol":"MUUSDT","orderId":"order-0","orderLinkId":"manual"}]),
+                    json!([{"code":0}]),
+                ),
+                (json!([good]), json!([{}])),
+            ] {
+                let (adapter, _) = subject(Some(
+                    json!({"retCode":0,"result":{"list":rows},"retExtInfo":{"list":statuses}}),
+                ));
+                let result = adapter
+                    .cancel_orders(Exchange::Bybit, "MUUSDT", &targets(1))
+                    .await;
+                assert!(matches!(result[0], Err(CancellationError::Unknown { .. })));
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_partial_failure_preserves_each_ack_without_terminal_claim() {
+            let (adapter, _) = subject(Some(json!({"retCode":0,"result":{"list":[
+                {"category":"linear","symbol":"MUUSDT","orderId":"order-0","orderLinkId":"g_0_S_native"},
+                {"category":"linear","symbol":"MUUSDT","orderId":"order-1","orderLinkId":"g_1_S_native"}]},
+                "retExtInfo":{"list":[{"code":0,"msg":"OK"},{"code":110001,"msg":"not found"}]}})));
+            let result = adapter
+                .cancel_orders(Exchange::Bybit, "MUUSDT", &targets(2))
+                .await;
+            assert!(result[0].is_ok());
+            assert!(matches!(result[1], Err(CancellationError::Unknown { .. })));
+        }
+
+        #[tokio::test]
+        async fn native_cancel_empty_and_invalid_scope_never_reach_transport() {
+            let (adapter, transport) = subject(None);
+            assert!(
+                adapter
+                    .cancel_orders(Exchange::Bybit, "MUUSDT", &[])
+                    .await
+                    .is_empty()
+            );
+            for (exchange, symbol, targets) in [
+                (Exchange::Binance, "MUUSDT", targets(1)),
+                (Exchange::Bybit, "wrong/symbol", targets(1)),
+                (Exchange::Bybit, "MUUSDT", vec![targets(1)[0].clone(); 2]),
+            ] {
+                assert!(
+                    adapter
+                        .cancel_orders(exchange, symbol, &targets)
+                        .await
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+            }
+            assert!(transport.requests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn native_cancel_validates_tail_before_first_wire_request() {
+            for duplicate_client in [false, true] {
+                let (adapter, transport) = subject(None);
+                let mut targets = targets(41);
+                if duplicate_client {
+                    targets[40].client_order_id = targets[0].client_order_id.clone();
+                } else {
+                    targets[40].exchange_order_id = targets[0].exchange_order_id.clone();
+                }
+                let result = adapter
+                    .cancel_orders(Exchange::Bybit, "MUUSDT", &targets)
+                    .await;
+                assert_eq!(result.len(), 41);
+                assert!(
+                    result
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+                assert!(transport.requests.lock().unwrap().is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_timeout_and_bad_envelope_are_unknown_without_retry() {
+            let transport =
+                MockTransport::with_response(Err(TransportError::Timeout("timed out".into())));
+            let result = adapter(transport.clone())
+                .cancel_orders(Exchange::Bybit, "MUUSDT", &targets(2))
+                .await;
+            assert!(
+                result
+                    .iter()
+                    .all(|r| matches!(r, Err(CancellationError::Unknown { .. })))
+            );
+            assert_eq!(transport.requests().len(), 1);
+            for body in [
+                json!({"retCode":10006}),
+                json!({"retCode":0,"result":{"list":[]},"retExtInfo":{"list":[]}}),
+                json!({"result":{"list":[]}}),
+            ] {
+                let (adapter, _) = subject(Some(body));
+                let result = adapter
+                    .cancel_orders(Exchange::Bybit, "MUUSDT", &targets(1))
+                    .await;
+                assert!(matches!(result[0], Err(CancellationError::Unknown { .. })));
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct FixedClock(u64);

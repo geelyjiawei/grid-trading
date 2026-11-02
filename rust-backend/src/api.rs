@@ -31,12 +31,12 @@ use crate::{
     engine::{
         ArmedStrategyLifecycle, FeeValuationSource, FileStrategyStartError, LeveragePreflightError,
         MarketSnapshot, PreparedStrategyKind, PreparedStrategyLifecycle,
-        PreparedStrategyStopOutcome, RuntimeCoordinator, RuntimeCoordinatorError,
-        RuntimeRegistryEntry, ShadowCollectionError, StrategyBootstrapError, StrategyLifecycle,
-        StrategyOrderPurpose, StrategyRunId, StrategyState, StrategyTransition,
-        advance_reference_time_ms, build_grid_preview, collect_stable_exchange_view,
-        collect_strategy_shadow_view, ensure_available_margin_snapshot,
-        load_authoritative_fee_config,
+        PreparedStrategyStopOutcome, ProfitProtection, ProfitProtectionControlError,
+        RuntimeCoordinator, RuntimeCoordinatorError, RuntimeRegistryEntry, ShadowCollectionError,
+        StrategyBootstrapError, StrategyLifecycle, StrategyOrderPurpose, StrategyProfitMetrics,
+        StrategyRunId, StrategyState, StrategyTransition, advance_reference_time_ms,
+        build_grid_preview, collect_stable_exchange_view, collect_strategy_shadow_view,
+        ensure_available_margin_snapshot, load_authoritative_fee_config,
     },
     exchange::{
         AccountBalanceSnapshotGateway, AccountBalanceUnit, ActiveOrderStatus, AuthoritativeOrder,
@@ -48,9 +48,7 @@ use crate::{
             ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayFactory,
             SharedConfiguredExchangeGateway,
         },
-        funding::{
-            FundingAccountFill, FundingAttribution, FundingHistorySnapshot, attribute_funding,
-        },
+        funding::FundingAttribution,
         registry::{ExchangeGatewayRegistry, ReadOnlyExchangeGateway, RegistryError},
     },
     persistence::{
@@ -1363,6 +1361,206 @@ async fn grid_symbol_status(
     }
 }
 
+#[derive(Deserialize)]
+struct ProfitProtectionSelection {
+    exchange: Option<Exchange>,
+    run_id: String,
+}
+
+struct ProfitProtectionUpdateRequest {
+    run_id: StrategyRunId,
+    expected_revision: u64,
+    take_profit_amount: Option<Decimal>,
+    stop_loss_amount: Option<Decimal>,
+}
+
+fn invalid_profit_protection_request() -> Box<Response> {
+    Box::new(api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_profit_protection",
+        "Provide run_id, expected_revision and both amount keys as positive decimal strings or null",
+    ))
+}
+
+fn parse_profit_protection_amount(value: Option<&Value>) -> Result<Option<Decimal>, Box<Response>> {
+    let value = value.ok_or_else(invalid_profit_protection_request)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value
+        .as_str()
+        .ok_or_else(invalid_profit_protection_request)?;
+    let mut parts = text.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction
+            .is_some_and(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        || parts.next().is_some()
+    {
+        return Err(invalid_profit_protection_request());
+    }
+    // Removing insignificant fractional zeroes preserves exact value, never rounds.
+    let normalized = match fraction.map(|part| part.trim_end_matches('0')) {
+        Some("") | None => whole.to_owned(),
+        Some(part) => format!("{whole}.{part}"),
+    };
+    let amount =
+        Decimal::from_str_exact(&normalized).map_err(|_| invalid_profit_protection_request())?;
+    if amount <= Decimal::ZERO {
+        return Err(invalid_profit_protection_request());
+    }
+    Ok(Some(amount))
+}
+
+fn parse_profit_protection_update(
+    body: &[u8],
+) -> Result<ProfitProtectionUpdateRequest, Box<Response>> {
+    let payload = parse_json_object(body)?;
+    let run_id = payload
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_profit_protection_request)?;
+    let run_id = StrategyRunId::parse(run_id).map_err(|_| invalid_profit_protection_request())?;
+    let expected_revision = payload
+        .get("expected_revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(invalid_profit_protection_request)?;
+    Ok(ProfitProtectionUpdateRequest {
+        run_id,
+        expected_revision,
+        take_profit_amount: parse_profit_protection_amount(payload.get("take_profit_amount"))?,
+        stop_loss_amount: parse_profit_protection_amount(payload.get("stop_loss_amount"))?,
+    })
+}
+
+fn profit_protection_control_error(error: ProfitProtectionControlError) -> Response {
+    match error {
+        ProfitProtectionControlError::NotFound => api_error(
+            StatusCode::NOT_FOUND,
+            "profit_protection_not_found",
+            "The strategy was not found",
+        ),
+        ProfitProtectionControlError::RunMismatch => api_error(
+            StatusCode::CONFLICT,
+            "profit_protection_run_mismatch",
+            "The strategy run changed; reload the selected strategy",
+        ),
+        ProfitProtectionControlError::NotRunning => api_error(
+            StatusCode::CONFLICT,
+            "profit_protection_not_running",
+            "The strategy no longer allows protection changes",
+        ),
+        ProfitProtectionControlError::RevisionConflict => api_error(
+            StatusCode::CONFLICT,
+            "profit_protection_revision_conflict",
+            "The protection revision changed; reload before saving",
+        ),
+        ProfitProtectionControlError::InvalidLimits => *invalid_profit_protection_request(),
+        ProfitProtectionControlError::State(error) => {
+            tracing::warn!(error = %error, "profit protection durable state is unavailable");
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "profit_protection_state_unavailable",
+                "The strategy protection state could not be safely read or saved",
+            )
+        }
+    }
+}
+
+fn profit_protection_runtime(
+    state: &ApiState,
+) -> Result<&RuntimeCoordinator<SharedConfiguredExchangeGateway>, Box<Response>> {
+    state
+        .runtime
+        .as_deref()
+        .filter(|runtime| runtime.recovery_completed())
+        .ok_or_else(|| {
+            Box::new(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "profit_protection_unavailable",
+                "The trading runtime is unavailable or has not completed strategy recovery",
+            ))
+        })
+}
+
+async fn get_profit_protection(
+    _session: AuthenticatedWebSession,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ProfitProtectionSelection>,
+) -> Response {
+    let exchange = selected_exchange(
+        &state,
+        ExchangeSelection {
+            exchange: selection.exchange,
+        },
+    );
+    let symbol = match normalize_symbol(exchange, &symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let run_id = match StrategyRunId::parse(selection.run_id) {
+        Ok(run_id) => run_id,
+        Err(_) => return *invalid_profit_protection_request(),
+    };
+    let runtime = match profit_protection_runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return *response,
+    };
+    match runtime
+        .profit_protection_status(exchange, &symbol, &run_id)
+        .await
+    {
+        Ok(status) => no_store_json(StatusCode::OK, status),
+        Err(error) => profit_protection_control_error(error),
+    }
+}
+
+async fn update_profit_protection(
+    _session: AuthenticatedWebSession,
+    _trading: TradingEnabled,
+    _content_type: JsonContentType,
+    State(state): State<ApiState>,
+    Path(symbol): Path<String>,
+    Query(selection): Query<ExchangeSelection>,
+    body: Bytes,
+) -> Response {
+    let exchange = selected_exchange(&state, selection);
+    let symbol = match normalize_symbol(exchange, &symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => return error.response(),
+    };
+    let update = match parse_profit_protection_update(&body) {
+        Ok(update) => update,
+        Err(response) => return *response,
+    };
+    let runtime = match profit_protection_runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return *response,
+    };
+    let now_ms = match unix_time_ms() {
+        Ok(now_ms) => now_ms,
+        Err(_) => return clock_unavailable(),
+    };
+    match runtime
+        .update_profit_protection(
+            exchange,
+            &symbol,
+            &update.run_id,
+            update.expected_revision,
+            update.take_profit_amount,
+            update.stop_loss_amount,
+            now_ms,
+        )
+        .await
+    {
+        Ok(status) => no_store_json(StatusCode::OK, status),
+        Err(error) => profit_protection_control_error(error),
+    }
+}
+
 async fn grid_preview(
     _session: AuthenticatedWebSession,
     _content_type: JsonContentType,
@@ -2122,6 +2320,9 @@ fn strategy_status_response(
             "engine_running": engine_running,
             "runtime_advancing": runtime_advancing,
             "lifecycle": state.lifecycle,
+            "profit_protection": ProfitProtection::default(),
+            "profit_protection_trigger": null,
+            "risk_exit_reason": null,
             "direction": state.config.direction,
             "grid_mode": state.config.grid_mode,
             "grid_count": state.config.grid_count,
@@ -2193,6 +2394,9 @@ fn strategy_status_response(
                 "engine_running": engine_running,
                 "runtime_advancing": runtime_advancing,
                 "lifecycle": state.lifecycle,
+                "profit_protection": state.profit_protection,
+                "profit_protection_trigger": state.profit_protection_trigger,
+                "risk_exit_reason": state.risk_exit_reason,
                 "direction": state.direction,
                 "grid_mode": state.config.grid_mode,
                 "grid_count": state.config.grid_count,
@@ -3893,33 +4097,7 @@ fn validated_one_way_quantity(
     exchange: Exchange,
     symbol: &str,
 ) -> Result<Decimal, SnapshotError> {
-    if position.exchange != exchange || position.symbol != symbol {
-        return Err(SnapshotError::new(
-            "position snapshot belongs to another exchange or symbol",
-        ));
-    }
-    let (quantity, entry_price) = position.one_way_position()?;
-    let leg = &position.legs[0];
-    if leg.mark_price <= Decimal::ZERO
-        || leg
-            .leverage
-            .is_some_and(|leverage| leverage <= Decimal::ZERO)
-        || (quantity.is_zero() && entry_price.is_some_and(|price| price <= Decimal::ZERO))
-        || (!quantity.is_zero() && entry_price.is_none_or(|price| price <= Decimal::ZERO))
-    {
-        return Err(SnapshotError::new(
-            "one-way position contains an invalid mark price, entry price, or leverage",
-        ));
-    }
-    Ok(quantity)
-}
-
-#[derive(Clone, Copy)]
-struct StrategyProfitMetrics {
-    realized_net_profit: Decimal,
-    grid_unrealized_profit: Decimal,
-    total_equity_profit: Decimal,
-    mark_price: Decimal,
+    crate::engine::validated_one_way_quantity(position, exchange, symbol)
 }
 
 async fn collect_strategy_funding(
@@ -3936,96 +4114,15 @@ async fn collect_strategy_funding(
     } else {
         now
     };
-    let history = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        gateway.funding_history(
-            strategy.exchange,
-            &strategy.symbol,
-            strategy.created_at_ms,
-            through_ms,
-        ),
-    )
-    .await
-    .map_err(|_| SnapshotError::new("funding history query timed out"))??;
-    attribute_strategy_funding(strategy, &history)
+    crate::engine::collect_strategy_funding_at(gateway, strategy, through_ms).await
 }
 
+#[cfg(test)]
 fn attribute_strategy_funding(
     strategy: &StrategyState,
-    history: &FundingHistorySnapshot,
+    history: &crate::exchange::funding::FundingHistorySnapshot,
 ) -> Result<FundingAttribution, SnapshotError> {
-    let last_settlement = history.payments.iter().map(|payment| payment.at_ms).max();
-    let mut owned = Vec::new();
-    if let Some(last_settlement) = last_settlement {
-        for event in strategy.inventory_events.values() {
-            let at_ms = event.execution_time_ms.ok_or_else(|| {
-                SnapshotError::new("funding attribution requires exact execution times")
-            })?;
-            if at_ms > last_settlement {
-                continue;
-            }
-            let order = strategy
-                .orders
-                .get(&event.source_client_order_id)
-                .ok_or_else(|| {
-                    SnapshotError::new("funding execution has no strategy-owned order")
-                })?;
-            if event.quantity <= Decimal::ZERO {
-                return Err(SnapshotError::new("funding execution quantity is invalid"));
-            }
-            owned.push(FundingAccountFill {
-                trade_id: event.exchange_trade_id.clone().ok_or_else(|| {
-                    SnapshotError::new("funding execution has no exact exchange trade id")
-                })?,
-                exchange_order_id: order.exchange_order_id.clone().ok_or_else(|| {
-                    SnapshotError::new("funding execution has no exact exchange order id")
-                })?,
-                at_ms,
-                signed_quantity: match order.shape.side {
-                    OrderSide::Buy => event.quantity,
-                    OrderSide::Sell => -event.quantity,
-                },
-            });
-        }
-        if let Some(account_fills) = &history.account_fills {
-            let owned_orders = strategy
-                .orders
-                .values()
-                .filter_map(|order| order.exchange_order_id.as_deref())
-                .collect::<BTreeSet<_>>();
-            let owned_trades = owned
-                .iter()
-                .map(|fill| fill.trade_id.as_str())
-                .collect::<BTreeSet<_>>();
-            // Legacy baselines have no exchange observation timestamp. External fills
-            // after creation make that replay boundary unknowable; never double-count them.
-            if account_fills.iter().any(|fill| {
-                fill.at_ms <= last_settlement
-                    && !owned_orders.contains(fill.exchange_order_id.as_str())
-            }) {
-                return Err(SnapshotError::new(
-                    "funding baseline boundary is ambiguous after external executions",
-                ));
-            }
-            if account_fills.iter().any(|fill| {
-                fill.at_ms <= last_settlement
-                    && owned_orders.contains(fill.exchange_order_id.as_str())
-                    && !owned_trades.contains(fill.trade_id.as_str())
-            }) {
-                return Err(SnapshotError::new(
-                    "funding settlement includes pending strategy executions",
-                ));
-            }
-        }
-    }
-    attribute_funding(
-        history,
-        strategy.exchange,
-        &strategy.symbol,
-        strategy.created_at_ms,
-        strategy.baseline.signed_quantity,
-        &owned,
-    )
+    crate::engine::attribute_strategy_funding(strategy, history)
 }
 
 fn strategy_profit_fields(
@@ -4159,37 +4256,7 @@ fn strategy_profit_metrics(
     strategy: &StrategyState,
     position: &PositionSnapshot,
 ) -> Result<StrategyProfitMetrics, SnapshotError> {
-    let actual_position =
-        validated_one_way_quantity(position, strategy.exchange, &strategy.symbol)?;
-    let expected_position = strategy
-        .expected_exchange_position()
-        .map_err(|_| SnapshotError::new("strategy expected-position arithmetic is invalid"))?;
-    if actual_position != expected_position {
-        return Err(SnapshotError::new(
-            "exchange position does not match the strategy-owned inventory ledger",
-        ));
-    }
-    let mark_price = position
-        .legs
-        .first()
-        .map(|leg| leg.mark_price)
-        .ok_or_else(|| SnapshotError::new("position snapshot has no one-way mark price"))?;
-    let realized_net_profit = strategy
-        .gross_realized_profit
-        .checked_sub(strategy.total_fee)
-        .ok_or_else(|| SnapshotError::new("strategy realized profit arithmetic overflowed"))?;
-    let grid_unrealized_profit = strategy
-        .grid_unrealized_profit(mark_price)
-        .map_err(|_| SnapshotError::new("strategy-owned inventory cannot be valued exactly"))?;
-    let total_equity_profit = realized_net_profit
-        .checked_add(grid_unrealized_profit)
-        .ok_or_else(|| SnapshotError::new("strategy equity profit arithmetic overflowed"))?;
-    Ok(StrategyProfitMetrics {
-        realized_net_profit,
-        grid_unrealized_profit,
-        total_equity_profit,
-        mark_price,
-    })
+    crate::engine::strategy_profit_metrics(strategy, position)
 }
 
 fn risk_order_response(order: &AuthoritativeOrder) -> Value {
@@ -4418,6 +4485,10 @@ fn router_with_state(state: ApiState) -> Router {
         )
         .route("/api/grid/status", get(grid_status))
         .route("/api/grid/status/{symbol}", get(grid_symbol_status))
+        .route(
+            "/api/grid/profit-protection/{symbol}",
+            get(get_profit_protection).post(update_profit_protection),
+        )
         .route("/api/grid/history", get(strategy_history))
         .route("/api/grid/funding/{run_id}", get(strategy_funding_audit))
         .route("/api/grid/preview", post(grid_preview))
@@ -4483,6 +4554,7 @@ mod tests {
                 ExchangeCredentials, ExchangeEnvironment, ExchangeGatewayFactory,
                 SharedConfiguredExchangeGateway,
             },
+            funding::{FundingAccountFill, FundingHistorySnapshot},
         },
         persistence::{
             FileArmedStrategyStateStore, FileOrderIntentStore, FileStrategyStateStore, IntentStore,
@@ -6259,6 +6331,17 @@ mod tests {
         assert_eq!(selected["exchange"], "aster");
         assert_eq!(selected["symbol"], "ANSEMUSDT");
         assert_eq!(selected["running"], true);
+        assert_eq!(selected["profit_protection"]["revision"], 0);
+        assert_eq!(
+            selected["profit_protection"]["take_profit_amount"],
+            Value::Null
+        );
+        assert_eq!(
+            selected["profit_protection"]["stop_loss_amount"],
+            Value::Null
+        );
+        assert_eq!(selected["risk_exit_reason"], Value::Null);
+        assert_eq!(selected["profit_protection_trigger"], Value::Null);
 
         let absent = app
             .oneshot(
@@ -6280,6 +6363,315 @@ mod tests {
                 "trading_enabled": false,
             })
         );
+    }
+
+    fn protection_request(body: Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/grid/profit-protection/ANSEMUSDT?exchange=aster")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn profit_protection_routes_require_web_auth_before_parsing_inputs() {
+        let directory = tempdir().unwrap();
+        let (web_auth, _) = configured_service(59, true);
+        let app = router_with_state(
+            ApiState::for_test(
+                verifier(),
+                true,
+                Arc::new(FileIdempotencyStore::new(directory.path())),
+                Arc::new(DisabledStartGridCommand),
+            )
+            .with_web_authentication(web_auth),
+        );
+        for method in [Method::GET, Method::POST] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/grid/profit-protection/ANSEMUSDT?exchange=aster")
+                        .body(Body::from("not-json"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        }
+    }
+
+    #[tokio::test]
+    async fn profit_protection_requires_json_and_retains_control_body_limit() {
+        let directory = tempdir().unwrap();
+        let app = router_with_state(ApiState::for_test(
+            verifier(),
+            true,
+            Arc::new(FileIdempotencyStore::new(directory.path())),
+            Arc::new(DisabledStartGridCommand),
+        ));
+        let no_type = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/grid/profit-protection/ANSEMUSDT?exchange=aster")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let oversized = app
+            .oneshot(protection_request(json!({
+                "padding": "x".repeat(MAX_CONTROL_BODY_BYTES),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn profit_protection_rejects_missing_amounts_numbers_and_invalid_identity() {
+        let directory = tempdir().unwrap();
+        let app = router_with_state(ApiState::for_test(
+            verifier(),
+            true,
+            Arc::new(FileIdempotencyStore::new(directory.path())),
+            Arc::new(DisabledStartGridCommand),
+        ));
+        let valid = json!({
+            "run_id": "RUN00001", "expected_revision": 0,
+            "take_profit_amount": "1.000000000000000001", "stop_loss_amount": null,
+        });
+        let mut invalid = Vec::new();
+        for key in [
+            "run_id",
+            "expected_revision",
+            "take_profit_amount",
+            "stop_loss_amount",
+        ] {
+            let mut body = valid.clone();
+            body.as_object_mut().unwrap().remove(key);
+            invalid.push(body);
+        }
+        for key in ["take_profit_amount", "stop_loss_amount"] {
+            for amount in [
+                json!(0),
+                json!(1.25),
+                json!("0"),
+                json!("-1"),
+                json!("NaN"),
+                json!("1e2"),
+                json!("79228162514264337593543950336"),
+                json!("0.00000000000000000000000000001"),
+            ] {
+                let mut body = valid.clone();
+                body[key] = amount;
+                invalid.push(body);
+            }
+        }
+        for (key, value) in [
+            ("run_id", json!("bad!")),
+            ("run_id", Value::Null),
+            ("expected_revision", json!(-1)),
+            ("expected_revision", json!("0")),
+        ] {
+            let mut body = valid.clone();
+            body[key] = value;
+            invalid.push(body);
+        }
+        for body in invalid {
+            let response = app
+                .clone()
+                .oneshot(protection_request(body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        let unavailable = app.oneshot(protection_request(valid)).await.unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn profit_protection_get_requires_exact_run_and_available_runtime() {
+        let directory = tempdir().unwrap();
+        let (app, strategy, _) = recovered_stop_app(directory.path()).await;
+        for query in ["", "&run_id=invalid!"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/grid/profit-protection/ANSEMUSDT?exchange=aster{query}"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let mismatch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/profit-protection/ANSEMUSDT?exchange=aster&run_id=OLD00001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        let wrong_market = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/grid/profit-protection/MISSINGUSDT?exchange=aster&run_id={}",
+                        strategy.run_id.as_str()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_market.status(), StatusCode::CONFLICT);
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/profit-protection/MISSINGUSDT?exchange=aster&run_id=OLD00001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let disabled = super::super::app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/grid/profit-protection/ANSEMUSDT?exchange=aster&run_id=RUN00001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn profit_protection_saves_disables_and_rejects_stale_revision_without_recreating_grid() {
+        let directory = tempdir().unwrap();
+        let (app, strategy, root) = recovered_stop_app(directory.path()).await;
+        let body = json!({
+            "run_id": strategy.run_id.as_str(), "expected_revision": 0,
+            "take_profit_amount": "100.000000000000000001", "stop_loss_amount": "0.25",
+        });
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/grid/profit-protection/ANSEMUSDT?exchange=aster&run_id={}",
+                        strategy.run_id.as_str()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial = response_json(initial).await;
+        assert_eq!(initial["profit_protection"]["revision"], 0);
+        assert_eq!(
+            initial["profit_protection"]["take_profit_amount"],
+            Value::Null
+        );
+        assert_eq!(
+            initial["profit_protection"]["stop_loss_amount"],
+            Value::Null
+        );
+        let mut wrong_run = body.clone();
+        wrong_run["run_id"] = json!("OLD00001");
+        let mismatch = app
+            .clone()
+            .oneshot(protection_request(wrong_run))
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        let response = app
+            .clone()
+            .oneshot(protection_request(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        let saved = response_json(response).await;
+        assert_eq!(saved["run_id"], strategy.run_id.as_str());
+        assert_eq!(saved["profit_protection"]["revision"], 1);
+        assert_eq!(
+            saved["profit_protection"]["take_profit_amount"],
+            "100.000000000000000001"
+        );
+        assert_eq!(saved["profit_protection"]["stop_loss_amount"], "0.25");
+        assert_eq!(saved["trigger"], Value::Null);
+        let conflict = app.clone().oneshot(protection_request(body)).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let disable = app
+            .clone()
+            .oneshot(protection_request(json!({
+                "run_id": strategy.run_id.as_str(), "expected_revision": 1,
+                "take_profit_amount": null, "stop_loss_amount": null,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::OK);
+        let disabled = response_json(disable).await;
+        assert_eq!(disabled["profit_protection"]["revision"], 2);
+        assert_eq!(
+            disabled["profit_protection"]["take_profit_amount"],
+            Value::Null
+        );
+        assert_eq!(
+            disabled["profit_protection"]["stop_loss_amount"],
+            Value::Null
+        );
+        let paths = StrategyFilePaths::new(&root, strategy.run_id.clone()).unwrap();
+        let durable = FileStrategyStateStore::load(paths.state()).unwrap();
+        assert_eq!(durable.snapshot().run_id, strategy.run_id);
+        assert_eq!(durable.snapshot().lifecycle, StrategyLifecycle::Running);
+        assert_eq!(durable.snapshot().orders, strategy.orders);
+        assert_eq!(
+            durable.snapshot().grid_position_net_quantity,
+            strategy.grid_position_net_quantity
+        );
+        assert_eq!(durable.snapshot().profit_protection.revision, 2);
+        let stop = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/grid/stop/ANSEMUSDT?exchange=aster")
+                    .header(IDEMPOTENCY_KEY_HEADER, KEY)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::ACCEPTED);
+        let terminal = app
+            .oneshot(protection_request(json!({
+                "run_id": strategy.run_id.as_str(), "expected_revision": 2,
+                "take_profit_amount": "1", "stop_loss_amount": null,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(terminal.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

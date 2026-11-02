@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +14,8 @@ use std::collections::VecDeque;
 
 use async_trait::async_trait;
 #[cfg(not(test))]
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
+use futures::{StreamExt, stream};
 use hmac::{Hmac, Mac};
 use serde_json::{Map, Number, Value, json};
 use sha2::Sha256;
@@ -60,6 +62,7 @@ const TESTNET_BASE_URL: &str = "https://testnet.binancefuture.com";
 const TRADE_PAGE_LIMIT: usize = 1_000;
 const MAX_TRADE_PAGES: usize = 64;
 const MAX_BATCH_CANCELLATIONS: usize = 10;
+const MAX_CANCEL_REQUESTS: usize = 3;
 const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 const POST_ONLY_WOULD_TAKE_CODE: &str = "-5022";
 const BINANCE_WEBSOCKET_ORDER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -902,90 +905,111 @@ where
                 targets.len()
             ];
         }
-        if symbol.trim().is_empty()
+        let mut order_ids = BTreeSet::new();
+        let mut client_ids = BTreeSet::new();
+        if validate_snapshot_request(exchange, Exchange::Binance, symbol).is_err()
             || targets.iter().any(|target| {
-                target.exchange_order_id.is_empty()
-                    || !target
-                        .exchange_order_id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit())
+                target
+                    .exchange_order_id
+                    .parse::<u64>()
+                    .ok()
+                    .is_none_or(|id| id == 0 || id.to_string() != target.exchange_order_id)
+                    || !order_ids.insert(&target.exchange_order_id)
+                    || !client_ids.insert(&target.client_order_id)
             })
         {
             return vec![
                 Err(invalid_cancellation(
-                    "symbol and numeric exchange order IDs are required",
+                    "a valid symbol and unique canonical order identities are required",
                 ));
                 targets.len()
             ];
         }
 
         let symbol = symbol.to_ascii_uppercase();
-        let mut results = Vec::with_capacity(targets.len());
-        for chunk in targets.chunks(MAX_BATCH_CANCELLATIONS) {
-            let order_ids = format!(
-                "[{}]",
-                chunk
-                    .iter()
-                    .map(|target| target.exchange_order_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            let request = match self.signed_request(
-                HttpMethod::Delete,
-                "/fapi/v1/batchOrders",
-                vec![
-                    ("symbol".into(), symbol.clone()),
-                    ("orderIdList".into(), order_ids),
-                ],
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    results.extend(
-                        (0..chunk.len()).map(|_| Err(invalid_cancellation(&error.to_string()))),
-                    );
-                    continue;
-                }
-            };
-            let response = match self.transport.execute(request).await {
-                Ok(response) => response,
-                Err(error) => {
-                    results.extend((0..chunk.len()).map(|_| {
-                        Err(CancellationError::Unknown {
-                            message: error.to_string(),
-                        })
-                    }));
-                    continue;
-                }
-            };
-            if !(200..300).contains(&response.status) {
-                let error = parse_exchange_error(&response.body);
-                results.extend((0..chunk.len()).map(|_| {
-                    Err(CancellationError::Unknown {
-                        message: error.message.clone(),
-                    })
-                }));
-                continue;
+        let chunks = targets
+            .chunks(MAX_BATCH_CANCELLATIONS)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let requests = chunks.into_iter().enumerate().map(|(index, chunk)| {
+            let symbol = symbol.clone();
+            async move { (index, self.cancel_native_chunk(&symbol, &chunk).await) }
+        });
+        let mut batches = stream::iter(requests)
+            .buffer_unordered(MAX_CANCEL_REQUESTS)
+            .collect::<Vec<_>>()
+            .await;
+        batches.sort_unstable_by_key(|(index, _)| *index);
+        batches.into_iter().flat_map(|(_, rows)| rows).collect()
+    }
+}
+
+impl<T, S, C> BinanceAdapter<T, S, C>
+where
+    T: HttpTransport,
+    S: BinanceRequestSigner,
+    C: MillisecondClock,
+{
+    async fn cancel_native_chunk(
+        &self,
+        symbol: &str,
+        chunk: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        let unknown =
+            |message: String| vec![Err(CancellationError::Unknown { message }); chunk.len()];
+        let order_ids = format!(
+            "[{}]",
+            chunk
+                .iter()
+                .map(|target| target.exchange_order_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let request = match self.signed_request(
+            HttpMethod::Delete,
+            "/fapi/v1/batchOrders",
+            vec![
+                ("symbol".into(), symbol.into()),
+                ("orderIdList".into(), order_ids),
+            ],
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return vec![Err(invalid_cancellation(&error.to_string())); chunk.len()];
             }
-            let rows = match serde_json::from_str::<serde_json::Value>(&response.body)
-                .ok()
-                .and_then(|value| value.as_array().cloned())
-            {
-                Some(rows) if rows.len() == chunk.len() => rows,
-                _ => {
-                    results.extend((0..chunk.len()).map(|_| {
-                        Err(CancellationError::Unknown {
-                            message: "Binance batch cancellation returned an invalid result set"
-                                .into(),
-                        })
-                    }));
-                    continue;
-                }
-            };
-            results.extend(rows.into_iter().zip(chunk).map(|(row, target)| {
+        };
+        let response = match self.transport.execute(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return unknown(error.to_string());
+            }
+        };
+        if !(200..300).contains(&response.status) {
+            let error = parse_exchange_error(&response.body);
+            return unknown(error.message);
+        }
+        let rows = match serde_json::from_str::<serde_json::Value>(&response.body)
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+        {
+            Some(rows) if rows.len() == chunk.len() => rows,
+            _ => {
+                return unknown("Binance batch cancellation returned an invalid result set".into());
+            }
+        };
+        rows.into_iter()
+            .zip(chunk)
+            .map(|(row, target)| {
                 if row.get("code").is_some() {
                     let error = parse_exchange_error(&row.to_string());
                     return Err(CancellationError::Unknown {
                         message: error.message,
+                    });
+                }
+                if row.get("symbol").and_then(Value::as_str) != Some(symbol) {
+                    return Err(CancellationError::Unknown {
+                        message: "Binance batch cancellation symbol is missing or mismatched"
+                            .into(),
                     });
                 }
                 parse_cancellation_acknowledgement(
@@ -998,9 +1022,8 @@ where
                         "Binance batch cancellation acknowledgement is not authoritative: {error}"
                     ),
                 })
-            }));
-        }
-        results
+            })
+            .collect()
     }
 }
 
@@ -2023,6 +2046,174 @@ mod tests {
             protocol::{HttpResponse, TransportError},
         },
     };
+
+    mod native_cancel_tests {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        fn targets(count: usize) -> Vec<OrderCancellationTarget> {
+            (0..count)
+                .map(|i| OrderCancellationTarget {
+                    client_order_id: ClientOrderId::parse(format!("g_{i}_S_native")).unwrap(),
+                    exchange_order_id: (100 + i).to_string(),
+                })
+                .collect()
+        }
+
+        #[derive(Clone, Default)]
+        struct DelayedTransport {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            requests: Arc<Mutex<Vec<PreparedHttpRequest>>>,
+        }
+
+        #[async_trait]
+        impl HttpTransport for DelayedTransport {
+            async fn execute(
+                &self,
+                request: PreparedHttpRequest,
+            ) -> Result<HttpResponse, TransportError> {
+                assert_eq!(request.path, "/fapi/v1/batchOrders");
+                let ids: Vec<u64> = serde_json::from_str(
+                    &request
+                        .query
+                        .iter()
+                        .find(|(key, _)| key == "orderIdList")
+                        .unwrap()
+                        .1,
+                )
+                .unwrap();
+                assert!(ids.len() <= 10);
+                self.requests.lock().unwrap().push(request);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(if ids[0] == 100 { 35 } else { 5 })).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: 200,
+                    body: json!(ids.iter().map(|id| json!({
+                    "symbol": "MUUSDT", "orderId": id,
+                    "clientOrderId": format!("g_{}_S_native", id - 100), "status": "CANCELED"
+                })).collect::<Vec<_>>())
+                    .to_string(),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_overlaps_three_requests_and_preserves_target_order() {
+            let transport = DelayedTransport::default();
+            let adapter = BinanceAdapter::with_base_url(
+                transport.clone(),
+                HmacSha256Signer::new("test-secret").unwrap(),
+                FixedClock(1_700_000_000_123),
+                "test-key",
+                "https://example.test",
+            );
+            let targets = targets(53);
+            let results = adapter
+                .cancel_orders(Exchange::Binance, "MUUSDT", &targets)
+                .await;
+            assert_eq!(transport.peak.load(Ordering::SeqCst), 3);
+            assert_eq!(transport.requests.lock().unwrap().len(), 6);
+            for (result, target) in results.iter().zip(&targets) {
+                let ack = result.as_ref().unwrap();
+                assert_eq!(ack.exchange_order_id, target.exchange_order_id);
+                assert_eq!(ack.client_order_id, target.client_order_id);
+            }
+            assert_eq!(results.len(), 53);
+        }
+
+        #[tokio::test]
+        async fn native_cancel_rejects_duplicate_or_invalid_scope_before_wire() {
+            for (exchange, symbol, mut targets) in [
+                (Exchange::Aster, "MUUSDT", targets(2)),
+                (Exchange::Binance, "wrong/symbol", targets(2)),
+                (Exchange::Binance, "MUUSDT", vec![targets(1)[0].clone(); 2]),
+                (Exchange::Binance, "MUUSDT", targets(2)),
+            ] {
+                if targets[0].exchange_order_id != targets[1].exchange_order_id
+                    && symbol == "MUUSDT"
+                    && exchange == Exchange::Binance
+                {
+                    targets[1].client_order_id = targets[0].client_order_id.clone();
+                }
+                let transport = DelayedTransport::default();
+                let adapter = BinanceAdapter::with_base_url(
+                    transport.clone(),
+                    HmacSha256Signer::new("test-secret").unwrap(),
+                    FixedClock(1),
+                    "test-key",
+                    "https://example.test",
+                );
+                let result = adapter.cancel_orders(exchange, symbol, &targets).await;
+                assert!(
+                    result
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+                assert!(transport.requests.lock().unwrap().is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_wrong_response_symbol_is_unknown() {
+            let transport = MockTransport::with_response(Ok(HttpResponse { status: 200,
+                body: json!([{"symbol":"BTCUSDT","orderId":100,"clientOrderId":"g_0_S_native","status":"CANCELED"}]).to_string() }));
+            let result = adapter(transport)
+                .cancel_orders(Exchange::Binance, "MUUSDT", &targets(1))
+                .await;
+            assert!(matches!(result[0], Err(CancellationError::Unknown { .. })));
+        }
+
+        #[tokio::test]
+        async fn native_cancel_validates_last_target_before_any_batch() {
+            for bad_id in ["", "00100", "0", "18446744073709551616", "100,999"] {
+                let mut targets = targets(31);
+                targets[30].exchange_order_id = bad_id.into();
+                let transport = MockTransport::default();
+                let result = adapter(transport.clone())
+                    .cancel_orders(Exchange::Binance, "MUUSDT", &targets)
+                    .await;
+                assert_eq!(result.len(), 31);
+                assert!(
+                    result
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+                assert!(transport.all_requests().is_empty());
+            }
+            let transport = MockTransport::default();
+            assert!(
+                adapter(transport.clone())
+                    .cancel_orders(Exchange::Binance, "MUUSDT", &[])
+                    .await
+                    .is_empty()
+            );
+            assert!(transport.all_requests().is_empty());
+        }
+
+        #[tokio::test]
+        async fn native_cancel_mismatched_and_extra_rows_never_invent_success() {
+            for rows in [
+                json!([]),
+                json!([{"symbol":"MUUSDT","orderId":100,"clientOrderId":"g_0_S_native","status":"CANCELED"},{}]),
+                json!([{"symbol":"MUUSDT","orderId":999,"clientOrderId":"g_0_S_native","status":"CANCELED"}]),
+                json!([{"symbol":"MUUSDT","orderId":100,"clientOrderId":"manual","status":"CANCELED"}]),
+                json!([{"symbol":"MUUSDT","orderId":100,"clientOrderId":"g_0_S_native","status":"NEW"}]),
+                json!([{"orderId":100,"clientOrderId":"g_0_S_native","status":"CANCELED"}]),
+            ] {
+                let transport = MockTransport::with_response(Ok(HttpResponse {
+                    status: 200,
+                    body: rows.to_string(),
+                }));
+                let result = adapter(transport)
+                    .cancel_orders(Exchange::Binance, "MUUSDT", &targets(1))
+                    .await;
+                assert!(matches!(result[0], Err(CancellationError::Unknown { .. })));
+            }
+        }
+    }
 
     mod funding_history_tests {
         use super::*;
@@ -3397,6 +3588,7 @@ mod tests {
                 .iter()
                 .map(|target| {
                     serde_json::json!({
+                        "symbol": "MUUSDT",
                         "orderId": target.exchange_order_id.parse::<u64>().unwrap(),
                         "clientOrderId": target.client_order_id.as_str(),
                         "status": "CANCELED"
@@ -3459,6 +3651,7 @@ mod tests {
                     .iter()
                     .map(|target| {
                         serde_json::json!({
+                            "symbol": "MUUSDT",
                             "orderId": target.exchange_order_id.parse::<u64>().unwrap(),
                             "clientOrderId": target.client_order_id.as_str(),
                             "status": "CANCELED"
@@ -3499,6 +3692,7 @@ mod tests {
             .iter()
             .map(|target| {
                 serde_json::json!({
+                    "symbol": "MUUSDT",
                     "orderId": target.exchange_order_id.parse::<u64>().unwrap(),
                     "clientOrderId": target.client_order_id.as_str(),
                     "status": "CANCELED"
@@ -3532,6 +3726,7 @@ mod tests {
             .collect::<Vec<_>>();
         let body = serde_json::json!([
             {
+                "symbol": "MUUSDT",
                 "orderId": 400,
                 "clientOrderId": "g_0_S_mixed",
                 "status": "CANCELED"
@@ -3541,6 +3736,7 @@ mod tests {
                 "msg": "Unknown order sent."
             },
             {
+                "symbol": "MUUSDT",
                 "orderId": 402,
                 "clientOrderId": "g_2_S_mixed",
                 "status": "CANCELED"

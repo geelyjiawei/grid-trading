@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     str::FromStr,
     sync::{
         Arc, Weak,
@@ -30,11 +30,11 @@ use crate::{
         ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderExecutionProgress, OpenOrderSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderHistorySnapshotGateway,
-        OrderLifecycle, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionLeg, PositionSide, PositionSnapshot,
-        PositionSnapshotGateway, SnapshotError, TradeFill, TradingFeeRateGateway, TradingFeeRates,
-        compare_trade_chronology,
+        OrderCancellationGateway, OrderCancellationTarget, OrderExecutionSnapshot,
+        OrderHistorySnapshotGateway, OrderLifecycle, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionLeg, PositionSide,
+        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradeFill, TradingFeeRateGateway,
+        TradingFeeRates, compare_trade_chronology,
         funding::{FundingHistorySnapshot, FundingPayment},
         protocol::{
             HttpMethod, HttpResponse, HttpTransport, NonceSource, PreparedHttpRequest,
@@ -61,6 +61,8 @@ const DEX_NAME: &str = "xyz";
 const FUNDING_PAGE_LIMIT: usize = 500;
 const MAX_FUNDING_PAGES: usize = 256;
 const MAX_FUNDING_ROWS: usize = 50_000;
+// Local safety bound, not a claim about a protocol maximum or atomic execution.
+const MAX_BATCH_CANCELLATIONS: usize = 100;
 // One default-weight Hyperliquid info request consumes about 1.2 seconds of our
 // conservative IP budget. Keep the same snapshot through a complete runtime
 // collection so position validation and the resulting limit order do not
@@ -2143,6 +2145,104 @@ where
             exchange_order_id: exchange_order_id.to_owned(),
         })
     }
+
+    async fn cancel_orders(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let mut order_ids = BTreeSet::new();
+        let mut client_ids = BTreeSet::new();
+        if validate_request(exchange, symbol).is_err()
+            || targets.iter().any(|target| {
+                target
+                    .exchange_order_id
+                    .parse::<u64>()
+                    .ok()
+                    .is_none_or(|id| id == 0 || id.to_string() != target.exchange_order_id)
+                    || !order_ids.insert(&target.exchange_order_id)
+                    || !client_ids.insert(&target.client_order_id)
+            })
+        {
+            return vec![Err(CancellationError::Invalid {
+                message: "a valid TRADE.XYZ symbol and unique canonical order identities are required".into(),
+            }); targets.len()];
+        }
+        let market = match self.market_info(symbol).await {
+            Ok(market) => market,
+            Err(error) => {
+                return vec![
+                    Err(CancellationError::Unknown {
+                        message: error.message
+                    });
+                    targets.len()
+                ];
+            }
+        };
+        let mut results = Vec::with_capacity(targets.len());
+        for chunk in targets.chunks(MAX_BATCH_CANCELLATIONS) {
+            let mut action = CancelAction::single(
+                market.asset_id,
+                chunk[0]
+                    .exchange_order_id
+                    .parse()
+                    .expect("validated order ID"),
+            );
+            for target in &chunk[1..] {
+                action.cancels.extend(
+                    CancelAction::single(
+                        market.asset_id,
+                        target
+                            .exchange_order_id
+                            .parse()
+                            .expect("validated order ID"),
+                    )
+                    .cancels,
+                );
+            }
+            let value = match self.post_action(&action).await {
+                Ok(response) => parse_write_response(response, "TRADE.XYZ batch cancellation").ok(),
+                Err(_) => None,
+            };
+            let rows = value
+                .as_ref()
+                .filter(|value| {
+                    value.pointer("/response/type").and_then(Value::as_str) == Some("cancel")
+                })
+                .and_then(|value| statuses(value).ok())
+                .filter(|rows| rows.len() == chunk.len());
+            let Some(rows) = rows else {
+                results.extend(vec![
+                    Err(CancellationError::Unknown {
+                        message: "TRADE.XYZ batch cancellation has no complete cancel status list"
+                            .into(),
+                    });
+                    chunk.len()
+                ]);
+                continue;
+            };
+            results.extend(rows.iter().zip(chunk).map(|(row, target)| {
+                if row.as_str() != Some("success") {
+                    return Err(CancellationError::Unknown {
+                        message: row
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("TRADE.XYZ cancellation was not confirmed")
+                            .into(),
+                    });
+                }
+                Ok(CancellationAcknowledgement {
+                    client_order_id: target.client_order_id.clone(),
+                    exchange_order_id: target.exchange_order_id.clone(),
+                })
+            }));
+        }
+        results
+    }
 }
 
 #[async_trait]
@@ -3034,6 +3134,188 @@ mod tests {
             0xea, 0xbc, 0x18, 0x7f, 0x66, 0x90, 0xf0, 0x46, 0x45, 0x93, 0x97, 0xb1, 0x7d, 0x9b,
             0x9a, 0x19, 0x68, 0x8e,
         ])
+    }
+
+    mod native_cancel_tests {
+        use super::*;
+        use crate::exchange::OrderCancellationTarget;
+
+        fn targets(count: usize) -> Vec<OrderCancellationTarget> {
+            (0..count)
+                .map(|i| OrderCancellationTarget {
+                    client_order_id: ClientOrderId::parse(format!("g_{i}_S_native")).unwrap(),
+                    exchange_order_id: (100 + i).to_string(),
+                })
+                .collect()
+        }
+
+        fn cancel_response(statuses: Value) -> HttpResponse {
+            response(
+                json!({"status":"ok","response":{"type":"cancel","data":{"statuses":statuses}}}),
+            )
+        }
+
+        #[tokio::test]
+        async fn native_cancel_bounds_signed_exact_asset_id_arrays_at_one_hundred() {
+            for count in [1, 100, 203] {
+                let transport =
+                    ScriptedTransport::new([market_response(), dex_response()].into_iter().chain(
+                        (0..count).step_by(100).map(|start| {
+                            cancel_response(json!(vec!["success"; (count - start).min(100)]))
+                        }),
+                    ));
+                let targets = targets(count);
+                let result = test_adapter(transport.clone())
+                    .cancel_orders(Exchange::TradeXyz, "MUUSDC", &targets)
+                    .await;
+                let requests = transport
+                    .requests()
+                    .into_iter()
+                    .filter(|r| r.path == "/exchange")
+                    .collect::<Vec<_>>();
+                assert_eq!(requests.len(), count.div_ceil(100));
+                assert_eq!(result.len(), count);
+                assert!(result.iter().all(Result::is_ok));
+                let mut sent = Vec::new();
+                for request in requests {
+                    let body: Value = serde_json::from_str(&request.body_string()).unwrap();
+                    assert_eq!(body["action"]["type"], "cancel");
+                    assert!(body["signature"].is_object());
+                    assert!(body["nonce"].is_u64());
+                    let rows = body["action"]["cancels"].as_array().unwrap();
+                    assert!(rows.len() <= 100);
+                    for row in rows {
+                        assert_eq!(row["a"], 110015);
+                        sent.push(row["o"].as_u64().unwrap());
+                    }
+                }
+                assert_eq!(sent, (100..100 + count as u64).collect::<Vec<_>>());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_validates_full_status_count_and_each_row() {
+            for (statuses, expected) in [
+                (
+                    json!(["success",{"error":"already filled"},"success"]),
+                    vec![true, false, true],
+                ),
+                (json!(["success"]), vec![false, false, false]),
+                (
+                    json!(["success", "success", "success", "success"]),
+                    vec![false, false, false],
+                ),
+                (json!(["success", {}, "success"]), vec![true, false, true]),
+            ] {
+                let transport = ScriptedTransport::new([
+                    market_response(),
+                    dex_response(),
+                    cancel_response(statuses),
+                ]);
+                let result = test_adapter(transport)
+                    .cancel_orders(Exchange::TradeXyz, "MUUSDC", &targets(3))
+                    .await;
+                assert_eq!(
+                    result.iter().map(Result::is_ok).collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(
+                    result
+                        .iter()
+                        .filter_map(|r| r.as_ref().err())
+                        .all(|e| matches!(e, CancellationError::Unknown { .. }))
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_empty_duplicates_foreign_exchange_and_bad_symbol_are_local() {
+            let transport = ScriptedTransport::new([]);
+            let adapter = test_adapter(transport.clone());
+            assert!(
+                adapter
+                    .cancel_orders(Exchange::TradeXyz, "MUUSDC", &[])
+                    .await
+                    .is_empty()
+            );
+            for (exchange, symbol, targets) in [
+                (Exchange::Binance, "MUUSDC", targets(1)),
+                (Exchange::TradeXyz, "wrong/symbol", targets(1)),
+                (Exchange::TradeXyz, "MUUSDC", vec![targets(1)[0].clone(); 2]),
+            ] {
+                assert!(
+                    adapter
+                        .cancel_orders(exchange, symbol, &targets)
+                        .await
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+            }
+            assert!(transport.requests().is_empty());
+        }
+
+        #[tokio::test]
+        async fn native_cancel_validates_tail_before_metadata_or_signing() {
+            for bad_id in ["", "00100", "0", "18446744073709551616", "100,999"] {
+                let transport = ScriptedTransport::new([]);
+                let mut targets = targets(201);
+                targets[200].exchange_order_id = bad_id.into();
+                let result = test_adapter(transport.clone())
+                    .cancel_orders(Exchange::TradeXyz, "MUUSDC", &targets)
+                    .await;
+                assert_eq!(result.len(), 201);
+                assert!(
+                    result
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+                assert!(transport.requests().is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_uses_existing_websocket_signer_and_never_retries_unknown() {
+            for unknown in [false, true] {
+                let transport = ScriptedTransport::new([market_response(), dex_response()]);
+                let mut adapter = test_adapter(transport.clone());
+                let (relay, mut commands) = websocket_action_relay();
+                relay.connected.store(true, Ordering::Release);
+                adapter.websocket_action_relay = Some(relay);
+                let responder = tokio::spawn(async move {
+                    let command = commands.recv().await.unwrap();
+                    assert_eq!(
+                        command.payload["action"],
+                        json!({"type":"cancel","cancels":[{"a":110015,"o":100},{"a":110015,"o":101}]})
+                    );
+                    assert_eq!(command.payload["nonce"], 1_583_838);
+                    assert!(command.payload["signature"].is_object());
+                    let reply = if unknown {
+                        Err(WebsocketActionError::Unknown(
+                            "timed out after write".into(),
+                        ))
+                    } else {
+                        Ok(
+                            json!({"status":"ok","response":{"type":"cancel","data":{"statuses":["success","success"]}}}),
+                        )
+                    };
+                    command.response.send(reply).unwrap();
+                });
+                let result = adapter
+                    .cancel_orders(Exchange::TradeXyz, "MUUSDC", &targets(2))
+                    .await;
+                responder.await.unwrap();
+                if unknown {
+                    assert!(
+                        result
+                            .iter()
+                            .all(|r| matches!(r, Err(CancellationError::Unknown { .. })))
+                    );
+                } else {
+                    assert!(result.iter().all(Result::is_ok));
+                }
+                assert!(transport.requests().iter().all(|r| r.path != "/exchange"));
+            }
+        }
     }
 
     #[derive(Clone)]

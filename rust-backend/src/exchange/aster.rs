@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeSet,
     sync::{Arc, Weak},
     time::Duration,
 };
 
 #[cfg(not(test))]
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use async_trait::async_trait;
 #[cfg(not(test))]
@@ -26,10 +27,10 @@ use crate::{
         ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder,
         HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
         LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
-        OrderCancellationGateway, OrderExecutionSnapshot, OrderHistorySnapshotGateway,
-        OrderLifecycle, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
-        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
-        SnapshotError, TradeFill, TradingFeeRateGateway, TradingFeeRates,
+        OrderCancellationGateway, OrderCancellationTarget, OrderExecutionSnapshot,
+        OrderHistorySnapshotGateway, OrderLifecycle, OrderLookup, OrderLookupGateway,
+        OrderPlacementGateway, PlacementAcknowledgement, PlacementError, PositionSnapshot,
+        PositionSnapshotGateway, SnapshotError, TradeFill, TradingFeeRateGateway, TradingFeeRates,
         codec::{
             build_order_parameters, execution_status_is_unknown, order_is_definitively_absent,
             parse_account_balance_snapshot, parse_authoritative_order,
@@ -64,6 +65,7 @@ const MAX_TRADE_HISTORY_QUERIES: usize = 64;
 const TRADE_PROBE_PADDING_MS: u64 = 5 * 60 * 1_000;
 const TRADE_WINDOW_LIMIT_MS: u64 = (7 * 24 * 60 * 60 * 1_000) - 1;
 const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
+const MAX_BATCH_CANCELLATIONS: usize = 10;
 #[cfg(not(test))]
 const ASTER_EXECUTION_DEDUPE_CAPACITY: usize = 4_096;
 #[cfg(not(test))]
@@ -1558,6 +1560,107 @@ where
             message: error.message,
         })
     }
+
+    async fn cancel_orders(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        targets: &[OrderCancellationTarget],
+    ) -> Vec<Result<CancellationAcknowledgement, CancellationError>> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let mut order_ids = BTreeSet::new();
+        let mut client_ids = BTreeSet::new();
+        if validate_snapshot_request(exchange, Exchange::Aster, symbol).is_err()
+            || targets.iter().any(|target| {
+                target
+                    .exchange_order_id
+                    .parse::<u64>()
+                    .ok()
+                    .is_none_or(|id| id == 0 || id.to_string() != target.exchange_order_id)
+                    || !order_ids.insert(&target.exchange_order_id)
+                    || !client_ids.insert(&target.client_order_id)
+            })
+        {
+            return vec![
+                Err(invalid_cancellation(
+                    "a valid Aster symbol and unique canonical order identities are required",
+                ));
+                targets.len()
+            ];
+        }
+        let symbol = symbol.to_ascii_uppercase();
+        let mut results = Vec::with_capacity(targets.len());
+        // Wallet-v3 supports at most ten exact IDs; keep its signed nonce flow unchanged.
+        for chunk in targets.chunks(MAX_BATCH_CANCELLATIONS) {
+            let order_ids = format!(
+                "[{}]",
+                chunk
+                    .iter()
+                    .map(|target| target.exchange_order_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let request = match self.signed_request(
+                HttpMethod::Delete,
+                "/fapi/v3/batchOrders",
+                vec![
+                    ("symbol".into(), symbol.clone()),
+                    ("orderIdList".into(), order_ids),
+                ],
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    results.extend(vec![
+                        Err(invalid_cancellation(&error.to_string()));
+                        chunk.len()
+                    ]);
+                    continue;
+                }
+            };
+            let rows = match self.transport.execute(request).await {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    serde_json::from_str::<Value>(&response.body)
+                        .ok()
+                        .and_then(|value| value.as_array().cloned())
+                }
+                _ => None,
+            };
+            let Some(rows) = rows.filter(|rows| rows.len() == chunk.len()) else {
+                results.extend(vec![
+                    Err(CancellationError::Unknown {
+                        message:
+                            "Aster batch cancellation has no complete authoritative result set"
+                                .into(),
+                    });
+                    chunk.len()
+                ]);
+                continue;
+            };
+            results.extend(rows.iter().zip(chunk).map(|(row, target)| {
+                if row.get("code").is_some()
+                    || row.get("symbol").and_then(Value::as_str) != Some(symbol.as_str())
+                {
+                    return Err(CancellationError::Unknown {
+                        message: "Aster batch cancellation row failed or has a mismatched symbol"
+                            .into(),
+                    });
+                }
+                parse_cancellation_acknowledgement(
+                    &row.to_string(),
+                    &target.client_order_id,
+                    &target.exchange_order_id,
+                )
+                .map_err(|error| CancellationError::Unknown {
+                    message: format!(
+                        "Aster batch cancellation acknowledgement is not authoritative: {error}"
+                    ),
+                })
+            }));
+        }
+        results
+    }
 }
 
 #[async_trait]
@@ -2523,6 +2626,171 @@ mod tests {
     struct RecordingSigner {
         address: String,
         messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    mod native_cancel_tests {
+        use super::*;
+        use crate::exchange::OrderCancellationTarget;
+        use serde_json::json;
+
+        fn targets(count: usize) -> Vec<OrderCancellationTarget> {
+            (0..count)
+                .map(|i| OrderCancellationTarget {
+                    client_order_id: ClientOrderId::parse(format!("g_{i}_S_native")).unwrap(),
+                    exchange_order_id: (100 + i).to_string(),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn native_cancel_uses_wallet_v3_ten_exact_ids_and_existing_signer() {
+            for count in [1, 10, 23] {
+                let targets = targets(count);
+                let transport = MockTransport::default();
+                for chunk in targets.chunks(10) {
+                    let rows = chunk.iter().map(|t| json!({"symbol":"MUUSDT","orderId":t.exchange_order_id.parse::<u64>().unwrap(),"clientOrderId":t.client_order_id.as_str(),"status":"CANCELED"})).collect::<Vec<_>>();
+                    transport.responses.lock().unwrap().push_back(Ok(
+                        crate::exchange::protocol::HttpResponse {
+                            status: 200,
+                            body: json!(rows).to_string(),
+                        },
+                    ));
+                }
+                // Supply enough replies for the pre-fix single-order fallback as well.
+                for _ in 0..count {
+                    transport.responses.lock().unwrap().push_back(Ok(
+                        crate::exchange::protocol::HttpResponse {
+                            status: 200,
+                            body: "[]".into(),
+                        },
+                    ));
+                }
+                let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+                let result = adapter(transport.clone(), signer.clone())
+                    .cancel_orders(Exchange::Aster, "MUUSDT", &targets)
+                    .await;
+                let requests = transport.all_requests();
+                assert_eq!(requests.len(), count.div_ceil(10));
+                assert!(requests.iter().all(|r| r.path == "/fapi/v3/batchOrders" && r.method == HttpMethod::Delete));
+                assert!(result.iter().all(Result::is_ok));
+                let sent = requests
+                    .iter()
+                    .flat_map(|r| {
+                        serde_json::from_str::<Vec<u64>>(
+                            &r.body.iter().find(|(k, _)| k == "orderIdList").unwrap().1,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(sent, (100..100 + count as u64).collect::<Vec<_>>());
+                let messages = signer.messages.lock().unwrap();
+                assert_eq!(messages.len(), requests.len());
+                assert!(messages.iter().all(|m| m.contains("orderIdList=")
+                    && m.contains("nonce=")
+                    && m.contains("signer=")));
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_malformed_rows_and_timeouts_remain_unknown() {
+            let target = targets(1);
+            for body in [
+                json!([]),
+                json!([{"symbol":"MUUSDT","orderId":100,"clientOrderId":"g_0_S_native","status":"CANCELED"},{}]),
+                json!([{"symbol":"BTCUSDT","orderId":100,"clientOrderId":"g_0_S_native","status":"CANCELED"}]),
+                json!([{"symbol":"MUUSDT","orderId":999,"clientOrderId":"g_0_S_native","status":"CANCELED"}]),
+                json!([{"symbol":"MUUSDT","orderId":100,"clientOrderId":"manual","status":"CANCELED"}]),
+                json!([{"symbol":"MUUSDT","orderId":100,"clientOrderId":"g_0_S_native","status":"NEW"}]),
+                json!([{"code":-2011,"msg":"Unknown order sent."}]),
+            ] {
+                let transport =
+                    MockTransport::with_response(Ok(crate::exchange::protocol::HttpResponse {
+                        status: 200,
+                        body: body.to_string(),
+                    }));
+                let result = adapter(
+                    transport,
+                    RecordingSigner::new("0x2222222222222222222222222222222222222222"),
+                )
+                .cancel_orders(Exchange::Aster, "MUUSDT", &target)
+                .await;
+                assert!(matches!(result[0], Err(CancellationError::Unknown { .. })));
+            }
+            let transport = MockTransport::with_response(Err(
+                crate::exchange::protocol::TransportError::Timeout("timed out".into()),
+            ));
+            let result = adapter(
+                transport,
+                RecordingSigner::new("0x2222222222222222222222222222222222222222"),
+            )
+            .cancel_orders(Exchange::Aster, "MUUSDT", &target)
+            .await;
+            assert!(matches!(result[0], Err(CancellationError::Unknown { .. })));
+        }
+
+        #[tokio::test]
+        async fn native_cancel_invalid_scope_never_signs_or_sends() {
+            for (exchange, symbol, targets) in [
+                (Exchange::Binance, "MUUSDT", targets(1)),
+                (Exchange::Aster, "wrong/symbol", targets(1)),
+                (Exchange::Aster, "MUUSDT", vec![targets(1)[0].clone(); 2]),
+            ] {
+                let transport = MockTransport::default();
+                let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+                let subject = adapter(transport.clone(), signer.clone());
+                assert!(
+                    subject
+                        .cancel_orders(exchange, symbol, &targets)
+                        .await
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+                assert!(
+                    subject
+                        .cancel_orders(Exchange::Aster, "MUUSDT", &[])
+                        .await
+                        .is_empty()
+                );
+                assert!(transport.all_requests().is_empty());
+                assert!(signer.messages.lock().unwrap().is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_cancel_validates_tail_and_preserves_partial_results() {
+            for bad_id in ["", "00100", "0", "18446744073709551616", "100,999"] {
+                let mut targets = targets(21);
+                targets[20].exchange_order_id = bad_id.into();
+                let transport = MockTransport::default();
+                let signer = RecordingSigner::new("0x2222222222222222222222222222222222222222");
+                let result = adapter(transport.clone(), signer.clone())
+                    .cancel_orders(Exchange::Aster, "MUUSDT", &targets)
+                    .await;
+                assert_eq!(result.len(), 21);
+                assert!(
+                    result
+                        .iter()
+                        .all(|r| matches!(r, Err(CancellationError::Invalid { .. })))
+                );
+                assert!(transport.all_requests().is_empty());
+                assert!(signer.messages.lock().unwrap().is_empty());
+            }
+            let transport = MockTransport::with_response(Ok(crate::exchange::protocol::HttpResponse { status:200,body:json!([
+                {"symbol":"MUUSDT","orderId":100,"clientOrderId":"g_0_S_native","status":"CANCELED"},
+                {"code":-2011,"msg":"unknown order"},
+                {"symbol":"MUUSDT","orderId":102,"clientOrderId":"g_2_S_native","status":"CANCELED"}
+            ]).to_string() }));
+            let result = adapter(
+                transport,
+                RecordingSigner::new("0x2222222222222222222222222222222222222222"),
+            )
+            .cancel_orders(Exchange::Aster, "MUUSDT", &targets(3))
+            .await;
+            assert_eq!(
+                result.iter().map(Result::is_ok).collect::<Vec<_>>(),
+                vec![true, false, true]
+            );
+        }
     }
 
     impl RecordingSigner {

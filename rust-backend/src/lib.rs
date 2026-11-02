@@ -246,6 +246,8 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
         let mut fee_settlement_ticker =
             tokio::time::interval(Duration::from_millis(FEE_SETTLEMENT_TICK_MS));
         fee_settlement_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut profit_protection_ticker = tokio::time::interval(Duration::from_secs(1));
+        profit_protection_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut execution_wakeups = subscribe_execution_wakeups();
         let (execution_completion_sender, mut execution_completions) =
             tokio::sync::mpsc::unbounded_channel();
@@ -334,6 +336,10 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                             log_runtime_advance(advance, false, None, None, 0);
                         }
                     });
+                }
+                _ = profit_protection_ticker.tick() => {
+                    let Some(now_ms) = system_time_ms() else { continue; };
+                    runtime.spawn_profit_protection_checks(now_ms).await;
                 }
                 _ = fee_settlement_ticker.tick() => {
                     let Some(now_ms) = system_time_ms() else {
