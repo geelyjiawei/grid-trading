@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 use thiserror::Error;
 
@@ -121,6 +124,7 @@ where
     G: OrderCancellationGateway,
     S: IntentStore,
 {
+    let started = Instant::now();
     if targets.is_empty() {
         return Ok(Vec::new());
     }
@@ -180,7 +184,10 @@ where
         }
     }
 
+    let persistence_started = Instant::now();
     store.insert_cancellations_prepared(prepared)?;
+    let prepare_persistence_ms =
+        u64::try_from(persistence_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let requests = dispatch
         .iter()
         .map(|target| OrderCancellationTarget {
@@ -188,7 +195,19 @@ where
             exchange_order_id: target.exchange_order_id.clone(),
         })
         .collect::<Vec<_>>();
+    if !requests.is_empty() {
+        tracing::info!(
+            ?exchange,
+            symbol,
+            client_order_id = requests[0].client_order_id.as_str(),
+            request_count = requests.len(),
+            prepare_persistence_ms,
+            "owned cancellation targets are durable; batch dispatch started"
+        );
+    }
+    let network_started = Instant::now();
     let mut outcomes = gateway.cancel_orders(exchange, &symbol, &requests).await;
+    let network_ms = u64::try_from(network_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if outcomes.len() != dispatch.len() {
         outcomes = dispatch
             .iter()
@@ -231,7 +250,21 @@ where
         transitions.push((client_order_id.clone(), state));
         results.insert(client_order_id, result);
     }
+    let acknowledgement_started = Instant::now();
     store.transition_cancellations(transitions, now_ms)?;
+    if !requests.is_empty() {
+        tracing::info!(
+            ?exchange,
+            symbol,
+            client_order_id = requests[0].client_order_id.as_str(),
+            request_count = requests.len(),
+            network_ms,
+            acknowledgement_persistence_ms =
+                u64::try_from(acknowledgement_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "owned cancellation batch outcomes persisted; terminal reconciliation still required"
+        );
+    }
 
     target_order
         .into_iter()

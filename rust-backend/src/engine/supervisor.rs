@@ -779,6 +779,7 @@ impl<G> RuntimeRegistry<G> {
         run_id: &StrategyRunId,
         now_ms: u64,
     ) -> Result<PreparedStrategyStopOutcome, RuntimeRegistryStopError> {
+        let started = Instant::now();
         let slot = self
             .entries
             .read()
@@ -790,8 +791,22 @@ impl<G> RuntimeRegistry<G> {
         // returning a transient busy error that would force the caller to guess or retry.
         let _waiter = ExecutionWaiter::register_stop(&slot.execution_waiters);
         let mut strategy = slot.strategy.lock().await;
+        let strategy_lock_wait_ms =
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let effective_now_ms = now_ms.max(strategy.updated_at_ms());
+        let persistence_started = Instant::now();
         let result = strategy.request_stop(effective_now_ms).map_err(Into::into);
+        tracing::info!(
+            run_id = run_id.as_str(),
+            exchange = ?slot.exchange,
+            symbol = slot.symbol,
+            request_received_at_ms = now_ms,
+            strategy_reference_time_ms = effective_now_ms,
+            strategy_lock_wait_ms,
+            persistence_ms = u64::try_from(persistence_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            durable = result.is_ok(),
+            "strategy stop control stages completed"
+        );
         slot.owns_market
             .store(!strategy.is_terminal(), Ordering::Release);
         result

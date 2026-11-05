@@ -1,16 +1,17 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::future::join_all;
 use rust_decimal::Decimal;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::{
     domain::{Exchange, GridConfig, GridConfigError},
@@ -82,6 +83,31 @@ pub struct RuntimeCoordinator<G> {
     registry: Arc<RuntimeRegistry<G>>,
     mutation_guard: Mutex<()>,
     recovery_completed: AtomicBool,
+    stop_wakeup: Notify,
+    exit_retries: StdMutex<BTreeMap<StrategyRunId, ExitRetrySchedule>>,
+}
+
+struct ExitRetrySchedule {
+    not_before: Instant,
+    delay: Duration,
+}
+
+impl ExitRetrySchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            not_before: now,
+            delay: Duration::from_millis(125),
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> bool {
+        if now < self.not_before {
+            return false;
+        }
+        self.not_before = now + self.delay;
+        self.delay = (self.delay * 2).min(Duration::from_secs(1));
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +139,8 @@ impl<G> RuntimeCoordinator<G> {
             registry: Arc::new(RuntimeRegistry::new()),
             mutation_guard: Mutex::new(()),
             recovery_completed: AtomicBool::new(false),
+            stop_wakeup: Notify::new(),
+            exit_retries: StdMutex::new(BTreeMap::new()),
         }
     }
 
@@ -134,6 +162,10 @@ impl<G> RuntimeCoordinator<G> {
 
     pub fn recovery_completed(&self) -> bool {
         self.recovery_completed.load(Ordering::Acquire)
+    }
+
+    pub async fn stop_wakeup(&self) {
+        self.stop_wakeup.notified().await;
     }
 
     pub async fn profit_protection_status(
@@ -314,27 +346,28 @@ where
         symbol: &str,
         now_ms: u64,
     ) -> Result<RuntimeStopReceipt, RuntimeCoordinatorError> {
-        let _guard = self.mutation_guard.lock().await;
-        let _catalog_lease = self.acquire_catalog_lease()?;
-        self.registry.prune_terminal().await;
-        let catalog = self.load_catalog().await?;
-        ensure_catalog_is_clean(&catalog)?;
-        let selected = catalog.select_live(exchange, symbol)?;
-        let owner = self.registry.owner_for_market(exchange, symbol).await;
-        let (Some(selected), Some(run_id)) = (selected, owner) else {
+        let started = Instant::now();
+        // Recovery/registration already established exclusive per-run ownership.
+        // Stopping that run neither creates a market owner nor needs to replay
+        // unrelated historical journals or wait for another market's start.
+        let Some(run_id) = self.registry.owner_for_market(exchange, symbol).await else {
             return Err(RuntimeCoordinatorError::MarketNotRunning {
                 exchange,
                 symbol: symbol.to_owned(),
             });
         };
-        if selected.run_id() != run_id.as_str() {
-            return Err(RuntimeCoordinatorError::RegistryCatalogMismatch {
-                exchange,
-                symbol: symbol.to_owned(),
-                owner_run_id: run_id,
-            });
-        }
+        let selection_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = self.registry.request_stop(&run_id, now_ms).await?;
+        self.stop_wakeup.notify_one();
+        tracing::info!(
+            run_id = run_id.as_str(),
+            ?exchange,
+            symbol,
+            request_received_at_ms = now_ms,
+            selection_ms,
+            coordinator_total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "strategy stop request is durable"
+        );
         Ok(RuntimeStopReceipt {
             run_id,
             exchange,
@@ -345,6 +378,43 @@ where
 
     pub async fn advance_all(&self, now_ms: u64) -> Vec<RuntimeAdvanceResult> {
         self.advance_matching(now_ms, |_| true).await
+    }
+
+    pub async fn advance_stopping(&self, now_ms: u64) -> Vec<RuntimeAdvanceResult> {
+        // Periodic admission intentionally hides lifecycles for overdue audits.
+        // Exit admission must retain them while respecting in-flight writes.
+        let entries = self.registry.entries().await;
+        let entries = {
+            let now = Instant::now();
+            let mut retries = self
+                .exit_retries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let live_ids = entries
+                .iter()
+                .map(|entry| entry.run_id.clone())
+                .collect::<BTreeSet<_>>();
+            retries.retain(|run_id, _| live_ids.contains(run_id));
+            entries
+                .into_iter()
+                .filter(|entry| {
+                    !entry.advancing
+                        && matches!(
+                            entry.lifecycle,
+                            Some(
+                                PreparedStrategyLifecycle::StopRequested
+                                    | PreparedStrategyLifecycle::RiskExitRequested
+                                    | PreparedStrategyLifecycle::Failed
+                            )
+                        )
+                        && retries
+                            .entry(entry.run_id.clone())
+                            .or_insert_with(|| ExitRetrySchedule::new(now))
+                            .admit(now)
+                })
+                .collect()
+        };
+        self.advance_entries(now_ms, entries, |_| true).await
     }
 
     pub async fn advance_exchange(
@@ -371,6 +441,15 @@ where
         include: impl Fn(&RuntimeRegistryEntry) -> bool,
     ) -> Vec<RuntimeAdvanceResult> {
         let entries = self.registry.periodic_entries().await;
+        self.advance_entries(now_ms, entries, include).await
+    }
+
+    async fn advance_entries(
+        &self,
+        now_ms: u64,
+        entries: Vec<RuntimeRegistryEntry>,
+        include: impl Fn(&RuntimeRegistryEntry) -> bool,
+    ) -> Vec<RuntimeAdvanceResult> {
         let advances = entries.into_iter().filter_map(|entry| {
             if !include(&entry)
                 || entry.advancing
@@ -518,4 +597,35 @@ pub enum RuntimeCoordinatorError {
     RegistrationInvariant,
     #[error(transparent)]
     Stop(#[from] RuntimeRegistryStopError),
+}
+
+#[cfg(test)]
+mod stop_retry_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_exit_retries_back_off_and_remain_capped_at_one_second() {
+        let base = Instant::now();
+        let mut schedule = ExitRetrySchedule::new(base);
+        for (millis, admitted) in [
+            (0, true),
+            (0, false),
+            (124, false),
+            (125, true),
+            (374, false),
+            (375, true),
+            (874, false),
+            (875, true),
+            (1874, false),
+            (1875, true),
+            (2874, false),
+            (2875, true),
+        ] {
+            assert_eq!(
+                schedule.admit(base + std::time::Duration::from_millis(millis)),
+                admitted,
+                "elapsed_ms={millis}"
+            );
+        }
+    }
 }

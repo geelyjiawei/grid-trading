@@ -3266,7 +3266,7 @@ where
                 RuntimeStage::LedgerReconciliation | RuntimeStage::ExecutionAccounting
             )
         });
-        let (exchange, symbol, cancellation_targets) = {
+        let (run_id, exchange, symbol, cancellation_targets) = {
             let state = self.machine.store().snapshot();
             let targets = state
                 .orders
@@ -3297,7 +3297,12 @@ where
                     .map_err(RuntimeTickError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            (state.exchange, state.symbol.clone(), targets)
+            (
+                state.run_id.clone(),
+                state.exchange,
+                state.symbol.clone(),
+                targets,
+            )
         };
 
         let mut dispatch_targets = Vec::new();
@@ -3428,6 +3433,7 @@ where
         if has_active_owned_orders {
             self.validate_ledger_ownership()?;
             tracing::info!(
+                run_id = run_id.as_str(),
                 exchange = ?exchange,
                 symbol,
                 cancellation_targets = cancellation_targets.len(),
@@ -3471,6 +3477,7 @@ where
             self.machine.mark_stopped(now_ms)?;
             self.validate_ledger_ownership()?;
             tracing::info!(
+                run_id = run_id.as_str(),
                 exchange = ?exchange,
                 symbol,
                 cancellation_targets = cancellation_targets.len(),
@@ -5724,46 +5731,347 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_lease_blocks_stop_without_changing_the_strategy() {
+    async fn catalog_lease_for_an_unrelated_mutation_does_not_block_owned_stop() {
         let directory = tempdir().unwrap();
-        let gateway = MockGateway::new(rules(), 1_100);
-        let coordinator =
-            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
-        let started = coordinator
-            .start(gateway.clone(), config(None), 1_100)
-            .await
-            .unwrap();
-        let catalog_lease =
+        let (coordinator, gateway, paths) = coordinator_from_file_fixture(directory.path()).await;
+        let _catalog_lease =
             StrategyRuntimeLease::acquire(directory.path().join(STRATEGY_CATALOG_LEASE_FILE_NAME))
                 .unwrap();
-
-        assert!(matches!(
-            coordinator
-                .request_stop(Exchange::Binance, "MUUSDT", 1_101)
-                .await,
-            Err(RuntimeCoordinatorError::CatalogLease(
-                RuntimeLeaseError::AlreadyHeld
-            ))
-        ));
-        assert_eq!(gateway.placement_call_count(), 0);
-        assert_eq!(coordinator.entries().await.len(), 1);
-        assert_eq!(
-            coordinator.entries().await[0].lifecycle,
-            Some(PreparedStrategyLifecycle::AwaitingOpening)
-        );
-
-        drop(catalog_lease);
         let stopped = coordinator
             .request_stop(Exchange::Binance, "MUUSDT", 1_102)
             .await
             .unwrap();
-        assert_eq!(stopped.run_id, started.run_id);
+        assert_eq!(&stopped.run_id, paths.run_id());
         assert!(matches!(
             stopped.outcome,
             PreparedStrategyStopOutcome::Active(StrategyTransition::LifecycleChanged {
                 lifecycle: StrategyLifecycle::StopRequested,
             })
         ));
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(
+            FileStrategyStateStore::load(paths.state())
+                .unwrap()
+                .snapshot()
+                .lifecycle,
+            StrategyLifecycle::StopRequested
+        );
+    }
+
+    async fn coordinator_from_file_fixture(
+        root: &std::path::Path,
+    ) -> (
+        Arc<RuntimeCoordinator<MockGateway>>,
+        MockGateway,
+        StrategyFilePaths,
+    ) {
+        let leased = validation_proof_file_runtime(root);
+        let gateway = leased.runtime().gateway.clone();
+        let paths = leased.paths().clone();
+        let coordinator = Arc::new(RuntimeCoordinator::new(
+            root.to_path_buf(),
+            runtime_settings(),
+        ));
+        assert!(matches!(
+            coordinator
+                .registry()
+                .register(PreparedLeasedFileStrategy::active(leased))
+                .await,
+            RuntimeRegistration::Registered
+        ));
+        (coordinator, gateway, paths)
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_does_not_replay_unrelated_historical_ledgers() {
+        let directory = tempdir().unwrap();
+        let (coordinator, gateway, paths) = coordinator_from_file_fixture(directory.path()).await;
+        let history = directory.path().join("history001");
+        std::fs::create_dir(&history).unwrap();
+        std::fs::write(
+            history.join("strategy.json"),
+            b"unreadable unrelated history",
+        )
+        .unwrap();
+
+        let stopped = coordinator
+            .request_stop(Exchange::Binance, "MUUSDT", 1_102)
+            .await
+            .unwrap();
+
+        assert_eq!(&stopped.run_id, paths.run_id());
+        let state = FileStrategyStateStore::load(paths.state()).unwrap();
+        assert_eq!(state.snapshot().lifecycle, StrategyLifecycle::StopRequested);
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(gateway.cancellation_batch_call_count(), 0);
+        assert_eq!(
+            std::fs::read(history.join("strategy.json")).unwrap(),
+            b"unreadable unrelated history"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_missing_owner_does_not_fall_back_to_disk_discovery() {
+        let directory = tempdir().unwrap();
+        std::fs::write(directory.path().join("unexpected-file"), b"not a strategy").unwrap();
+        let coordinator: RuntimeCoordinator<MockGateway> =
+            RuntimeCoordinator::new(directory.path().to_path_buf(), runtime_settings());
+
+        assert!(matches!(
+            coordinator
+                .request_stop(Exchange::Binance, "MUUSDT", 1_102)
+                .await,
+            Err(RuntimeCoordinatorError::MarketNotRunning { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_stop_does_not_wait_for_an_unrelated_start_preflight() {
+        let directory = tempdir().unwrap();
+        let (coordinator, gateway, paths) = coordinator_from_file_fixture(directory.path()).await;
+        let other_gateway = MockGateway::new(rules(), 1_100).with_symbol("ALTUSDT");
+        let gate = other_gateway.block_market_snapshot();
+        let mut other_config = config(None);
+        other_config.symbol = "ALTUSDT".into();
+        let starting_coordinator = Arc::clone(&coordinator);
+        let start = tokio::spawn(async move {
+            starting_coordinator
+                .start(other_gateway, other_config, 1_100)
+                .await
+        });
+        gate.wait_until_entered().await;
+
+        let stop = tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.request_stop(Exchange::Binance, "MUUSDT", 1_102),
+        )
+        .await;
+        // The unrelated task is still in a read-only preflight, before any order exists.
+        start.abort();
+        let _ = start.await;
+
+        let receipt = stop
+            .expect("owned stop must not wait for unrelated preflight")
+            .unwrap();
+        assert_eq!(&receipt.run_id, paths.run_id());
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(
+            FileStrategyStateStore::load(paths.state())
+                .unwrap()
+                .snapshot()
+                .lifecycle,
+            StrategyLifecycle::StopRequested
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_wakes_exit_only_sweep_without_a_normal_tick() {
+        let directory = tempdir().unwrap();
+        let (coordinator, gateway, paths) = coordinator_from_file_fixture(directory.path()).await;
+        let other_gateway = MockGateway::new(rules(), 1_100).with_symbol("ALTUSDT");
+        let mut other_config = config(None);
+        other_config.symbol = "ALTUSDT".into();
+        let plan = build_grid_plan(
+            &other_config,
+            &MarketSnapshot {
+                last_price: Decimal::new(1014, 0),
+                mark_price: Decimal::new(1014, 0),
+            },
+            &rules(),
+        )
+        .unwrap();
+        let other_state = StrategyState::from_plan(
+            StrategyRunId::parse("other002").unwrap(),
+            other_config,
+            rules(),
+            plan,
+            PositionBaseline::flat(),
+            1_000,
+        )
+        .unwrap();
+        let other_paths =
+            StrategyFilePaths::new(directory.path(), other_state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(other_paths.state(), other_state).unwrap();
+        let other = recover_leased_file_strategy(
+            other_gateway.clone(),
+            other_paths.clone(),
+            runtime_settings(),
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.registry().register(other).await,
+            RuntimeRegistration::Registered
+        ));
+        gateway.state.lock().unwrap().position_quantity = Decimal::new(-5, 1);
+
+        coordinator
+            .request_stop(Exchange::Binance, "MUUSDT", 1_102)
+            .await
+            .unwrap();
+        let revision = FileStrategyStateStore::load(paths.state())
+            .unwrap()
+            .snapshot()
+            .revision;
+        coordinator
+            .request_stop(Exchange::Binance, "MUUSDT", 1_103)
+            .await
+            .unwrap();
+        assert_eq!(
+            FileStrategyStateStore::load(paths.state())
+                .unwrap()
+                .snapshot()
+                .revision,
+            revision
+        );
+        tokio::time::timeout(Duration::from_secs(1), coordinator.stop_wakeup())
+            .await
+            .expect("a durable stop must wake the scheduler even before it begins waiting");
+
+        let exits = coordinator.advance_stopping(1_104).await;
+        assert_eq!(exits.len(), 1);
+        assert_eq!(&exits[0].run_id, paths.run_id());
+        assert!(exits[0].result.is_ok(), "{:?}", exits[0].result);
+        assert_eq!(
+            FileStrategyStateStore::load(paths.state())
+                .unwrap()
+                .snapshot()
+                .lifecycle,
+            StrategyLifecycle::Stopped
+        );
+        assert_eq!(
+            FileStrategyStateStore::load(other_paths.state())
+                .unwrap()
+                .snapshot()
+                .lifecycle,
+            StrategyLifecycle::AwaitingOpening
+        );
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(other_gateway.placement_call_count(), 0);
+        assert_eq!(
+            gateway.state.lock().unwrap().position_quantity,
+            Decimal::new(-5, 1)
+        );
+        assert!(coordinator.advance_stopping(1_105).await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_overdue_stop_exits_while_an_unrelated_tick_is_blocked() {
+        let directory = tempdir().unwrap();
+        let (coordinator, gateway, paths) = coordinator_from_file_fixture(directory.path()).await;
+        let other_gateway = MockGateway::new(rules(), 1_100)
+            .with_symbol("ALTUSDT")
+            .with_exchange(Exchange::Aster);
+        let gate = other_gateway.block_market_snapshot();
+        let mut other_config = config(None);
+        other_config.exchange = Some(Exchange::Aster);
+        other_config.symbol = "ALTUSDT".into();
+        let plan = build_grid_plan(
+            &other_config,
+            &MarketSnapshot {
+                last_price: Decimal::new(1014, 0),
+                mark_price: Decimal::new(1014, 0),
+            },
+            &rules(),
+        )
+        .unwrap();
+        let other_state = StrategyState::from_plan(
+            StrategyRunId::parse("slow0002").unwrap(),
+            other_config,
+            rules(),
+            plan,
+            PositionBaseline::flat(),
+            1_000,
+        )
+        .unwrap();
+        let other_paths =
+            StrategyFilePaths::new(directory.path(), other_state.run_id.clone()).unwrap();
+        FileStrategyStateStore::create(other_paths.state(), other_state).unwrap();
+        let other =
+            recover_leased_file_strategy(other_gateway, other_paths, runtime_settings()).unwrap();
+        assert!(matches!(
+            coordinator.registry().register(other).await,
+            RuntimeRegistration::Registered
+        ));
+        let ticking_coordinator = Arc::clone(&coordinator);
+        let blocked = tokio::spawn(async move {
+            ticking_coordinator
+                .advance_exchange(Exchange::Aster, 1_101)
+                .await
+        });
+        gate.wait_until_entered().await;
+        // The periodic audit uses a monotonic real-time deadline, not business time.
+        tokio::time::sleep(Duration::from_millis(5_100)).await;
+
+        coordinator
+            .request_stop(Exchange::Binance, "MUUSDT", 1_102)
+            .await
+            .unwrap();
+        let exits = coordinator.advance_stopping(1_103).await;
+        blocked.abort();
+        let _ = blocked.await;
+
+        assert_eq!(
+            exits.len(),
+            1,
+            "an overdue audit must not hide a stop from exit admission"
+        );
+        assert!(exits[0].result.is_ok(), "{:?}", exits[0].result);
+        assert_eq!(
+            FileStrategyStateStore::load(paths.state())
+                .unwrap()
+                .snapshot()
+                .lifecycle,
+            StrategyLifecycle::Stopped
+        );
+        assert_eq!(gateway.placement_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_failure_does_not_publish_a_success_wakeup() {
+        let directory = tempdir().unwrap();
+        let (coordinator, gateway, paths) = coordinator_from_file_fixture(directory.path()).await;
+        std::fs::write(paths.state(), b"external stale checkpoint replacement").unwrap();
+
+        assert!(
+            coordinator
+                .request_stop(Exchange::Binance, "MUUSDT", 1_102)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), coordinator.stop_wakeup())
+                .await
+                .is_err()
+        );
+        assert_eq!(gateway.placement_call_count(), 0);
+        assert_eq!(gateway.cancellation_batch_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_retries_do_not_poll_pending_orders_on_every_wakeup() {
+        let directory = tempdir().unwrap();
+        let (coordinator, gateway, _) = coordinator_from_file_fixture(directory.path()).await;
+        let opening = coordinator.advance_all(1_101).await;
+        assert!(opening.iter().all(|result| result.result.is_ok()));
+        assert_eq!(gateway.placement_call_count(), 1);
+        coordinator
+            .request_stop(Exchange::Binance, "MUUSDT", 1_102)
+            .await
+            .unwrap();
+
+        let first = coordinator.advance_stopping(1_103).await;
+        assert_eq!(first.len(), 1);
+        assert!(first[0].result.is_ok(), "{:?}", first[0].result);
+        assert_eq!(gateway.cancellation_batch_call_count(), 1);
+        let snapshots = gateway.execution_snapshot_call_count();
+        let second = coordinator.advance_stopping(1_104).await;
+
+        assert!(
+            second.is_empty(),
+            "a pending exit needs a retry budget, not one read per wakeup"
+        );
+        assert_eq!(gateway.execution_snapshot_call_count(), snapshots);
+        assert_eq!(gateway.cancellation_batch_call_count(), 1);
     }
 
     #[tokio::test]

@@ -51,6 +51,7 @@ const DEFAULT_STRATEGY_ROOT: &str = "/app/data/rust-control/strategies";
 const DEFAULT_WEB_ROOT: &str = "/app/web";
 const DEFAULT_CONFIG_FILE: &str = "/app/data/api_config.json";
 const DEFAULT_RUNTIME_TICK_MS: u64 = 1_000;
+const STOP_RUNTIME_RETRY_MS: u64 = 125;
 const TRADE_XYZ_RUNTIME_AUDIT_TICK_MS: u64 = 5_000;
 const FEE_SETTLEMENT_TICK_MS: u64 = 5_000;
 const DEFAULT_MARKET_MAX_AGE_MS: u64 = 15_000;
@@ -240,6 +241,9 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_RUNTIME_TICK_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut stop_retry_ticker =
+            tokio::time::interval(Duration::from_millis(STOP_RUNTIME_RETRY_MS));
+        stop_retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut trade_xyz_audit_ticker =
             tokio::time::interval(Duration::from_millis(TRADE_XYZ_RUNTIME_AUDIT_TICK_MS));
         trade_xyz_audit_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -257,6 +261,8 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
         loop {
             tokio::select! {
                 biased;
+                _ = runtime.stop_wakeup() => spawn_stop_sweep(&runtime),
+                _ = stop_retry_ticker.tick() => spawn_stop_sweep(&runtime),
                 event = execution_wakeups.recv() => {
                     match event {
                         Ok(event) => {
@@ -351,6 +357,21 @@ fn spawn_runtime_scheduler(runtime: Arc<RuntimeCoordinator<SharedConfiguredExcha
                     runtime.spawn_fee_settlements(now_ms).await;
                 }
             }
+        }
+    });
+}
+
+fn spawn_stop_sweep(runtime: &Arc<RuntimeCoordinator<SharedConfiguredExchangeGateway>>) {
+    let Some(now_ms) = system_time_ms() else {
+        tracing::error!("system clock is unavailable; stop sweep skipped");
+        return;
+    };
+    let runtime = Arc::clone(runtime);
+    tokio::spawn(async move {
+        // Each run already has an advancement reservation. A slow/unknown exit
+        // cannot queue overlapping sweeps or hold up a newly requested stop.
+        for advance in runtime.advance_stopping(now_ms).await {
+            log_runtime_advance(advance, false, None, None, 0);
         }
     });
 }
