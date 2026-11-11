@@ -819,10 +819,7 @@ where
         root.join(STRATEGY_START_STAGING_DIRECTORY_NAME),
         run_id.clone(),
     )?;
-    let reservation = StrategyStartReservation::acquire(staging_paths)?;
-    // A previous contender may have published while this request waited for the
-    // per-run reservation. Recheck before making any exchange request.
-    ensure_strategy_destination_absent(&paths)?;
+    let reservation = StrategyStartReservation::acquire(staging_paths, &paths)?;
     let prepared = prepare_new_strategy(
         &gateway,
         run_id,
@@ -900,15 +897,28 @@ fn path_entry_exists(path: &std::path::Path) -> Result<bool, FileStrategyStartEr
 struct StrategyStartReservation {
     paths: StrategyFilePaths,
     lease: Option<StrategyRuntimeLease>,
+    // Unlike the payload lease, this inode is never renamed or removed.
+    _start_guard: StrategyRuntimeLease,
 }
 
 impl StrategyStartReservation {
-    fn acquire(paths: StrategyFilePaths) -> Result<Self, FileStrategyStartError> {
+    fn acquire(
+        paths: StrategyFilePaths,
+        destination: &StrategyFilePaths,
+    ) -> Result<Self, FileStrategyStartError> {
         ensure_start_staging_root(&paths).map_err(FileStrategyStartError::StartReservation)?;
+        let guard_path = paths
+            .directory()
+            .with_file_name(format!(".{}.lock", paths.run_id().as_str()));
+        let start_guard = StrategyRuntimeLease::acquire(guard_path)?;
+        // A previous owner may have published since the initial check. Reject
+        // before creating or resetting any payload, while holding a stable lock.
+        ensure_strategy_destination_absent(destination)?;
         let lease = StrategyRuntimeLease::acquire(paths.lease())?;
         let reservation = Self {
             paths,
             lease: Some(lease),
+            _start_guard: start_guard,
         };
         reservation
             .reset_abandoned_payload()
@@ -938,7 +948,6 @@ impl StrategyStartReservation {
             .take()
             .expect("a live start reservation must own its lease")
             .relocate(destination.lease());
-        remove_empty_staging_root(&self.paths);
         Ok(lease)
     }
 }
@@ -1026,27 +1035,7 @@ fn cleanup_start_reservation(
     drop(lease);
     remove_regular_file_if_present(paths.lease())?;
     fs::remove_dir(paths.directory())?;
-    remove_empty_staging_root(paths);
     Ok(())
-}
-
-fn remove_empty_staging_root(paths: &StrategyFilePaths) {
-    let Some(staging) = paths.directory().parent() else {
-        return;
-    };
-    match fs::remove_dir(staging) {
-        Ok(()) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-            ) => {}
-        Err(error) => tracing::warn!(
-            path = %staging.display(),
-            error = %error,
-            "failed to remove an empty strategy start staging root"
-        ),
-    }
 }
 
 pub fn recover_leased_file_strategy<G>(
@@ -5380,6 +5369,196 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn reservation_lifecycle_cleanup_retains_root_and_guard_for_discovery() {
+        let directory = tempdir().unwrap();
+        let staging = directory.path().join(STRATEGY_START_STAGING_DIRECTORY_NAME);
+        let paths =
+            StrategyFilePaths::new(&staging, StrategyRunId::parse("guard001").unwrap()).unwrap();
+        let destination = StrategyFilePaths::new(directory.path(), paths.run_id().clone()).unwrap();
+        let reservation = StrategyStartReservation::acquire(paths.clone(), &destination).unwrap();
+
+        drop(reservation);
+
+        assert!(
+            staging.is_dir(),
+            "cleanup must retain the shared staging root"
+        );
+        assert!(staging.join(".guard001.lock").is_file());
+        assert!(!paths.directory().exists());
+        let discovery = discover_strategy_files(directory.path()).unwrap();
+        assert!(discovery.strategies.is_empty());
+        assert!(discovery.anomalies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reservation_lifecycle_guard_blocks_before_payload_creation_or_bootstrap() {
+        let directory = tempdir().unwrap();
+        let staging = directory.path().join(STRATEGY_START_STAGING_DIRECTORY_NAME);
+        let run_id = StrategyRunId::parse("guard002").unwrap();
+        let paths = StrategyFilePaths::new(&staging, run_id.clone()).unwrap();
+        let _guard = StrategyRuntimeLease::acquire(staging.join(".guard002.lock")).unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+
+        let result = prepare_leased_file_strategy(
+            gateway.clone(),
+            directory.path(),
+            run_id,
+            triggered_config(),
+            1_100,
+            runtime_settings(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(FileStrategyStartError::Lease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+        assert!(!paths.directory().exists());
+    }
+
+    #[tokio::test]
+    async fn reservation_lifecycle_guard_covers_cleanup_and_detached_payload_lock() {
+        let directory = tempdir().unwrap();
+        let staging = directory.path().join(STRATEGY_START_STAGING_DIRECTORY_NAME);
+        let run_id = StrategyRunId::parse("guard003").unwrap();
+        let paths = StrategyFilePaths::new(&staging, run_id.clone()).unwrap();
+        let destination = StrategyFilePaths::new(directory.path(), run_id.clone()).unwrap();
+        let mut reservation =
+            StrategyStartReservation::acquire(paths.clone(), &destination).unwrap();
+        fs::write(paths.state(), b"unpublished state").unwrap();
+        fs::write(paths.intents(), b"unpublished intents").unwrap();
+        let delayed_payload_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.lease())
+            .unwrap();
+        let gateway = MockGateway::new(rules(), 1_100);
+
+        // Force the cleanup gap: the payload lease is gone, but its owner is not.
+        drop(reservation.lease.take());
+        assert!(matches!(
+            prepare_leased_file_strategy(
+                gateway.clone(),
+                directory.path(),
+                run_id.clone(),
+                triggered_config(),
+                1_100,
+                runtime_settings(),
+            )
+            .await,
+            Err(FileStrategyStartError::Lease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        assert_eq!(fs::read(paths.state()).unwrap(), b"unpublished state");
+        assert_eq!(fs::read(paths.intents()).unwrap(), b"unpublished intents");
+
+        cleanup_start_reservation(&paths, None).unwrap();
+        delayed_payload_lock.try_lock().unwrap();
+        assert!(!paths.directory().exists());
+        assert!(matches!(
+            prepare_leased_file_strategy(
+                gateway.clone(),
+                directory.path(),
+                run_id,
+                triggered_config(),
+                1_100,
+                runtime_settings(),
+            )
+            .await,
+            Err(FileStrategyStartError::Lease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        assert!(!paths.directory().exists());
+        assert_eq!(gateway.all_bootstrap_call_count(), 0);
+
+        drop(reservation);
+        let retry = StrategyStartReservation::acquire(paths.clone(), &destination).unwrap();
+        assert!(matches!(
+            StrategyStartReservation::acquire(paths.clone(), &destination),
+            Err(FileStrategyStartError::Lease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        drop(retry);
+        assert!(staging.join(".guard003.lock").is_file());
+        assert!(!paths.directory().exists());
+    }
+
+    #[test]
+    fn reservation_lifecycle_rechecks_destination_before_abandoned_payload_reset() {
+        let directory = tempdir().unwrap();
+        let run_id = StrategyRunId::parse("guard004").unwrap();
+        let destination = StrategyFilePaths::new(directory.path(), run_id.clone()).unwrap();
+        let paths = StrategyFilePaths::new(
+            directory.path().join(STRATEGY_START_STAGING_DIRECTORY_NAME),
+            run_id,
+        )
+        .unwrap();
+        ensure_strategy_destination_absent(&destination).unwrap();
+        // A prior winner publishes after the contender's initial destination check.
+        fs::create_dir_all(destination.directory()).unwrap();
+        fs::write(destination.state(), b"published evidence").unwrap();
+        fs::create_dir_all(paths.directory()).unwrap();
+        fs::write(paths.state(), b"abandoned state evidence").unwrap();
+        fs::write(paths.intents(), b"abandoned intent evidence").unwrap();
+
+        let result = StrategyStartReservation::acquire(paths.clone(), &destination);
+
+        assert!(matches!(
+            result,
+            Err(FileStrategyStartError::StateAlreadyExists)
+        ));
+        assert_eq!(
+            fs::read(destination.state()).unwrap(),
+            b"published evidence"
+        );
+        assert_eq!(
+            fs::read(paths.state()).unwrap(),
+            b"abandoned state evidence"
+        );
+        assert_eq!(
+            fs::read(paths.intents()).unwrap(),
+            b"abandoned intent evidence"
+        );
+    }
+
+    #[test]
+    fn reservation_lifecycle_failed_publish_preserves_stable_guard_identity() {
+        let directory = tempdir().unwrap();
+        let run_id = StrategyRunId::parse("guard005").unwrap();
+        let destination = StrategyFilePaths::new(directory.path(), run_id.clone()).unwrap();
+        let staging = directory.path().join(STRATEGY_START_STAGING_DIRECTORY_NAME);
+        let paths = StrategyFilePaths::new(&staging, run_id).unwrap();
+        let reservation = StrategyStartReservation::acquire(paths.clone(), &destination).unwrap();
+        let guard_path = staging.join(".guard005.lock");
+        let delayed_guard = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&guard_path)
+            .expect("a reservation must own a stable guard outside its payload");
+        fs::create_dir_all(destination.directory()).unwrap();
+        fs::write(destination.state(), b"winner").unwrap();
+
+        assert!(matches!(
+            reservation.publish(&destination),
+            Err(FileStrategyStartError::StateAlreadyExists)
+        ));
+        assert!(!paths.directory().exists());
+        assert!(staging.is_dir());
+        delayed_guard.try_lock().unwrap();
+        assert!(matches!(
+            StrategyRuntimeLease::acquire(&guard_path),
+            Err(RuntimeLeaseError::AlreadyHeld)
+        ));
+        assert_eq!(fs::read(destination.state()).unwrap(), b"winner");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_flight_start_is_invisible_until_atomic_publish() {
         let directory = tempdir().unwrap();
@@ -5420,6 +5599,48 @@ mod tests {
         let published = discover_strategy_files(&root).unwrap();
         assert_eq!(published.strategies.len(), 1);
         assert!(published.anomalies.is_empty());
+        let staging = root.join(STRATEGY_START_STAGING_DIRECTORY_NAME);
+        let guard_path = staging.join(".staging1.lock");
+        assert!(staging.is_dir());
+        let delayed_guard = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&guard_path)
+            .unwrap();
+        let published_bytes = fs::read(final_paths.state()).unwrap();
+        assert!(matches!(
+            StrategyRuntimeLease::acquire(final_paths.lease()),
+            Err(RuntimeLeaseError::AlreadyHeld)
+        ));
+        drop(prepared);
+        delayed_guard.try_lock().unwrap();
+        assert!(matches!(
+            StrategyRuntimeLease::acquire(&guard_path),
+            Err(RuntimeLeaseError::AlreadyHeld)
+        ));
+        assert!(matches!(
+            StrategyStartReservation::acquire(staging_paths, &final_paths),
+            Err(FileStrategyStartError::Lease(
+                RuntimeLeaseError::AlreadyHeld
+            ))
+        ));
+        drop(delayed_guard);
+        let duplicate_gateway = MockGateway::new(rules(), 1_100);
+        assert!(matches!(
+            prepare_leased_file_strategy(
+                duplicate_gateway.clone(),
+                &root,
+                final_paths.run_id().clone(),
+                config(None),
+                1_100,
+                runtime_settings(),
+            )
+            .await,
+            Err(FileStrategyStartError::StateAlreadyExists)
+        ));
+        assert_eq!(duplicate_gateway.all_bootstrap_call_count(), 0);
+        assert_eq!(fs::read(final_paths.state()).unwrap(), published_bytes);
+        assert!(guard_path.is_file());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
