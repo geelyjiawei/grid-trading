@@ -99,14 +99,23 @@ fn committed_query_snapshot<G>(
     strategy: &PreparedLeasedFileStrategy<G>,
 ) -> Option<StrategyCatalogSnapshot> {
     if let Some(runtime) = strategy.active_runtime() {
-        Some(StrategyCatalogSnapshot::Active(
-            runtime.runtime().machine().store().shared_snapshot(),
-        ))
+        committed_active_query_snapshot(runtime)
     } else {
         strategy
             .armed_strategy()
             .map(|armed| StrategyCatalogSnapshot::Armed(Box::new(armed.snapshot().clone())))
     }
+}
+
+fn committed_active_query_snapshot<G>(
+    runtime: &super::LeasedFileStrategyRuntime<G>,
+) -> Option<StrategyCatalogSnapshot> {
+    // Reuses the concrete stores' exact revision-pair proof. A partially
+    // committed intent/state update must never become current query evidence.
+    runtime.runtime().verify_ledger_ownership().ok()?;
+    Some(StrategyCatalogSnapshot::Active(
+        runtime.runtime().machine().store().shared_snapshot(),
+    ))
 }
 
 struct PublishedStrategyGuard<'a, G> {
@@ -2432,6 +2441,58 @@ mod fee_settlement_tests {
         let status = wait_profit(&registry, &run).await;
         assert_eq!(status.observation.status, "unavailable", "{status:?}");
         assert!(status.trigger.is_none());
+    }
+
+    #[tokio::test]
+    async fn published_query_snapshot_rejects_interrupted_cross_ledger_commit() {
+        let directory = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = pending_strategy(directory.path(), &gateway, "query002", 0, false).await;
+        let paths = strategy.paths().clone();
+        drop(strategy);
+        let mut active = super::super::LeasedFileStrategyRuntime::load(
+            gateway,
+            paths,
+            RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap(),
+        )
+        .unwrap();
+        assert!(committed_active_query_snapshot(&active).is_some());
+        let shape = active
+            .runtime()
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .next()
+            .unwrap()
+            .shape
+            .clone();
+        // Simulate a durable intent append followed by failed strategy synchronization.
+        active
+            .runtime_mut()
+            .intent_store_mut()
+            .insert_prepared(
+                OrderIntent::prepare(
+                    ClientOrderId::parse("query-foreign-001").unwrap(),
+                    Exchange::Binance,
+                    shape,
+                    1_300,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        active
+            .runtime()
+            .machine()
+            .store()
+            .snapshot()
+            .validate()
+            .unwrap();
+        assert!(
+            committed_active_query_snapshot(&active).is_none(),
+            "a valid individual state is not a cross-ledger ownership certificate"
+        );
     }
 
     #[tokio::test]
