@@ -244,15 +244,13 @@ pub(super) fn reconcile_history(
             return Err(invalid(
                 "account history contains a pending owned execution",
             ));
-        } else {
-            if external
-                .insert(key, fill.clone())
-                .is_some_and(|previous| previous != fill)
-            {
-                return Err(invalid(
-                    "account history rewrites confirmed external executions",
-                ));
-            }
+        } else if external
+            .insert(key, fill.clone())
+            .is_some_and(|previous| previous != fill)
+        {
+            return Err(invalid(
+                "account history rewrites confirmed external executions",
+            ));
         }
     }
     if state
