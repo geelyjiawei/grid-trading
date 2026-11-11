@@ -6509,11 +6509,33 @@ mod tests {
         let catalog = load_strategy_catalog(directory.path()).unwrap();
         assert!(catalog.anomalies().is_empty());
         assert!(catalog.entries().is_empty());
-        assert!(
-            std::fs::read_dir(directory.path())
+        let mut root_entries = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        root_entries.sort();
+        let mut expected_entries = vec![
+            STRATEGY_CATALOG_LEASE_FILE_NAME.to_owned(),
+            STRATEGY_START_STAGING_DIRECTORY_NAME.to_owned(),
+        ];
+        expected_entries.sort();
+        assert_eq!(root_entries, expected_entries);
+        let guards =
+            std::fs::read_dir(directory.path().join(STRATEGY_START_STAGING_DIRECTORY_NAME))
                 .unwrap()
-                .all(|entry| entry.unwrap().file_name() == STRATEGY_CATALOG_LEASE_FILE_NAME)
-        );
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        assert_eq!(guards.len(), 1, "only one stable start guard may remain");
+        assert!(guards[0].file_type().unwrap().is_file());
+        let guard_name = guards[0].file_name().into_string().unwrap();
+        let guard_run = guard_name
+            .strip_prefix('.')
+            .unwrap()
+            .strip_suffix(".lock")
+            .unwrap();
+        StrategyRunId::parse(guard_run).unwrap();
+        let guard = StrategyRuntimeLease::acquire(guards[0].path()).unwrap();
+        drop(guard);
 
         let fresh_gateway = MockGateway::new(rules(), 20_001);
         let retry = coordinator
