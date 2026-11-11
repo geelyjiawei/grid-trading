@@ -49,6 +49,7 @@ use super::exchange_inputs::advance_reference_time_ms;
 const MAX_CONCURRENT_ORDER_LOOKUPS: usize = 8;
 const MAX_CONCURRENT_EXECUTION_SNAPSHOTS: usize = 8;
 const MAX_CONCURRENT_REPLACEMENT_SUBMISSIONS: usize = 4;
+const EXTERNAL_HISTORY_AUDIT_INTERVAL_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +202,7 @@ pub struct StrategyRuntime<G, I, S> {
     maximum_market_age_ms: u64,
     maximum_future_skew_ms: u64,
     maximum_submissions_per_tick: usize,
+    external_submission_fence: bool,
 }
 
 pub(crate) enum PreparedExecutionEventStep<G> {
@@ -1455,6 +1457,7 @@ impl LeasedFileArmedStrategy {
             machine: StrategyMachine::new(state_store),
             ledger_validation_proof: Some(Mutex::new(None)),
             execution_sync: prepared.execution_sync,
+            external_submission_fence: false,
             maximum_market_age_ms: settings.maximum_market_age_ms,
             maximum_future_skew_ms: settings.maximum_future_skew_ms,
             maximum_submissions_per_tick: settings.maximum_submissions_per_tick,
@@ -1598,6 +1601,11 @@ where
             maximum_submissions_per_tick,
         )?;
         let execution_sync = ExecutionSyncService::new(quote_asset)?;
+        let external_submission_fence = machine
+            .store()
+            .snapshot()
+            .external_position_blocker
+            .is_some();
         Ok(Self {
             gateway,
             intent_store,
@@ -1608,6 +1616,7 @@ where
             maximum_market_age_ms,
             maximum_future_skew_ms,
             maximum_submissions_per_tick,
+            external_submission_fence,
         })
     }
 
@@ -2168,13 +2177,7 @@ where
             u64::try_from(accounting_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let convergence_started = Instant::now();
         self.converge_accounted_terminal_intents(now_ms)?;
-        if let Some(message) = self
-            .machine
-            .store()
-            .snapshot()
-            .external_position_blocker
-            .clone()
-        {
+        if let Some(message) = self.external_submission_blocker() {
             report.blockers.push(RuntimeBlocker {
                 stage: RuntimeStage::PositionReconciliation,
                 client_order_id: None,
@@ -2338,7 +2341,10 @@ where
                 let has_open_evidence = open_progress
                     .as_ref()
                     .is_some_and(|progress| progress.contains_key(client_order_id));
-                ((intent_requires_lookup(intent) || has_open_evidence) && !has_matching_progress
+                let retryable_identity_probe = self.external_submission_fence
+                    && matches!(intent.state, IntentState::RetryableNotSubmitted { .. });
+                ((intent_requires_lookup(intent) || has_open_evidence || retryable_identity_probe)
+                    && !has_matching_progress
                     || !strategy_is_synchronized)
                     .then_some(client_order_id.clone())
             })
@@ -2351,7 +2357,10 @@ where
                     .as_ref()
                     .and_then(|progress| progress.get(client_order_id))
                     .is_some();
-                (intent_requires_lookup(intent) && !has_open_evidence)
+                ((intent_requires_lookup(intent)
+                    || (self.external_submission_fence
+                        && matches!(intent.state, IntentState::RetryableNotSubmitted { .. })))
+                    && !has_open_evidence)
                     .then_some(client_order_id.clone())
             })
             .collect::<Vec<_>>();
@@ -2621,13 +2630,7 @@ where
                 .await;
         }
         if mode == RuntimeTickMode::ExecutionEvent && lifecycle == StrategyLifecycle::Running {
-            if let Some(message) = self
-                .machine
-                .store()
-                .snapshot()
-                .external_position_blocker
-                .clone()
-            {
+            if let Some(message) = self.external_submission_blocker() {
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::PositionReconciliation,
                     client_order_id: None,
@@ -2783,6 +2786,7 @@ where
                 &mut report,
                 inputs.position.signed_quantity,
                 advance_reference_time_ms(now_ms, tick_started.elapsed()),
+                priority,
             )
             .await?
         {
@@ -2848,23 +2852,28 @@ where
         report: &mut RuntimeTickReport,
         observed_quantity: Decimal,
         now_ms: u64,
+        priority: Option<&PeriodicReadPriority>,
     ) -> Result<bool, RuntimeTickError> {
         let state = self.machine.store().snapshot();
-        if state.expected_exchange_position()? == observed_quantity
-            && state.external_position_blocker.is_none()
+        let mismatch = state.expected_exchange_position()? != observed_quantity;
+        let fenced = self.external_submission_fence || state.external_position_blocker.is_some();
+        let last_history_ms = state
+            .external_history_through_ms
+            .unwrap_or(state.created_at_ms);
+        if !mismatch
+            && !fenced
+            && now_ms.saturating_sub(last_history_ms) < EXTERNAL_HISTORY_AUDIT_INTERVAL_MS
         {
             return Ok(true);
         }
-        let (exchange, symbol, from_ms) =
-            (state.exchange, state.symbol.clone(), state.created_at_ms);
+        let (exchange, symbol, from_ms) = (state.exchange, state.symbol.clone(), last_history_ms);
         // Persist the observation before awaiting history so neither a later fast
         // event nor restart can authorize placements using the stale manual budget.
-        self.machine.block_external_inventory(
-            "account position requires execution-proven external inventory reconciliation".into(),
-            now_ms,
-        )?;
+        if mismatch || fenced {
+            self.fence_external_submissions(now_ms)?;
+        }
         let started = Instant::now();
-        let observation = tokio::time::timeout(Duration::from_secs(3), async {
+        let read = tokio::time::timeout(Duration::from_secs(3), async {
             let history = self
                 .gateway
                 .account_position_history(exchange, &symbol, from_ms, now_ms)
@@ -2877,11 +2886,22 @@ where
                 ));
             }
             Ok(history)
-        })
-        .await;
+        });
+        let observation = if let Some(priority) = priority {
+            match priority.read(read).await {
+                Some(result) => result,
+                None => return Ok(false),
+            }
+        } else {
+            read.await
+        };
         let history = match observation {
             Ok(Ok(history)) => history,
             Ok(Err(error)) => {
+                self.fence_external_submissions(advance_reference_time_ms(
+                    now_ms,
+                    started.elapsed(),
+                ))?;
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::PositionReconciliation,
                     client_order_id: None,
@@ -2890,6 +2910,10 @@ where
                 return Ok(false);
             }
             Err(_) => {
+                self.fence_external_submissions(advance_reference_time_ms(
+                    now_ms,
+                    started.elapsed(),
+                ))?;
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::PositionReconciliation,
                     client_order_id: None,
@@ -2903,8 +2927,15 @@ where
             observed_quantity,
             advance_reference_time_ms(now_ms, started.elapsed()),
         ) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                self.external_submission_fence = false;
+                Ok(true)
+            }
             Err(StrategyMachineError::InvalidState(error)) => {
+                self.fence_external_submissions(advance_reference_time_ms(
+                    now_ms,
+                    started.elapsed(),
+                ))?;
                 report.blockers.push(RuntimeBlocker {
                     stage: RuntimeStage::PositionReconciliation,
                     client_order_id: None,
@@ -2912,8 +2943,35 @@ where
                 });
                 Ok(false)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                self.external_submission_fence = true;
+                Err(error.into())
+            }
         }
+    }
+
+    fn external_submission_blocker(&self) -> Option<String> {
+        self.machine
+            .store()
+            .snapshot()
+            .external_position_blocker
+            .clone()
+            .or_else(|| {
+                self.external_submission_fence.then(|| {
+                    "external inventory observation is fenced pending durable reconciliation".into()
+                })
+            })
+    }
+
+    fn fence_external_submissions(&mut self, now_ms: u64) -> Result<(), RuntimeTickError> {
+        // The volatile fence is set first: a failed strategy WAL must not leave
+        // the separate intent WAL able to authorize a subsequent network write.
+        self.external_submission_fence = true;
+        self.machine.block_external_inventory(
+            "account position requires execution-proven external inventory reconciliation".into(),
+            now_ms,
+        )?;
+        Ok(())
     }
 
     fn prepare_ready_replacement_submissions(
@@ -2921,6 +2979,9 @@ where
         report: &RuntimeTickReport,
         now_ms: u64,
     ) -> Result<Vec<OrderIntent>, RuntimeTickError> {
+        if self.external_submission_fence {
+            return Ok(Vec::new());
+        }
         let ready = {
             let state = self.machine.store().snapshot();
             let retryable_ids = self
@@ -3055,6 +3116,14 @@ where
         now_ms: u64,
         replacements_only: bool,
     ) -> Result<(), RuntimeTickError> {
+        if let Some(message) = self.external_submission_blocker() {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::PositionReconciliation,
+                client_order_id: None,
+                message,
+            });
+            return Ok(());
+        }
         let submissions_started = Instant::now();
         let (ready, exchange) = {
             let state = self.machine.store().snapshot();
@@ -3606,6 +3675,7 @@ where
                 &mut report,
                 inputs.position.signed_quantity,
                 advance_reference_time_ms(now_ms, exit_started.elapsed()),
+                None,
             )
             .await?
         {
@@ -10485,6 +10555,157 @@ mod tests {
             signed_quantity: manual_quantity,
         });
         fills
+    }
+
+    #[tokio::test]
+    async fn manual_review_net_zero_external_overclose_is_not_hidden_by_equal_position() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let baseline = PositionBaseline {
+            signed_quantity: Decimal::new(-5, 1),
+            entry_price: Some(Decimal::new(1014, 0)),
+        };
+        let machine = machine_with_baseline(config(None), &rules, baseline.clone());
+        let opening_id = opening_id(&machine);
+        let quantity = machine.store().snapshot().orders[&opening_id]
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        gateway.set_position(baseline.signed_quantity, baseline.entry_price);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::ZERO);
+        gateway.set_position(baseline.signed_quantity - quantity, baseline.entry_price);
+        runtime.tick(1_200).await.unwrap();
+        let mut history = account_fills_with_manual(&gateway, Decimal::new(6, 1));
+        history.push(crate::exchange::funding::FundingAccountFill {
+            trade_id: "manual-execution-002".into(),
+            exchange_order_id: "manual-order-002".into(),
+            at_ms: 1_260,
+            signed_quantity: Decimal::new(-6, 1),
+        });
+        gateway.state.lock().unwrap().account_history_result = Some(Ok(history));
+        gateway.set_market_price(Decimal::new(1014, 0), 11_300);
+        let before = gateway.placement_call_count();
+        let report = runtime.tick(11_300).await.unwrap();
+        assert!(
+            report.is_blocked(),
+            "net equality must not hide an external prefix overclose"
+        );
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .external_position_blocker
+                .is_some()
+        );
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .external_fills
+                .is_empty()
+        );
+        assert_eq!(gateway.placement_call_count(), before);
+    }
+
+    #[tokio::test]
+    async fn manual_review_failed_blocker_write_fences_later_fast_submission() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        let (source_id, shape, _) = accepted_add_order(runtime.machine());
+        gateway.fill_order(&source_id, shape.price.unwrap(), Decimal::new(1, 3));
+        runtime.maximum_submissions_per_tick = 0;
+        runtime
+            .tick_execution_event(1_300, Some(&gateway.exchange_order_id(&source_id)))
+            .await
+            .unwrap();
+        assert!(
+            !runtime
+                .machine()
+                .store()
+                .snapshot()
+                .ready_intents(1_301)
+                .unwrap()
+                .is_empty()
+        );
+        runtime.maximum_submissions_per_tick = 100;
+        let expected = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .expected_exchange_position()
+            .unwrap();
+        gateway.set_position(expected + Decimal::new(2, 1), Some(Decimal::new(1014, 0)));
+        runtime.machine_mut().store_mut().fail_next_write();
+        let before = gateway.placement_call_count();
+        assert!(runtime.tick(1_400).await.is_err());
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .external_position_blocker
+                .is_none()
+        );
+        let report = runtime.tick_execution_event(1_500, None).await.unwrap();
+        assert!(
+            report.submissions.is_empty(),
+            "failed strategy WAL write must still fence the healthy intent WAL"
+        );
+        assert_eq!(gateway.placement_call_count(), before);
+    }
+
+    #[tokio::test]
+    async fn manual_review_periodic_audit_commit_failure_fences_queued_submissions() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        deploy_running_short_grid(&mut runtime, &gateway).await;
+        let (source_id, shape, _) = accepted_add_order(runtime.machine());
+        gateway.fill_order(&source_id, shape.price.unwrap(), Decimal::new(1, 3));
+        runtime.maximum_submissions_per_tick = 0;
+        runtime
+            .tick_execution_event(1_300, Some(&gateway.exchange_order_id(&source_id)))
+            .await
+            .unwrap();
+        runtime.maximum_submissions_per_tick = 100;
+        let expected = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .expected_exchange_position()
+            .unwrap();
+        gateway.set_position(expected, Some(Decimal::new(1014, 0)));
+        let mut history = account_fills_with_manual(&gateway, Decimal::new(-2, 1));
+        history.push(crate::exchange::funding::FundingAccountFill {
+            trade_id: "manual-execution-002".into(),
+            exchange_order_id: "manual-order-002".into(),
+            at_ms: 1_260,
+            signed_quantity: Decimal::new(2, 1),
+        });
+        gateway.state.lock().unwrap().account_history_result = Some(Ok(history));
+        gateway.set_market_price(Decimal::new(1014, 0), 11_300);
+        runtime.machine_mut().store_mut().fail_next_write();
+        let before = gateway.placement_call_count();
+        assert!(runtime.tick(11_300).await.is_err());
+        let report = runtime.tick_execution_event(11_500, None).await.unwrap();
+        assert!(
+            report.submissions.is_empty(),
+            "a failed periodic audit commit must fence even with an unchanged net position"
+        );
+        assert_eq!(gateway.placement_call_count(), before);
     }
 
     #[tokio::test]

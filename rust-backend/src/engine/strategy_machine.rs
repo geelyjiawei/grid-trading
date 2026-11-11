@@ -7873,6 +7873,118 @@ mod tests {
     }
 
     #[test]
+    fn manual_review_retryable_unknown_submission_cannot_be_adopted_as_external() {
+        let mut machine = manual_machine();
+        let opening = opening_id(machine.store().snapshot());
+        let quantity = machine.store().snapshot().orders[&opening].shape.quantity;
+        accept_strategy_order(&mut machine, &opening, "owned-opening", 101);
+        let (mut snapshot, valued) = single_valued_trade(
+            &machine,
+            opening,
+            ValuedTradeFixture {
+                exchange_order_id: "owned-opening",
+                trade_id: "owned-opening-trade",
+                price: decimal(1012),
+                quantity,
+                trade_time_ms: 120,
+                applied_at_ms: 130,
+            },
+        );
+        snapshot.order.exchange = Exchange::Binance;
+        machine
+            .apply_valued_execution(&snapshot, &valued, 130)
+            .unwrap();
+        let order = machine
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| order.shape.reduce_only && order.tracking == StrategyOrderTracking::Ready)
+            .unwrap()
+            .clone();
+        let mut intent =
+            OrderIntent::prepare(order.client_order_id, Exchange::Binance, order.shape, 140)
+                .unwrap();
+        machine.synchronize_intent(&intent, 140).unwrap();
+        intent.state = IntentState::SubmitUnknown {
+            message: "lost acknowledgement".into(),
+        };
+        machine.synchronize_intent(&intent, 141).unwrap();
+        intent.state = IntentState::RetryableNotSubmitted {
+            message: "negative lookup after ten seconds".into(),
+        };
+        machine.synchronize_intent(&intent, 142).unwrap();
+        let history = external_history(vec![
+            crate::exchange::funding::FundingAccountFill {
+                trade_id: "owned-opening-trade".into(),
+                exchange_order_id: "owned-opening".into(),
+                at_ms: 120,
+                signed_quantity: -quantity,
+            },
+            crate::exchange::funding::FundingAccountFill {
+                trade_id: "late-owned-fill".into(),
+                exchange_order_id: "late-owned-order".into(),
+                at_ms: 150,
+                signed_quantity: Decimal::new(1, 1),
+            },
+        ]);
+        assert!(
+            machine
+                .reconcile_external_inventory(&history, Decimal::new(-32, 1), 201)
+                .is_err()
+        );
+        assert!(machine.store().snapshot().external_fills.is_empty());
+    }
+
+    #[test]
+    fn manual_review_incremental_history_retains_prior_evidence_and_overlaps_exactly() {
+        let mut machine = manual_machine();
+        let first = external_fill("1", Decimal::new(2, 1), 200);
+        machine
+            .reconcile_external_inventory(
+                &external_history(vec![first.clone()]),
+                Decimal::new(-3, 1),
+                201,
+            )
+            .unwrap();
+        let mut next = external_history(vec![first, external_fill("2", Decimal::new(-1, 1), 250)]);
+        next.from_ms = 200;
+        next.through_ms = 300;
+        machine
+            .reconcile_external_inventory(&next, Decimal::new(-4, 1), 301)
+            .unwrap();
+        assert_eq!(machine.store().snapshot().external_fills.len(), 2);
+        assert_eq!(
+            machine
+                .store()
+                .snapshot()
+                .manual_position_quantity()
+                .unwrap(),
+            Decimal::new(-4, 1)
+        );
+        assert_eq!(
+            machine.store().snapshot().external_history_through_ms,
+            Some(300)
+        );
+        let before = machine.store().snapshot().clone();
+        let mut stale = next.clone();
+        stale.from_ms = 201;
+        assert!(
+            machine
+                .reconcile_external_inventory(&stale, Decimal::new(-4, 1), 302)
+                .is_err()
+        );
+        assert_eq!(machine.store().snapshot(), &before);
+        let mut suffix = external_history(vec![]);
+        suffix.from_ms = 300;
+        suffix.through_ms = 400;
+        machine
+            .reconcile_external_inventory(&suffix, Decimal::new(-4, 1), 401)
+            .unwrap();
+        assert_eq!(machine.store().snapshot().external_fills.len(), 2);
+    }
+
+    #[test]
     fn manual_position_funding_and_profit_exclude_manual_inventory() {
         use crate::exchange::{
             PositionLeg, PositionSide, PositionSnapshot,

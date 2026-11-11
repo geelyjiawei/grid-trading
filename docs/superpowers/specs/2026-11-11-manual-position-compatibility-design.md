@@ -15,7 +15,8 @@ quantity/ownership/deduplication checks, and durable-before-submission writes.
   exchange order ID, trade ID, signed quantity and execution time. A position
   difference alone is never evidence of a manual trade.
 - Replay complete official account execution history from strategy creation on
-  reconciliation. Exclude and verify owned executions using durable order/trade
+  initial reconciliation, then inclusive incremental windows from the last
+  durable verified-through timestamp. Exclude and verify owned executions using durable order/trade
   identities. Reject unknown/pending owned executions, conflicting duplicates,
   incomplete/truncated history, ambiguous creation-time fills, and reversed or
   overclosed external inventory. Never rewrite the baseline to make totals fit.
@@ -32,15 +33,27 @@ quantity/ownership/deduplication checks, and durable-before-submission writes.
 ## Integration And Limits
 
 Normal fill-to-replacement execution must not acquire a new REST dependency.
-Periodic position mismatches invoke bounded read-only history reconciliation,
+Periodic position mismatches and a ten-second independent history audit invoke bounded read-only history reconciliation,
 re-read the authoritative position, and commit external evidence before allowing
-further placements. Persist a reconciliation blocker across recovery so a fast
-event cannot bypass an already-observed external inventory conflict.
+further placements. History audits yield to execution/stop priority. Independently
+auditing executions is necessary because equal-and-opposite external fills can
+hide a prefix overclose behind an unchanged position. Persist a reconciliation
+blocker across recovery and set a volatile submission fence before attempting
+that write, so even a failed strategy WAL cannot authorize writes through the
+separate intent WAL. Retryable submissions without a bound exchange identity
+cannot authorize new external-fill adoption; probe their exact client IDs while
+fenced and wait for positive ownership evidence.
 
 Exchange-side manual orders cannot be intercepted. Between an external trade and
 its observation the application cannot promise physical isolation in a netted
 account. Cross margin, shared leverage/balance, forced liquidations, opposing
 positions and subaccount migration are not solved by virtual ownership.
+
+Source completeness/work bounds are deliberate fail-closed limits: Binance
+89 days, Aster 90 days, Bybit supported historical retention and 256 requests,
+and Hyperliquid 10000 retained account fills/64 pages. Older or saturated
+histories may require manual reconciliation rather than automatic adoption.
+These are availability limits, not permission to skip evidence.
 
 Old files deserialize with empty external history. Legacy boundaries that cannot
 be proven remain blocked rather than silently adopted. Do not modify production

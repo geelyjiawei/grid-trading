@@ -142,7 +142,8 @@ pub(super) fn reconcile_history(
 ) -> Result<(BTreeMap<String, FundingAccountFill>, Decimal), StrategyStateError> {
     if history.exchange != state.exchange
         || history.symbol != state.symbol
-        || history.from_ms != state.created_at_ms
+        || (history.from_ms != state.created_at_ms
+            && state.external_history_through_ms != Some(history.from_ms))
         || history.through_ms < history.from_ms
         || history.through_ms > now_ms
         || state
@@ -222,7 +223,16 @@ pub(super) fn reconcile_history(
     {
         return Err(invalid("complete account history omits an owned execution"));
     }
-    let mut external = BTreeMap::new();
+    let mut external = state.external_fills.clone();
+    if state
+        .external_fills
+        .values()
+        .any(|fill| fill.at_ms >= history.from_ms && account.get(&fill.trade_id) != Some(fill))
+    {
+        return Err(invalid(
+            "account history omits confirmed external executions in its coverage interval",
+        ));
+    }
     for (key, fill) in account {
         if let Some(owned) = owned_trades.get(&key) {
             if owned != &fill {
@@ -235,7 +245,14 @@ pub(super) fn reconcile_history(
                 "account history contains a pending owned execution",
             ));
         } else {
-            external.insert(key, fill);
+            if external
+                .insert(key, fill.clone())
+                .is_some_and(|previous| previous != fill)
+            {
+                return Err(invalid(
+                    "account history rewrites confirmed external executions",
+                ));
+            }
         }
     }
     if state
@@ -245,6 +262,24 @@ pub(super) fn reconcile_history(
     {
         return Err(invalid(
             "account history omits or rewrites confirmed external executions",
+        ));
+    }
+    let unbound_retryable = state.orders.values().any(|order| {
+        order.exchange_order_id.is_none()
+            && matches!(
+                order.tracking,
+                StrategyOrderTracking::Intent {
+                    state: IntentState::RetryableNotSubmitted { .. }
+                }
+            )
+    });
+    if unbound_retryable
+        && external
+            .iter()
+            .any(|(key, fill)| state.external_fills.get(key) != Some(fill))
+    {
+        return Err(invalid(
+            "retryable owned submissions have unresolved identities; new external fills cannot be adopted",
         ));
     }
     let manual = replay_manual_quantity(state, &external, history.through_ms)?;
