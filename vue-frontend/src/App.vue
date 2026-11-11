@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watchEffect } from "vue";
 import { ApiError, api } from "./api/client";
 import type {
   ApiConfigResponse,
@@ -28,13 +28,12 @@ import StrategyOverview from "./components/StrategyOverview.vue";
 import ProfitProtectionPanel from "./components/ProfitProtectionPanel.vue";
 import ExchangeRecordsPanel from "./components/ExchangeRecordsPanel.vue";
 import { exchangeName, quoteAsset, strategyCanStop } from "./format";
-import { matchingStrategyRisk } from "./strategy-profit";
+import { matchingStrategyRisk, PRIOR_PROFIT_DISPLAY_MAX_AGE_MS, PROFIT_SNAPSHOT_MAX_AGE_MS } from "./strategy-profit";
 
 const exchanges: Exchange[] = ["binance", "aster", "bybit", "trade_xyz"];
 const SYMBOL_REFRESH_DELAY_MS = 450;
 const PRICE_POLL_INTERVAL_MS = 5_000;
 const SLOW_MARKET_POLL_INTERVAL_MS = 30_000;
-const PROFIT_SNAPSHOT_MAX_AGE_MS = 60_000;
 type ColorTheme = "dark" | "light";
 interface MarketRefreshOptions {
   price: boolean;
@@ -71,7 +70,6 @@ const tradingEnabled = ref(false);
 const selectedStatus = ref<GridStatus | null>(null);
 const protectionRefreshKey = ref(0);
 const risk = ref<RiskSnapshot | null>(null);
-const riskReceivedAt = ref(0);
 const profitClock = ref(Date.now());
 const profitSnapshots = ref<Record<string, { risk: RiskSnapshot; receivedAt: number }>>({});
 const positions = ref<PositionSnapshot[]>([]);
@@ -117,12 +115,44 @@ const profitAttempts = new Map<string, number>();
 let profitRefreshRunning = false;
 let disposed = false;
 
-const visibleRisk = computed(() =>
-  profitClock.value - riskReceivedAt.value < PROFIT_SNAPSHOT_MAX_AGE_MS ? risk.value : null,
-);
+function displaySnapshot(snapshot: { risk: RiskSnapshot; receivedAt: number } | undefined): RiskSnapshot | null {
+  if (!snapshot) return null;
+  return snapshot.risk.profit_data_status !== undefined
+    || profitClock.value - snapshot.receivedAt < PROFIT_SNAPSHOT_MAX_AGE_MS ? snapshot.risk : null;
+}
+
+const visibleRisk = computed(() => {
+  if (selectedStatus.value && (selectedStatus.value.exchange !== activeExchange.value
+    || selectedStatus.value.symbol !== symbol.value)) return null;
+  const key = selectedStatus.value && profitKey(selectedStatus.value);
+  return key ? displaySnapshot(profitSnapshots.value[key]) : risk.value;
+});
 const strategyRisks = computed(() => Object.values(profitSnapshots.value)
-  .filter(snapshot => profitClock.value - snapshot.receivedAt < PROFIT_SNAPSHOT_MAX_AGE_MS)
-  .map(snapshot => snapshot.risk));
+  .map(displaySnapshot).filter((snapshot): snapshot is RiskSnapshot => snapshot !== null));
+
+// Display expiry must still advance when every network read is stuck. One local timer, no reads.
+watchEffect(onCleanup => {
+  const now = profitClock.value;
+  let deadline = Infinity;
+  for (const snapshot of Object.values(profitSnapshots.value)) {
+    const observedAt = snapshot.risk.profit_observed_at_ms;
+    const boundaries = snapshot.risk.profit_data_status === undefined
+      ? [snapshot.receivedAt + PROFIT_SNAPSHOT_MAX_AGE_MS]
+      : typeof observedAt === "number" && Number.isSafeInteger(observedAt) && observedAt > 0
+        && observedAt <= snapshot.receivedAt
+        ? [observedAt + PROFIT_SNAPSHOT_MAX_AGE_MS + 1, observedAt + PRIOR_PROFIT_DISPLAY_MAX_AGE_MS + 1] : [];
+    const riskAt = snapshot.risk.risk_observed_at_ms;
+    if (typeof riskAt === "number" && Number.isSafeInteger(riskAt) && riskAt > 0 && riskAt <= snapshot.receivedAt) {
+      boundaries.push(riskAt + PROFIT_SNAPSHOT_MAX_AGE_MS + 1);
+    }
+    for (const boundary of boundaries) {
+      if (boundary > now) deadline = Math.min(deadline, boundary);
+    }
+  }
+  if (!Number.isFinite(deadline)) return;
+  const timer = window.setTimeout(() => { profitClock.value = Date.now(); }, Math.max(1, deadline - Date.now()));
+  onCleanup(() => window.clearTimeout(timer));
+});
 
 function profitKey(grid: GridStatus): string | null {
   return grid.run_id ? `${grid.exchange}:${grid.symbol}:${grid.run_id}` : null;
@@ -158,9 +188,23 @@ function requestRisk(exchange: Exchange, requestedSymbol: string): Promise<RiskS
     } else {
       invalidate();
     }
-  }, () => {
+  }, (reason: unknown) => {
     finish();
-    invalidate();
+    if (disposed || !authenticated.value) return;
+    const previous = requestedKey ? profitSnapshots.value[requestedKey] : undefined;
+    const transient = !(reason instanceof ApiError) || reason.status === 429
+      || reason.status === 408 || reason.status >= 500;
+    if (requestedKey && previous && transient
+      && ["verified", "stale", "refreshing"].includes(previous.risk.profit_data_status ?? "")) {
+      profitSnapshots.value = { ...profitSnapshots.value, [requestedKey]: {
+        ...previous,
+        risk: { ...previous.risk, profit_data_status: "stale",
+          profit_refresh_error: reason instanceof Error ? reason.message : "收益查询暂不可用" },
+      } };
+      profitClock.value = Date.now();
+    } else {
+      invalidate();
+    }
   });
   return request;
 }
@@ -401,7 +445,7 @@ async function refreshMarket(options: MarketRefreshOptions = fullMarketRefresh):
     if (options.risk) {
       requests.push(settle(
         requestRisk(exchange, requestedSymbol),
-        (value) => { risk.value = value; riskReceivedAt.value = Date.now(); },
+        (value) => { risk.value = value; },
         () => { risk.value = null; },
       ));
     }
@@ -814,6 +858,7 @@ onUnmounted(() => {
         :grids="grids"
         :risks="strategyRisks"
         :current-risk="visibleRisk"
+        :profit-now="profitClock"
         :active-exchange="activeExchange"
         :active-symbol="symbol"
         :loading="loading"
@@ -824,6 +869,7 @@ onUnmounted(() => {
         class="dashboard-span bot-workspace"
         :status="selectedStatus"
         :risk="visibleRisk"
+        :profit-now="profitClock"
         :stop-busy="stopBusy"
         :stop-error="stopError"
         @stop="stopStrategy"

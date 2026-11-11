@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { GridStatus, RiskSnapshot } from "../api/types";
-import { matchingStrategyRisk, profitTone, strategyFundingIncome, strategyNetProfit } from "../strategy-profit";
+import { currentStrategyObservation, matchingStrategyRisk, profitTone, strategyFundingIncome, strategyProfitDisplay } from "../strategy-profit";
 import {
   directionName,
   formatExactDecimal,
@@ -17,6 +17,7 @@ const props = withDefaults(defineProps<{
   risk: RiskSnapshot | null;
   stopBusy?: boolean;
   stopError?: string;
+  profitNow?: number;
 }>(), {
   stopBusy: false,
   stopError: "",
@@ -24,16 +25,18 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{ stop: [] }>();
 const stopConfirmation = ref(false);
-const currentRisk = computed(() => matchingStrategyRisk(props.status, props.risk));
+const profitDisplay = computed(() => strategyProfitDisplay(props.status, props.risk, props.profitNow));
+const currentRisk = computed(() => currentStrategyObservation(props.status, props.risk, props.profitNow));
+const profitRisk = computed(() => profitDisplay.value.value === null ? currentRisk.value : matchingStrategyRisk(props.status, props.risk));
 const realizedNetProfit = computed(
-  () => currentRisk.value?.realized_net_profit ?? props.status?.realized_net_profit ?? props.status?.total_profit,
+  () => profitRisk.value?.realized_net_profit ?? props.status?.realized_net_profit ?? props.status?.total_profit,
 );
-const totalEquityProfit = computed(() => strategyNetProfit(props.status, currentRisk.value));
-const fundingNetIncome = computed(() => strategyFundingIncome(props.status, currentRisk.value));
+const totalEquityProfit = computed(() => profitDisplay.value.value);
+const fundingNetIncome = computed(() => strategyFundingIncome(props.status, profitRisk.value));
 const gridUnrealizedProfit = computed(
-  () => currentRisk.value?.grid_unrealised_pnl ?? currentRisk.value?.unrealised_pnl ?? null,
+  () => profitRisk.value?.grid_unrealised_pnl ?? profitRisk.value?.unrealised_pnl ?? null,
 );
-const totalFee = computed(() => currentRisk.value?.total_fee ?? props.status?.total_fee);
+const totalFee = computed(() => profitRisk.value?.total_fee ?? props.status?.total_fee);
 const totalVolume = computed(() => currentRisk.value?.total_volume ?? props.status?.total_volume);
 const completedPairs = computed(
   () => currentRisk.value?.completed_pairs ?? props.status?.completed_pairs ?? 0,
@@ -257,6 +260,10 @@ function positionLabel(value: unknown): string {
         <div><span>完成配对</span><strong>{{ completedPairs }}</strong></div>
         <div><span>方向 / 模式</span><strong>{{ directionName(status.direction) }} · {{ status.grid_mode === "geometric" ? "等比" : "等差" }}</strong></div>
       </div>
+      <p v-if="profitDisplay.state !== 'verified'" class="form-hint" data-testid="profit-freshness" role="status">
+        <mark v-if="profitDisplay.state === 'stale'">上次核对 <time :datetime="new Date(profitDisplay.observedAtMs!).toISOString()">{{ new Date(profitDisplay.observedAtMs!).toLocaleString('zh-CN', { hour12: false }) }}</time> · 非当前收益</mark>
+        {{ profitDisplay.reason }}
+      </p>
       <p class="form-hint">总权益利润＝本轮已实现盈亏＋本轮浮动盈亏－成交手续费＋已结算资金费。已实现净利润仅扣成交手续费，不含资金费。不含旧仓和手动仓位盈亏；未来平仓手续费尚未发生，未计入。</p>
       <p class="form-hint">已结算资金费：正数收入，负数支出。资金费核对最多延迟60秒，并非逐笔实时更新。</p>
       <p v-if="totalEquityProfit == null" class="form-hint">总权益利润等待当前策略的交易所权威风险快照、手续费估值及已结算资金费核实，不使用旧数据或账户整仓盈亏代替。</p>

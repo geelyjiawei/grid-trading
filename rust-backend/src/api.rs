@@ -71,6 +71,7 @@ const PREVIEW_MARKET_MAX_AGE_MS: u64 = 15_000;
 const PREVIEW_MARKET_FUTURE_SKEW_MS: u64 = 1_000;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const MAX_CONCURRENT_RISK_SNAPSHOTS: usize = 1;
+const MAX_CONCURRENT_RISK_QUERIES: usize = 2;
 const MAX_CONCURRENT_FULL_CATALOG_SCANS: usize = 1;
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "idempotency-replayed";
 
@@ -105,6 +106,54 @@ enum AdminAuthentication {
     Configured(AdminTokenVerifier),
 }
 
+#[derive(Default)]
+struct RiskQueryBudget {
+    active: std::sync::Mutex<BTreeSet<String>>,
+}
+
+impl RiskQueryBudget {
+    fn try_enter(self: &Arc<Self>, key: String) -> Option<RiskQueryLease> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active.len() >= MAX_CONCURRENT_RISK_QUERIES || !active.insert(key.clone()) {
+            return None;
+        }
+        Some(RiskQueryLease {
+            budget: Arc::clone(self),
+            key,
+        })
+    }
+}
+
+struct RiskQueryLease {
+    budget: Arc<RiskQueryBudget>,
+    key: String,
+}
+
+impl Drop for RiskQueryLease {
+    fn drop(&mut self) {
+        self.budget
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
+
+fn risk_query_busy() -> Response {
+    let mut response = api_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "risk_snapshot_busy",
+        "An authoritative risk snapshot is already running; retry shortly",
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("2"));
+    response
+}
+
 #[derive(Clone)]
 struct ApiState {
     authentication: AdminAuthentication,
@@ -118,6 +167,7 @@ struct ApiState {
     exchange_config_store: Option<EncryptedExchangeConfigStore>,
     exchange_configuration_gate: Arc<tokio::sync::Mutex<()>>,
     risk_snapshot_gate: Arc<tokio::sync::Semaphore>,
+    risk_query_budget: Arc<RiskQueryBudget>,
     full_catalog_scan_gate: Arc<tokio::sync::Semaphore>,
     strategy_root: PathBuf,
 }
@@ -148,6 +198,7 @@ impl ApiState {
             risk_snapshot_gate: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_RISK_SNAPSHOTS,
             )),
+            risk_query_budget: Arc::new(RiskQueryBudget::default()),
             full_catalog_scan_gate: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_FULL_CATALOG_SCANS,
             )),
@@ -177,6 +228,7 @@ impl ApiState {
             risk_snapshot_gate: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_RISK_SNAPSHOTS,
             )),
+            risk_query_budget: Arc::new(RiskQueryBudget::default()),
             full_catalog_scan_gate: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_FULL_CATALOG_SCANS,
             )),
@@ -263,6 +315,7 @@ impl ApiState {
             risk_snapshot_gate: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_RISK_SNAPSHOTS,
             )),
+            risk_query_budget: Arc::new(RiskQueryBudget::default()),
             full_catalog_scan_gate: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_FULL_CATALOG_SCANS,
             )),
@@ -2128,69 +2181,26 @@ async fn stable_runtime_catalog(
         ));
     }
 
-    for _ in 0..3 {
-        let before_runtime = runtime.entries().await;
-        let catalog =
-            load_runtime_catalog_snapshot(state.strategy_root.clone(), before_runtime.as_slice())
-                .await?;
-        let after_runtime = runtime.entries().await;
-        if before_runtime != after_runtime {
-            continue;
-        }
-        if !catalog.anomalies().is_empty() {
-            return Err(api_error(
+    let (catalog, entries) = runtime
+        .registry()
+        .query_catalog(None)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "committed runtime query snapshot unavailable");
+            api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "strategy_catalog_anomaly",
-                "The active strategy catalog contains unresolved anomalies",
-            ));
-        }
-        if !runtime_catalog_matches(&catalog, &after_runtime) {
-            return Err(api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "runtime_catalog_mismatch",
-                "The runtime registry and durable strategy catalog do not agree",
-            ));
-        }
-        return Ok((catalog, after_runtime));
+                "strategy_status_changed",
+                "The strategy state changed while it was being read; retry the status request",
+            )
+        })?;
+    if !runtime_catalog_matches(&catalog, &entries) {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_catalog_mismatch",
+            "The runtime registry and committed strategy snapshots do not agree",
+        ));
     }
-    Err(api_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "strategy_status_changed",
-        "The strategy state changed while it was being read; retry the status request",
-    ))
-}
-
-async fn load_runtime_catalog_snapshot(
-    root: PathBuf,
-    runtime_entries: &[RuntimeRegistryEntry],
-) -> Result<StrategyCatalog, Response> {
-    let run_ids = runtime_entries
-        .iter()
-        .map(|entry| entry.run_id.clone())
-        .collect::<Vec<_>>();
-    match tokio::task::spawn_blocking(move || {
-        load_strategy_catalog_for_run_ids(root, run_ids.as_slice())
-    })
-    .await
-    {
-        Ok(Ok(catalog)) => Ok(catalog),
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "active strategy catalog could not be read");
-            Err(api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "strategy_catalog_unavailable",
-                "The active strategy catalog is unavailable",
-            ))
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "active strategy catalog task failed");
-            Err(api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "strategy_catalog_unavailable",
-                "The active strategy catalog is unavailable",
-            ))
-        }
-    }
+    Ok((catalog, entries))
 }
 
 async fn load_catalog_snapshot(root: PathBuf) -> Result<StrategyCatalog, Response> {
@@ -3435,52 +3445,26 @@ async fn observe_risk_strategy(
         );
     }
 
-    for _ in 0..3 {
-        let before_runtime = runtime.entries().await;
-        let catalog =
-            match load_risk_catalog(state.strategy_root.clone(), Some(before_runtime.as_slice()))
-                .await
-            {
-                Ok(catalog) => catalog,
-                Err(()) => {
-                    return build_risk_strategy_observation(
-                        None,
-                        runtime.entries().await,
-                        true,
-                        exchange,
-                        symbol,
-                        Some("strategy_catalog_unavailable"),
-                    );
-                }
-            };
-        let after_runtime = runtime.entries().await;
-        if before_runtime == after_runtime {
-            return build_risk_strategy_observation(
-                Some(catalog),
-                after_runtime,
+    match runtime
+        .registry()
+        .query_catalog(Some((exchange, symbol)))
+        .await
+    {
+        Ok((catalog, entries)) => {
+            build_risk_strategy_observation(Some(catalog), entries, true, exchange, symbol, None)
+        }
+        Err(error) => {
+            tracing::warn!(?exchange, symbol, error = %error, "committed risk query snapshot unavailable");
+            build_risk_strategy_observation(
+                None,
+                runtime.entries().await,
                 true,
                 exchange,
                 symbol,
-                None,
-            );
+                Some("strategy_status_changed"),
+            )
         }
     }
-
-    let runtime_entries = runtime.entries().await;
-    let catalog = load_risk_catalog(
-        state.strategy_root.clone(),
-        Some(runtime_entries.as_slice()),
-    )
-    .await
-    .ok();
-    build_risk_strategy_observation(
-        catalog,
-        runtime_entries,
-        true,
-        exchange,
-        symbol,
-        Some("strategy_status_changed"),
-    )
 }
 
 async fn load_risk_catalog(
@@ -3640,6 +3624,7 @@ fn no_store_runtime_risk_json(response: Value, runtime: &RuntimeMarketObservatio
         );
     };
     response.extend(runtime_fields);
+    response.insert("risk_observed_at_ms".into(), json!(unix_time_ms().ok()));
     no_store_json(StatusCode::OK, Value::Object(response))
 }
 
@@ -3654,19 +3639,15 @@ async fn exchange_risk(
         Ok(symbol) => symbol,
         Err(error) => return error.response(),
     };
-    let _risk_snapshot_permit = match Arc::clone(&state.risk_snapshot_gate).try_acquire_owned() {
+    let risk_snapshot_permit = match Arc::clone(&state.risk_snapshot_gate).try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => {
-            let mut response = api_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "risk_snapshot_busy",
-                "An authoritative risk snapshot is already running; retry shortly",
-            );
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("2"));
-            return response;
-        }
+        Err(_) => return risk_query_busy(),
+    };
+    let Some(_query_lease) = state
+        .risk_query_budget
+        .try_enter(format!("{exchange:?}:{symbol}"))
+    else {
+        return risk_query_busy();
     };
     let gateway = match read_gateway(&state, exchange) {
         Ok(gateway) => gateway,
@@ -3684,6 +3665,59 @@ async fn exchange_risk(
 
     match selected {
         Some(StrategyCatalogSnapshot::Active(strategy)) => {
+            // History can take seconds. It must not hold the short snapshot
+            // slot or an execution lock, and the ledger is recaptured afterwards.
+            drop(risk_snapshot_permit);
+            let (strategy, runtime, history) = if state
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.recovery_completed())
+            {
+                let expected_run = strategy.run_id.clone();
+                let from_ms = strategy.created_at_ms;
+                let through = strategy_funding_cutoff(&strategy);
+                // Do not pin a large obsolete ledger across a slow network read.
+                drop(strategy);
+                let history = match through {
+                    Ok(through) => {
+                        collect_funding_history_range(
+                            gateway.as_ref(),
+                            exchange,
+                            &symbol,
+                            from_ms,
+                            through,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let current = observe_risk_strategy(&state, exchange, &symbol).await;
+                match current.selected {
+                    Some(StrategyCatalogSnapshot::Active(current_strategy))
+                        if current_strategy.run_id == expected_run
+                            && !current.runtime.advancing
+                            && current.runtime.state_error.is_none()
+                            && current.catalog_problem.is_none() =>
+                    {
+                        (current_strategy, current.runtime, history)
+                    }
+                    _ => {
+                        return api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "risk_snapshot_changed",
+                            "The strategy changed during verification; retry shortly",
+                        );
+                    }
+                }
+            } else {
+                let history = collect_strategy_funding_history(gateway.as_ref(), &strategy).await;
+                (strategy, runtime, history)
+            };
+            let runtime_has_risk = runtime.state_error.is_some();
+            let _short_snapshot_permit = match state.risk_snapshot_gate.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => return risk_query_busy(),
+            };
             let collected = match collect_strategy_shadow_view(gateway.as_ref(), &strategy).await {
                 Ok(collected) => collected,
                 Err(error) => return risk_collection_failure(exchange, &symbol, error),
@@ -3739,8 +3773,17 @@ async fn exchange_risk(
                     "funding attribution requires fully accounted strategy orders",
                 ))
             } else {
-                collect_strategy_funding(gateway.as_ref(), &strategy).await
+                history.and_then(|history| {
+                    crate::engine::attribute_strategy_funding(&strategy, &history)
+                })
             };
+            if !risk_revision_is_current(&state, &strategy).await {
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "risk_snapshot_changed",
+                    "The strategy changed during verification; retry shortly",
+                );
+            }
             let profit_fields = strategy_profit_fields(&strategy, profit_metrics, funding);
             let response = json!({
                 "version": 1,
@@ -4054,12 +4097,19 @@ async fn collect_orphan_cancel_targets(
     exchange: Exchange,
     symbol: &str,
 ) -> Result<Vec<AuthoritativeOrder>, OrphanTargetCollectionError> {
-    let (catalog, _) = stable_runtime_catalog(state)
+    let (catalog, entries) = stable_runtime_catalog(state)
         .await
         .map_err(|_| OrphanTargetCollectionError)?;
+    if entries
+        .iter()
+        .any(|entry| entry.exchange == exchange && entry.symbol == symbol && entry.advancing)
+    {
+        return Err(OrphanTargetCollectionError);
+    }
     let selected = catalog
         .select_live(exchange, symbol)
         .map_err(|_| OrphanTargetCollectionError)?;
+    let expected = selected.clone();
     let gateway = read_gateway(state, exchange).map_err(|_| OrphanTargetCollectionError)?;
     let mut targets = match selected {
         Some(StrategyCatalogSnapshot::Active(strategy)) => {
@@ -4084,6 +4134,38 @@ async fn collect_orphan_cancel_targets(
                 .collect::<Vec<_>>()
         }
     };
+    if let Some(runtime) = state
+        .runtime
+        .as_ref()
+        .filter(|runtime| runtime.recovery_completed())
+    {
+        let (current, entries) = runtime
+            .registry()
+            .query_catalog(Some((exchange, symbol)))
+            .await
+            .map_err(|_| OrphanTargetCollectionError)?;
+        if entries.iter().any(|entry| entry.advancing) {
+            return Err(OrphanTargetCollectionError);
+        }
+        let current = current
+            .select_live(exchange, symbol)
+            .map_err(|_| OrphanTargetCollectionError)?;
+        let same_revision = match (expected.as_ref(), current.as_ref()) {
+            (None, None) => true,
+            (
+                Some(StrategyCatalogSnapshot::Active(before)),
+                Some(StrategyCatalogSnapshot::Active(after)),
+            ) => before.run_id == after.run_id && before.revision == after.revision,
+            (
+                Some(StrategyCatalogSnapshot::Armed(before)),
+                Some(StrategyCatalogSnapshot::Armed(after)),
+            ) => before.run_id == after.run_id && before.revision == after.revision,
+            _ => false,
+        };
+        if !same_revision {
+            return Err(OrphanTargetCollectionError);
+        }
+    }
     targets.sort_by(|left, right| {
         left.client_order_id
             .cmp(&right.client_order_id)
@@ -4104,17 +4186,79 @@ async fn collect_strategy_funding(
     gateway: &dyn ReadOnlyExchangeGateway,
     strategy: &StrategyState,
 ) -> Result<FundingAttribution, SnapshotError> {
+    crate::engine::collect_strategy_funding_at(
+        gateway,
+        strategy,
+        strategy_funding_cutoff(strategy)?,
+    )
+    .await
+}
+
+async fn collect_strategy_funding_history(
+    gateway: &dyn ReadOnlyExchangeGateway,
+    strategy: &StrategyState,
+) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
+    let through_ms = strategy_funding_cutoff(strategy)?;
+    collect_funding_history_range(
+        gateway,
+        strategy.exchange,
+        &strategy.symbol,
+        strategy.created_at_ms,
+        through_ms,
+    )
+    .await
+}
+
+async fn collect_funding_history_range(
+    gateway: &dyn ReadOnlyExchangeGateway,
+    exchange: Exchange,
+    symbol: &str,
+    from_ms: u64,
+    through_ms: u64,
+) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        gateway.funding_history(exchange, symbol, from_ms, through_ms),
+    )
+    .await
+    .map_err(|_| SnapshotError::new("funding history query timed out"))?
+}
+
+fn strategy_funding_cutoff(strategy: &StrategyState) -> Result<u64, SnapshotError> {
     let now =
         unix_time_ms().map_err(|_| SnapshotError::new("funding query clock is unavailable"))?;
-    let through_ms = if matches!(
-        strategy.lifecycle,
-        StrategyLifecycle::Stopped | StrategyLifecycle::Closed
-    ) {
-        strategy.updated_at_ms.min(now)
-    } else {
-        now
+    Ok(
+        if matches!(
+            strategy.lifecycle,
+            StrategyLifecycle::Stopped | StrategyLifecycle::Closed
+        ) {
+            strategy.updated_at_ms.min(now)
+        } else {
+            now
+        },
+    )
+}
+
+async fn risk_revision_is_current(state: &ApiState, strategy: &StrategyState) -> bool {
+    let Some(runtime) = state
+        .runtime
+        .as_ref()
+        .filter(|runtime| runtime.recovery_completed())
+    else {
+        return true;
     };
-    crate::engine::collect_strategy_funding_at(gateway, strategy, through_ms).await
+    let Ok((catalog, entries)) = runtime
+        .registry()
+        .query_catalog(Some((strategy.exchange, &strategy.symbol)))
+        .await
+    else {
+        return false;
+    };
+    if entries.len() != 1 || entries[0].advancing {
+        return false;
+    }
+    matches!(catalog.select_live(strategy.exchange, &strategy.symbol), Ok(Some(StrategyCatalogSnapshot::Active(current)))
+        if current.run_id == strategy.run_id && current.revision == strategy.revision)
 }
 
 #[cfg(test)]
@@ -4135,12 +4279,16 @@ fn strategy_profit_fields(
             run_id = strategy.run_id.as_str(), error = %error, "strategy funding attribution is unavailable");
     }
     let fees_settled = strategy.pending_fee_valuation_count() == 0;
+    let funding_error = funding.as_ref().err().map(|error| error.message.clone());
     let funding = funding.ok();
     let net = metrics
         .filter(|_| fees_settled)
         .zip(funding)
         .and_then(|(metrics, funding)| metrics.total_equity_profit.checked_add(funding.net_income));
     json!({
+        "profit_data_status": if net.is_some() { "verified" } else { "unavailable" },
+        "profit_observed_at_ms": net.and_then(|_| funding.map(|funding| funding.through_ms)),
+        "profit_refresh_error": funding_error,
         "gross_profit": strategy.gross_realized_profit.to_string(),
         "realized_net_profit": metrics.filter(|_| fees_settled).map(|metrics| metrics.realized_net_profit.to_string()),
         "unrealised_pnl": metrics.map(|metrics| metrics.grid_unrealized_profit.to_string()),
@@ -4180,7 +4328,14 @@ async fn strategy_funding_audit(
             );
         }
     };
-    let _permit = match state.risk_snapshot_gate.try_acquire() {
+    let _query_lease = match state
+        .risk_query_budget
+        .try_enter(format!("funding:{}", run_id.as_str()))
+    {
+        Some(lease) => lease,
+        None => return risk_query_busy(),
+    };
+    let disk_permit = match state.full_catalog_scan_gate.try_acquire() {
         Ok(permit) => permit,
         Err(_) => {
             return api_error(
@@ -4206,6 +4361,7 @@ async fn strategy_funding_audit(
             );
         }
     };
+    drop(disk_permit);
     let Some(StrategyCatalogSnapshot::Active(strategy)) = catalog
         .entries()
         .iter()
@@ -5128,6 +5284,7 @@ mod tests {
     struct StrategyRiskGateway {
         open_orders: Vec<AuthoritativeOrder>,
         position: PositionSnapshot,
+        funding_block: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl ExchangeIdentityGateway for StrategyRiskGateway {
@@ -5145,6 +5302,10 @@ mod tests {
             from_ms: u64,
             through_ms: u64,
         ) -> Result<FundingHistorySnapshot, SnapshotError> {
+            if let Some((entered, release)) = &self.funding_block {
+                entered.notify_one();
+                release.notified().await;
+            }
             Ok(FundingHistorySnapshot {
                 exchange,
                 symbol: symbol.into(),
@@ -5386,6 +5547,7 @@ mod tests {
             StrategyRiskGateway {
                 open_orders,
                 position,
+                funding_block: None,
             },
         )
     }
@@ -6043,7 +6205,7 @@ mod tests {
     fn scoped_runtime_observation_requires_exact_identity_kind_and_lifecycle() {
         let directory = tempdir().unwrap();
         let (strategy, _) = persist_clean_running_strategy(directory.path());
-        let snapshot = StrategyCatalogSnapshot::Active(Box::new(strategy.clone()));
+        let snapshot = StrategyCatalogSnapshot::Active(Arc::new(strategy.clone()));
         let exact = RuntimeRegistryEntry {
             run_id: strategy.run_id.clone(),
             exchange: strategy.exchange,
@@ -6108,7 +6270,7 @@ mod tests {
     fn scoped_runtime_observation_fails_closed_for_missing_or_unowned_runtime() {
         let directory = tempdir().unwrap();
         let (strategy, _) = persist_clean_running_strategy(directory.path());
-        let snapshot = StrategyCatalogSnapshot::Active(Box::new(strategy.clone()));
+        let snapshot = StrategyCatalogSnapshot::Active(Arc::new(strategy.clone()));
 
         let missing = scoped_runtime_observation(
             true,
@@ -6262,6 +6424,128 @@ mod tests {
         assert_eq!(risk["profit_scope"], "strategy_owned_inventory");
         assert_eq!(risk["profit_calculation_error"], Value::Null);
         assert_eq!(risk["has_risk"], false);
+    }
+
+    #[tokio::test]
+    async fn recovered_queries_use_validated_runtime_state_without_replaying_disk_catalogs() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        let (strategy, _) = persist_clean_running_strategy(&root);
+        let settings = RuntimeSettings::new("USDT", 10_000, 100, 100).unwrap();
+        let runtime = Arc::new(RuntimeCoordinator::new(root, settings.clone()));
+        let gateway = ExchangeGatewayFactory::standard(ExchangeEnvironment::Testnet)
+            .unwrap()
+            .build(ExchangeCredentials::aster("1".repeat(64)).unwrap())
+            .unwrap()
+            .shared();
+        let report = runtime
+            .recover(&ConfiguredTestRuntimeProvider { gateway, settings })
+            .await
+            .unwrap();
+        assert_eq!(report.registered, vec![strategy.run_id.clone()]);
+        let state = ApiState::for_test(
+            verifier(),
+            false,
+            Arc::new(FileIdempotencyStore::new(
+                directory.path().join("idempotency"),
+            )),
+            Arc::new(DisabledStartGridCommand),
+        )
+        .with_strategy_root(directory.path().join("must-not-read-this-directory"))
+        .with_runtime(Arc::clone(&runtime));
+        let (catalog, entries) = stable_runtime_catalog(&state).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(catalog.entries()[0].run_id(), strategy.run_id.as_str());
+        let observation = observe_risk_strategy(&state, Exchange::Aster, "ANSEMUSDT").await;
+        assert_eq!(
+            observation.selected.unwrap().run_id(),
+            strategy.run_id.as_str()
+        );
+        assert!(observation.catalog_problem.is_none());
+        let unrelated = observe_risk_strategy(&state, Exchange::Aster, "MUUSDT").await;
+        assert!(unrelated.selected.is_none());
+        assert!(unrelated.catalog_problem.is_none());
+        assert!(risk_revision_is_current(&state, &strategy).await);
+        runtime
+            .registry()
+            .request_stop(&strategy.run_id, strategy.updated_at_ms + 1)
+            .await
+            .unwrap();
+        assert!(!risk_revision_is_current(&state, &strategy).await);
+    }
+
+    #[test]
+    fn risk_query_admission_bounds_unique_markets_and_releases_after_cancellation() {
+        let budget = Arc::new(RiskQueryBudget::default());
+        let first = budget.try_enter("binance:QUSDT".into()).unwrap();
+        assert!(budget.try_enter("binance:QUSDT".into()).is_none());
+        let second = budget.try_enter("aster:QUSDT".into()).unwrap();
+        assert!(budget.try_enter("bybit:QUSDT".into()).is_none());
+        drop(first);
+        let third = budget.try_enter("bybit:QUSDT".into()).unwrap();
+        drop((second, third));
+        assert!(budget.active.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_funding_does_not_hold_the_authoritative_snapshot_slot() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("strategies");
+        let (_, mut gateway) = persist_clean_running_strategy(&root);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        gateway.funding_block = Some((Arc::clone(&entered), Arc::clone(&release)));
+        let mut gateways = ExchangeGatewayRegistry::empty(Exchange::Aster);
+        gateways
+            .register_gateway(
+                Arc::new(gateway),
+                ExchangeEnvironment::Production,
+                "test",
+                None,
+            )
+            .unwrap();
+        let state = ApiState::for_test(
+            verifier(),
+            false,
+            Arc::new(FileIdempotencyStore::new(
+                directory.path().join("idempotency"),
+            )),
+            Arc::new(DisabledStartGridCommand),
+        )
+        .with_strategy_root(root)
+        .with_exchange_gateways(gateways);
+        let app = router_with_state(state.clone());
+        let first = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            state.risk_snapshot_gate.try_acquire().is_ok(),
+            "slow funding must not monopolize unrelated risk reads"
+        );
+        let duplicate = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/risk/ANSEMUSDT?exchange=aster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::TOO_MANY_REQUESTS);
+        release.notify_one();
+        let response = first.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["profit_data_status"], "verified");
+        assert!(response["profit_observed_at_ms"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -7559,6 +7843,7 @@ mod tests {
         fs::write(paths.state(), b"{").unwrap();
         let gateway = StrategyRiskGateway {
             open_orders: Vec::new(),
+            funding_block: None,
             position: PositionSnapshot {
                 exchange: Exchange::Aster,
                 symbol: "ANSEMUSDT".into(),
@@ -7700,6 +7985,7 @@ mod tests {
         FileArmedStrategyStateStore::create(paths.state(), armed).unwrap();
         let gateway = StrategyRiskGateway {
             open_orders: Vec::new(),
+            funding_block: None,
             position: PositionSnapshot {
                 exchange: Exchange::Aster,
                 symbol: "ANSEMUSDT".into(),

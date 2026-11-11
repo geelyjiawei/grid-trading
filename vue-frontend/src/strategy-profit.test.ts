@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GridStatus, RiskSnapshot } from "./api/types";
-import { strategyNetProfit } from "./strategy-profit";
+import { currentStrategyObservation, strategyNetProfit } from "./strategy-profit";
 
 const status: GridStatus = {
   run_id: "funding-run", exchange: "bybit", symbol: "BTCUSDT", running: true,
@@ -20,6 +20,39 @@ function risk(overrides: Record<string, unknown> = {}): RiskSnapshot {
 }
 
 describe("funding-inclusive strategy net profit", () => {
+  it("keeps fresh position evidence separate from unavailable profit", () => {
+    const now = 1_800_000_000_000;
+    const snapshot = risk({ profit_data_status: "unavailable", profit_observed_at_ms: null,
+      risk_observed_at_ms: now, observation_complete: true, funding_status: "unavailable" });
+    expect(currentStrategyObservation(status, snapshot, now)).toBe(snapshot);
+    expect(strategyNetProfit(status, snapshot)).toBeNull();
+    for (const override of [
+      { run_id: "wrong-run" }, { symbol: "ETHUSDT" }, { exchange: "aster" },
+      { risk_observed_at_ms: now - 60_001 }, { risk_observed_at_ms: now + 1 },
+      { risk_observed_at_ms: null }, { risk_observed_at_ms: 0 },
+      { observation_complete: false }, { profit_data_status: "stale" },
+      { profit_data_status: "refreshing" },
+    ]) {
+      expect(currentStrategyObservation(status, { ...snapshot, ...override } as RiskSnapshot, now)).toBeNull();
+    }
+  });
+
+  it.each(["stale", "refreshing", "unavailable", "unknown"])(
+    "never exposes %s data as canonical current profit", (profitDataStatus) => {
+      expect(strategyNetProfit(status, risk({
+        profit_data_status: profitDataStatus, profit_observed_at_ms: Date.now(),
+      }))).toBeNull();
+    },
+  );
+
+  it.each([undefined, null, 0, -1, Number.NaN, Infinity, "1700000000000", Date.now() + 60_000])(
+    "rejects metadata claiming verification without a real observation time %s", (observedAt) => {
+      expect(strategyNetProfit(status, risk({
+        profit_data_status: "verified", profit_observed_at_ms: observedAt,
+      }))).toBeNull();
+    },
+  );
+
   it.each([
     ["3", "-22"], ["-3", "-28"], ["0", "-25"], [0, "-25"],
   ])("uses the authoritative total with funding %s without charging fees or funding again", (funding, total) => {

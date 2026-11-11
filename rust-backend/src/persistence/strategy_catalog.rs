@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use thiserror::Error;
@@ -9,7 +10,7 @@ use crate::{
     domain::Exchange,
     engine::{
         ArmedStrategyLifecycle, ArmedStrategyState, StrategyLifecycle, StrategyState,
-        StrategyStateStore, validate_cross_ledger_ownership,
+        validate_cross_ledger_ownership,
     },
 };
 
@@ -21,7 +22,7 @@ use super::{
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrategyCatalogSnapshot {
     Armed(Box<ArmedStrategyState>),
-    Active(Box<StrategyState>),
+    Active(Arc<StrategyState>),
 }
 
 impl StrategyCatalogSnapshot {
@@ -79,6 +80,13 @@ pub struct StrategyCatalog {
 }
 
 impl StrategyCatalog {
+    pub(crate) fn from_runtime_snapshots(entries: Vec<StrategyCatalogSnapshot>) -> Self {
+        Self {
+            entries,
+            anomalies: Vec::new(),
+        }
+    }
+
     pub fn entries(&self) -> &[StrategyCatalogSnapshot] {
         &self.entries
     }
@@ -164,7 +172,7 @@ fn load_catalog_entry(
             StrategyCatalogSnapshot::Armed(Box::new(store.snapshot().clone()))
         }
         Ok(FilePreparedStrategyStore::Active(store)) => {
-            StrategyCatalogSnapshot::Active(Box::new(store.snapshot().clone()))
+            StrategyCatalogSnapshot::Active(store.shared_snapshot())
         }
         Err(error) => {
             tracing::warn!(path = %paths.state().display(), error = %error, "strategy state catalog entry could not be loaded");

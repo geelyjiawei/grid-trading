@@ -545,14 +545,14 @@ mod funding_history_reader {
         )
         .await?;
         payments.sort_by_key(|entry| entry.at_ms);
-        let account_fills = if payments.is_empty() {
-            None
-        } else {
+        let account_fills = if let Some(last_settlement) = payments.last() {
+            // Attribution replays executions only through the latest settled payment.
+            // Include the boundary so same-millisecond ambiguity still fails closed.
             let mut fills = collect(
                 "/fapi/v1/userTrades",
                 &symbol,
                 from_ms,
-                through_ms,
+                last_settlement.at_ms,
                 false,
                 &fetch,
                 account_fill,
@@ -560,6 +560,8 @@ mod funding_history_reader {
             .await?;
             fills.sort_by_key(|entry| entry.at_ms);
             Some(fills)
+        } else {
+            None
         };
         Ok(FundingHistorySnapshot {
             exchange,
@@ -2339,6 +2341,42 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn funding_history_limits_account_reads_to_latest_settlement_not_requested_end() {
+            let day = 24 * 60 * 60 * 1000;
+            let from = BASE - 8 * day;
+            let transport = queued(vec![
+                json!([payment(2, from + 100, "-1"), payment(1, from + 50, "1")]),
+                json!([]),
+                json!([fill(1, from + 20, "BUY")]),
+                json!([]),
+            ]);
+            let result = subject(transport.clone())
+                .funding_history(Exchange::Binance, "MUUSDT", from, BASE)
+                .await
+                .unwrap();
+            assert_eq!((result.from_ms, result.through_ms), (from, BASE));
+            assert_eq!(result.payments.len(), 2);
+            assert_eq!(result.account_fills.unwrap().len(), 1);
+            let requests = transport.all_requests();
+            assert_eq!(param(&requests[1], "endTime"), BASE.to_string());
+            assert_eq!(param(&requests[2], "startTime"), from.to_string());
+            assert_eq!(param(&requests[2], "endTime"), (from + 100).to_string());
+            assert_eq!(requests.len(), 3, "no post-settlement trade windows");
+        }
+
+        #[tokio::test]
+        async fn funding_history_rejects_account_rows_after_the_settlement_cutoff() {
+            let error = subject(queued(vec![
+                json!([payment(1, BASE + 50, "-1")]),
+                json!([fill(1, BASE + 51, "BUY")]),
+            ]))
+            .funding_history(Exchange::Binance, "MUUSDT", BASE, BASE + 100)
+            .await
+            .expect_err("an exchange row beyond the narrowed query must fail closed");
+            assert!(error.message.contains("outside requested window"));
+        }
+
+        #[tokio::test]
         async fn funding_history_empty_payments_do_not_query_account_trades() {
             let transport = queued(vec![json!([])]);
             let result = subject(transport.clone())
@@ -2412,22 +2450,28 @@ mod tests {
                 json!(&rows[500..]),
             ]);
             let result = subject(transport.clone())
-                .funding_history(Exchange::Binance, "MUUSDT", BASE - 1000, BASE - 1)
+                .funding_history(Exchange::Binance, "MUUSDT", BASE - 1000, BASE + 100)
                 .await
                 .unwrap();
+            assert_eq!(result.through_ms, BASE + 100);
             let fills = result.account_fills.unwrap();
             assert_eq!(fills.len(), 1000);
             assert_eq!(fills[0].signed_quantity, Decimal::new(25, 1));
             assert_eq!(fills[999].signed_quantity, Decimal::new(-25, 1));
-            assert_eq!(transport.all_requests().len(), 4);
+            let requests = transport.all_requests();
+            assert_eq!(requests.len(), 4);
+            assert_eq!(param(&requests[1], "endTime"), (BASE - 1).to_string());
+            assert_eq!(param(&requests[2], "endTime"), (BASE - 501).to_string());
+            assert_eq!(param(&requests[3], "startTime"), (BASE - 500).to_string());
+            assert_eq!(param(&requests[3], "endTime"), (BASE - 1).to_string());
         }
 
         #[tokio::test]
         async fn funding_history_uses_disjoint_seven_day_windows_for_income_and_account_trades() {
             let from = BASE - 8 * 24 * 60 * 60 * 1000;
             let transport = queued(vec![
-                json!([payment(1, from + 1, "-1")]),
                 json!([]),
+                json!([payment(1, BASE, "-1")]),
                 json!([]),
                 json!([]),
             ]);

@@ -58,6 +58,7 @@ const BINANCE_REQUEST_INTERVAL: Duration = Duration::from_millis(60);
 const INSTRUMENT_RULES_CACHE_TTL: Duration = Duration::from_secs(60);
 const TRADING_FEE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const FUNDING_HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
+const FUNDING_HISTORY_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
 const FUNDING_HISTORY_CACHE_CAPACITY: usize = 8;
 // Finish and cache failures before the API's outer fifteen-second deadline cancels this future.
 const FUNDING_HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
@@ -129,15 +130,29 @@ struct FundingHistoryCacheEntry {
     result: Result<FundingHistorySnapshot, SnapshotError>,
 }
 
+impl FundingHistoryCacheEntry {
+    fn ttl(&self) -> Duration {
+        if self.result.is_ok() {
+            FUNDING_HISTORY_CACHE_TTL
+        } else {
+            FUNDING_HISTORY_FAILURE_CACHE_TTL
+        }
+    }
+}
+
+type FundingHistoryReadGate = tokio::sync::Mutex<()>;
+
 #[derive(Debug)]
 struct FundingHistoryCache {
     values: Mutex<HashMap<String, FundingHistoryCacheEntry>>,
+    in_flight: Mutex<HashMap<String, std::sync::Weak<FundingHistoryReadGate>>>,
 }
 
 impl FundingHistoryCache {
     fn new() -> Self {
         Self {
             values: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -165,7 +180,40 @@ impl FundingHistoryCache {
         if let Some(cached) = self.get(&key, through_ms, Instant::now()) {
             return cached;
         }
-        self.refresh(key, through_ms, timeout, request).await
+        let deadline = tokio::time::Instant::now() + timeout;
+        let gate = {
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_flight.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = in_flight.get(&key).and_then(std::sync::Weak::upgrade) {
+                gate
+            } else {
+                if in_flight.len() >= FUNDING_HISTORY_CACHE_CAPACITY {
+                    return Err(SnapshotError::new(
+                        "funding history read capacity exhausted",
+                    ));
+                }
+                let gate = Arc::new(FundingHistoryReadGate::new(()));
+                in_flight.insert(key.clone(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        // The caller owns both the gate and network future; cancellation releases both.
+        let _guard = tokio::time::timeout_at(deadline, gate.lock())
+            .await
+            .map_err(|_| SnapshotError::new("funding history in-flight wait timed out"))?;
+        if let Some(cached) = self.get(&key, through_ms, Instant::now()) {
+            return cached;
+        }
+        self.refresh(
+            key,
+            through_ms,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            request,
+        )
+        .await
     }
 
     fn get(
@@ -179,7 +227,7 @@ impl FundingHistoryCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = values.get(key)?;
-        if now.saturating_duration_since(entry.cached_at) >= FUNDING_HISTORY_CACHE_TTL {
+        if now.saturating_duration_since(entry.cached_at) >= entry.ttl() {
             values.remove(key);
             return None;
         }
@@ -200,9 +248,7 @@ impl FundingHistoryCache {
             .values
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        values.retain(|_, entry| {
-            now.saturating_duration_since(entry.cached_at) < FUNDING_HISTORY_CACHE_TTL
-        });
+        values.retain(|_, entry| now.saturating_duration_since(entry.cached_at) < entry.ttl());
         if !values.contains_key(&key) && values.len() >= FUNDING_HISTORY_CACHE_CAPACITY {
             let oldest = values
                 .iter()
@@ -1502,6 +1548,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn funding_history_cache_coalesces_identical_cold_fetches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = FundingHistoryCache::new();
+        let reads = AtomicUsize::new(0);
+        let request = || async {
+            reads.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(funding_snapshot(200))
+        };
+        let (first, second) = tokio::join!(
+            cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), request()),
+            cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), request()),
+        );
+        assert_eq!(first, Ok(funding_snapshot(200)));
+        assert_eq!(second, first);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one cold network fetch");
+    }
+
+    #[tokio::test]
+    async fn funding_history_cache_coalesces_advancing_ends_without_relabelling_the_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = FundingHistoryCache::new();
+        let reads = AtomicUsize::new(0);
+        let request = |through_ms| {
+            let reads = &reads;
+            async move {
+                reads.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(funding_snapshot(through_ms))
+            }
+        };
+        let (first, later) = tokio::join!(
+            cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), request(200)),
+            cache.get_or_fetch("key".into(), 201, Duration::from_secs(1), request(201)),
+        );
+        assert_eq!(first, Ok(funding_snapshot(200)));
+        assert_eq!(
+            later, first,
+            "cached observation must retain its original end"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn funding_history_cache_coalesces_cold_failures_without_inventing_zero() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = FundingHistoryCache::new();
+        let reads = AtomicUsize::new(0);
+        let request = || async {
+            reads.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Err(SnapshotError::new("endpoint unavailable"))
+        };
+        let (first, second) = tokio::join!(
+            cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), request()),
+            cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), request()),
+        );
+        assert_eq!(first, Err(SnapshotError::new("endpoint unavailable")));
+        assert_eq!(second, first);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn funding_history_cache_bounds_distinct_in_flight_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = FundingHistoryCache::new();
+        let reads = AtomicUsize::new(0);
+        let results = futures::future::join_all((0..9).map(|index| {
+            let cache = &cache;
+            let reads = &reads;
+            async move {
+                cache
+                    .get_or_fetch(index.to_string(), 200, Duration::from_millis(10), async {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending().await
+                    })
+                    .await
+            }
+        }))
+        .await;
+        assert!(results.iter().all(Result::is_err));
+        assert_eq!(reads.load(Ordering::SeqCst), 8, "bounded network work");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| { result.as_ref().unwrap_err().message.contains("capacity") })
+                .count(),
+            1
+        );
+        assert_eq!(
+            cache
+                .get_or_fetch("recovered".into(), 200, Duration::from_secs(1), async {
+                    Ok(funding_snapshot(200))
+                })
+                .await,
+            Ok(funding_snapshot(200)),
+            "finished gates must not permanently consume capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn funding_history_cache_never_coalesces_a_later_end_into_an_earlier_request() {
+        let cache = FundingHistoryCache::new();
+        let (later, earlier) = tokio::join!(
+            cache.get_or_fetch("key".into(), 300, Duration::from_secs(1), async {
+                tokio::task::yield_now().await;
+                Ok(funding_snapshot(300))
+            }),
+            cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), async {
+                tokio::task::yield_now().await;
+                Ok(funding_snapshot(200))
+            }),
+        );
+        assert_eq!(later.unwrap().through_ms, 300);
+        assert_eq!(earlier.unwrap().through_ms, 200);
+    }
+
+    #[tokio::test]
+    async fn funding_history_cache_cancelled_leader_drops_network_and_allows_waiter_retry() {
+        let cache = FundingHistoryCache::new();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (network, mut dropped) = tokio::sync::oneshot::channel::<()>();
+        let (leader, waiter) = tokio::join!(
+            async {
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), async move {
+                        let _network = network;
+                        started.send(()).unwrap();
+                        std::future::pending().await
+                    }),
+                )
+                .await
+            },
+            async {
+                ready.await.unwrap();
+                cache
+                    .get_or_fetch("key".into(), 200, Duration::from_secs(1), async {
+                        assert!(
+                            matches!(
+                                dropped.try_recv(),
+                                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                            ),
+                            "the waiter must not fetch until the leader's network future drops"
+                        );
+                        Ok(funding_snapshot(200))
+                    })
+                    .await
+            },
+        );
+        assert!(leader.is_err());
+        assert_eq!(waiter, Ok(funding_snapshot(200)));
+    }
+
+    #[tokio::test]
+    async fn funding_history_cache_wait_timeout_does_not_start_or_cancel_another_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = FundingHistoryCache::new();
+        let reads = AtomicUsize::new(0);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let (leader, waiter) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                cache.get_or_fetch("key".into(), 200, Duration::from_secs(1), async {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    started.send(()).unwrap();
+                    held.await.unwrap();
+                    Ok(funding_snapshot(200))
+                }),
+                async {
+                    ready.await.unwrap();
+                    let result = cache
+                        .get_or_fetch("key".into(), 200, Duration::from_millis(1), async {
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            Ok(funding_snapshot(200))
+                        })
+                        .await;
+                    release.send(()).unwrap();
+                    result
+                },
+            )
+        })
+        .await
+        .expect("a waiter must have its own bounded deadline");
+        assert!(
+            waiter
+                .unwrap_err()
+                .message
+                .contains("in-flight wait timed out")
+        );
+        assert_eq!(leader, Ok(funding_snapshot(200)));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.get("key", 200, Instant::now()), Some(leader));
+    }
+
+    #[tokio::test]
     async fn funding_history_timeout_is_cached_before_the_outer_deadline() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1524,7 +1771,7 @@ mod tests {
         assert!(error.message.contains("timed out"));
         let cached_at = cache.values.lock().unwrap().get("key").unwrap().cached_at;
         assert_eq!(
-            cache.get("key", 300, cached_at + Duration::from_secs(59)),
+            cache.get("key", 300, cached_at + Duration::from_secs(4)),
             Some(Err(error.clone()))
         );
         let cached = cache
@@ -1540,7 +1787,7 @@ mod tests {
             "a cached timeout must not retry the fetch"
         );
         assert_eq!(
-            cache.get("key", 300, cached_at + Duration::from_secs(60)),
+            cache.get("key", 300, cached_at + Duration::from_secs(5)),
             None
         );
     }
@@ -1586,17 +1833,17 @@ mod tests {
     }
 
     #[test]
-    fn funding_history_cache_preserves_errors_for_sixty_seconds_instead_of_zero() {
+    fn funding_history_cache_retries_errors_after_five_seconds_instead_of_zero() {
         let cache = FundingHistoryCache::new();
         let now = Instant::now();
         let error = SnapshotError::new("funding history rate limited");
         cache.insert("key".into(), 200, Err(error.clone()), now);
 
         assert_eq!(
-            cache.get("key", 300, now + Duration::from_secs(59)),
+            cache.get("key", 300, now + Duration::from_secs(4)),
             Some(Err(error))
         );
-        assert_eq!(cache.get("key", 300, now + Duration::from_secs(60)), None);
+        assert_eq!(cache.get("key", 300, now + Duration::from_secs(5)), None);
     }
 
     #[test]

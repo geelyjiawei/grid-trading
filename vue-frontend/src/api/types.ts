@@ -265,6 +265,10 @@ export interface TradesResponse {
 }
 
 export interface RiskSnapshot {
+  risk_observed_at_ms?: number | null;
+  profit_data_status?: "verified" | "refreshing" | "stale" | "unavailable";
+  profit_observed_at_ms?: number | null;
+  profit_refresh_error?: string | null;
   run_id?: string | null;
   exchange?: Exchange;
   symbol?: string;

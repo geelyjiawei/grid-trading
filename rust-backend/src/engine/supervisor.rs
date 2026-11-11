@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    ops::{Deref, DerefMut},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -19,7 +20,10 @@ use crate::exchange::{
     OpenOrderSnapshotGateway, OrderCancellationGateway, OrderLookupGateway, OrderPlacementGateway,
     PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
 };
-use crate::persistence::{StrategyDiscoveryAnomaly, StrategyDiscoveryReport, StrategyFilePaths};
+use crate::persistence::{
+    StrategyCatalog, StrategyCatalogSnapshot, StrategyDiscoveryAnomaly, StrategyDiscoveryReport,
+    StrategyFilePaths,
+};
 
 use super::exchange_inputs::advance_reference_time_ms;
 use super::periodic_priority::{PeriodicPriority, PriorityWaiter as ExecutionWaiter};
@@ -50,7 +54,86 @@ struct RuntimeSlot<G> {
     execution_waiters: PeriodicPriority,
     fee_settlement: std::sync::Mutex<FeeSettlementSchedule>,
     profit_check: std::sync::Mutex<ProfitCheckSchedule>,
-    strategy: Mutex<PreparedLeasedFileStrategy<G>>,
+    strategy: PublishedStrategy<G>,
+}
+
+// Queries share only committed immutable state. Publishing on guard release
+// covers success, errors and cancellation without queueing behind trading work.
+struct PublishedStrategy<G> {
+    inner: Mutex<PreparedLeasedFileStrategy<G>>,
+    snapshot: std::sync::RwLock<Option<StrategyCatalogSnapshot>>,
+}
+
+impl<G> PublishedStrategy<G> {
+    fn new(strategy: PreparedLeasedFileStrategy<G>) -> Self {
+        let snapshot = committed_query_snapshot(&strategy);
+        Self {
+            inner: Mutex::new(strategy),
+            snapshot: std::sync::RwLock::new(snapshot),
+        }
+    }
+
+    async fn lock(&self) -> PublishedStrategyGuard<'_, G> {
+        PublishedStrategyGuard {
+            guard: self.inner.lock().await,
+            published: &self.snapshot,
+        }
+    }
+
+    fn try_lock(&self) -> Result<PublishedStrategyGuard<'_, G>, tokio::sync::TryLockError> {
+        self.inner.try_lock().map(|guard| PublishedStrategyGuard {
+            guard,
+            published: &self.snapshot,
+        })
+    }
+
+    fn snapshot(&self) -> Option<StrategyCatalogSnapshot> {
+        self.snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+fn committed_query_snapshot<G>(
+    strategy: &PreparedLeasedFileStrategy<G>,
+) -> Option<StrategyCatalogSnapshot> {
+    if let Some(runtime) = strategy.active_runtime() {
+        Some(StrategyCatalogSnapshot::Active(
+            runtime.runtime().machine().store().shared_snapshot(),
+        ))
+    } else {
+        strategy
+            .armed_strategy()
+            .map(|armed| StrategyCatalogSnapshot::Armed(Box::new(armed.snapshot().clone())))
+    }
+}
+
+struct PublishedStrategyGuard<'a, G> {
+    guard: tokio::sync::MutexGuard<'a, PreparedLeasedFileStrategy<G>>,
+    published: &'a std::sync::RwLock<Option<StrategyCatalogSnapshot>>,
+}
+
+impl<G> Deref for PublishedStrategyGuard<'_, G> {
+    type Target = PreparedLeasedFileStrategy<G>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<G> DerefMut for PublishedStrategyGuard<'_, G> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<G> Drop for PublishedStrategyGuard<'_, G> {
+    fn drop(&mut self) {
+        *self
+            .published
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = committed_query_snapshot(&self.guard);
+    }
 }
 
 #[derive(Default)]
@@ -397,7 +480,7 @@ impl<G> RuntimeRegistry<G> {
                 execution_waiters: PeriodicPriority::default(),
                 fee_settlement: std::sync::Mutex::new(FeeSettlementSchedule::default()),
                 profit_check: std::sync::Mutex::new(ProfitCheckSchedule::default()),
-                strategy: Mutex::new(strategy),
+                strategy: PublishedStrategy::new(strategy),
             }),
         );
         RuntimeRegistration::Registered
@@ -439,6 +522,53 @@ impl<G> RuntimeRegistry<G> {
 
     pub async fn entries(&self) -> Vec<RuntimeRegistryEntry> {
         self.registry_entries(false, false).await
+    }
+
+    pub(crate) async fn query_catalog(
+        &self,
+        market: Option<(Exchange, &str)>,
+    ) -> Result<(StrategyCatalog, Vec<RuntimeRegistryEntry>), SnapshotError> {
+        let slots = self.entries.read().await;
+        let mut snapshots = Vec::new();
+        let mut entries = Vec::new();
+        for (run_id, slot) in slots.iter().filter(|(_, slot)| {
+            slot.owns_market.load(Ordering::Acquire)
+                && market.is_none_or(|(exchange, symbol)| {
+                    slot.exchange == exchange && slot.symbol == symbol
+                })
+        }) {
+            // Never queue a dashboard read behind a trading mutation.
+            let guard = slot.strategy.try_lock().ok();
+            let snapshot = if let Some(strategy) = guard.as_ref() {
+                committed_query_snapshot(strategy)
+            } else {
+                slot.strategy.snapshot()
+            }
+            .ok_or_else(|| {
+                SnapshotError::new("strategy transition has no committed query snapshot")
+            })?;
+            if snapshot.run_id() != run_id.as_str()
+                || snapshot.exchange() != slot.exchange
+                || snapshot.symbol() != slot.symbol
+            {
+                return Err(SnapshotError::new(
+                    "runtime query snapshot identity mismatch",
+                ));
+            }
+            let advancing = guard.is_none()
+                || slot.execution_waiters.has_waiters()
+                || slot.unlocked_placements.load(Ordering::Acquire) > 0;
+            entries.push(RuntimeRegistryEntry {
+                run_id: run_id.clone(),
+                exchange: slot.exchange,
+                symbol: slot.symbol.clone(),
+                kind: guard.as_ref().map(|strategy| strategy.kind()),
+                lifecycle: guard.as_ref().map(|strategy| strategy.lifecycle()),
+                advancing,
+            });
+            snapshots.push(snapshot);
+        }
+        Ok((StrategyCatalog::from_runtime_snapshots(snapshots), entries))
     }
 
     pub(crate) async fn periodic_entries(&self) -> Vec<RuntimeRegistryEntry> {
@@ -2302,6 +2432,50 @@ mod fee_settlement_tests {
         let status = wait_profit(&registry, &run).await;
         assert_eq!(status.observation.status, "unavailable", "{status:?}");
         assert!(status.trigger.is_none());
+    }
+
+    #[tokio::test]
+    async fn published_query_catalog_never_waits_for_trading_and_tracks_committed_stops() {
+        let directory = tempdir().unwrap();
+        let gateway = FeeGateway::new();
+        let strategy = pending_strategy(directory.path(), &gateway, "query001", 1, false).await;
+        let run = strategy.run_id().clone();
+        let registry = RuntimeRegistry::new();
+        registry.register(strategy).await;
+        let slot = registry.entries.read().await.get(&run).unwrap().clone();
+        let guard = slot.strategy.lock().await;
+        let (before, entries) = registry.query_catalog(None).await.unwrap();
+        assert_eq!(before.entries().len(), 1);
+        assert!(entries[0].advancing);
+        let crate::persistence::StrategyCatalogSnapshot::Active(first) = &before.entries()[0]
+        else {
+            panic!("expected active snapshot");
+        };
+        assert!(Arc::ptr_eq(
+            first,
+            &guard
+                .active_runtime()
+                .unwrap()
+                .runtime()
+                .machine()
+                .store()
+                .shared_snapshot()
+        ));
+        let (unrelated, _) = registry
+            .query_catalog(Some((Exchange::Bybit, "MUUSDT")))
+            .await
+            .unwrap();
+        assert!(unrelated.entries().is_empty());
+        drop(guard);
+        registry.request_stop(&run, 1_500).await.unwrap();
+        let (after, entries) = registry.query_catalog(None).await.unwrap();
+        assert!(!entries[0].advancing);
+        let crate::persistence::StrategyCatalogSnapshot::Active(state) = &after.entries()[0] else {
+            panic!("expected active snapshot");
+        };
+        assert_eq!(state.lifecycle, StrategyLifecycle::StopRequested);
+        assert_eq!(first.lifecycle, StrategyLifecycle::DeployingGrid);
+        assert!(!Arc::ptr_eq(first, state));
     }
 
     #[tokio::test]

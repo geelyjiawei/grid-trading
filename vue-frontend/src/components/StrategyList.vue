@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import type { Exchange, GridStatus, RiskSnapshot } from "../api/types";
 import { directionName, exchangeName, formatNumber, quoteAsset, strategyStatusLabel } from "../format";
-import { matchingStrategyRisk, profitTone, strategyNetProfit } from "../strategy-profit";
+import { matchingStrategyRisk, profitTone, strategyProfitDisplay } from "../strategy-profit";
 
 const props = withDefaults(defineProps<{
   grids: GridStatus[];
@@ -10,6 +11,7 @@ const props = withDefaults(defineProps<{
   loading: boolean;
   currentRisk?: RiskSnapshot | null;
   risks?: RiskSnapshot[];
+  profitNow?: number;
 }>(), { currentRisk: null, risks: () => [] });
 
 const emit = defineEmits<{
@@ -23,9 +25,10 @@ function riskFor(grid: GridStatus): RiskSnapshot | null {
   return props.risks.find(risk => matchingStrategyRisk(grid, risk)) ?? null;
 }
 
-function netProfit(grid: GridStatus) {
-  return strategyNetProfit(grid, riskFor(grid));
-}
+const strategyRows = computed(() => props.grids.map(grid => {
+  const snapshot = riskFor(grid);
+  return { grid, snapshot, profit: strategyProfitDisplay(grid, snapshot, props.profitNow) };
+}));
 </script>
 
 <template>
@@ -41,7 +44,7 @@ function netProfit(grid: GridStatus) {
     <p v-if="loading && grids.length === 0" class="empty-state">正在读取策略…</p>
     <p v-else-if="grids.length === 0" class="empty-state">当前没有活动策略</p>
     <button
-      v-for="grid in grids"
+      v-for="{ grid, snapshot, profit } in strategyRows"
       :key="`${grid.exchange}:${grid.symbol}`"
       class="strategy-row"
       :class="{ active: grid.exchange === activeExchange && grid.symbol === activeSymbol }"
@@ -56,10 +59,14 @@ function netProfit(grid: GridStatus) {
         <small>{{ exchangeName(grid.exchange) }} · {{ directionName(grid.direction) }} · {{ grid.grid_mode === "geometric" ? "等比" : "等差" }} · {{ strategyStatusLabel(grid) }}</small>
       </span>
       <span class="strategy-profit">
-        <strong :class="profitTone(netProfit(grid))" title="本轮已实现盈亏＋本轮浮动盈亏－成交手续费＋已结算资金费；资金费核对最多延迟60秒；未来平仓手续费尚未发生，未计入">
-          {{ netProfit(grid) == null ? "待核对" : `${formatNumber(netProfit(grid), 4)} ${quoteAsset(grid.exchange)}` }}
+        <strong :class="profitTone(profit.value)" title="本轮已实现盈亏＋本轮浮动盈亏－成交手续费＋已结算资金费；资金费核对最多延迟60秒；未来平仓手续费尚未发生，未计入">
+          {{ profit.value == null ? "待核对" : `${formatNumber(profit.value, 4)} ${quoteAsset(grid.exchange)}` }}
         </strong>
-        <small>净收益（含浮盈亏及资金费） · 完成 {{ riskFor(grid)?.completed_pairs ?? grid.completed_pairs ?? 0 }} 次</small>
+        <small v-if="profit.state !== 'verified'" data-testid="profit-freshness" role="status">
+          <mark v-if="profit.state === 'stale'">上次核对 <time :datetime="new Date(profit.observedAtMs!).toISOString()">{{ new Date(profit.observedAtMs!).toLocaleString('zh-CN', { hour12: false }) }}</time> · 非当前收益</mark>
+          {{ profit.reason }}
+        </small>
+        <small>净收益（含浮盈亏及资金费） · 完成 {{ snapshot?.completed_pairs ?? grid.completed_pairs ?? 0 }} 次</small>
       </span>
     </button>
   </section>

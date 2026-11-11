@@ -304,11 +304,29 @@ impl ValidatedStrategyState {
         previous: &StrategyState,
         snapshot: StrategyState,
     ) -> Result<Self, StrategyStateError> {
-        if inventory_replay_inputs_and_outputs_are_unchanged(previous, &snapshot) {
-            snapshot.validate_internal(false)?;
-        } else {
-            snapshot.validate()?;
+        // The caller holds the store's validated, immutable predecessor. A
+        // revision alone is never a validation certificate for arbitrary state.
+        if previous.revision.checked_add(1) != Some(snapshot.revision) {
+            return Err(StrategyStateError::InvalidSuccessorRevision);
         }
+        if snapshot.updated_at_ms < previous.updated_at_ms {
+            return Err(StrategyStateError::TimestampRegression);
+        }
+        let predecessor = (previous.version == snapshot.version
+            && previous.run_id == snapshot.run_id
+            && previous.config == snapshot.config
+            && previous.instrument_rules == snapshot.instrument_rules
+            && previous.exchange == snapshot.exchange
+            && previous.symbol == snapshot.symbol
+            && previous.direction == snapshot.direction
+            && previous.plan == snapshot.plan
+            && previous.baseline == snapshot.baseline
+            && previous.created_at_ms == snapshot.created_at_ms)
+            .then_some(previous);
+        let replay_inventory = predecessor.is_none_or(|previous| {
+            !inventory_replay_inputs_and_outputs_are_unchanged(previous, &snapshot)
+        });
+        snapshot.validate_internal(replay_inventory, predecessor)?;
         Ok(Self(snapshot))
     }
 
@@ -604,7 +622,7 @@ impl StrategyState {
     }
 
     pub fn validate(&self) -> Result<(), StrategyStateError> {
-        self.validate_internal(true)
+        self.validate_internal(true, None)
     }
 
     fn validate_profit_protection(&self) -> Result<(), StrategyStateError> {
@@ -654,7 +672,11 @@ impl StrategyState {
         Ok(())
     }
 
-    fn validate_internal(&self, replay_inventory: bool) -> Result<(), StrategyStateError> {
+    fn validate_internal(
+        &self,
+        replay_inventory: bool,
+        predecessor: Option<&StrategyState>,
+    ) -> Result<(), StrategyStateError> {
         if !matches!(self.version, 1 | 2) {
             return Err(StrategyStateError::UnsupportedVersion(self.version));
         }
@@ -743,7 +765,21 @@ impl StrategyState {
             _ => {}
         }
 
+        let mut previous_orders = predecessor.map(|previous| previous.orders.iter().peekable());
         for (key, order) in &self.orders {
+            // Ordered merge avoids a second tree lookup for every historical
+            // order; only an exactly matching key can supply prior evidence.
+            let previous_order = previous_orders.as_mut().and_then(|orders| {
+                while orders
+                    .peek()
+                    .is_some_and(|(previous_key, _)| *previous_key < key)
+                {
+                    orders.next();
+                }
+                orders
+                    .next_if(|(previous_key, _)| *previous_key == key)
+                    .map(|(_, order)| order)
+            });
             if key != &order.client_order_id || order.shape.symbol != self.symbol {
                 return Err(StrategyStateError::OrderIdentityMismatch);
             }
@@ -766,18 +802,30 @@ impl StrategyState {
                 return Err(StrategyStateError::InvalidExecutionTotals);
             }
             if let Some(audit) = &order.execution_audit {
-                validate_execution_audit_payload(
-                    self.exchange,
-                    order,
-                    audit,
-                    order.cumulative_quantity,
-                    order.cumulative_quote,
-                    order.cumulative_fee,
-                    order.terminal_status,
-                )?;
+                // Exact record equality covers every payload validation input,
+                // including shape, exchange identity, totals and fee evidence.
+                // Cross-order ownership, ledger and capacity checks still run.
+                if previous_order != Some(order) {
+                    if let Some(previous_audit) =
+                        previous_order.and_then(|order| order.execution_audit.as_ref())
+                    {
+                        validate_execution_audit_extension(previous_audit, audit)?;
+                    }
+                    validate_execution_audit_payload(
+                        self.exchange,
+                        order,
+                        audit,
+                        order.cumulative_quantity,
+                        order.cumulative_quote,
+                        order.cumulative_fee,
+                        order.terminal_status,
+                    )?;
+                }
                 if audit.synced_at_ms > self.updated_at_ms {
                     return Err(StrategyStateError::InvalidExecutionAudit);
                 }
+            } else if previous_order.is_some_and(|order| order.execution_audit.is_some()) {
+                return Err(StrategyStateError::InvalidExecutionAudit);
             }
             if order.terminal_processed != order.terminal_status.is_some() {
                 return Err(StrategyStateError::TerminalProcessingMismatch);
@@ -1896,6 +1944,8 @@ fn validate_execution_audit_payload(
     expected_fee: Decimal,
     expected_terminal_status: Option<TerminalOrderStatus>,
 ) -> Result<(), StrategyStateError> {
+    #[cfg(test)]
+    tests::AUDIT_VALIDATION_CALLS.with(|calls| calls.set(calls.get() + 1));
     let snapshot = &audit.snapshot;
     if audit.synced_at_ms == 0
         || snapshot.order.exchange != strategy_exchange
@@ -3777,7 +3827,9 @@ fn inventory_replay_inputs_and_outputs_are_unchanged(
     previous: &StrategyState,
     next: &StrategyState,
 ) -> bool {
-    if previous.direction != next.direction
+    // Failed snapshots may retain diagnostic inventory that never passed replay.
+    if previous.lifecycle == StrategyLifecycle::Failed
+        || previous.direction != next.direction
         || previous.inventory_events != next.inventory_events
         || previous.grid_position_net_quantity != next.grid_position_net_quantity
         || previous.opening_filled_quantity != next.opening_filled_quantity
@@ -5090,6 +5142,8 @@ pub enum StrategyStateError {
     UnsupportedVersion(u8),
     #[error("strategy timestamp regressed")]
     TimestampRegression,
+    #[error("validated strategy successor revision does not advance exactly once")]
+    InvalidSuccessorRevision,
     #[error("grid-owned position has the wrong directional sign")]
     GridPositionDirectionMismatch,
     #[error("strategy order identity or symbol does not match its map key")]
@@ -9993,6 +10047,408 @@ mod tests {
             &previous,
             &changed_opening_target
         ));
+    }
+
+    thread_local! {
+        pub(super) static AUDIT_VALIDATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn validation_reuse_machine() -> StrategyMachine<MemoryStrategyStateStore> {
+        let mut machine = small_neutral_risk_machine();
+        let buy = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        accept_strategy_order(&mut machine, &buy, "reuse-order", 101);
+        apply_single_valued_trade(
+            &mut machine,
+            buy,
+            ValuedTradeFixture {
+                exchange_order_id: "reuse-order",
+                trade_id: "1001",
+                price: Decimal::new(28, 2),
+                quantity: decimal(20),
+                trade_time_ms: 102,
+                applied_at_ms: 103,
+            },
+        );
+        machine.store().snapshot().validate().unwrap();
+        machine
+    }
+
+    #[test]
+    fn validation_reuse_proven_successor_avoids_unchanged_audit_payload_work() {
+        let mut machine = validation_reuse_machine();
+        let previous = machine.store().snapshot().clone();
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        previous.validate().unwrap();
+        assert_eq!(AUDIT_VALIDATION_CALLS.with(|calls| calls.get()), 1);
+
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        machine.request_stop(104).unwrap();
+        assert_eq!(machine.store().snapshot().revision, previous.revision + 1);
+        assert_eq!(machine.store().snapshot().orders, previous.orders);
+        assert_eq!(
+            AUDIT_VALIDATION_CALLS.with(|calls| calls.get()),
+            0,
+            "an exact unchanged audit needs comparison, not payload revalidation"
+        );
+        machine.store().snapshot().validate().unwrap();
+    }
+
+    #[test]
+    fn validation_reuse_rejects_stale_or_same_revision_mutated_successors() {
+        let previous = validation_reuse_machine().store().snapshot().clone();
+        for revision in [
+            previous.revision - 1,
+            previous.revision,
+            previous.revision + 2,
+        ] {
+            let mut next = previous.clone();
+            next.revision = revision;
+            next.lifecycle = StrategyLifecycle::StopRequested;
+            next.updated_at_ms += 1;
+            assert!(ValidatedStrategyState::from_validated_transition(&previous, next).is_err());
+        }
+    }
+
+    #[test]
+    fn validation_reuse_rejects_rewound_audit_even_if_standalone_state_is_valid() {
+        let previous = validation_reuse_machine().store().snapshot().clone();
+        let mut next = previous.clone();
+        next.revision += 1;
+        next.updated_at_ms += 1;
+        next.orders
+            .values_mut()
+            .find_map(|order| order.execution_audit.as_mut())
+            .unwrap()
+            .synced_at_ms -= 1;
+        next.validate().unwrap();
+        assert!(ValidatedStrategyState::from_validated_transition(&previous, next).is_err());
+    }
+
+    #[test]
+    fn validation_reuse_mutable_escape_rechecks_same_revision_corruption() {
+        let mut machine = validation_reuse_machine();
+        machine
+            .store_mut()
+            .snapshot
+            .orders
+            .values_mut()
+            .find_map(|order| order.execution_audit.as_mut())
+            .unwrap()
+            .fee_valuations[0]
+            .quote_asset = "WRONG".into();
+        let before = machine.store().snapshot().clone();
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        assert!(machine.request_stop(104).is_err());
+        assert_eq!(AUDIT_VALIDATION_CALLS.with(|calls| calls.get()), 1);
+        assert_eq!(machine.store().snapshot(), &before);
+    }
+
+    #[test]
+    fn validation_reuse_changed_evidence_keeps_full_validation_errors() {
+        let previous = validation_reuse_machine().store().snapshot().clone();
+        type StateMutation = (&'static str, fn(&mut StrategyState));
+        let mutations: &[StateMutation] = &[
+            ("run identity", |state| {
+                state.run_id = StrategyRunId::parse("OTHER001").unwrap()
+            }),
+            ("strategy shape", |state| state.config.grid_count += 1),
+            ("negative quantity", |state| {
+                state
+                    .orders
+                    .values_mut()
+                    .find(|order| order.execution_audit.is_some())
+                    .unwrap()
+                    .cumulative_quantity = -Decimal::ONE;
+            }),
+            ("overallocated quantity", |state| {
+                let order = state
+                    .orders
+                    .values_mut()
+                    .find(|order| order.execution_audit.is_some())
+                    .unwrap();
+                order.cumulative_quantity = order.shape.quantity + Decimal::ONE;
+            }),
+            ("order identity", |state| {
+                let other_id = state
+                    .orders
+                    .values()
+                    .find(|order| order.execution_audit.is_none())
+                    .unwrap()
+                    .client_order_id
+                    .clone();
+                state
+                    .orders
+                    .values_mut()
+                    .find(|order| order.execution_audit.is_some())
+                    .unwrap()
+                    .client_order_id = other_id;
+            }),
+            ("order shape", |state| {
+                state
+                    .orders
+                    .values_mut()
+                    .find(|order| order.execution_audit.is_some())
+                    .unwrap()
+                    .shape
+                    .quantity += Decimal::ONE;
+            }),
+            ("audit identity", |state| {
+                state
+                    .orders
+                    .values_mut()
+                    .find_map(|order| order.execution_audit.as_mut())
+                    .unwrap()
+                    .snapshot
+                    .order
+                    .exchange_order_id = "not-owned".into();
+            }),
+            ("audit trade shape", |state| {
+                state
+                    .orders
+                    .values_mut()
+                    .find_map(|order| order.execution_audit.as_mut())
+                    .unwrap()
+                    .snapshot
+                    .trades[0]
+                    .side = OrderSide::Sell;
+            }),
+            ("duplicate trade", |state| {
+                let audit = state
+                    .orders
+                    .values_mut()
+                    .find_map(|order| order.execution_audit.as_mut())
+                    .unwrap();
+                audit.snapshot.trades.push(audit.snapshot.trades[0].clone());
+            }),
+            ("fee valuation", |state| {
+                state
+                    .orders
+                    .values_mut()
+                    .find_map(|order| order.execution_audit.as_mut())
+                    .unwrap()
+                    .fee_valuations[0]
+                    .quote_asset = "WRONG".into();
+            }),
+            ("future audit", |state| {
+                state
+                    .orders
+                    .values_mut()
+                    .find_map(|order| order.execution_audit.as_mut())
+                    .unwrap()
+                    .synced_at_ms = state.updated_at_ms + 1;
+            }),
+            ("volume", |state| state.total_volume += Decimal::ONE),
+            ("fees", |state| state.total_fee += Decimal::ONE),
+            ("profit replay", |state| {
+                state.gross_realized_profit += Decimal::ONE
+            }),
+            ("lot replay", |state| {
+                state.neutral_lots.values_mut().next().unwrap().entry_value += Decimal::ONE;
+            }),
+            ("event replay", |state| {
+                state.inventory_events.values_mut().next().unwrap().quote += Decimal::ONE;
+            }),
+            ("duplicate event", |state| {
+                let event = state.inventory_events.values().next().unwrap().clone();
+                state
+                    .inventory_events
+                    .insert(state.next_inventory_event_sequence, event);
+                state.next_inventory_event_sequence += 1;
+            }),
+            ("cell capacity", |state| {
+                state
+                    .replacement_obligations
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .shape
+                    .quantity += Decimal::ONE;
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut next = previous.clone();
+            next.revision += 1;
+            next.updated_at_ms += 1;
+            mutate(&mut next);
+            let expected = next.validate().expect_err(name);
+            let actual =
+                ValidatedStrategyState::from_validated_transition(&previous, next).expect_err(name);
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn validation_reuse_untrusted_load_recovery_and_mutable_escape_validate_audits() {
+        let previous = validation_reuse_machine().store().snapshot().clone();
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        ValidatedStrategyState::new(previous.clone()).unwrap();
+        assert_eq!(AUDIT_VALIDATION_CALLS.with(|calls| calls.get()), 1);
+
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        let mut machine = StrategyMachine::new(MemoryStrategyStateStore::new(previous));
+        assert_eq!(AUDIT_VALIDATION_CALLS.with(|calls| calls.get()), 1);
+        machine.store_mut();
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        machine.request_stop(104).unwrap();
+        assert_eq!(AUDIT_VALIDATION_CALLS.with(|calls| calls.get()), 1);
+    }
+
+    #[test]
+    fn validation_reuse_failed_diagnostic_state_cannot_authorize_skipping_replay() {
+        let mut previous = validation_reuse_machine().store().snapshot().clone();
+        previous.lifecycle = StrategyLifecycle::Failed;
+        previous.failure = Some("diagnostic inventory failure".into());
+        previous.gross_realized_profit += Decimal::ONE;
+        previous.validate().unwrap();
+        let mut next = previous.clone();
+        next.revision += 1;
+        next.updated_at_ms += 1;
+        next.lifecycle = StrategyLifecycle::Stopped;
+        assert_eq!(
+            next.validate(),
+            Err(StrategyStateError::InventoryEventLedgerMismatch)
+        );
+        assert!(ValidatedStrategyState::from_validated_transition(&previous, next).is_err());
+    }
+
+    #[test]
+    fn validation_reuse_changed_context_falls_back_to_full_audit_validation() {
+        let previous = validation_reuse_machine().store().snapshot().clone();
+        let mut next = previous.clone();
+        next.revision += 1;
+        next.updated_at_ms += 1;
+        next.created_at_ms -= 1;
+        next.validate().unwrap();
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        ValidatedStrategyState::from_validated_transition(&previous, next).unwrap();
+        assert_eq!(AUDIT_VALIDATION_CALLS.with(|calls| calls.get()), 1);
+    }
+
+    #[test]
+    fn validation_reuse_only_changed_audit_is_validated_and_global_dedup_still_runs() {
+        let mut machine = validation_reuse_machine();
+        let previous = machine.store().snapshot().clone();
+        let id = grid_id(&previous, 0, OrderSide::Buy, false);
+        accept_strategy_order(&mut machine, &id, "second-reuse-order", 104);
+        let shape = machine.store().snapshot().orders[&id].shape.clone();
+        apply_single_valued_trade(
+            &mut machine,
+            id.clone(),
+            ValuedTradeFixture {
+                exchange_order_id: "second-reuse-order",
+                trade_id: "1002",
+                price: shape.price.unwrap(),
+                quantity: shape.quantity,
+                trade_time_ms: 105,
+                applied_at_ms: 106,
+            },
+        );
+        let mut next = machine.store().snapshot().clone();
+        next.revision = previous.revision + 1;
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        ValidatedStrategyState::from_validated_transition(&previous, next.clone()).unwrap();
+        assert_eq!(AUDIT_VALIDATION_CALLS.with(|calls| calls.get()), 1);
+
+        let audit = next
+            .orders
+            .get_mut(&id)
+            .unwrap()
+            .execution_audit
+            .as_mut()
+            .unwrap();
+        audit.snapshot.trades[0].trade_id = "1001".into();
+        audit.fee_valuations[0].trade_id = "1001".into();
+        next.inventory_events
+            .values_mut()
+            .find(|event| event.source_client_order_id == id)
+            .unwrap()
+            .exchange_trade_id = Some("1001".into());
+        assert_eq!(
+            next.validate(),
+            Err(StrategyStateError::InvalidExecutionAudit)
+        );
+        assert!(ValidatedStrategyState::from_validated_transition(&previous, next).is_err());
+    }
+
+    #[test]
+    #[ignore = "synthetic local CPU profile, not an end-to-end latency claim"]
+    fn validation_reuse_history_profile() {
+        let mut machine = small_neutral_risk_machine();
+        let rules = machine.store().snapshot().instrument_rules.clone();
+        let mut id = grid_id(machine.store().snapshot(), 1, OrderSide::Buy, false);
+        for index in 0..128 {
+            let now = 101 + index * 4;
+            let exchange_id = format!("profile-order-{index}");
+            let trade_id = (1000 + index).to_string();
+            accept_strategy_order(&mut machine, &id, &exchange_id, now);
+            let shape = machine.store().snapshot().orders[&id].shape.clone();
+            apply_single_valued_trade(
+                &mut machine,
+                id,
+                ValuedTradeFixture {
+                    exchange_order_id: &exchange_id,
+                    trade_id: &trade_id,
+                    price: shape.price.unwrap(),
+                    quantity: shape.quantity,
+                    trade_time_ms: now + 1,
+                    applied_at_ms: now + 2,
+                },
+            );
+            id = match machine.materialize_replacements(&rules, now + 3).unwrap() {
+                StrategyTransition::ReplacementOrdersReady {
+                    mut client_order_ids,
+                } => {
+                    assert_eq!(client_order_ids.len(), 1);
+                    client_order_ids.pop().unwrap()
+                }
+                other => panic!("unexpected transition: {other:?}"),
+            };
+        }
+        let previous = machine.store().snapshot();
+        let candidates: Vec<_> = (0..20)
+            .map(|_| {
+                let mut next = previous.clone();
+                next.revision += 1;
+                next.updated_at_ms += 1;
+                next.lifecycle = StrategyLifecycle::StopRequested;
+                next
+            })
+            .collect();
+        AUDIT_VALIDATION_CALLS.with(|calls| calls.set(0));
+        let started = Instant::now();
+        for candidate in &candidates {
+            candidate.validate().unwrap();
+        }
+        let full = started.elapsed();
+        let full_calls = AUDIT_VALIDATION_CALLS.with(|calls| calls.replace(0));
+        let started = Instant::now();
+        for candidate in &candidates {
+            candidate
+                .validate_internal(
+                    !inventory_replay_inputs_and_outputs_are_unchanged(previous, candidate),
+                    None,
+                )
+                .unwrap();
+        }
+        let old_successor = started.elapsed();
+        let old_successor_calls = AUDIT_VALIDATION_CALLS.with(|calls| calls.replace(0));
+        let started = Instant::now();
+        let validated: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| {
+                ValidatedStrategyState::from_validated_transition(previous, candidate).unwrap()
+            })
+            .collect();
+        let successor = started.elapsed();
+        std::hint::black_box(&validated);
+        let successor_calls = AUDIT_VALIDATION_CALLS.with(|calls| calls.get());
+        eprintln!(
+            "synthetic profile: orders={} audits=128 iterations=20 full={full:?} old_successor={old_successor:?} successor={successor:?} payload_calls={full_calls}/{old_successor_calls}/{successor_calls}; excludes cloning/persistence/network",
+            previous.orders.len()
+        );
+        assert_eq!(full_calls, 128 * 20);
+        assert_eq!(old_successor_calls, 128 * 20);
+        assert_eq!(successor_calls, 0);
     }
 
     #[test]

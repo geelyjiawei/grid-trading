@@ -84,6 +84,170 @@ describe("theme control", () => {
 });
 
 describe("workspace request isolation", () => {
+  it("expires independently verified risk when profit is unavailable and all refreshes hang", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const grid: GridStatus = { run_id: "risk-only", exchange: "binance", symbol: "BTCUSDT", running: true };
+    installWorkspaceMocks([grid]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    const reads = vi.spyOn(api, "risk").mockResolvedValueOnce({
+      run_id: grid.run_id, exchange: grid.exchange, symbol: grid.symbol,
+      has_risk: true, observation_complete: true, risk_observed_at_ms: Date.now(),
+      funding_status: "unavailable", profit_data_status: "unavailable", profit_observed_at_ms: null,
+    });
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.get(".strategy-overview").text()).toContain("风险核对未通过");
+    vi.mocked(api.gridStatus).mockImplementation(() => new Promise(() => {}));
+    reads.mockImplementation(() => new Promise(() => {}));
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(wrapper.get(".strategy-overview").text()).not.toContain("风险核对未通过");
+    wrapper.unmount();
+  });
+
+  it("expires historical values at 120 seconds even when both status and risk refreshes hang", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const grid: GridStatus = { run_id: "hung-refresh", exchange: "binance", symbol: "BTCUSDT", running: true };
+    installWorkspaceMocks([grid]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    const reads = vi.spyOn(api, "risk").mockResolvedValueOnce({
+      run_id: grid.run_id, exchange: grid.exchange, symbol: grid.symbol,
+      total_equity_profit: "-22", total_fee: "5", fee_valuation_pending_count: 0,
+      funding_status: "verified", funding_net_income: "3", profit_scope: "strategy_owned_inventory",
+      profit_data_status: "verified", profit_observed_at_ms: Date.now(),
+    }).mockRejectedValueOnce(new ApiError("busy", 429));
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(wrapper.get(".metric-primary strong").text()).toBe("-22 USDT");
+    vi.mocked(api.gridStatus).mockImplementation(() => new Promise(() => {}));
+    reads.mockImplementation(() => new Promise(() => {}));
+    await vi.advanceTimersByTimeAsync(90_001);
+    expect(wrapper.get(".strategy-profit strong").text()).toBe("待核对");
+    expect(wrapper.get(".metric-primary strong").text()).toBe("待核对");
+    expect(wrapper.get('[data-testid="settled-funding"] strong').text()).toBe("待核对");
+    expect(reads).toHaveBeenCalledTimes(3);
+    wrapper.unmount();
+  });
+
+  it("hides retained profit immediately while the selected symbol is being edited", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const grid: GridStatus = { run_id: "editing-symbol", exchange: "binance", symbol: "BTCUSDT", running: true };
+    installWorkspaceMocks([grid]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValue({
+      run_id: grid.run_id, exchange: grid.exchange, symbol: grid.symbol,
+      total_equity_profit: "-22", total_fee: "5", fee_valuation_pending_count: 0,
+      funding_status: "verified", funding_net_income: "3", profit_scope: "strategy_owned_inventory",
+      profit_data_status: "verified", profit_observed_at_ms: Date.now(),
+    });
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.get(".metric-primary strong").text()).toBe("-22 USDT");
+    await wrapper.get(".symbol-control input").setValue("ETHUSDT");
+    expect(wrapper.get(".metric-primary strong").text()).toBe("待核对");
+    wrapper.unmount();
+  });
+
+  it.each(["unknown", "unavailable"])("does not promote a %s response into verified historical profit on transient failure", async state => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const grid: GridStatus = { run_id: "never-verified", exchange: "binance", symbol: "BTCUSDT", running: true };
+    installWorkspaceMocks([grid]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValueOnce({
+      run_id: grid.run_id, exchange: grid.exchange, symbol: grid.symbol,
+      total_equity_profit: "999", total_fee: "5", fee_valuation_pending_count: 0,
+      funding_status: "verified", funding_net_income: "3", profit_scope: "strategy_owned_inventory",
+      profit_data_status: state, profit_observed_at_ms: Date.now(),
+    } as RiskSnapshot).mockRejectedValue(new ApiError("risk collection busy", 429));
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.get(".strategy-profit strong").text()).toBe("待核对");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(wrapper.get(".strategy-profit strong").text()).toBe("待核对");
+    expect(wrapper.get(".metric-primary strong").text()).toBe("待核对");
+    wrapper.unmount();
+  });
+
+  it("drops retained same-symbol profit immediately when the strategy run changes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const grid: GridStatus = { run_id: "old-owner", exchange: "binance", symbol: "BTCUSDT", running: true };
+    installWorkspaceMocks([grid]);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    vi.spyOn(api, "risk").mockResolvedValueOnce({
+      run_id: grid.run_id, exchange: grid.exchange, symbol: grid.symbol,
+      total_equity_profit: "-22", total_fee: "5", fee_valuation_pending_count: 0,
+      funding_status: "verified", funding_net_income: "3", profit_scope: "strategy_owned_inventory",
+      profit_data_status: "verified", profit_observed_at_ms: Date.now(),
+    }).mockRejectedValue(new ApiError("funding timeout", 504));
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(wrapper.get(".strategy-profit strong").text()).toBe("-22 USDT");
+    vi.mocked(api.gridStatus).mockResolvedValue({ running: true, count: 1, grids: [{ ...grid, run_id: "new-owner" }] });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(wrapper.get(".strategy-profit strong").text()).toBe("待核对");
+    expect(wrapper.get(".metric-primary strong").text()).toBe("待核对");
+    wrapper.unmount();
+  });
+
+  it("retains same-run verified profit on transient 429 with its old time, expires it, and clears stale on fresh data", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const grids: GridStatus[] = [
+      { run_id: "resilient-current", exchange: "binance", symbol: "BTCUSDT", running: true },
+      { run_id: "resilient-other", exchange: "aster", symbol: "ANSEMUSDT", running: true },
+    ];
+    installWorkspaceMocks(grids);
+    vi.spyOn(api, "price").mockResolvedValue({ last_price: "100", mark_price: "100" });
+    let busy = false;
+    const riskSpy = vi.spyOn(api, "risk").mockImplementation(async (exchange, symbol) => {
+      if (busy) throw new ApiError("risk collection busy", 429);
+      return {
+        run_id: grids.find(grid => grid.exchange === exchange && grid.symbol === symbol)?.run_id,
+        exchange, symbol, gross_profit: "100", total_fee: "5", realized_net_profit: "95",
+        grid_unrealised_pnl: "-120", total_equity_profit: "-22",
+        funding_status: "verified", funding_net_income: "3", fee_valuation_pending_count: 0,
+        profit_scope: "strategy_owned_inventory", profit_data_status: "verified",
+        profit_observed_at_ms: Date.now(), profit_refresh_error: null,
+      };
+    });
+    const wrapper = mount(App);
+    await flushPromises();
+    await flushPromises();
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["-22 USDT", "-22 USDT"]);
+    busy = true;
+    await vi.advanceTimersByTimeAsync(33_000);
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["-22 USDT", "-22 USDT"]);
+    expect(wrapper.get(".metric-primary strong").text()).toBe("-22 USDT");
+    for (const time of wrapper.findAll('[data-testid="profit-freshness"] time')) {
+      expect(time.attributes("datetime")).toBe("2027-01-15T08:00:00.000Z");
+    }
+    expect(wrapper.findAll('[data-testid="profit-freshness"] time')).toHaveLength(3);
+    expect(wrapper.get('[data-testid="settled-funding"] strong').text()).toBe("3 USDT");
+    expect(wrapper.get(".strategy-overview").text()).toContain("非当前收益");
+    expect(riskSpy).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["待核对", "待核对"]);
+    expect(wrapper.get(".metric-primary strong").text()).toBe("待核对");
+    expect(wrapper.get(".strategy-overview").text()).toContain("超过120秒");
+    busy = false;
+    await vi.advanceTimersByTimeAsync(33_000);
+    expect(wrapper.findAll(".strategy-profit strong").map(node => node.text())).toEqual(["-22 USDT", "-22 USDT"]);
+    expect(wrapper.get(".metric-primary strong").text()).toBe("-22 USDT");
+    expect(wrapper.text()).not.toContain("非当前收益");
+    wrapper.unmount();
+  });
+
   it("refreshes protection only for the selected enabled run on the existing status cadence", async () => {
     vi.useFakeTimers();
     const protection = { revision: 0, take_profit_amount: "20", stop_loss_amount: null, updated_at_ms: null };
