@@ -21,6 +21,15 @@ pub(crate) struct MapDelta<K: Ord, V> {
     removals: Vec<K>,
 }
 
+impl<K: Ord, V> Default for MapDelta<K, V> {
+    fn default() -> Self {
+        Self {
+            upserts: BTreeMap::new(),
+            removals: Vec::new(),
+        }
+    }
+}
+
 impl<K: Ord + Clone, V: PartialEq + Clone> MapDelta<K, V> {
     fn between(previous: &BTreeMap<K, V>, next: &BTreeMap<K, V>) -> Self {
         Self {
@@ -65,6 +74,8 @@ pub(crate) struct StrategyDelta {
     lots_by_level: MapDelta<u16, LevelLot>,
     neutral_lots: MapDelta<u64, NeutralLot>,
     inventory_events: MapDelta<u64, InventoryExecutionEvent>,
+    #[serde(default)]
+    external_fills: MapDelta<String, crate::exchange::funding::FundingAccountFill>,
     replacement_obligations: MapDelta<u64, ReplacementObligation>,
 }
 
@@ -73,12 +84,12 @@ fn strategy_header(state: &StrategyState) -> StrategyState {
         ($($field:ident),* $(,)?) => {{
             let StrategyState {
                 $($field,)* orders: _, lots_by_level: _, neutral_lots: _,
-                inventory_events: _, replacement_obligations: _,
+                inventory_events: _, replacement_obligations: _, external_fills: _,
             } = state;
             StrategyState { $($field: $field.clone(),)*
                 orders: BTreeMap::new(), lots_by_level: BTreeMap::new(),
                 neutral_lots: BTreeMap::new(), inventory_events: BTreeMap::new(),
-                replacement_obligations: BTreeMap::new(),
+                replacement_obligations: BTreeMap::new(), external_fills: BTreeMap::new(),
             }
         }};
     }
@@ -94,6 +105,9 @@ fn strategy_header(state: &StrategyState) -> StrategyState {
         plan,
         lifecycle,
         baseline,
+        external_position_delta,
+        external_history_through_ms,
+        external_position_blocker,
         grid_position_net_quantity,
         opening_filled_quantity,
         opening_filled_value,
@@ -140,6 +154,21 @@ impl JournalState for StrategyState {
                 "journal strategy successor identity mismatch",
             ));
         }
+        if self.baseline != next.baseline
+            || self
+                .external_fills
+                .iter()
+                .any(|(key, fill)| next.external_fills.get(key) != Some(fill))
+            || self.external_history_through_ms.is_some_and(|through| {
+                next.external_history_through_ms
+                    .is_none_or(|next| next < through)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal external inventory evidence was rewritten",
+            ));
+        }
         Ok(())
     }
 
@@ -150,6 +179,7 @@ impl JournalState for StrategyState {
             lots_by_level: MapDelta::between(&self.lots_by_level, &next.lots_by_level),
             neutral_lots: MapDelta::between(&self.neutral_lots, &next.neutral_lots),
             inventory_events: MapDelta::between(&self.inventory_events, &next.inventory_events),
+            external_fills: MapDelta::between(&self.external_fills, &next.external_fills),
             replacement_obligations: MapDelta::between(
                 &self.replacement_obligations,
                 &next.replacement_obligations,
@@ -159,11 +189,11 @@ impl JournalState for StrategyState {
 
     fn apply(&mut self, delta: Self::Delta) -> io::Result<()> {
         let mut header = delta.header;
-        self.validate_successor(&header)?;
         if !header.orders.is_empty()
             || !header.lots_by_level.is_empty()
             || !header.neutral_lots.is_empty()
             || !header.inventory_events.is_empty()
+            || !header.external_fills.is_empty()
             || !header.replacement_obligations.is_empty()
         {
             return Err(io::Error::new(
@@ -171,6 +201,10 @@ impl JournalState for StrategyState {
                 "journal strategy identity or scalar header mismatch",
             ));
         }
+        let mut external_fills = self.external_fills.clone();
+        delta.external_fills.apply(&mut external_fills)?;
+        header.external_fills = external_fills;
+        self.validate_successor(&header)?;
         delta.orders.apply(&mut self.orders)?;
         delta.lots_by_level.apply(&mut self.lots_by_level)?;
         delta.neutral_lots.apply(&mut self.neutral_lots)?;

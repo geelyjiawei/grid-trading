@@ -5,6 +5,158 @@ use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
 use crate::domain::{ClientOrderId, OrderSide};
+use crate::exchange::{SnapshotError, funding::FundingAccountFill};
+use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AccountHistoryFill {
+    pub coin: String,
+    pub fill: FundingAccountFill,
+    direction: String,
+    start_position: Decimal,
+    hash: String,
+    liquidation: bool,
+}
+
+impl AccountHistoryFill {
+    pub fn require_ordinary_perp_trade(&self) -> Result<(), SnapshotError> {
+        let quantity = self.fill.signed_quantity;
+        let before = self.start_position;
+        let expected = if quantity > Decimal::ZERO {
+            if before >= Decimal::ZERO {
+                "Open Long"
+            } else if quantity <= -before {
+                "Close Short"
+            } else {
+                "Short > Long"
+            }
+        } else if before <= Decimal::ZERO {
+            "Open Short"
+        } else if -quantity <= before {
+            "Close Long"
+        } else {
+            "Long > Short"
+        };
+        if self.liquidation || self.direction != expected {
+            return Err(SnapshotError::new(
+                "TRADE.XYZ account history contains unsupported nontrade or liquidation evidence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn parse_account_fill_page(
+    value: &Value,
+    from_ms: u64,
+    through_ms: u64,
+) -> Result<Vec<AccountHistoryFill>, SnapshotError> {
+    let rows = value
+        .as_array()
+        .filter(|rows| rows.len() <= 2_000)
+        .ok_or_else(|| SnapshotError::new("TRADE.XYZ account fill page is invalid or oversized"))?;
+    let mut parsed = Vec::with_capacity(rows.len());
+    let mut last_ms = from_ms;
+    for row in rows {
+        if row
+            .get("positionIdx")
+            .is_some_and(|value| value.as_u64() != Some(0))
+            || row
+                .get("positionSide")
+                .is_some_and(|value| value.as_str() != Some("BOTH"))
+        {
+            return Err(SnapshotError::new(
+                "TRADE.XYZ account fill position mode is ambiguous",
+            ));
+        }
+        let text = |field| {
+            row.get(field)
+                .and_then(Value::as_str)
+                .filter(|text| {
+                    !text.is_empty()
+                        && text
+                            .bytes()
+                            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+                })
+                .filter(|text| text.trim() == *text)
+                .ok_or_else(|| {
+                    SnapshotError::new(format!("TRADE.XYZ account fill {field} is invalid"))
+                })
+        };
+        let id = |field| -> Result<String, SnapshotError> {
+            let value = row
+                .get(field)
+                .ok_or_else(|| SnapshotError::new("TRADE.XYZ account fill identity is missing"))?;
+            let raw = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) if number.as_u64().is_some() => number.to_string(),
+                _ => {
+                    return Err(SnapshotError::new(
+                        "TRADE.XYZ account fill identity is invalid",
+                    ));
+                }
+            };
+            if raw.is_empty()
+                || raw.len() > 20
+                || !raw.bytes().all(|byte| byte.is_ascii_digit())
+                || raw.parse::<u64>().ok().is_none_or(|id| id == 0)
+            {
+                return Err(SnapshotError::new(
+                    "TRADE.XYZ account fill identity is invalid",
+                ));
+            }
+            Ok(raw)
+        };
+        let at_ms = row
+            .get("time")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| SnapshotError::new("TRADE.XYZ account fill timestamp is invalid"))?;
+        if at_ms == 0 || at_ms < last_ms || at_ms > through_ms {
+            return Err(SnapshotError::new(
+                "TRADE.XYZ account fills are out of range or unordered",
+            ));
+        }
+        last_ms = at_ms;
+        let coin = text("coin")?;
+        if coin.len() > 128 || coin.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return Err(SnapshotError::new("TRADE.XYZ account fill coin is invalid"));
+        }
+        let quantity = Decimal::from_str_exact(text("sz")?)
+            .ok()
+            .filter(|qty| *qty > Decimal::ZERO)
+            .ok_or_else(|| SnapshotError::new("TRADE.XYZ account fill quantity is invalid"))?;
+        let signed_quantity = match text("side")? {
+            "B" => quantity,
+            "A" => -quantity,
+            _ => return Err(SnapshotError::new("TRADE.XYZ account fill side is invalid")),
+        };
+        let hash = text("hash")?;
+        if hash.len() != 66
+            || !hash.starts_with("0x")
+            || !hash[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(SnapshotError::new(
+                "TRADE.XYZ account fill transaction hash is invalid",
+            ));
+        }
+        parsed.push(AccountHistoryFill {
+            coin: coin.to_owned(),
+            fill: FundingAccountFill {
+                trade_id: id("tid")?,
+                exchange_order_id: id("oid")?,
+                at_ms,
+                signed_quantity,
+            },
+            direction: text("dir")?.to_owned(),
+            start_position: Decimal::from_str_exact(text("startPosition")?).map_err(|_| {
+                SnapshotError::new("TRADE.XYZ account fill start position is invalid")
+            })?,
+            hash: hash.to_owned(),
+            liquidation: row.get("liquidation").is_some_and(|value| !value.is_null()),
+        });
+    }
+    Ok(parsed)
+}
 
 const CLOID_MAGIC: u128 = 0b10_1101;
 const CLOID_MAGIC_SHIFT: u32 = 122;

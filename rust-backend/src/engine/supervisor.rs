@@ -1077,6 +1077,12 @@ where
     } else {
         cached?
     };
+    let history = super::complete_funding_account_history(
+        gateway,
+        history,
+        !identity.external_fills.is_empty(),
+    )
+    .await?;
     let state = capture_profit_state(slot, identity)?;
     let funding = attribute_strategy_funding(&state, &history)?;
     let sample = profit_sample(
@@ -1147,7 +1153,7 @@ fn capture_profit_state<G>(
     Ok(state)
 }
 
-async fn fresh_profit_funding<G: AccountBalanceSnapshotGateway>(
+async fn fresh_profit_funding<G: AccountBalanceSnapshotGateway + PositionSnapshotGateway>(
     gateway: &G,
     state: &StrategyState,
     through: u64,
@@ -1163,7 +1169,8 @@ async fn fresh_profit_funding<G: AccountBalanceSnapshotGateway>(
             "fresh funding does not cover the decision interval",
         ));
     }
-    Ok(history)
+    super::complete_funding_account_history(gateway, history, !state.external_fills.is_empty())
+        .await
 }
 
 async fn check_profit_protection<G>(

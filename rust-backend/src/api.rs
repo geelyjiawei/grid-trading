@@ -2153,6 +2153,9 @@ fn strategy_history_row(snapshot: &StrategyCatalogSnapshot) -> Result<Value, Box
                 "total_volume": state.total_volume.to_string(),
                 "completed_pairs": state.completed_pairs,
                 "baseline_position": state.baseline.signed_quantity.to_string(),
+                "manual_position_net_qty": state.manual_position_quantity().ok().map(|quantity| quantity.to_string()),
+                "external_position_net_qty": state.external_position_delta.to_string(),
+                "external_position_blocker": state.external_position_blocker,
                 "grid_position_net_qty": state.grid_position_net_quantity.to_string(),
             }))
         }
@@ -2441,6 +2444,10 @@ fn strategy_status_response(
                 },
                 "grid_position_net_qty": state.grid_position_net_quantity.to_string(),
                 "expected_position_net_qty": expected_position.to_string(),
+                "manual_position_net_qty": state.manual_position_quantity().ok().map(|quantity| quantity.to_string()),
+                "external_position_net_qty": state.external_position_delta.to_string(),
+                "external_position_blocker": state.external_position_blocker,
+                "external_history_through_ms": state.external_history_through_ms,
                 "opening_filled_qty": state.opening_filled_quantity.to_string(),
                 "planned_total_qty": state.plan.total_quantity.to_string(),
                 "failure": state.failure,
@@ -3675,6 +3682,7 @@ async fn exchange_risk(
             {
                 let expected_run = strategy.run_id.clone();
                 let from_ms = strategy.created_at_ms;
+                let external_activity = !strategy.external_fills.is_empty();
                 let through = strategy_funding_cutoff(&strategy);
                 // Do not pin a large obsolete ledger across a slow network read.
                 drop(strategy);
@@ -3686,6 +3694,7 @@ async fn exchange_risk(
                             &symbol,
                             from_ms,
                             through,
+                            external_activity,
                         )
                         .await
                     }
@@ -4205,6 +4214,7 @@ async fn collect_strategy_funding_history(
         &strategy.symbol,
         strategy.created_at_ms,
         through_ms,
+        !strategy.external_fills.is_empty(),
     )
     .await
 }
@@ -4215,13 +4225,15 @@ async fn collect_funding_history_range(
     symbol: &str,
     from_ms: u64,
     through_ms: u64,
+    external_activity: bool,
 ) -> Result<crate::exchange::funding::FundingHistorySnapshot, SnapshotError> {
-    tokio::time::timeout(
+    let history = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         gateway.funding_history(exchange, symbol, from_ms, through_ms),
     )
     .await
-    .map_err(|_| SnapshotError::new("funding history query timed out"))?
+    .map_err(|_| SnapshotError::new("funding history query timed out"))??;
+    crate::engine::complete_funding_account_history(gateway, history, external_activity).await
 }
 
 fn strategy_funding_cutoff(strategy: &StrategyState) -> Result<u64, SnapshotError> {

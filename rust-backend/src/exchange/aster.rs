@@ -259,7 +259,49 @@ mod funding_history_reader {
         })
     }
 
-    async fn collect<R, F, Fut, P>(
+    pub(super) async fn load_position_fills<F, Fut>(
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+        now_ms: u64,
+        fetch: F,
+    ) -> Result<Vec<FundingAccountFill>, SnapshotError>
+    where
+        F: Fn(&'static str, Parameters) -> Fut + Sync,
+        Fut: Future<Output = Result<String, SnapshotError>> + Send,
+    {
+        // Match the existing conservative funding reader retention/work bound.
+        const POSITION_HISTORY_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+        if from_ms > through_ms
+            || through_ms > now_ms
+            || now_ms.saturating_sub(from_ms) > POSITION_HISTORY_MS
+        {
+            return Err(SnapshotError::new(
+                "account position history window is invalid or unsupported",
+            ));
+        }
+        let mut fills = collect(
+            "/fapi/v3/userTrades",
+            symbol,
+            from_ms,
+            through_ms,
+            false,
+            &fetch,
+            position_fill,
+        )
+        .await?;
+        fills.sort_by(|left, right| {
+            crate::exchange::compare_trade_chronology(
+                left.at_ms,
+                &left.trade_id,
+                right.at_ms,
+                &right.trade_id,
+            )
+        });
+        Ok(fills)
+    }
+
+    async fn collect<K, R, F, Fut, P>(
         path: &'static str,
         symbol: &str,
         from_ms: u64,
@@ -269,10 +311,11 @@ mod funding_history_reader {
         parse: P,
     ) -> Result<Vec<R>, SnapshotError>
     where
+        K: Ord + Clone + Send,
         R: Clone + PartialEq + Send,
         F: Fn(&'static str, Parameters) -> Fut + Sync,
         Fut: Future<Output = Result<String, SnapshotError>> + Send,
-        P: Fn(&Value, &str, u64, u64) -> Result<Option<(u64, R)>, SnapshotError> + Send + Sync,
+        P: Fn(&Value, &str, u64, u64) -> Result<Option<(K, R)>, SnapshotError> + Send + Sync,
     {
         let mut windows = Vec::new();
         let mut start = from_ms;
@@ -319,7 +362,7 @@ mod funding_history_reader {
                     if seen.get(&id).is_some_and(|previous| previous != &record) {
                         return Err(SnapshotError::new("conflicting funding history duplicate"));
                     }
-                    seen.insert(id, record.clone());
+                    seen.insert(id.clone(), record.clone());
                     if !full {
                         complete.insert(id, record);
                     }
@@ -425,6 +468,68 @@ mod funding_history_reader {
                 amount,
                 asset: asset.into(),
                 position_quantity: None,
+            },
+        )))
+    }
+
+    fn opaque_id(row: &Value, key: &str) -> Result<String, SnapshotError> {
+        match row.get(key) {
+            Some(Value::String(raw)) if crate::exchange::is_valid_trade_id(raw) => Ok(raw.clone()),
+            Some(Value::Number(number)) if number.is_u64() => Ok(number.to_string()),
+            _ => Err(SnapshotError::new(format!(
+                "account position history missing or invalid {key}"
+            ))),
+        }
+    }
+
+    fn position_fill(
+        row: &Value,
+        symbol: &str,
+        from: u64,
+        through: u64,
+    ) -> Result<Option<(String, FundingAccountFill)>, SnapshotError> {
+        if text(row, "symbol")? != symbol {
+            return Err(SnapshotError::new(
+                "account position history symbol does not match request",
+            ));
+        }
+        if text(row, "positionSide")? != "BOTH" {
+            return Err(SnapshotError::new(
+                "account position history requires one-way position sides",
+            ));
+        }
+        let id = opaque_id(row, "id")?;
+        let order_id = opaque_id(row, "orderId")?;
+        let at_ms = timestamp(row, from, through)?;
+        let quantity = decimal(row, "qty")?;
+        if quantity <= Decimal::ZERO {
+            return Err(SnapshotError::new(
+                "account position history fill quantity must be positive",
+            ));
+        }
+        let buy = match text(row, "side")? {
+            "BUY" => true,
+            "SELL" => false,
+            _ => {
+                return Err(SnapshotError::new(
+                    "account position history fill side is invalid",
+                ));
+            }
+        };
+        if let Some(buyer) = row.get("buyer")
+            && buyer.as_bool() != Some(buy)
+        {
+            return Err(SnapshotError::new(
+                "account position history side conflicts with buyer",
+            ));
+        }
+        Ok(Some((
+            id.clone(),
+            FundingAccountFill {
+                trade_id: id,
+                exchange_order_id: order_id,
+                at_ms,
+                signed_quantity: if buy { quantity } else { -quantity },
             },
         )))
     }
@@ -1242,6 +1347,38 @@ where
     S: AsterMessageSigner,
     N: NonceSource,
 {
+    async fn account_position_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<crate::exchange::AccountPositionHistory, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Aster, symbol)?;
+        let symbol = symbol.trim().to_ascii_uppercase();
+        let fills = funding_history_reader::load_position_fills(
+            &symbol,
+            from_ms,
+            through_ms,
+            self.nonce_source.next_nonce() / 1000,
+            |path, parameters| async move {
+                let request = self
+                    .signed_request(HttpMethod::Get, path, parameters)
+                    .map_err(|error| SnapshotError::new(error.to_string()))?;
+                self.execute_snapshot(request, "Aster account position history")
+                    .await
+            },
+        )
+        .await?;
+        Ok(crate::exchange::AccountPositionHistory {
+            exchange,
+            symbol,
+            from_ms,
+            through_ms,
+            fills,
+        })
+    }
+
     async fn position_snapshot(
         &self,
         exchange: Exchange,
@@ -2109,6 +2246,442 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing query parameter {name}"))
                 .1
                 .clone()
+        }
+
+        mod account_position_history_tests {
+            use super::*;
+
+            #[derive(Clone, Default)]
+            struct DenseTradeHistory(Arc<std::sync::atomic::AtomicUsize>);
+
+            #[async_trait]
+            impl HttpTransport for DenseTradeHistory {
+                async fn execute(
+                    &self,
+                    request: PreparedHttpRequest,
+                ) -> Result<HttpResponse, TransportError> {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(request.path, "/fapi/v3/userTrades");
+                    let start = param(&request, "startTime").parse::<u64>().unwrap();
+                    let end = param(&request, "endTime").parse::<u64>().unwrap();
+                    let rows: Vec<_> = if end - start >= 1000 {
+                        (0..1000)
+                            .map(|id| {
+                                let mut row = fill(id, start + id * (end - start) / 1000, "BUY");
+                                row["id"] = json!(format!("{start}:{end}:{id}"));
+                                row
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: json!(rows).to_string(),
+                    })
+                }
+            }
+
+            #[tokio::test]
+            async fn query_budget_returns_error_not_partial_history() {
+                let transport = DenseTradeHistory::default();
+                let adapter = AsterAdapter::with_base_url(
+                    transport.clone(),
+                    RecordingSigner::new("0x2222222222222222222222222222222222222222"),
+                    FixedNonce(1_700_000_000_123_456),
+                    "0x1111111111111111111111111111111111111111",
+                    "https://example.test",
+                );
+                let error = adapter
+                    .account_position_history(
+                        Exchange::Aster,
+                        "MUUSDT",
+                        BASE - 8 * 24 * 60 * 60 * 1000,
+                        BASE,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("query budget"), "{error}");
+                assert_eq!(transport.0.load(std::sync::atomic::Ordering::Relaxed), 256);
+            }
+
+            #[tokio::test]
+            async fn preserves_exact_ids_and_reads_only_signed_symbol_trade_history() {
+                let mut buy = fill(7, BASE, "BUY");
+                buy["id"] = json!("0007");
+                buy["orderId"] = json!("184467440737095516160");
+                let mut sell = fill(7, BASE + 100, "SELL");
+                sell["orderId"] = json!("manual-order-A");
+                let transport = queued(vec![json!([sell, buy])]);
+                let result = subject(transport.clone())
+                    .account_position_history(Exchange::Aster, "muusdt", BASE, BASE + 100)
+                    .await
+                    .unwrap();
+                assert_eq!(result.exchange, Exchange::Aster);
+                assert_eq!(result.symbol, "MUUSDT");
+                assert_eq!((result.from_ms, result.through_ms), (BASE, BASE + 100));
+                assert_eq!(result.fills.len(), 2);
+                assert_eq!(result.fills[0].trade_id, "0007");
+                assert_eq!(result.fills[0].exchange_order_id, "184467440737095516160");
+                assert_eq!(result.fills[0].signed_quantity, Decimal::new(25, 1));
+                assert_eq!(result.fills[1].trade_id, "7");
+                assert_eq!(result.fills[1].exchange_order_id, "manual-order-A");
+                assert_eq!(result.fills[1].signed_quantity, Decimal::new(-25, 1));
+                let requests = transport.all_requests();
+                assert_eq!(requests.len(), 1);
+                let request = &requests[0];
+                assert_eq!(request.method, HttpMethod::Get);
+                assert_eq!(request.path, "/fapi/v3/userTrades");
+                assert_eq!(param(request, "symbol"), "MUUSDT");
+                assert_eq!(param(request, "startTime"), BASE.to_string());
+                assert_eq!(param(request, "endTime"), (BASE + 100).to_string());
+                assert_eq!(param(request, "limit"), "1000");
+                assert!(!param(request, "signature").is_empty());
+                assert!(
+                    !request.query.iter().any(|(key, _)| matches!(
+                        key.as_str(),
+                        "orderId" | "fromId" | "incomeType"
+                    ))
+                );
+            }
+
+            #[tokio::test]
+            async fn empty_history_succeeds_without_income_or_position_reads() {
+                let transport = queued(vec![json!([])]);
+                let history = subject(transport.clone())
+                    .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                    .await
+                    .unwrap();
+                assert!(history.fills.is_empty());
+                assert_eq!(transport.all_requests().len(), 1);
+            }
+
+            #[tokio::test]
+            async fn retention_boundary_is_bounded_before_network() {
+                let now = BASE + 123;
+                let oldest = now - 90 * 24 * 60 * 60 * 1000;
+                let transport = queued(vec![json!([]); 13]);
+                let history = subject(transport.clone())
+                    .account_position_history(Exchange::Aster, "MUUSDT", oldest, now)
+                    .await
+                    .unwrap();
+                assert!(history.fills.is_empty());
+                assert_eq!(transport.all_requests().len(), 13);
+                let transport = MockTransport::default();
+                assert!(
+                    subject(transport.clone())
+                        .account_position_history(Exchange::Aster, "MUUSDT", oldest - 1, now)
+                        .await
+                        .is_err()
+                );
+                assert!(transport.all_requests().is_empty());
+            }
+
+            #[tokio::test]
+            async fn preserves_large_numeric_ids_without_float_or_string_coercion() {
+                let mut row = fill(1, BASE, "BUY");
+                row["id"] = json!(9_007_199_254_740_993u64);
+                row["orderId"] = json!(u64::MAX);
+                row["time"] = json!(BASE.to_string());
+                row.as_object_mut().unwrap().remove("buyer");
+                let mut duplicate = row.clone();
+                duplicate["id"] = json!("9007199254740993");
+                let history = subject(queued(vec![json!([row, duplicate])]))
+                    .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                    .await
+                    .unwrap();
+                assert_eq!(history.fills.len(), 1);
+                assert_eq!(history.fills[0].trade_id, "9007199254740993");
+                assert_eq!(history.fills[0].exchange_order_id, "18446744073709551615");
+                assert_eq!(history.fills[0].at_ms, BASE);
+            }
+
+            #[tokio::test]
+            async fn uses_canonical_chronology_without_normalizing_equal_magnitude_ids() {
+                let mut padded = fill(2, BASE, "BUY");
+                padded["id"] = json!("02");
+                let history = subject(queued(vec![json!([
+                    fill(10, BASE, "BUY"),
+                    fill(2, BASE, "BUY"),
+                    padded,
+                ])]))
+                .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                .await
+                .unwrap();
+                assert_eq!(
+                    history
+                        .fills
+                        .iter()
+                        .map(|fill| fill.trade_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["02", "2", "10"]
+                );
+            }
+
+            #[tokio::test]
+            async fn rejects_invalid_scope_or_unsupported_ranges_before_network() {
+                let day = 24 * 60 * 60 * 1000;
+                for (exchange, symbol, from, through) in [
+                    (Exchange::Binance, "MUUSDT", BASE, BASE),
+                    (Exchange::Aster, "", BASE, BASE),
+                    (Exchange::Aster, "MU USDT", BASE, BASE),
+                    (Exchange::Aster, "MUUSDT", BASE + 1, BASE),
+                    (Exchange::Aster, "MUUSDT", BASE, BASE + 124),
+                    (Exchange::Aster, "MUUSDT", BASE - 91 * day, BASE),
+                    (Exchange::Aster, "MUUSDT", 0, BASE),
+                    (Exchange::Aster, "MUUSDT", 0, u64::MAX),
+                ] {
+                    let transport = MockTransport::default();
+                    assert!(
+                        subject(transport.clone())
+                            .account_position_history(exchange, symbol, from, through)
+                            .await
+                            .is_err(),
+                        "{exchange:?} {symbol} {from}..{through}"
+                    );
+                    assert!(transport.all_requests().is_empty());
+                }
+            }
+
+            #[tokio::test]
+            async fn rejects_malformed_hedged_foreign_and_out_of_bounds_fills() {
+                for field in [
+                    "id",
+                    "orderId",
+                    "time",
+                    "side",
+                    "positionSide",
+                    "qty",
+                    "symbol",
+                ] {
+                    let mut row = fill(1, BASE, "BUY");
+                    row.as_object_mut().unwrap().remove(field);
+                    assert!(
+                        subject(queued(vec![json!([row])]))
+                            .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                            .await
+                            .is_err(),
+                        "missing {field}"
+                    );
+                }
+                for (field, value) in [
+                    ("id", json!("")),
+                    ("id", json!(" 1")),
+                    ("id", json!("x".repeat(129))),
+                    ("id", json!(-1)),
+                    ("id", json!(1.5)),
+                    ("orderId", json!(null)),
+                    ("orderId", json!("order\n1")),
+                    ("orderId", json!("1 ")),
+                    ("time", json!(-1)),
+                    ("time", json!(1.5)),
+                    ("time", json!("bad")),
+                    ("time", json!(BASE - 1)),
+                    ("time", json!(BASE + 101)),
+                    ("side", json!("buy")),
+                    ("side", json!("UNKNOWN")),
+                    ("buyer", json!(false)),
+                    ("buyer", json!("true")),
+                    ("positionSide", json!("LONG")),
+                    ("positionSide", json!("SHORT")),
+                    ("positionSide", json!("both")),
+                    ("positionSide", json!(null)),
+                    ("qty", json!("0")),
+                    ("qty", json!("-0")),
+                    ("qty", json!("-1")),
+                    ("qty", json!("NaN")),
+                    ("qty", json!(1)),
+                    ("qty", json!("1e-2")),
+                    ("qty", json!("0.20000000000000000000000000001")),
+                    ("qty", json!("0.00000000000000000000000000001")),
+                    ("symbol", json!("BTCUSDT")),
+                    ("symbol", json!("muusdt")),
+                ] {
+                    let mut row = fill(1, BASE, "BUY");
+                    row[field] = value.clone();
+                    assert!(
+                        subject(queued(vec![json!([row])]))
+                            .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                            .await
+                            .is_err(),
+                        "accepted {field}={value}"
+                    );
+                }
+            }
+
+            #[tokio::test]
+            async fn deduplicates_exact_identity_but_rejects_conflicting_evidence() {
+                let row = fill(1, BASE, "BUY");
+                let history = subject(queued(vec![json!([row.clone(), row.clone()])]))
+                    .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                    .await
+                    .unwrap();
+                assert_eq!(history.fills.len(), 1);
+                for (field, value) in [
+                    ("orderId", json!("other-order")),
+                    ("qty", json!("3")),
+                    ("time", json!(BASE + 1)),
+                ] {
+                    let mut changed = row.clone();
+                    changed[field] = value;
+                    assert!(
+                        subject(queued(vec![json!([row.clone(), changed])]))
+                            .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                            .await
+                            .is_err(),
+                        "{field}"
+                    );
+                }
+                let mut changed = row.clone();
+                changed["side"] = json!("SELL");
+                changed["buyer"] = json!(false);
+                assert!(
+                    subject(queued(vec![json!([row, changed])]))
+                        .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err()
+                );
+            }
+
+            #[tokio::test]
+            async fn completes_full_pages_with_disjoint_subwindows_and_equal_timestamps() {
+                let rows: Vec<_> = (0..1000)
+                    .map(|id| fill(id, BASE - 1000 + (id / 2) * 2, "SELL"))
+                    .collect();
+                let transport = queued(vec![json!(rows), json!(rows[..500]), json!(rows[500..])]);
+                let history = subject(transport.clone())
+                    .account_position_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                    .await
+                    .unwrap();
+                assert_eq!(history.fills.len(), 1000);
+                assert_eq!(history.fills[0].at_ms, BASE - 1000);
+                assert_eq!(history.fills.last().unwrap().at_ms, BASE - 2);
+                let requests = transport.all_requests();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(param(&requests[1], "startTime"), (BASE - 1000).to_string());
+                assert_eq!(param(&requests[1], "endTime"), (BASE - 501).to_string());
+                assert_eq!(param(&requests[2], "startTime"), (BASE - 500).to_string());
+                assert_eq!(param(&requests[2], "endTime"), (BASE - 1).to_string());
+            }
+
+            #[tokio::test]
+            async fn covers_multiple_seven_day_windows_without_gaps_or_income_queries() {
+                let day = 24 * 60 * 60 * 1000;
+                let from = BASE - 8 * day;
+                let boundary = BASE - day;
+                let transport = queued(vec![
+                    json!([fill(1, from, "BUY"), fill(2, boundary - 1, "SELL")]),
+                    json!([fill(3, boundary, "BUY"), fill(4, BASE + 100, "SELL")]),
+                ]);
+                let history = subject(transport.clone())
+                    .account_position_history(Exchange::Aster, "MUUSDT", from, BASE + 100)
+                    .await
+                    .unwrap();
+                assert_eq!(history.fills.len(), 4);
+                let requests = transport.all_requests();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(param(&requests[0], "startTime"), from.to_string());
+                assert_eq!(param(&requests[0], "endTime"), (boundary - 1).to_string());
+                assert_eq!(param(&requests[1], "startTime"), boundary.to_string());
+                assert_eq!(param(&requests[1], "endTime"), (BASE + 100).to_string());
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| request.path == "/fapi/v3/userTrades")
+                );
+            }
+
+            #[tokio::test]
+            async fn rejects_saturated_oversized_and_nonadvancing_pages() {
+                let full = vec![fill(1, BASE, "BUY"); 1000];
+                let error = subject(queued(vec![json!(full)]))
+                    .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("truncated"), "{error}");
+                assert!(
+                    subject(queued(vec![json!(vec![fill(1, BASE, "BUY"); 1001])]))
+                        .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                        .await
+                        .is_err()
+                );
+                let rows: Vec<_> = (0..1000)
+                    .map(|id| fill(id, BASE - 1000 + id, "BUY"))
+                    .collect();
+                assert!(
+                    subject(queued(vec![json!(rows), json!(rows)]))
+                        .account_position_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                        .await
+                        .is_err()
+                );
+            }
+
+            #[tokio::test]
+            async fn rejects_disappearing_or_conflicting_parent_page_evidence() {
+                let rows: Vec<_> = (0..1000)
+                    .map(|id| fill(id, BASE - 1000 + id, "BUY"))
+                    .collect();
+                let error = subject(queued(vec![
+                    json!(rows),
+                    json!(rows[1..500]),
+                    json!(rows[500..]),
+                ]))
+                .account_position_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("changed"), "{error}");
+                let mut first = rows[..500].to_vec();
+                first[0]["orderId"] = json!("conflicting-order");
+                assert!(
+                    subject(queued(vec![json!(rows), json!(first)]))
+                        .account_position_history(Exchange::Aster, "MUUSDT", BASE - 1000, BASE - 1)
+                        .await
+                        .is_err()
+                );
+            }
+
+            #[tokio::test]
+            async fn propagates_transport_http_and_malformed_page_errors() {
+                for response in [
+                    Err(TransportError::Connection("offline".into())),
+                    Ok(HttpResponse {
+                        status: 429,
+                        body: r#"{"code":-1003,"msg":"rate limited"}"#.into(),
+                    }),
+                    Ok(HttpResponse {
+                        status: 500,
+                        body: "server error".into(),
+                    }),
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: "{".into(),
+                    }),
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: "{}".into(),
+                    }),
+                ] {
+                    assert!(
+                        subject(MockTransport::with_response(response))
+                            .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE)
+                            .await
+                            .is_err()
+                    );
+                }
+                let transport = queued(vec![json!(vec![fill(1, BASE, "BUY"); 1000])]);
+                transport
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .push_back(Err(TransportError::Timeout("interrupted".into())));
+                assert!(
+                    subject(transport.clone())
+                        .account_position_history(Exchange::Aster, "MUUSDT", BASE, BASE + 100)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(transport.all_requests().len(), 2);
+            }
         }
 
         #[tokio::test]

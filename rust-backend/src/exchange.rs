@@ -721,6 +721,29 @@ pub trait PositionSnapshotGateway: Send + Sync {
         exchange: Exchange,
         symbol: &str,
     ) -> Result<PositionSnapshot, SnapshotError>;
+
+    /// Complete account executions for this market and inclusive time window.
+    /// An unsupported or truncated history must be an error, never an empty page.
+    async fn account_position_history(
+        &self,
+        _exchange: Exchange,
+        _symbol: &str,
+        _from_ms: u64,
+        _through_ms: u64,
+    ) -> Result<AccountPositionHistory, SnapshotError> {
+        Err(SnapshotError::new(
+            "complete account position history is unavailable",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPositionHistory {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub from_ms: u64,
+    pub through_ms: u64,
+    pub fills: Vec<funding::FundingAccountFill>,
 }
 
 #[cfg(test)]

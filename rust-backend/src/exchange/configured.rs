@@ -1122,6 +1122,37 @@ impl InstrumentRulesGateway for ConfiguredExchangeGateway {
 
 #[async_trait]
 impl PositionSnapshotGateway for ConfiguredExchangeGateway {
+    async fn account_position_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<crate::exchange::AccountPositionHistory, SnapshotError> {
+        match self {
+            Self::Binance(gateway) => {
+                gateway
+                    .account_position_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+            Self::Aster(gateway) => {
+                gateway
+                    .account_position_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+            Self::Bybit(gateway) => {
+                gateway
+                    .account_position_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+            Self::TradeXyz(gateway) => {
+                gateway
+                    .account_position_history(exchange, symbol, from_ms, through_ms)
+                    .await
+            }
+        }
+    }
+
     async fn position_snapshot(
         &self,
         exchange: Exchange,
@@ -1479,6 +1510,18 @@ impl InstrumentRulesGateway for SharedConfiguredExchangeGateway {
 
 #[async_trait]
 impl PositionSnapshotGateway for SharedConfiguredExchangeGateway {
+    async fn account_position_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<crate::exchange::AccountPositionHistory, SnapshotError> {
+        self.inner
+            .account_position_history(exchange, symbol, from_ms, through_ms)
+            .await
+    }
+
     async fn position_snapshot(
         &self,
         exchange: Exchange,

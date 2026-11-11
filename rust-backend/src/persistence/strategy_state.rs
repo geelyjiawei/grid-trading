@@ -485,6 +485,67 @@ mod tests {
     }
 
     #[test]
+    fn manual_inventory_migrates_legacy_file_and_replays_incremental_wal_with_blocker() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("strategy.json");
+        let initial = state();
+        let mut legacy =
+            serde_json::to_value(PersistedStrategyState::Active(Box::new(initial.clone())))
+                .unwrap();
+        for field in [
+            "external_fills",
+            "external_position_delta",
+            "external_history_through_ms",
+            "external_position_blocker",
+        ] {
+            legacy["state"].as_object_mut().unwrap().remove(field);
+        }
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let store = FileStrategyStateStore::load(&path).unwrap();
+        assert_eq!(store.snapshot(), &initial);
+        let mut machine = crate::engine::StrategyMachine::new(store);
+        let fill = crate::exchange::funding::FundingAccountFill {
+            trade_id: "external-opaque-001".into(),
+            exchange_order_id: "manual-001".into(),
+            at_ms: 120,
+            signed_quantity: Decimal::new(-5, 1),
+        };
+        let history = crate::exchange::AccountPositionHistory {
+            exchange: initial.exchange,
+            symbol: initial.symbol.clone(),
+            from_ms: 100,
+            through_ms: 200,
+            fills: vec![fill],
+        };
+        machine
+            .reconcile_external_inventory(&history, Decimal::new(-5, 1), 201)
+            .unwrap();
+        let checkpoint = fs::read(&path).unwrap();
+        machine
+            .block_external_inventory("unresolved external execution".into(), 202)
+            .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            checkpoint,
+            "warm blocker commit must not rewrite the full snapshot"
+        );
+        let expected = machine.store().snapshot().clone();
+        drop(machine);
+        let restored = FileStrategyStateStore::load(&path).unwrap();
+        assert_eq!(restored.snapshot(), &expected);
+        assert_eq!(
+            restored.snapshot().manual_position_quantity().unwrap(),
+            Decimal::new(-5, 1)
+        );
+        assert!(restored.snapshot().ready_intents(203).unwrap().is_empty());
+        assert_eq!(
+            restored.snapshot().grid_position_net_quantity,
+            Decimal::ZERO
+        );
+        assert_eq!(restored.snapshot().baseline, initial.baseline);
+    }
+
+    #[test]
     fn atomic_file_store_round_trips_exact_strategy_state() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("strategy.json");

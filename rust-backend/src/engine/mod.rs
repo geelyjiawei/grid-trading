@@ -5,6 +5,7 @@ mod coordinator;
 mod exchange_inputs;
 mod execution_accounting;
 mod execution_sync;
+mod external_inventory;
 mod fee_rates;
 mod grid_plan;
 mod leverage;
@@ -90,7 +91,7 @@ pub use strategy_machine::{
 };
 pub(crate) use strategy_profit::{
     StrategyProfitMetrics, attribute_strategy_funding, collect_strategy_funding_at,
-    strategy_profit_metrics, validated_one_way_quantity,
+    complete_funding_account_history, strategy_profit_metrics, validated_one_way_quantity,
 };
 pub use submission::{
     SubmissionError, SubmissionResult, SubmissionService, submit_many_with, submit_with,

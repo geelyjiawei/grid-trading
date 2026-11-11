@@ -14,13 +14,168 @@ use crate::{
         CancellationAcknowledgement, ExchangeMarketSnapshot, HistoricalMinutePrice,
         HistoricalOrder, LeverageAcknowledgement, OpenOrderExecutionProgress, OrderLifecycle,
         PlacementAcknowledgement, PositionLeg, PositionSide, PositionSnapshot, TradeFill,
-        TradingFeeRates, execution::OrderExecutionHeader, is_valid_trade_id,
-        strategy_client_order_id,
+        TradingFeeRates, execution::OrderExecutionHeader, funding::FundingAccountFill,
+        is_valid_trade_id, strategy_client_order_id,
     },
 };
 
 const CATEGORY: &str = "linear";
 const MAX_OPEN_ORDER_PAGE_SIZE: usize = 50;
+
+#[derive(Debug)]
+pub(super) struct AccountExecutionPage {
+    pub fills: Vec<FundingAccountFill>,
+    pub next_cursor: Option<String>,
+}
+
+fn account_cursor(result: &Value) -> Result<Option<String>, BybitCodecError> {
+    let cursor = result
+        .get("nextPageCursor")
+        .and_then(Value::as_str)
+        .ok_or(BybitCodecError::InvalidField("nextPageCursor"))?;
+    if cursor.len() > 4096 || !cursor.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(BybitCodecError::InvalidField("nextPageCursor"));
+    }
+    Ok((!cursor.is_empty()).then(|| cursor.to_owned()))
+}
+
+pub(super) fn parse_account_execution_page(
+    body: &str,
+    symbol: &str,
+    from_ms: u64,
+    through_ms: u64,
+) -> Result<AccountExecutionPage, BybitCodecError> {
+    let root = success_root(body)?;
+    let result = result_object(&root)?;
+    require_category(result)?;
+    let next_cursor = account_cursor(result)?;
+    let rows = required_array(result, "list")?;
+    if rows.len() > 100 {
+        return Err(BybitCodecError::InvalidField("list"));
+    }
+    let mut fills = Vec::new();
+    for row in rows {
+        let at_ms = required_u64(row, "execTime")?;
+        if at_ms == 0 || at_ms < from_ms || at_ms > through_ms {
+            return Err(BybitCodecError::InvalidField("execTime"));
+        }
+        let row_symbol = required_string(row, "symbol")?;
+        if !row_symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return Err(BybitCodecError::InvalidField("symbol"));
+        }
+        if row_symbol != symbol {
+            continue;
+        }
+        match required_string(row, "execType")? {
+            "Funding" => continue,
+            "Trade" => {}
+            _ => return Err(BybitCodecError::InvalidField("execType")),
+        }
+        if row.get("positionIdx").is_some() && required_u64(row, "positionIdx")? != 0 {
+            return Err(BybitCodecError::InvalidField("positionIdx"));
+        }
+        if row
+            .get("positionSide")
+            .is_some_and(|value| value.as_str() != Some("BOTH"))
+        {
+            return Err(BybitCodecError::InvalidField("positionSide"));
+        }
+        if let Some(create_type) = optional_string(row, "createType")? {
+            validate_account_create_type(&create_type)?;
+        }
+        let trade_id = required_string(row, "execId")?;
+        let exchange_order_id = required_string(row, "orderId")?;
+        if !is_valid_trade_id(trade_id) || !is_valid_trade_id(exchange_order_id) {
+            return Err(BybitCodecError::InvalidField("executionIdentity"));
+        }
+        let quantity = Decimal::from_str_exact(required_string(row, "execQty")?)
+            .map_err(|_| BybitCodecError::InvalidField("execQty"))?;
+        if quantity <= Decimal::ZERO {
+            return Err(BybitCodecError::InvalidField("execQty"));
+        }
+        let signed_quantity = match required_string(row, "side")? {
+            "Buy" => quantity,
+            "Sell" => -quantity,
+            _ => return Err(BybitCodecError::InvalidField("side")),
+        };
+        fills.push(FundingAccountFill {
+            trade_id: trade_id.to_owned(),
+            exchange_order_id: exchange_order_id.to_owned(),
+            at_ms,
+            signed_quantity,
+        });
+    }
+    Ok(AccountExecutionPage { fills, next_cursor })
+}
+
+fn validate_account_create_type(create_type: &str) -> Result<(), BybitCodecError> {
+    // Unknown exchange-generated changes must not be relabelled as a manual trade.
+    match create_type {
+        "CreateByUser"
+        | "CreateByStopOrder"
+        | "CreateByTakeProfit"
+        | "CreateByPartialTakeProfit"
+        | "CreateByStopLoss"
+        | "CreateByPartialStopLoss"
+        | "CreateByTrailingStop"
+        | "CreateByTrailingProfit"
+        | "CreateByClosing"
+        | "CreateByFGridBot"
+        | "CloseByFGridBot"
+        | "CreateByTWAP"
+        | "CreateByMartingaleBot"
+        | "CloseByMartingaleBot"
+        | "CreateByIceBerg"
+        | "CreateByChaseOrder"
+        | "CreateByBboOrder"
+        | "CreateByTVSignal"
+        | "CreateByMmRateClose"
+        | "CreateByArbitrage"
+        | "CreateByDdh" => Ok(()),
+        _ => Err(BybitCodecError::InvalidField("createType")),
+    }
+}
+
+pub(super) fn parse_account_order_mode(
+    body: &str,
+    symbol: &str,
+    fill: &FundingAccountFill,
+) -> Result<bool, BybitCodecError> {
+    let root = success_root(body)?;
+    let result = result_object(&root)?;
+    require_category(result)?;
+    if account_cursor(result)?.is_some() {
+        return Err(BybitCodecError::InvalidField("nextPageCursor"));
+    }
+    let rows = required_array(result, "list")?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    if rows.len() != 1 {
+        return Err(BybitCodecError::DuplicateRecord);
+    }
+    let row = &rows[0];
+    if required_string(row, "symbol")? != symbol
+        || required_string(row, "orderId")? != fill.exchange_order_id
+        || required_u64(row, "positionIdx")? != 0
+        || row
+            .get("positionSide")
+            .is_some_and(|value| value.as_str() != Some("BOTH"))
+        || required_string(row, "side")?
+            != if fill.signed_quantity > Decimal::ZERO {
+                "Buy"
+            } else {
+                "Sell"
+            }
+    {
+        return Err(BybitCodecError::IdentityMismatch);
+    }
+    validate_account_create_type(required_string(row, "createType")?)?;
+    Ok(true)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BybitErrorBody {

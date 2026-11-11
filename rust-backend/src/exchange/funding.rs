@@ -13,7 +13,7 @@ pub struct FundingPayment {
     pub position_quantity: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FundingAccountFill {
     pub trade_id: String,
     pub exchange_order_id: String,

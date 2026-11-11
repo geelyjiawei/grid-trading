@@ -25,8 +25,8 @@ use crate::{
     },
     exchange::{
         AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountBalanceUnit,
-        ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement, CancellationError,
-        ExchangeIdentityGateway, ExchangeMarketSnapshot, ExecutionSnapshotError,
+        AccountPositionHistory, ActiveOrderStatus, AuthoritativeOrder, CancellationAcknowledgement,
+        CancellationError, ExchangeIdentityGateway, ExchangeMarketSnapshot, ExecutionSnapshotError,
         ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
         InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
         LookupError, MarketSnapshotGateway, OpenOrderExecutionProgress, OpenOrderSnapshotGateway,
@@ -41,11 +41,11 @@ use crate::{
             TransportError,
         },
         trade_xyz_codec::{
-            CancelAction, HyperliquidSignature, HyperliquidSigner, OrderAction, TradeXyzCodecError,
-            UpdateLeverageAction, WireOrder, WireOrderType, decode_cloid, default_exchange_coin,
-            effective_price_tick, encode_cloid, exchange_coin, local_symbol,
-            maximum_decimal_price_tick, normalize_address, quantity_step, symbol_base, valid_price,
-            wire_decimal,
+            AccountHistoryFill, CancelAction, HyperliquidSignature, HyperliquidSigner, OrderAction,
+            TradeXyzCodecError, UpdateLeverageAction, WireOrder, WireOrderType, decode_cloid,
+            default_exchange_coin, effective_price_tick, encode_cloid, exchange_coin, local_symbol,
+            maximum_decimal_price_tick, normalize_address, parse_account_fill_page, quantity_step,
+            symbol_base, valid_price, wire_decimal,
         },
     },
 };
@@ -61,6 +61,11 @@ const DEX_NAME: &str = "xyz";
 const FUNDING_PAGE_LIMIT: usize = 500;
 const MAX_FUNDING_PAGES: usize = 256;
 const MAX_FUNDING_ROWS: usize = 50_000;
+const MAX_ACCOUNT_FILL_PAGES: usize = 64;
+const ACCOUNT_FILL_RETENTION_LIMIT: usize = 10_000;
+// The general /info time-pagination contract is 500 rows, while fills documents
+// up to 2000. Only a page below the smaller bound proves exhaustion.
+const ACCOUNT_FILL_EXHAUSTION_THRESHOLD: usize = 500;
 // Local safety bound, not a claim about a protocol maximum or atomic execution.
 const MAX_BATCH_CANCELLATIONS: usize = 100;
 // One default-weight Hyperliquid info request consumes about 1.2 seconds of our
@@ -995,6 +1000,65 @@ where
         self.transport.execute(request).await
     }
 
+    async fn account_fill_window(
+        &self,
+        from_ms: u64,
+        through_ms: Option<u64>,
+    ) -> Result<BTreeMap<(String, String), AccountHistoryFill>, SnapshotError> {
+        let mut seen = BTreeMap::new();
+        let mut start = from_ms;
+        for _ in 0..MAX_ACCOUNT_FILL_PAGES {
+            let mut query = json!({
+                "type":"userFillsByTime", "user":self.account_address,
+                "startTime":start, "aggregateByTime":false
+            });
+            if let Some(end) = through_ms {
+                query["endTime"] = json!(end);
+            }
+            let value = self
+                .post_info(query, "TRADE.XYZ account execution history lookup failed")
+                .await?;
+            let rows = parse_account_fill_page(&value, start, through_ms.unwrap_or(now_ms()?))?;
+            let row_count = rows.len();
+            let last_ms = rows.last().map(|row| row.fill.at_ms);
+            let previous_count = seen.len();
+            for row in rows {
+                let key = (row.coin.clone(), row.fill.trade_id.clone());
+                if let Some(previous) = seen.get(&key) {
+                    if previous != &row {
+                        return Err(SnapshotError::new(
+                            "TRADE.XYZ account fill identity conflict",
+                        ));
+                    }
+                } else {
+                    seen.insert(key, row);
+                }
+                if seen.len() >= ACCOUNT_FILL_RETENTION_LIMIT {
+                    return Err(SnapshotError::new(
+                        "TRADE.XYZ account history reached the retained 10000-fill cap; completeness is unknown",
+                    ));
+                }
+            }
+            if row_count < ACCOUNT_FILL_EXHAUSTION_THRESHOLD {
+                return Ok(seen);
+            }
+            let next = last_ms.ok_or_else(|| {
+                SnapshotError::new("TRADE.XYZ account history timestamp is missing")
+            })?;
+            if next <= start || seen.len() == previous_count {
+                return Err(SnapshotError::new(
+                    "TRADE.XYZ saturated account history cannot advance without losing same-millisecond fills",
+                ));
+            }
+            // Inclusive overlap is mandatory: advancing by one could omit a
+            // capped suffix of executions sharing the last timestamp.
+            start = next;
+        }
+        Err(SnapshotError::new(
+            "TRADE.XYZ account history page limit exceeded",
+        ))
+    }
+
     async fn verify_credentials(&self) -> Result<(), SnapshotError> {
         self.credentials_verified
             .get_or_try_init(|| async {
@@ -1612,6 +1676,56 @@ where
     T: HttpTransport,
     N: NonceSource,
 {
+    async fn account_position_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<AccountPositionHistory, SnapshotError> {
+        validate_request(exchange, symbol)?;
+        let now = now_ms()?;
+        if from_ms > through_ms || through_ms > now {
+            return Err(SnapshotError::new(
+                "TRADE.XYZ account history interval is invalid or in the future",
+            ));
+        }
+        self.verify_credentials().await?;
+        let symbol = symbol.to_ascii_uppercase();
+        let market = self.market_info(&symbol).await?;
+        let bounded = self.account_fill_window(from_ms, Some(through_ms)).await?;
+        // An empty old interval can mean eviction, not no trades. Scan the full
+        // retained account (including other markets and newer fills) to prove
+        // the 10000-fill cap has not been reached before claiming completeness.
+        // Use the server-current default end on every probe page: newer fills
+        // can evict old evidence even after our client-side `now` was captured.
+        let retained = self.account_fill_window(0, None).await?;
+        let retained_interval = retained
+            .into_iter()
+            .filter(|(_, row)| row.fill.at_ms >= from_ms && row.fill.at_ms <= through_ms)
+            .collect::<BTreeMap<_, _>>();
+        if bounded != retained_interval {
+            return Err(SnapshotError::new(
+                "TRADE.XYZ account history disagrees with retained-history evidence",
+            ));
+        }
+        let mut fills = Vec::new();
+        for row in bounded.into_values().filter(|row| row.coin == market.coin) {
+            row.require_ordinary_perp_trade()?;
+            fills.push(row.fill);
+        }
+        fills.sort_by(|left, right| {
+            compare_trade_chronology(left.at_ms, &left.trade_id, right.at_ms, &right.trade_id)
+        });
+        Ok(AccountPositionHistory {
+            exchange,
+            symbol,
+            from_ms,
+            through_ms,
+            fills,
+        })
+    }
+
     async fn position_snapshot(
         &self,
         exchange: Exchange,
@@ -3469,6 +3583,372 @@ mod tests {
                 .into_iter()
                 .chain(pages.into_iter().map(response)),
         )
+    }
+
+    fn account_fill(id: u64, coin: &str, at_ms: u64) -> Value {
+        json!({
+            "coin":coin, "tid":id, "oid":91, "time":at_ms,
+            "side":"B", "sz":"0.2", "dir":"Open Long", "startPosition":"0",
+            "hash":format!("0x{id:064x}"), "px":"101", "closedPnl":"0",
+            "crossed":true, "fee":"0.01", "feeToken":"USDC"
+        })
+    }
+
+    #[tokio::test]
+    async fn account_position_history_reads_manual_orders_exact_coin_and_retention_witness() {
+        let mut manual = account_fill(7, "xyz:MU", 100);
+        manual["tid"] = json!("0007");
+        manual["oid"] = json!("00091");
+        let all = json!([
+            manual,
+            account_fill(8, "MU", 100),
+            account_fill(9, "other:MU", 100),
+            account_fill(10, "@107", 100)
+        ]);
+        let transport = funding_transport(vec![all.clone(), all]);
+        let history = test_adapter(transport.clone())
+            .account_position_history(Exchange::TradeXyz, "muusdc", 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(history.symbol, "MUUSDC");
+        assert_eq!(history.fills.len(), 1);
+        assert_eq!(history.fills[0].trade_id, "0007");
+        assert_eq!(history.fills[0].exchange_order_id, "00091");
+        assert_eq!(history.fills[0].signed_quantity, Decimal::new(2, 1));
+        let requests = transport.requests();
+        let bodies = requests
+            .iter()
+            .map(|r| serde_json::from_str::<Value>(&r.body_string()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(bodies[2]["type"], "userFillsByTime");
+        assert_eq!(bodies[2]["startTime"], 100);
+        assert_eq!(bodies[2]["endTime"], 100);
+        assert_eq!(bodies[2]["aggregateByTime"], false);
+        assert_eq!(bodies[3]["startTime"], 0);
+        assert!(
+            bodies[3].get("endTime").is_none(),
+            "retention must include fills arriving after the bounded read"
+        );
+        assert!(requests.iter().all(|r| r.path == "/info"));
+    }
+
+    #[tokio::test]
+    async fn account_position_history_paginates_all_symbols_with_inclusive_overlap() {
+        let page = (1..=500)
+            .map(|i| account_fill(i, if i == 1 { "xyz:MU" } else { "BTC" }, i))
+            .collect::<Vec<_>>();
+        let tail = vec![page[499].clone(), account_fill(501, "xyz:MU", 501)];
+        let transport = funding_transport(vec![json!(page), json!(tail), json!(page), json!(tail)]);
+        let history = test_adapter(transport.clone())
+            .account_position_history(Exchange::TradeXyz, "MUUSDC", 1, 501)
+            .await
+            .unwrap();
+        assert_eq!(history.fills.len(), 2);
+        assert_eq!(history.fills[1].at_ms, 501);
+        let requests = transport.requests();
+        let body: Value = serde_json::from_str(&requests[3].body_string()).unwrap();
+        assert_eq!(body["startTime"], 500);
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_conflicting_duplicates_and_retention_disagreement() {
+        let row = account_fill(1, "xyz:MU", 100);
+        for (field, value) in [
+            ("sz", json!("0.3")),
+            ("oid", json!(92)),
+            ("time", json!(101)),
+        ] {
+            let mut other = row.clone();
+            other[field] = value;
+            let page = json!([row.clone(), other]);
+            let transport = funding_transport(vec![page.clone(), page]);
+            assert!(
+                test_adapter(transport)
+                    .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 101)
+                    .await
+                    .is_err()
+            );
+        }
+        let transport = funding_transport(vec![json!([row]), json!([])]);
+        assert!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_nontrade_liquidation_bad_ids_and_bounds() {
+        for (field, value) in [
+            ("tid", json!(" 1")),
+            ("oid", json!(0)),
+            ("oid", json!("1\n")),
+            ("sz", json!("0")),
+            ("sz", json!("-1")),
+            ("side", json!("Buy")),
+            ("time", json!(99)),
+            ("dir", json!("ADL")),
+            ("dir", json!("Auto-Deleveraging")),
+            ("dir", json!("Spot Transfer")),
+            ("dir", json!("Settlement")),
+            ("dir", json!("Open Short")),
+            ("liquidation", json!({"method":"backstop"})),
+        ] {
+            let mut row = account_fill(1, "xyz:MU", 100);
+            row[field] = value;
+            let transport = funding_transport(vec![json!([row.clone()]), json!([row])]);
+            assert!(
+                test_adapter(transport)
+                    .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                    .await
+                    .is_err(),
+                "accepted {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_position_history_fails_closed_on_saturated_same_millisecond_and_retained_cap()
+    {
+        let page = (1..=500)
+            .map(|i| account_fill(i, "BTC", 100))
+            .collect::<Vec<_>>();
+        let transport = funding_transport(vec![json!(page)]);
+        assert!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .is_err()
+        );
+        // A small/empty requested interval does not prove that older fills survived retention.
+        let mut pages = vec![json!([])];
+        for start in (1..10_000).step_by(499) {
+            let rows = (start..=(start + 499).min(10_000))
+                .map(|i| account_fill(i, "BTC", i))
+                .collect::<Vec<_>>();
+            pages.push(json!(rows));
+        }
+        let transport = funding_transport(pages);
+        assert!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_resolves_alias_and_default_perp_coin() {
+        let row = account_fill(1, "xyz:SKHX", 100);
+        let transport = ScriptedTransport::new([
+            skhx_market_response(),
+            dex_response(),
+            response(json!([row.clone()])),
+            response(json!([row])),
+        ]);
+        assert_eq!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "SKHYNIXUSDC", 100, 100)
+                .await
+                .unwrap()
+                .fills
+                .len(),
+            1
+        );
+        let rows = json!([
+            account_fill(1, "CASHCAT", 100),
+            account_fill(2, "xyz:CASHCAT", 100)
+        ]);
+        let transport = ScriptedTransport::new([
+            response(json!([{"universe":[]}, []])),
+            default_cashcat_market_response(),
+            response(rows.clone()),
+            response(rows),
+        ]);
+        assert_eq!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "CASHCATUSDC", 100, 100)
+                .await
+                .unwrap()
+                .fills
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_accepts_empty_history_and_rejects_local_invalid_requests() {
+        let transport = funding_transport(vec![json!([]), json!([])]);
+        assert!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .unwrap()
+                .fills
+                .is_empty()
+        );
+        let transport = ScriptedTransport::new([]);
+        for (exchange, symbol, from, through) in [
+            (Exchange::Bybit, "MUUSDC", 100, 100),
+            (Exchange::TradeXyz, "MU/USDC", 100, 100),
+            (Exchange::TradeXyz, "MUUSDC", 101, 100),
+            (Exchange::TradeXyz, "MUUSDC", 100, u64::MAX),
+        ] {
+            assert!(
+                test_adapter(transport.clone())
+                    .account_position_history(exchange, symbol, from, through)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_position_history_preserves_sell_close_and_flip_quantities() {
+        let mut rows = Vec::new();
+        for (id, side, before, dir, qty) in [
+            (1, "A", "0", "Open Short", "0.5"),
+            (2, "B", "-0.5", "Close Short", "0.2"),
+            (3, "B", "-0.3", "Short > Long", "0.7"),
+            (4, "A", "0.4", "Close Long", "0.1"),
+            (5, "A", "0.3", "Long > Short", "0.4"),
+        ] {
+            let mut row = account_fill(id, "xyz:MU", 99 + id);
+            row["side"] = json!(side);
+            row["startPosition"] = json!(before);
+            row["dir"] = json!(dir);
+            row["sz"] = json!(qty);
+            rows.push(row);
+        }
+        let transport = funding_transport(vec![json!(rows), json!(rows)]);
+        let history = test_adapter(transport)
+            .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 104)
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .fills
+                .iter()
+                .map(|fill| fill.signed_quantity)
+                .collect::<Vec<_>>(),
+            vec![
+                Decimal::new(-5, 1),
+                Decimal::new(2, 1),
+                Decimal::new(7, 1),
+                Decimal::new(-1, 1),
+                Decimal::new(-4, 1)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_unordered_oversized_and_malformed_pages() {
+        for page in [
+            json!({"error":"bad"}),
+            json!([
+                account_fill(1, "xyz:MU", 101),
+                account_fill(2, "xyz:MU", 100)
+            ]),
+            json!(
+                (1..=2001)
+                    .map(|i| account_fill(i, "BTC", 100))
+                    .collect::<Vec<_>>()
+            ),
+        ] {
+            let transport = funding_transport(vec![page]);
+            let error = test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 101)
+                .await
+                .unwrap_err();
+            assert!(!error.message.contains("script is exhausted"));
+        }
+        let transport = ScriptedTransport::new([
+            market_response(),
+            dex_response(),
+            HttpResponse {
+                status: 503,
+                body: "unavailable".into(),
+            },
+        ]);
+        assert!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_unrepresentable_exact_quantity() {
+        let mut row = account_fill(1, "xyz:MU", 100);
+        row["sz"] = json!("0.20000000000000000000000000001");
+        let transport = funding_transport(vec![json!([row.clone()]), json!([row])]);
+        assert!(
+            test_adapter(transport)
+                .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_accepts_documented_zero_hash_twap_trade() {
+        let mut row = account_fill(1, "xyz:MU", 100);
+        row["hash"] = json!(format!("0x{}", "0".repeat(64)));
+        let transport = funding_transport(vec![json!([row.clone()]), json!([row])]);
+        let history = test_adapter(transport)
+            .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(history.fills.len(), 1);
+        assert_eq!(history.fills[0].signed_quantity, Decimal::new(2, 1));
+    }
+
+    #[tokio::test]
+    async fn account_position_history_uses_canonical_chronology_without_rewriting_ids() {
+        let rows = ["10", "2", "02"]
+            .into_iter()
+            .map(|id| {
+                let mut row = account_fill(1, "xyz:MU", 100);
+                row["tid"] = json!(id);
+                row
+            })
+            .collect::<Vec<_>>();
+        let transport = funding_transport(vec![json!(rows), json!(rows)]);
+        let history = test_adapter(transport)
+            .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .fills
+                .iter()
+                .map(|fill| fill.trade_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["02", "2", "10"]
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_hedge_annotations() {
+        for (field, value) in [
+            ("positionIdx", json!(1)),
+            ("positionIdx", Value::Null),
+            ("positionSide", json!("LONG")),
+            ("positionSide", Value::Null),
+        ] {
+            let mut row = account_fill(1, "xyz:MU", 100);
+            row[field] = value;
+            let transport = funding_transport(vec![json!([row.clone()]), json!([row])]);
+            assert!(
+                test_adapter(transport)
+                    .account_position_history(Exchange::TradeXyz, "MUUSDC", 100, 100)
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]

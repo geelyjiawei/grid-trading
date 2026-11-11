@@ -3,7 +3,7 @@ use std::{
     fs, io,
     path::PathBuf,
     sync::Mutex,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{StreamExt, stream};
@@ -2168,6 +2168,19 @@ where
             u64::try_from(accounting_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let convergence_started = Instant::now();
         self.converge_accounted_terminal_intents(now_ms)?;
+        if let Some(message) = self
+            .machine
+            .store()
+            .snapshot()
+            .external_position_blocker
+            .clone()
+        {
+            report.blockers.push(RuntimeBlocker {
+                stage: RuntimeStage::PositionReconciliation,
+                client_order_id: None,
+                message,
+            });
+        }
         self.validate_ledger_ownership()?;
         let convergence_ms =
             u64::try_from(convergence_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2608,6 +2621,19 @@ where
                 .await;
         }
         if mode == RuntimeTickMode::ExecutionEvent && lifecycle == StrategyLifecycle::Running {
+            if let Some(message) = self
+                .machine
+                .store()
+                .snapshot()
+                .external_position_blocker
+                .clone()
+            {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::PositionReconciliation,
+                    client_order_id: None,
+                    message,
+                });
+            }
             if report.is_blocked()
                 && !report.blockers.iter().all(|blocker| {
                     matches!(
@@ -2752,22 +2778,17 @@ where
                 )
                 .await;
         }
-        let expected_position = self
-            .machine
-            .store()
-            .snapshot()
-            .expected_exchange_position()?;
-        if inputs.position.signed_quantity != expected_position {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::PositionReconciliation,
-                client_order_id: None,
-                message: format!(
-                    "position snapshot is not yet consistent with execution accounting: expected {expected_position}, actual {}",
-                    inputs.position.signed_quantity
-                ),
-            });
+        if !self
+            .reconcile_external_position(
+                &mut report,
+                inputs.position.signed_quantity,
+                advance_reference_time_ms(now_ms, tick_started.elapsed()),
+            )
+            .await?
+        {
             return Ok(report);
         }
+        let now_ms = now_ms.max(self.machine.store().snapshot().updated_at_ms);
         let risk_transition = self
             .machine
             .evaluate_risk_price(inputs.market.mark_price, now_ms)?;
@@ -2820,6 +2841,79 @@ where
                 .await;
         }
         Ok(report)
+    }
+
+    async fn reconcile_external_position(
+        &mut self,
+        report: &mut RuntimeTickReport,
+        observed_quantity: Decimal,
+        now_ms: u64,
+    ) -> Result<bool, RuntimeTickError> {
+        let state = self.machine.store().snapshot();
+        if state.expected_exchange_position()? == observed_quantity
+            && state.external_position_blocker.is_none()
+        {
+            return Ok(true);
+        }
+        let (exchange, symbol, from_ms) =
+            (state.exchange, state.symbol.clone(), state.created_at_ms);
+        // Persist the observation before awaiting history so neither a later fast
+        // event nor restart can authorize placements using the stale manual budget.
+        self.machine.block_external_inventory(
+            "account position requires execution-proven external inventory reconciliation".into(),
+            now_ms,
+        )?;
+        let started = Instant::now();
+        let observation = tokio::time::timeout(Duration::from_secs(3), async {
+            let history = self
+                .gateway
+                .account_position_history(exchange, &symbol, from_ms, now_ms)
+                .await?;
+            let position = self.gateway.position_snapshot(exchange, &symbol).await?;
+            let quantity = super::validated_one_way_quantity(&position, exchange, &symbol)?;
+            if quantity != observed_quantity {
+                return Err(crate::exchange::SnapshotError::new(
+                    "position changed while collecting account execution evidence",
+                ));
+            }
+            Ok(history)
+        })
+        .await;
+        let history = match observation {
+            Ok(Ok(history)) => history,
+            Ok(Err(error)) => {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::PositionReconciliation,
+                    client_order_id: None,
+                    message: error.to_string(),
+                });
+                return Ok(false);
+            }
+            Err(_) => {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::PositionReconciliation,
+                    client_order_id: None,
+                    message: "complete account execution history reconciliation timed out".into(),
+                });
+                return Ok(false);
+            }
+        };
+        match self.machine.reconcile_external_inventory(
+            &history,
+            observed_quantity,
+            advance_reference_time_ms(now_ms, started.elapsed()),
+        ) {
+            Ok(_) => Ok(true),
+            Err(StrategyMachineError::InvalidState(error)) => {
+                report.blockers.push(RuntimeBlocker {
+                    stage: RuntimeStage::PositionReconciliation,
+                    client_order_id: None,
+                    message: error.to_string(),
+                });
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn prepare_ready_replacement_submissions(
@@ -3507,22 +3601,17 @@ where
             });
             return Ok(report);
         }
-        let expected_position = self
-            .machine
-            .store()
-            .snapshot()
-            .expected_exchange_position()?;
-        if inputs.position.signed_quantity != expected_position {
-            report.blockers.push(RuntimeBlocker {
-                stage: RuntimeStage::PositionReconciliation,
-                client_order_id: None,
-                message: format!(
-                    "exit position snapshot is not yet consistent with execution accounting: expected {expected_position}, actual {}",
-                    inputs.position.signed_quantity
-                ),
-            });
+        if !self
+            .reconcile_external_position(
+                &mut report,
+                inputs.position.signed_quantity,
+                advance_reference_time_ms(now_ms, exit_started.elapsed()),
+            )
+            .await?
+        {
             return Ok(report);
         }
+        let now_ms = now_ms.max(self.machine.store().snapshot().updated_at_ms);
 
         match lifecycle {
             StrategyLifecycle::RiskExitRequested => {
@@ -3744,6 +3833,9 @@ mod tests {
         market_snapshot_calls: usize,
         rules_snapshot_calls: usize,
         position_snapshot_calls: usize,
+        account_history_calls: usize,
+        account_history_result:
+            Option<Result<Vec<crate::exchange::funding::FundingAccountFill>, SnapshotError>>,
         order_lookup_calls: usize,
         active_order_lookups: usize,
         maximum_concurrent_order_lookups: usize,
@@ -3819,6 +3911,8 @@ mod tests {
                     market_snapshot_calls: 0,
                     rules_snapshot_calls: 0,
                     position_snapshot_calls: 0,
+                    account_history_calls: 0,
+                    account_history_result: None,
                     order_lookup_calls: 0,
                     active_order_lookups: 0,
                     maximum_concurrent_order_lookups: 0,
@@ -4518,6 +4612,43 @@ mod tests {
 
     #[async_trait]
     impl PositionSnapshotGateway for MockGateway {
+        async fn account_position_history(
+            &self,
+            exchange: Exchange,
+            symbol: &str,
+            from_ms: u64,
+            through_ms: u64,
+        ) -> Result<crate::exchange::AccountPositionHistory, SnapshotError> {
+            let mut state = self.state.lock().unwrap();
+            state.account_history_calls += 1;
+            let fills = match state.account_history_result.clone() {
+                Some(result) => result?,
+                None => state
+                    .executions
+                    .values()
+                    .flat_map(|execution| &execution.trades)
+                    .map(|trade| crate::exchange::funding::FundingAccountFill {
+                        trade_id: trade.trade_id.clone(),
+                        exchange_order_id: trade.exchange_order_id.clone(),
+                        at_ms: trade.trade_time_ms,
+                        signed_quantity: if trade.side == OrderSide::Buy {
+                            trade.quantity
+                        } else {
+                            -trade.quantity
+                        },
+                    })
+                    .filter(|fill| fill.at_ms >= from_ms && fill.at_ms <= through_ms)
+                    .collect(),
+            };
+            Ok(crate::exchange::AccountPositionHistory {
+                exchange,
+                symbol: symbol.into(),
+                from_ms,
+                through_ms,
+                fills,
+            })
+        }
+
         async fn position_snapshot(
             &self,
             _exchange: Exchange,
@@ -9734,8 +9865,25 @@ mod tests {
             .snapshot()
             .ready_intents(1_201)
             .unwrap();
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].shape.quantity, opening_quantity - partial_quantity);
+        assert!(
+            ready.is_empty(),
+            "observed position conflicts must block even directly requested intents"
+        );
+        let remainder = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .orders
+            .values()
+            .find(|order| {
+                order.purpose == StrategyOrderPurpose::Opening
+                    && order.tracking == StrategyOrderTracking::Ready
+            })
+            .unwrap();
+        assert_eq!(
+            remainder.shape.quantity,
+            opening_quantity - partial_quantity
+        );
 
         gateway.set_position(-partial_quantity, Some(Decimal::new(1014, 0)));
         let recovered = runtime.tick(1_300).await.unwrap();
@@ -10308,6 +10456,211 @@ mod tests {
         assert!(!recovered.is_blocked());
         assert_eq!(recovered.submissions.len(), 1);
         assert_eq!(gateway.placement_call_count(), 1);
+    }
+
+    fn account_fills_with_manual(
+        gateway: &MockGateway,
+        manual_quantity: Decimal,
+    ) -> Vec<crate::exchange::funding::FundingAccountFill> {
+        let state = gateway.state.lock().unwrap();
+        let mut fills = state
+            .executions
+            .values()
+            .flat_map(|execution| &execution.trades)
+            .map(|trade| crate::exchange::funding::FundingAccountFill {
+                trade_id: trade.trade_id.clone(),
+                exchange_order_id: trade.exchange_order_id.clone(),
+                at_ms: trade.trade_time_ms,
+                signed_quantity: if trade.side == OrderSide::Buy {
+                    trade.quantity
+                } else {
+                    -trade.quantity
+                },
+            })
+            .collect::<Vec<_>>();
+        fills.push(crate::exchange::funding::FundingAccountFill {
+            trade_id: "manual-execution-001".into(),
+            exchange_order_id: "manual-order-001".into(),
+            at_ms: 1_250,
+            signed_quantity: manual_quantity,
+        });
+        fills
+    }
+
+    #[tokio::test]
+    async fn manual_partial_close_reconciles_and_fast_replacement_keeps_no_history_dependency() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let baseline = PositionBaseline {
+            signed_quantity: Decimal::new(-5, 1),
+            entry_price: Some(Decimal::new(1014, 0)),
+        };
+        let machine = machine_with_baseline(
+            config(Some(Decimal::new(1016, 0))),
+            &rules,
+            baseline.clone(),
+        );
+        let opening_id = opening_id(&machine);
+        let opening_quantity = machine.store().snapshot().orders[&opening_id]
+            .shape
+            .quantity;
+        let mut runtime = runtime(gateway.clone(), MemoryOrderIntentStore::default(), machine);
+        gateway.set_position(baseline.signed_quantity, baseline.entry_price);
+        runtime.tick(1_100).await.unwrap();
+        gateway.fill_order(&opening_id, Decimal::new(1014, 0), Decimal::new(5, 2));
+        gateway.set_position(
+            baseline.signed_quantity - opening_quantity,
+            baseline.entry_price,
+        );
+        assert!(!runtime.tick(1_200).await.unwrap().is_blocked());
+        let grid_before = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .grid_position_net_quantity;
+        let history = account_fills_with_manual(&gateway, Decimal::new(2, 1));
+        gateway.state.lock().unwrap().account_history_result = Some(Ok(history));
+        gateway.set_position(Decimal::new(-3, 1) + grid_before, baseline.entry_price);
+        let report = runtime.tick(1_300).await.unwrap();
+        assert!(!report.is_blocked(), "{report:?}");
+        let state = runtime.machine().store().snapshot();
+        assert_eq!(state.baseline, baseline);
+        assert_eq!(
+            state.manual_position_quantity().unwrap(),
+            Decimal::new(-3, 1)
+        );
+        assert_eq!(state.grid_position_net_quantity, grid_before);
+        assert_eq!(gateway.state.lock().unwrap().account_history_calls, 1);
+        let (source_id, shape, _) = accepted_add_order(runtime.machine());
+        gateway.fill_order(&source_id, shape.price.unwrap(), Decimal::new(1, 3));
+        let exchange_id = gateway.exchange_order_id(&source_id);
+        let counter = runtime
+            .tick_execution_event(1_400, Some(&exchange_id))
+            .await
+            .unwrap();
+        assert_eq!(counter.submissions.len(), 1, "{counter:?}");
+        assert_eq!(gateway.state.lock().unwrap().account_history_calls, 1);
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .manual_position_quantity()
+                .unwrap(),
+            Decimal::new(-3, 1)
+        );
+
+        let grid_quantity = runtime
+            .machine()
+            .store()
+            .snapshot()
+            .grid_position_net_quantity;
+        gateway.set_position(Decimal::new(-3, 1) + grid_quantity, baseline.entry_price);
+        gateway.set_market_price(Decimal::new(1016, 0), 1_600);
+        gateway.set_cancellation_marks_terminal(true);
+        let mut close = None;
+        for tick_ms in [1_600, 1_700, 1_800] {
+            runtime.tick(tick_ms).await.unwrap();
+            close = runtime
+                .machine()
+                .store()
+                .snapshot()
+                .orders
+                .values()
+                .find(|order| {
+                    matches!(order.purpose, StrategyOrderPurpose::RiskClose)
+                        && matches!(
+                            order.tracking,
+                            StrategyOrderTracking::Intent {
+                                state: IntentState::Accepted { .. }
+                            }
+                        )
+                })
+                .cloned();
+            if close.is_some() {
+                break;
+            }
+        }
+        let close =
+            close.expect("owned-only risk close must remain available after manual reconciliation");
+        assert_eq!(close.shape.quantity, grid_quantity.abs());
+        assert!(close.shape.reduce_only);
+        gateway.fill_order(
+            &close.client_order_id,
+            Decimal::new(1016, 0),
+            Decimal::new(1, 3),
+        );
+        gateway.set_position(Decimal::new(-3, 1), baseline.entry_price);
+        runtime.tick(1_900).await.unwrap();
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Closed
+        );
+        assert_eq!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .manual_position_quantity()
+                .unwrap(),
+            Decimal::new(-3, 1)
+        );
+        assert_eq!(
+            gateway.state.lock().unwrap().position_quantity,
+            Decimal::new(-3, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_overclose_latches_fast_path_but_does_not_prevent_owned_only_stop() {
+        let rules = rules();
+        let gateway = MockGateway::new(rules.clone(), 1_100);
+        let mut runtime = runtime(
+            gateway.clone(),
+            MemoryOrderIntentStore::default(),
+            machine(config(None), &rules),
+        );
+        let opening_quantity = deploy_running_short_grid(&mut runtime, &gateway).await;
+        let history = account_fills_with_manual(&gateway, Decimal::new(2, 1));
+        gateway.state.lock().unwrap().account_history_result = Some(Ok(history));
+        gateway.set_position(
+            -opening_quantity + Decimal::new(2, 1),
+            Some(Decimal::new(1014, 0)),
+        );
+        let report = runtime.tick(1_300).await.unwrap();
+        assert!(report.is_blocked());
+        assert!(
+            runtime
+                .machine()
+                .store()
+                .snapshot()
+                .external_position_blocker
+                .is_some()
+        );
+        assert_eq!(runtime.machine().store().snapshot().external_fills.len(), 0);
+        let (source_id, shape, _) = accepted_add_order(runtime.machine());
+        gateway.fill_order(&source_id, shape.price.unwrap(), Decimal::new(1, 3));
+        let exchange_id = gateway.exchange_order_id(&source_id);
+        let placements = gateway.placement_call_count();
+        let report = runtime
+            .tick_execution_event(1_400, Some(&exchange_id))
+            .await
+            .unwrap();
+        assert!(report.submissions.is_empty());
+        assert_eq!(gateway.placement_call_count(), placements);
+        gateway.set_cancellation_marks_terminal(true);
+        runtime.machine_mut().request_stop(1_500).unwrap();
+        let stopped = runtime.tick(1_600).await.unwrap();
+        assert_eq!(
+            runtime.machine().store().snapshot().lifecycle,
+            StrategyLifecycle::Stopped,
+            "{stopped:?}"
+        );
+        assert_eq!(gateway.placement_call_count(), placements);
+        assert_eq!(
+            gateway.state.lock().unwrap().position_quantity,
+            -opening_quantity + Decimal::new(2, 1)
+        );
     }
 
     #[tokio::test]

@@ -251,6 +251,14 @@ pub struct StrategyState {
     pub plan: GridPlan,
     pub lifecycle: StrategyLifecycle,
     pub baseline: PositionBaseline,
+    #[serde(default)]
+    pub external_fills: BTreeMap<String, crate::exchange::funding::FundingAccountFill>,
+    #[serde(default)]
+    pub external_position_delta: Decimal,
+    #[serde(default)]
+    pub external_history_through_ms: Option<u64>,
+    #[serde(default)]
+    pub external_position_blocker: Option<String>,
     pub grid_position_net_quantity: Decimal,
     pub opening_filled_quantity: Decimal,
     pub opening_filled_value: Decimal,
@@ -438,6 +446,10 @@ impl StrategyState {
             plan,
             lifecycle,
             baseline,
+            external_fills: BTreeMap::new(),
+            external_position_delta: Decimal::ZERO,
+            external_history_through_ms: None,
+            external_position_blocker: None,
             grid_position_net_quantity: Decimal::ZERO,
             opening_filled_quantity: Decimal::ZERO,
             opening_filled_value: Decimal::ZERO,
@@ -472,11 +484,19 @@ impl StrategyState {
     }
 
     pub fn expected_exchange_position(&self) -> Result<Decimal, StrategyStateError> {
-        self.baseline
-            .signed_quantity
+        self.manual_position_quantity()?
             .checked_add(self.grid_position_net_quantity)
             .ok_or(StrategyStateError::NumericOverflow(
                 "expected exchange position",
+            ))
+    }
+
+    pub fn manual_position_quantity(&self) -> Result<Decimal, StrategyStateError> {
+        self.baseline
+            .signed_quantity
+            .checked_add(self.external_position_delta)
+            .ok_or(StrategyStateError::NumericOverflow(
+                "manual position quantity",
             ))
     }
 
@@ -574,6 +594,9 @@ impl StrategyState {
     }
 
     pub fn ready_intents(&self, now_ms: u64) -> Result<Vec<OrderIntent>, StrategyStateError> {
+        if self.external_position_blocker.is_some() {
+            return Ok(Vec::new());
+        }
         if matches!(
             self.lifecycle,
             StrategyLifecycle::StopRequested
@@ -696,6 +719,17 @@ impl StrategyState {
         }
         self.baseline.validate()?;
         self.baseline.validate_for_direction(self.direction)?;
+        if let Some(previous) = predecessor {
+            super::external_inventory::validate_extension(previous, self)?;
+        }
+        if predecessor.is_none_or(|previous| {
+            previous.external_fills != self.external_fills
+                || previous.external_position_delta != self.external_position_delta
+                || previous.external_history_through_ms != self.external_history_through_ms
+                || previous.external_position_blocker != self.external_position_blocker
+        }) {
+            super::external_inventory::validate_persisted(self)?;
+        }
         match self.failure.as_deref() {
             Some(message) if message.trim().is_empty() => {
                 return Err(StrategyStateError::InvalidFailureState);
@@ -780,6 +814,23 @@ impl StrategyState {
                     .next_if(|(previous_key, _)| *previous_key == key)
                     .map(|(_, order)| order)
             });
+            if !self.external_fills.is_empty()
+                && previous_order != Some(order)
+                && self.external_fills.values().any(|fill| {
+                    order.exchange_order_id.as_ref() == Some(&fill.exchange_order_id)
+                        || order.execution_audit.as_ref().is_some_and(|audit| {
+                            audit
+                                .snapshot
+                                .trades
+                                .iter()
+                                .any(|trade| trade.trade_id == fill.trade_id)
+                        })
+                })
+            {
+                return Err(StrategyStateError::InvalidExternalInventory(
+                    "owned order conflicts with external execution evidence".into(),
+                ));
+            }
             if key != &order.client_order_id || order.shape.symbol != self.symbol {
                 return Err(StrategyStateError::OrderIdentityMismatch);
             }
@@ -2987,6 +3038,62 @@ where
         self.finalize_and_store(next, now_ms, StrategyTransition::Failed { message })
     }
 
+    pub fn reconcile_external_inventory(
+        &mut self,
+        history: &crate::exchange::AccountPositionHistory,
+        actual_quantity: Decimal,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
+        let snapshot = self.store.snapshot();
+        let (fills, delta) = super::external_inventory::reconcile_history(
+            snapshot,
+            history,
+            actual_quantity,
+            now_ms,
+        )?;
+        if snapshot.external_fills == fills
+            && snapshot.external_position_delta == delta
+            && snapshot.external_history_through_ms == Some(history.through_ms)
+            && snapshot.external_position_blocker.is_none()
+        {
+            return Ok(StrategyTransition::NoChange);
+        }
+        let mut next = snapshot.clone();
+        next.external_fills = fills;
+        next.external_position_delta = delta;
+        next.external_history_through_ms = Some(history.through_ms);
+        next.external_position_blocker = None;
+        self.finalize_and_store(
+            next,
+            now_ms,
+            StrategyTransition::Updated {
+                new_obligation_ids: Vec::new(),
+            },
+        )
+    }
+
+    pub fn block_external_inventory(
+        &mut self,
+        message: String,
+        now_ms: u64,
+    ) -> Result<StrategyTransition, StrategyMachineError> {
+        self.ensure_snapshot_validated()?;
+        let snapshot = self.store.snapshot();
+        if snapshot.external_position_blocker.as_ref() == Some(&message) {
+            return Ok(StrategyTransition::NoChange);
+        }
+        let mut next = snapshot.clone();
+        next.external_position_blocker = Some(message);
+        self.finalize_and_store(
+            next,
+            now_ms,
+            StrategyTransition::Updated {
+                new_obligation_ids: Vec::new(),
+            },
+        )
+    }
+
     pub fn request_stop(
         &mut self,
         now_ms: u64,
@@ -5114,6 +5221,8 @@ pub enum StrategyStateError {
     InvalidSymbol,
     #[error("strategy baseline is invalid")]
     InvalidBaseline,
+    #[error("external inventory reconciliation is invalid: {0}")]
+    InvalidExternalInventory(String),
     #[error("existing one-way position cannot be isolated from this grid direction")]
     BaselineDirectionConflict,
     #[error("stop loss or take profit is on the unsafe side of the strategy reference")]
@@ -7508,6 +7617,351 @@ mod tests {
                 .filter(|order| order.tracking == StrategyOrderTracking::Dormant)
                 .count(),
             20
+        );
+    }
+
+    fn manual_machine() -> StrategyMachine<MemoryStrategyStateStore> {
+        StrategyMachine::new(MemoryStrategyStateStore::new(state(
+            Direction::Short,
+            PositionBaseline {
+                signed_quantity: Decimal::new(-5, 1),
+                entry_price: Some(decimal(1015)),
+            },
+        )))
+    }
+
+    fn external_fill(
+        id: &str,
+        quantity: Decimal,
+        at_ms: u64,
+    ) -> crate::exchange::funding::FundingAccountFill {
+        crate::exchange::funding::FundingAccountFill {
+            trade_id: id.into(),
+            exchange_order_id: format!("manual-{id}"),
+            signed_quantity: quantity,
+            at_ms,
+        }
+    }
+
+    fn external_history(
+        fills: Vec<crate::exchange::funding::FundingAccountFill>,
+    ) -> crate::exchange::AccountPositionHistory {
+        crate::exchange::AccountPositionHistory {
+            exchange: Exchange::Binance,
+            symbol: config(Direction::Short).symbol,
+            from_ms: 100,
+            through_ms: 200,
+            fills,
+        }
+    }
+
+    #[test]
+    fn manual_close_changes_only_external_inventory_and_is_idempotent() {
+        let mut machine = manual_machine();
+        let before = machine.store().snapshot().clone();
+        let fill = external_fill("00123", Decimal::new(2, 1), 120);
+        let history = external_history(vec![fill.clone(), fill]);
+        machine
+            .reconcile_external_inventory(&history, Decimal::new(-3, 1), 201)
+            .unwrap();
+        let after = machine.store().snapshot().clone();
+        assert_eq!(
+            after.manual_position_quantity().unwrap(),
+            Decimal::new(-3, 1)
+        );
+        assert_eq!(
+            after.expected_exchange_position().unwrap(),
+            Decimal::new(-3, 1)
+        );
+        assert_eq!(after.baseline, before.baseline);
+        assert_eq!(after.orders, before.orders);
+        assert_eq!(after.inventory_events, before.inventory_events);
+        assert_eq!(after.grid_position_net_quantity, Decimal::ZERO);
+        assert_eq!(after.total_fee, before.total_fee);
+        assert_eq!(after.gross_realized_profit, before.gross_realized_profit);
+        assert_eq!(after.external_fills.len(), 1);
+        machine
+            .reconcile_external_inventory(&history, Decimal::new(-3, 1), 202)
+            .unwrap();
+        assert_eq!(machine.store().snapshot(), &after);
+    }
+
+    #[test]
+    fn manual_add_then_close_and_full_close_never_reopen_external_inventory() {
+        for (fills, remaining) in [
+            (
+                vec![external_fill("1", Decimal::new(5, 1), 120)],
+                Decimal::ZERO,
+            ),
+            (
+                vec![
+                    external_fill("1", Decimal::new(-4, 1), 120),
+                    external_fill("2", Decimal::new(6, 1), 130),
+                ],
+                Decimal::new(-3, 1),
+            ),
+        ] {
+            let mut machine = manual_machine();
+            machine
+                .reconcile_external_inventory(&external_history(fills), remaining, 201)
+                .unwrap();
+            assert_eq!(
+                machine
+                    .store()
+                    .snapshot()
+                    .manual_position_quantity()
+                    .unwrap(),
+                remaining
+            );
+            assert_eq!(machine.store().snapshot().orders.len(), 21);
+            assert_eq!(
+                machine.store().snapshot().grid_position_net_quantity,
+                Decimal::ZERO
+            );
+            machine.store().snapshot().validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn manual_history_rejects_overclose_even_when_later_add_hides_the_net() {
+        for fills in [
+            vec![external_fill("1", Decimal::new(6, 1), 120)],
+            vec![
+                external_fill("1", Decimal::new(6, 1), 120),
+                external_fill("2", Decimal::new(-2, 1), 130),
+            ],
+            vec![external_fill("1", Decimal::new(2, 1), 100)],
+            vec![
+                external_fill("1", Decimal::new(2, 1), 120),
+                external_fill("2", Decimal::new(-1, 1), 120),
+            ],
+        ] {
+            let mut machine = manual_machine();
+            let before = machine.store().snapshot().clone();
+            assert!(
+                machine
+                    .reconcile_external_inventory(
+                        &external_history(fills),
+                        Decimal::new(-1, 1),
+                        201
+                    )
+                    .is_err()
+            );
+            assert_eq!(machine.store().snapshot(), &before);
+        }
+    }
+
+    #[test]
+    fn manual_history_rejects_conflicts_missing_provenance_and_unexplained_deltas() {
+        let first = external_fill("opaque-001", Decimal::new(2, 1), 120);
+        let mut conflict = first.clone();
+        conflict.signed_quantity = Decimal::new(1, 1);
+        for (history, actual) in [
+            (
+                external_history(vec![first.clone(), conflict]),
+                Decimal::new(-3, 1),
+            ),
+            (external_history(vec![]), Decimal::new(-3, 1)),
+            (external_history(vec![first]), Decimal::new(-2, 1)),
+        ] {
+            let mut machine = manual_machine();
+            assert!(
+                machine
+                    .reconcile_external_inventory(&history, actual, 201)
+                    .is_err()
+            );
+            assert_eq!(machine.store().write_attempts(), 0);
+        }
+        let mut machine = manual_machine();
+        machine
+            .reconcile_external_inventory(
+                &external_history(vec![external_fill("1", Decimal::new(2, 1), 120)]),
+                Decimal::new(-3, 1),
+                201,
+            )
+            .unwrap();
+        assert!(
+            machine
+                .reconcile_external_inventory(&external_history(vec![]), Decimal::new(-5, 1), 202)
+                .is_err()
+        );
+        assert_eq!(
+            machine
+                .store()
+                .snapshot()
+                .manual_position_quantity()
+                .unwrap(),
+            Decimal::new(-3, 1)
+        );
+    }
+
+    #[test]
+    fn manual_inventory_failed_persistence_cannot_authorize_changed_position() {
+        let mut machine = manual_machine();
+        let before = machine.store().snapshot().clone();
+        machine.store_mut().fail_next_write();
+        assert!(
+            machine
+                .reconcile_external_inventory(
+                    &external_history(vec![external_fill("1", Decimal::new(2, 1), 120)]),
+                    Decimal::new(-3, 1),
+                    201
+                )
+                .is_err()
+        );
+        assert_eq!(machine.store().snapshot(), &before);
+    }
+
+    #[test]
+    fn manual_position_blocker_survives_serde_and_prevents_ready_orders() {
+        let mut machine = manual_machine();
+        assert!(
+            !machine
+                .store()
+                .snapshot()
+                .ready_intents(101)
+                .unwrap()
+                .is_empty()
+        );
+        machine
+            .block_external_inventory("manual inventory exceeds its owned budget".into(), 101)
+            .unwrap();
+        let restored: StrategyState =
+            serde_json::from_str(&serde_json::to_string(machine.store().snapshot()).unwrap())
+                .unwrap();
+        restored.validate().unwrap();
+        assert!(restored.ready_intents(102).unwrap().is_empty());
+        assert!(restored.external_position_blocker.is_some());
+        assert_eq!(restored.lifecycle, StrategyLifecycle::AwaitingOpening);
+    }
+
+    #[test]
+    fn manual_position_shadow_reports_external_delta_and_latched_conflict() {
+        use crate::exchange::{PositionLeg, PositionSide, PositionSnapshot};
+        let mut machine = manual_machine();
+        machine
+            .reconcile_external_inventory(
+                &external_history(vec![external_fill("1", Decimal::new(2, 1), 120)]),
+                Decimal::new(-3, 1),
+                201,
+            )
+            .unwrap();
+        let position = PositionSnapshot {
+            exchange: Exchange::Binance,
+            symbol: machine.store().snapshot().symbol.clone(),
+            legs: vec![PositionLeg {
+                side: PositionSide::Both,
+                signed_quantity: Decimal::new(-3, 1),
+                entry_price: Some(decimal(1015)),
+                mark_price: decimal(1012),
+                unrealized_profit: Decimal::ZERO,
+                leverage: Some(decimal(3)),
+            }],
+        };
+        let audit = super::super::audit_strategy_shadow(machine.store().snapshot(), &position, &[]);
+        assert_eq!(audit.position.quantity_delta, Some(Decimal::ZERO));
+        assert_eq!(audit.position.expected_quantity, Some(Decimal::new(-3, 1)));
+        assert_eq!(audit.position.external_quantity, Decimal::new(2, 1));
+        machine
+            .block_external_inventory("external ownership unresolved".into(), 202)
+            .unwrap();
+        let audit = super::super::audit_strategy_shadow(machine.store().snapshot(), &position, &[]);
+        assert!(audit.issues.iter().any(|issue| matches!(
+            issue,
+            super::super::ShadowAuditIssue::ExternalInventoryUnreconciled { .. }
+        )));
+    }
+
+    #[test]
+    fn manual_position_funding_and_profit_exclude_manual_inventory() {
+        use crate::exchange::{
+            PositionLeg, PositionSide, PositionSnapshot,
+            funding::{FundingAccountFill, FundingHistorySnapshot, FundingPayment},
+        };
+        let mut machine = manual_machine();
+        let opening = opening_id(machine.store().snapshot());
+        let quantity = machine.store().snapshot().orders[&opening].shape.quantity;
+        assert_eq!(quantity, Decimal::new(28, 1));
+        accept_strategy_order(&mut machine, &opening, "owned-order-001", 101);
+        let (mut execution, valued) = single_valued_trade(
+            &machine,
+            opening,
+            ValuedTradeFixture {
+                exchange_order_id: "owned-order-001",
+                trade_id: "owned-trade-001",
+                price: decimal(1012),
+                quantity,
+                trade_time_ms: 120,
+                applied_at_ms: 130,
+            },
+        );
+        execution.order.exchange = Exchange::Binance;
+        machine
+            .apply_valued_execution(&execution, &valued, 130)
+            .unwrap();
+        let owned = FundingAccountFill {
+            trade_id: "owned-trade-001".into(),
+            exchange_order_id: "owned-order-001".into(),
+            at_ms: 120,
+            signed_quantity: -quantity,
+        };
+        let manual = external_fill("manual-001", Decimal::new(2, 1), 160);
+        let history = external_history(vec![owned.clone(), manual.clone()]);
+        let mut position = PositionSnapshot {
+            exchange: Exchange::Binance,
+            symbol: history.symbol.clone(),
+            legs: vec![PositionLeg {
+                side: PositionSide::Both,
+                signed_quantity: Decimal::new(-33, 1),
+                entry_price: Some(decimal(1012)),
+                mark_price: decimal(1000),
+                unrealized_profit: decimal(9999),
+                leverage: Some(decimal(3)),
+            }],
+        };
+        let before =
+            super::super::strategy_profit_metrics(machine.store().snapshot(), &position).unwrap();
+        machine
+            .reconcile_external_inventory(&history, Decimal::new(-31, 1), 201)
+            .unwrap();
+        position.legs[0].signed_quantity = Decimal::new(-31, 1);
+        let after =
+            super::super::strategy_profit_metrics(machine.store().snapshot(), &position).unwrap();
+        assert_eq!(after.total_equity_profit, before.total_equity_profit);
+        assert_eq!(after.grid_unrealized_profit, Decimal::new(336, 1));
+        assert_eq!(after.realized_net_profit, Decimal::ZERO);
+        let funding = FundingHistorySnapshot {
+            exchange: Exchange::Binance,
+            symbol: history.symbol,
+            from_ms: 100,
+            through_ms: 200,
+            account_fills: Some(vec![owned, manual]),
+            payments: vec![
+                FundingPayment {
+                    id: "before-manual-close".into(),
+                    at_ms: 140,
+                    amount: Decimal::new(-33, 1),
+                    asset: "USDT".into(),
+                    position_quantity: None,
+                },
+                FundingPayment {
+                    id: "after-manual-close".into(),
+                    at_ms: 180,
+                    amount: Decimal::new(-31, 1),
+                    asset: "USDT".into(),
+                    position_quantity: None,
+                },
+            ],
+        };
+        let result =
+            super::super::attribute_strategy_funding(machine.store().snapshot(), &funding).unwrap();
+        assert_eq!(result.net_income, Decimal::new(-56, 1));
+        assert_eq!(result.payment_count, 2);
+        machine
+            .block_external_inventory("unresolved external change".into(), 202)
+            .unwrap();
+        assert!(
+            super::super::strategy_profit_metrics(machine.store().snapshot(), &position).is_err()
         );
     }
 

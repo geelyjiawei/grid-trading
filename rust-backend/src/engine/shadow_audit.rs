@@ -36,6 +36,11 @@ pub fn audit_strategy_shadow(
                 .unwrap_or_else(|| "strategy failed without a reason".into()),
         });
     }
+    if let Some(message) = &strategy.external_position_blocker {
+        issues.push(ShadowAuditIssue::ExternalInventoryUnreconciled {
+            message: message.clone(),
+        });
+    }
 
     let expected_position = match strategy.expected_exchange_position() {
         Ok(quantity) => Some(quantity),
@@ -48,6 +53,7 @@ pub fn audit_strategy_shadow(
     };
     let mut position_audit = ShadowPositionAudit {
         baseline_quantity: strategy.baseline.signed_quantity,
+        external_quantity: strategy.external_position_delta,
         grid_owned_quantity: strategy.grid_position_net_quantity,
         expected_quantity: expected_position,
         actual_quantity: None,
@@ -572,6 +578,8 @@ pub struct ShadowAuditReport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowPositionAudit {
     pub baseline_quantity: Decimal,
+    #[serde(default)]
+    pub external_quantity: Decimal,
     pub grid_owned_quantity: Decimal,
     pub expected_quantity: Option<Decimal>,
     pub actual_quantity: Option<Decimal>,
@@ -615,6 +623,9 @@ pub enum ShadowExpectedLifecycle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ShadowAuditIssue {
+    ExternalInventoryUnreconciled {
+        message: String,
+    },
     InvalidStrategyState {
         message: String,
     },

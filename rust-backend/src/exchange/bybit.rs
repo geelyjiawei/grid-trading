@@ -16,25 +16,27 @@ use zeroize::Zeroizing;
 use crate::{
     domain::{ClientOrderId, Exchange, OrderIntent, OrderKind, OrderSide, TimeInForce},
     exchange::{
-        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, CancellationAcknowledgement,
-        CancellationError, ExchangeMarketSnapshot, ExecutionSnapshotError,
-        ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder, HistoricalPriceGateway,
-        InstrumentRulesGateway, LeverageAcknowledgement, LeverageError, LeverageGateway,
-        LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway, OrderCancellationGateway,
-        OrderCancellationTarget, OrderExecutionSnapshot, OrderHistorySnapshotGateway, OrderLookup,
-        OrderLookupGateway, OrderPlacementGateway, PlacementAcknowledgement, PlacementError,
-        PositionSnapshot, PositionSnapshotGateway, SnapshotError, TradingFeeRateGateway,
-        TradingFeeRates,
+        AccountBalanceSnapshot, AccountBalanceSnapshotGateway, AccountPositionHistory,
+        CancellationAcknowledgement, CancellationError, ExchangeMarketSnapshot,
+        ExecutionSnapshotError, ExecutionSnapshotGateway, HistoricalMinutePrice, HistoricalOrder,
+        HistoricalPriceGateway, InstrumentRulesGateway, LeverageAcknowledgement, LeverageError,
+        LeverageGateway, LookupError, MarketSnapshotGateway, OpenOrderSnapshotGateway,
+        OrderCancellationGateway, OrderCancellationTarget, OrderExecutionSnapshot,
+        OrderHistorySnapshotGateway, OrderLookup, OrderLookupGateway, OrderPlacementGateway,
+        PlacementAcknowledgement, PlacementError, PositionSnapshot, PositionSnapshotGateway,
+        SnapshotError, TradingFeeRateGateway, TradingFeeRates,
         bybit_codec::{
-            parse_account_balance_snapshot, parse_cancellation_acknowledgement, parse_error,
-            parse_exact_order_record, parse_execution_page, parse_historical_minute_open,
-            parse_instrument_rules, parse_leverage_acknowledgement, parse_market_snapshot,
-            parse_open_order_page, parse_order_history_page, parse_placement_acknowledgement,
-            parse_position_snapshot, parse_trading_fee_rates,
+            parse_account_balance_snapshot, parse_account_execution_page, parse_account_order_mode,
+            parse_cancellation_acknowledgement, parse_error, parse_exact_order_record,
+            parse_execution_page, parse_historical_minute_open, parse_instrument_rules,
+            parse_leverage_acknowledgement, parse_market_snapshot, parse_open_order_page,
+            parse_order_history_page, parse_placement_acknowledgement, parse_position_snapshot,
+            parse_trading_fee_rates,
         },
         codec::validate_snapshot_request,
+        compare_trade_chronology,
         execution::assemble_execution_snapshot,
-        funding::{FundingHistorySnapshot, FundingPayment},
+        funding::{FundingAccountFill, FundingHistorySnapshot, FundingPayment},
         protocol::{
             HttpMethod, HttpResponse, HttpTransport, MillisecondClock, Parameters,
             PreparedHttpRequest, encode_parameters,
@@ -58,6 +60,9 @@ const FUNDING_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const FUNDING_RETENTION_MS: u64 = 730 * 24 * 60 * 60 * 1_000;
 const MAX_FUNDING_REQUESTS: usize = 256;
 const FUNDING_PAGE_LIMIT: usize = 50;
+const ACCOUNT_HISTORY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const ACCOUNT_HISTORY_RETENTION_MS: u64 = 730 * 24 * 60 * 60 * 1_000;
+const MAX_ACCOUNT_HISTORY_REQUESTS: usize = 256;
 const REALTIME_EXECUTION_SNAPSHOT_WAIT: Duration = Duration::from_millis(250);
 
 mod order_ws;
@@ -1500,6 +1505,150 @@ where
     S: BybitRequestSigner,
     C: MillisecondClock,
 {
+    async fn account_position_history(
+        &self,
+        exchange: Exchange,
+        symbol: &str,
+        from_ms: u64,
+        through_ms: u64,
+    ) -> Result<AccountPositionHistory, SnapshotError> {
+        validate_snapshot_request(exchange, Exchange::Bybit, symbol)?;
+        let symbol = symbol.to_ascii_uppercase();
+        let now = self.clock.now_millis();
+        if from_ms > through_ms
+            || through_ms > now
+            || from_ms < now.saturating_sub(ACCOUNT_HISTORY_RETENTION_MS)
+        {
+            return Err(SnapshotError::new(
+                "Bybit account history interval is invalid or exceeds retention",
+            ));
+        }
+        let mut fills = BTreeMap::<String, FundingAccountFill>::new();
+        let mut requests = 0;
+        let mut window_start = from_ms;
+        loop {
+            let window_end =
+                through_ms.min(window_start.saturating_add(ACCOUNT_HISTORY_WINDOW_MS - 1));
+            let mut cursor = None;
+            let mut cursors = BTreeSet::new();
+            loop {
+                if requests == MAX_ACCOUNT_HISTORY_REQUESTS {
+                    return Err(SnapshotError::new(
+                        "Bybit account history request limit exceeded",
+                    ));
+                }
+                let mut query = vec![
+                    ("category".into(), CATEGORY.into()),
+                    ("symbol".into(), symbol.clone()),
+                    ("startTime".into(), window_start.to_string()),
+                    ("endTime".into(), window_end.to_string()),
+                    ("limit".into(), EXECUTION_PAGE_LIMIT.to_string()),
+                ];
+                if let Some(cursor) = cursor {
+                    query.push(("cursor".into(), cursor));
+                }
+                let request = self
+                    .signed_get("/v5/execution/list", query)
+                    .map_err(|error| SnapshotError::new(error.to_string()))?;
+                requests += 1;
+                let body = self
+                    .execute_snapshot(request, "Bybit account execution history")
+                    .await?;
+                let page = parse_account_execution_page(&body, &symbol, window_start, window_end)
+                    .map_err(|error| {
+                    SnapshotError::new(format!("invalid Bybit account history: {error}"))
+                })?;
+                for fill in page.fills {
+                    if let Some(previous) = fills.get(&fill.trade_id) {
+                        if previous != &fill {
+                            return Err(SnapshotError::new("Bybit account fill identity conflict"));
+                        }
+                    } else {
+                        fills.insert(fill.trade_id.clone(), fill);
+                    }
+                }
+                let Some(next) = page.next_cursor else { break };
+                if !cursors.insert(next.clone()) {
+                    return Err(SnapshotError::new(
+                        "Bybit account history cursor did not advance",
+                    ));
+                }
+                cursor = Some(next);
+            }
+            if window_end == through_ms {
+                break;
+            }
+            window_start = window_end + 1;
+        }
+        let mut fills = fills.into_values().collect::<Vec<_>>();
+        fills.sort_by(|left, right| {
+            compare_trade_chronology(left.at_ms, &left.trade_id, right.at_ms, &right.trade_id)
+        });
+        // Executions omit positionIdx. Prove each historical order was one-way;
+        // a current position-mode check cannot disambiguate older hedge fills.
+        let mut orders = BTreeMap::<String, bool>::new();
+        for fill in &fills {
+            let buy = fill.signed_quantity > Decimal::ZERO;
+            if let Some(previous_buy) = orders.get(&fill.exchange_order_id) {
+                if *previous_buy != buy {
+                    return Err(SnapshotError::new(
+                        "Bybit account order has conflicting fill sides",
+                    ));
+                }
+                continue;
+            }
+            let mut verified = false;
+            for path in ["/v5/order/realtime", "/v5/order/history"] {
+                if requests == MAX_ACCOUNT_HISTORY_REQUESTS {
+                    return Err(SnapshotError::new(
+                        "Bybit account history request limit exceeded",
+                    ));
+                }
+                let mut query = vec![
+                    ("category".into(), CATEGORY.into()),
+                    ("symbol".into(), symbol.clone()),
+                    ("orderId".into(), fill.exchange_order_id.clone()),
+                    ("limit".into(), "1".into()),
+                ];
+                if path == "/v5/order/history" {
+                    query.push((
+                        "startTime".into(),
+                        fill.at_ms
+                            .saturating_sub(ACCOUNT_HISTORY_WINDOW_MS - 1)
+                            .to_string(),
+                    ));
+                    query.push(("endTime".into(), fill.at_ms.to_string()));
+                }
+                let request = self
+                    .signed_get(path, query)
+                    .map_err(|error| SnapshotError::new(error.to_string()))?;
+                requests += 1;
+                let body = self
+                    .execute_snapshot(request, "Bybit account execution order mode")
+                    .await?;
+                if parse_account_order_mode(&body, &symbol, fill).map_err(|error| {
+                    SnapshotError::new(format!("invalid Bybit historical order mode: {error}"))
+                })? {
+                    verified = true;
+                    break;
+                }
+            }
+            if !verified {
+                return Err(SnapshotError::new(
+                    "Bybit historical execution position mode is unavailable",
+                ));
+            }
+            orders.insert(fill.exchange_order_id.clone(), buy);
+        }
+        Ok(AccountPositionHistory {
+            exchange,
+            symbol,
+            from_ms,
+            through_ms,
+            fills,
+        })
+    }
+
     async fn position_snapshot(
         &self,
         exchange: Exchange,
@@ -1948,6 +2097,389 @@ mod tests {
     }
 
     const FUNDING_START: u64 = 1_699_000_000_000;
+
+    fn account_fill(id: &str, at_ms: u64) -> Value {
+        serde_json::json!({
+            "symbol":"MUUSDT", "orderId":"Manual-001", "orderLinkId":"",
+            "side":"Buy", "execType":"Trade", "createType":"CreateByUser",
+            "execId":id, "execQty":"0.2", "execTime":at_ms.to_string()
+        })
+    }
+
+    fn account_page(rows: Vec<Value>, cursor: &str) -> String {
+        serde_json::json!({"retCode":0,"result":{
+            "category":"linear", "list":rows, "nextPageCursor":cursor
+        }})
+        .to_string()
+    }
+
+    fn account_order(position_index: u64) -> String {
+        account_page(
+            vec![serde_json::json!({
+                "symbol":"MUUSDT", "orderId":"Manual-001", "side":"Buy",
+                "positionIdx":position_index, "createType":"CreateByUser"
+            })],
+            "",
+        )
+    }
+
+    #[tokio::test]
+    async fn account_position_history_reads_manual_fills_and_exact_ids_without_client_ids() {
+        let mut external = account_fill("000AbC-1", FUNDING_START);
+        external.as_object_mut().unwrap().remove("orderLinkId");
+        let mut other = account_fill("other", FUNDING_START);
+        other["symbol"] = serde_json::json!("BTCUSDT");
+        let transport = MockTransport::with_response(ok(account_page(vec![other, external], "")));
+        transport.push(ok(account_order(0)));
+        let history = adapter(transport.clone())
+            .account_position_history(Exchange::Bybit, "muusdt", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap();
+        assert_eq!(history.symbol, "MUUSDT");
+        assert_eq!(history.fills.len(), 1);
+        assert_eq!(history.fills[0].trade_id, "000AbC-1");
+        assert_eq!(history.fills[0].exchange_order_id, "Manual-001");
+        assert_eq!(history.fills[0].signed_quantity, Decimal::new(2, 1));
+        let requests = transport.requests();
+        assert_eq!(requests[0].path, "/v5/execution/list");
+        for (key, value) in [
+            ("category", "linear"),
+            ("symbol", "MUUSDT"),
+            ("limit", "100"),
+        ] {
+            assert!(requests[0].query.contains(&(key.into(), value.into())));
+        }
+        assert!(
+            !requests[0]
+                .query
+                .iter()
+                .any(|(key, _)| matches!(key.as_str(), "orderId" | "orderLinkId" | "execType"))
+        );
+        assert_eq!(requests[1].path, "/v5/order/realtime");
+        assert!(
+            requests[1]
+                .query
+                .contains(&("orderId".into(), "Manual-001".into()))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == HttpMethod::Get)
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_exhausts_cursors_and_nonoverlapping_seven_day_windows() {
+        let end = FUNDING_START + 7 * 24 * 60 * 60 * 1_000;
+        let first = account_fill("a", FUNDING_START);
+        let mut last = account_fill("b", end);
+        last["side"] = serde_json::json!("Sell");
+        last["orderId"] = serde_json::json!("Manual-002");
+        let transport = MockTransport::with_response(ok(account_page(vec![first.clone()], "a/+=")));
+        transport.push(ok(account_page(vec![first], "")));
+        transport.push(ok(account_page(vec![last], "")));
+        transport.push(ok(account_order(0)));
+        let second = account_order(0)
+            .replace("Manual-001", "Manual-002")
+            .replace("Buy", "Sell");
+        transport.push(ok(second));
+        let history = adapter(transport.clone())
+            .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, end)
+            .await
+            .unwrap();
+        assert_eq!(history.fills.len(), 2);
+        assert_eq!(history.fills[1].signed_quantity, Decimal::new(-2, 1));
+        let requests = transport.requests();
+        assert!(
+            requests[0]
+                .query
+                .contains(&("endTime".into(), (end - 1).to_string()))
+        );
+        assert!(
+            requests[1]
+                .query
+                .contains(&("cursor".into(), "a/+=".into()))
+        );
+        assert!(
+            requests[2]
+                .query
+                .contains(&("startTime".into(), end.to_string()))
+        );
+        assert!(!requests[2].query.iter().any(|(key, _)| key == "cursor"));
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_malformed_nontrade_hedged_and_out_of_bounds() {
+        for (field, value) in [
+            ("execId", serde_json::json!(" spaced")),
+            ("orderId", serde_json::json!("a\n")),
+            ("side", serde_json::json!("BUY")),
+            ("execQty", serde_json::json!("0")),
+            ("execQty", serde_json::json!("-1")),
+            (
+                "execTime",
+                serde_json::json!((FUNDING_START - 1).to_string()),
+            ),
+            ("execType", serde_json::json!("AdlTrade")),
+            ("execType", serde_json::json!("BustTrade")),
+            ("execType", serde_json::json!("Delivery")),
+            ("execType", serde_json::json!("Settle")),
+            ("execType", serde_json::json!("MovePosition")),
+            ("createType", serde_json::json!("CreateByLiq")),
+            ("positionIdx", serde_json::json!(1)),
+        ] {
+            let mut row = account_fill("a", FUNDING_START);
+            row[field] = value;
+            let transport = MockTransport::with_response(ok(account_page(vec![row], "")));
+            assert!(
+                adapter(transport)
+                    .account_position_history(
+                        Exchange::Bybit,
+                        "MUUSDT",
+                        FUNDING_START,
+                        FUNDING_START
+                    )
+                    .await
+                    .is_err(),
+                "accepted {field}"
+            );
+        }
+        let transport = MockTransport::with_response(ok(account_page(
+            vec![account_fill("a", FUNDING_START)],
+            "",
+        )));
+        transport.push(ok(account_order(1)));
+        assert!(
+            adapter(transport)
+                .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_duplicate_conflicts_cycles_and_missing_cursors() {
+        let row = account_fill("a", FUNDING_START);
+        for field in ["execQty", "orderId", "side", "execTime"] {
+            let mut conflict = row.clone();
+            conflict[field] = match field {
+                "execQty" => serde_json::json!("0.3"),
+                "orderId" => serde_json::json!("other"),
+                "side" => serde_json::json!("Sell"),
+                _ => serde_json::json!((FUNDING_START + 1).to_string()),
+            };
+            let transport =
+                MockTransport::with_response(ok(account_page(vec![row.clone()], "next")));
+            transport.push(ok(account_page(vec![conflict], "")));
+            assert!(
+                adapter(transport)
+                    .account_position_history(
+                        Exchange::Bybit,
+                        "MUUSDT",
+                        FUNDING_START,
+                        FUNDING_START + 1
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let transport = MockTransport::with_response(ok(account_page(vec![], "loop")));
+        transport.push(ok(account_page(vec![], "loop")));
+        assert!(
+            adapter(transport)
+                .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await
+                .is_err()
+        );
+        let transport = MockTransport::with_response(ok(
+            r#"{"retCode":0,"result":{"category":"linear","list":[]}}"#,
+        ));
+        assert!(
+            adapter(transport)
+                .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_empty_and_request_cap_fail_closed() {
+        let transport = MockTransport::with_response(ok(account_page(vec![], "")));
+        assert!(
+            adapter(transport)
+                .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await
+                .unwrap()
+                .fills
+                .is_empty()
+        );
+        let transport = MockTransport::default();
+        for page in 0..256 {
+            transport.push(ok(account_page(vec![], &format!("next-{page}"))));
+        }
+        assert!(
+            adapter(transport.clone())
+                .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await
+                .is_err()
+        );
+        assert_eq!(transport.requests().len(), 256);
+        let transport = MockTransport::default();
+        for (exchange, symbol, from, through) in [
+            (Exchange::Binance, "MUUSDT", FUNDING_START, FUNDING_START),
+            (Exchange::Bybit, "MU/USDT", FUNDING_START, FUNDING_START),
+            (Exchange::Bybit, "MUUSDT", 1, FUNDING_START),
+            (Exchange::Bybit, "MUUSDT", FUNDING_START + 1, FUNDING_START),
+            (Exchange::Bybit, "MUUSDT", FUNDING_START, u64::MAX),
+        ] {
+            assert!(
+                adapter(transport.clone())
+                    .account_position_history(exchange, symbol, from, through)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_position_history_requires_exact_historical_order_mode_when_cache_misses() {
+        let transport = MockTransport::with_response(ok(account_page(
+            vec![account_fill("a", FUNDING_START)],
+            "",
+        )));
+        transport.push(ok(account_page(vec![], "")));
+        transport.push(ok(account_order(0)));
+        let history = adapter(transport.clone())
+            .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap();
+        assert_eq!(history.fills.len(), 1);
+        assert_eq!(transport.requests()[2].path, "/v5/order/history");
+        assert!(
+            transport.requests()[2]
+                .query
+                .contains(&("endTime".into(), FUNDING_START.to_string()))
+        );
+        assert!(transport.requests()[2].query.contains(&(
+            "startTime".into(),
+            (FUNDING_START - 604_799_999).to_string()
+        )));
+        for wrong in [
+            account_page(vec![], ""),
+            account_order(0).replace("Manual-001", "other"),
+            account_order(0).replace("Buy", "Sell"),
+        ] {
+            let transport = MockTransport::with_response(ok(account_page(
+                vec![account_fill("a", FUNDING_START)],
+                "",
+            )));
+            transport.push(ok(account_page(vec![], "")));
+            transport.push(ok(wrong));
+            assert!(
+                adapter(transport)
+                    .account_position_history(
+                        Exchange::Bybit,
+                        "MUUSDT",
+                        FUNDING_START,
+                        FUNDING_START
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_bad_envelopes_and_oversized_pages() {
+        for body in [
+            r#"{"retCode":10001,"result":{"category":"linear","list":[],"nextPageCursor":""}}"#
+                .to_owned(),
+            account_page(vec![account_fill("a", FUNDING_START); 101], ""),
+            account_page(vec![], "").replace("linear", "spot"),
+            "not JSON".into(),
+        ] {
+            let transport = MockTransport::with_response(ok(body));
+            assert!(
+                adapter(transport)
+                    .account_position_history(
+                        Exchange::Bybit,
+                        "MUUSDT",
+                        FUNDING_START,
+                        FUNDING_START
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let transport = MockTransport::with_response(Ok(HttpResponse {
+            status: 503,
+            body: "unavailable".into(),
+        }));
+        assert!(
+            adapter(transport)
+                .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_unrepresentable_exact_quantity() {
+        let mut row = account_fill("a", FUNDING_START);
+        row["execQty"] = serde_json::json!("0.20000000000000000000000000001");
+        let transport = MockTransport::with_response(ok(account_page(vec![row], "")));
+        transport.push(ok(account_order(0)));
+        assert!(
+            adapter(transport)
+                .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_uses_canonical_chronology_without_rewriting_ids() {
+        let rows = ["10", "2", "02"]
+            .into_iter()
+            .map(|id| account_fill(id, FUNDING_START))
+            .collect();
+        let transport = MockTransport::with_response(ok(account_page(rows, "")));
+        transport.push(ok(account_order(0)));
+        let history = adapter(transport)
+            .account_position_history(Exchange::Bybit, "MUUSDT", FUNDING_START, FUNDING_START)
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .fills
+                .iter()
+                .map(|fill| fill.trade_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["02", "2", "10"]
+        );
+    }
+
+    #[tokio::test]
+    async fn account_position_history_rejects_hedge_annotations() {
+        for value in [serde_json::json!("LONG"), Value::Null, serde_json::json!(7)] {
+            let mut row = account_fill("a", FUNDING_START);
+            row["positionSide"] = value;
+            let transport = MockTransport::with_response(ok(account_page(vec![row], "")));
+            transport.push(ok(account_order(0)));
+            assert!(
+                adapter(transport)
+                    .account_position_history(
+                        Exchange::Bybit,
+                        "MUUSDT",
+                        FUNDING_START,
+                        FUNDING_START
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     fn funding_row(id: &str, at_ms: u64, amount: &str, size: &str) -> serde_json::Value {
         serde_json::json!({
